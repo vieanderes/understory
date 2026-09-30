@@ -217,9 +217,21 @@ describe('AssistantPanel', () => {
     expect(window.localStorage.getItem('understory:assistant:provider')).toBe('mcp');
     expect(ids.at(-1)).toBe('mcp');
 
-    const code = window.sessionStorage.getItem('understory:assistant:pairing') ?? '';
-    expect(code).toMatch(/^[A-Z2-9]{8}$/);
+    // The tab keeps its secret beside the code; only the code is shown.
+    const stored = window.sessionStorage.getItem('understory:assistant:pairing') ?? '';
+    expect(stored).toMatch(/^[A-Z2-9]{8}:[0-9a-f]{64}$/);
+    const [code = '', secret = ''] = stored.split(':');
     expect(screen.getByText(`${code.slice(0, 4)}-${code.slice(4)}`)).toBeInTheDocument();
+    expect(document.body.textContent).not.toContain(secret);
+    expect(screen.getByText(/No Claude app connected yet/)).toBeInTheDocument();
+
+    // A new code replaces the old one at once.
+    await user.click(screen.getByRole('button', { name: 'New code' }));
+    const [next = ''] = (window.sessionStorage.getItem('understory:assistant:pairing') ?? '').split(
+      ':',
+    );
+    expect(next).not.toBe(code);
+    expect(screen.getByText(`${next.slice(0, 4)}-${next.slice(4)}`)).toBeInTheDocument();
     expect(
       screen.getByText(
         `claude mcp add --transport http understory ${window.location.origin}/api/mcp`,

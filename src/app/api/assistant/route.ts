@@ -18,7 +18,7 @@ import {
 export const dynamic = 'force-dynamic';
 
 export async function POST(request: Request) {
-  const tooMany = limited(request, 'reply');
+  const tooMany = await limited(request, 'reply');
   if (tooMany) return tooMany;
   const apiKey = request.headers.get(KEY_HEADER)?.trim();
   if (!apiKey) {

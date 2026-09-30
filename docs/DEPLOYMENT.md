@@ -15,15 +15,18 @@ needs no database and no environment variables. That keeps every host an option.
 
 The online-test simulator's assistant (docs/ONLINE-TEST.md, section 6) adds the only
 per-request server code: `/api/assistant`, `/api/assistant/local`, `/api/assistant/bridge`
-and `/api/mcp`. Each is rate-limited per client in process memory
+and `/api/mcp`. Each is rate-limited per client
 (`src/adapters/assistant/server/rate-limit.ts`): 30 replies a minute, 240 bridge or MCP
-calls a minute. The API key route spends the candidate's own key, never one of ours. The
+calls a minute, and a client that sends twenty wrong pairing codes or tab secrets is shut
+out for ten minutes. The API key route spends the candidate's own key, never one of ours. The
 local route answers only on the candidate's machine. The MCP bridge keeps sessions in
 memory by default, which is enough on the VPS. On Vercel, create a free Upstash Redis
 database (or add Vercel's Redis integration) and set `UPSTASH_REDIS_REST_URL` and
 `UPSTASH_REDIS_REST_TOKEN` (or `KV_REST_API_URL` and `KV_REST_API_TOKEN`): every instance then
-shares the sessions, and connecting Claude through MCP works there too. The rate limit
-stays per instance, a floor rather than a ceiling.
+shares the sessions, and connecting Claude through MCP works there too. The rate limits
+are counted in the same store, so with Redis they hold across every instance; without it,
+each instance keeps its own count, a floor rather than a ceiling. How the MCP connection
+stays safe without a sign-in is in docs/ONLINE-TEST.md, section 6.
 
 ## Vercel
 

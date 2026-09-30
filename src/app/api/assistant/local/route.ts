@@ -24,7 +24,7 @@ function notFound() {
 /** Whether the panel may offer this provider. */
 export async function GET(request: Request) {
   if (!localCliAllowed(request)) return notFound();
-  const tooMany = limited(request, 'bridge');
+  const tooMany = await limited(request, 'bridge');
   if (tooMany) return tooMany;
   const available = localCliEnabled(process.env) && (await cliAvailable());
   return Response.json({ available }, { headers: { 'Cache-Control': 'no-store' } });
@@ -32,7 +32,7 @@ export async function GET(request: Request) {
 
 export async function POST(request: Request) {
   if (!localCliAllowed(request)) return notFound();
-  const tooMany = limited(request, 'reply');
+  const tooMany = await limited(request, 'reply');
   if (tooMany) return tooMany;
 
   const parsed = await readBody(request, assistantBodySchema);

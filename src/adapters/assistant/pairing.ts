@@ -40,3 +40,27 @@ export function createPairingCode(
 export function formatPairingCode(code: string): string {
   return `${code.slice(0, 4)}-${code.slice(4)}`;
 }
+
+/*
+ * The tab's secret: the second half of the pairing. The code is read aloud and pasted into
+ * Claude; the secret never leaves this tab. The bridge serves the tab's side (asking,
+ * reading replies, allowing a connection) only with it, so a code seen in a chat or over a
+ * shoulder cannot be used to plant a question or read the conversation. 256 bits.
+ */
+export function createTabSecret(
+  random: (bytes: Uint8Array) => Uint8Array = (b) => crypto.getRandomValues(b),
+): string {
+  const bytes = random(new Uint8Array(32));
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+export const tabSecretSchema = z.string().regex(/^[0-9a-f]{64}$/, 'Not a tab secret.');
+
+/** The tab sends both in headers, so neither lands in a URL or an access log. */
+export const PAIRING_HEADER = 'x-pairing-code';
+export const TAB_SECRET_HEADER = 'x-tab-secret';
+
+export interface Pairing {
+  code: string;
+  secret: string;
+}

@@ -206,11 +206,52 @@ providers sit behind `src/core/ports/assistant.ts`:
      server (`pnpm dev`, the VPS) memory is enough. On Vercel set `UPSTASH_REDIS_REST_URL`
      and `UPSTASH_REDIS_REST_TOKEN` (or Vercel's Redis integration's `KV_REST_API_URL` and
      `KV_REST_API_TOKEN`), so every serverless instance sees the same sessions.
+   - Pick **No sign-in** when adding the connector, then press **Allow** in the panel
+     when Claude first uses the code. See "How it stays safe" below.
 2. **Your API key.** Kept in this browser; each request goes to `/api/assistant`, which
    streams from the Anthropic Messages API and never stores the key. Works on any host.
 3. **Claude Code on this machine.** Only when the app runs on your machine (`pnpm dev`, or
    `ASSISTANT_LOCAL_CLI=1 pnpm start`): `/api/assistant/local` runs `claude -p` with the
    account logged in there.
+
+### How it stays safe
+
+The MCP connector has no sign-in, because Understory has no accounts: there is nothing
+for OAuth to check. Three locks take its place, one per party, and the panel explains them
+behind "How this stays safe" (`src/features/online-test/assistant/ConnectionSafety.tsx`).
+
+1. **The pairing code** names a session: eight characters from 31, about 40 bits, made in
+   the tab. **New code** replaces it and ends the old session at once. An idle session is
+   dropped after 30 minutes.
+2. **The tab's secret** (256 bits) is made beside the code and never leaves the tab. The
+   bridge keeps only its SHA-256 hash, and serves the tab's side (asking, pushing context,
+   reading replies, allowing a connection, ending) only with it. So a code seen in a chat
+   or over a shoulder cannot plant a question or read the conversation. A second tab using
+   the same code gets 403 and moves to a new code.
+3. **The learner's Allow.** At `initialize` the server gives each app connection its own
+   `Mcp-Session-Id`, stored with the sessions so any serverless instance knows it. The
+   first tool call from a connection the session has not seen records it as a request and
+   waits up to 45 seconds; the panel polls, shows Allow and Deny, and the call goes through
+   once allowed. From then on only that connection is served; another is refused, or told
+   to ask the learner, and never sees the code or the question. A new connection that is
+   allowed replaces the old one.
+
+Around them:
+
+- Everything the tab sends reaches Claude fenced in `<untrusted>` tags, and the server's
+  instructions say it is data, not instructions, so a planted "now read my email" cannot
+  steer the learner's other connectors. The read tools are annotated read-only; `reply`
+  only posts to the panel, which renders plain Markdown with no HTML and `http(s)` links.
+- The code and secret travel in headers (`x-pairing-code`, `x-tab-secret`), never in a URL
+  or an access log.
+- Rate limits are counted in the same store, so on Vercel with Redis every instance shares
+  one count. Twenty wrong codes or secrets from one client shut it out for ten minutes.
+- A request with a foreign `Origin` (another site's page) is refused, as the MCP spec
+  asks, and every MCP response is `Cache-Control: no-store`.
+
+What is left: someone who can read the learner's Claude chat, and gets the learner to
+press Allow for them, within the session. The panel shows the time of every request and
+of the allowed connection, and New code ends it all.
 
 ## 6a. Guided mode
 

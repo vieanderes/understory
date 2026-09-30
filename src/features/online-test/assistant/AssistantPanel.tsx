@@ -1,6 +1,14 @@
 'use client';
 
-import { ArrowUp, Check, ChevronDown, Copy, CornerDownRight, Square } from 'lucide-react';
+import {
+  ArrowUp,
+  Check,
+  ChevronDown,
+  Copy,
+  CornerDownRight,
+  RefreshCw,
+  Square,
+} from 'lucide-react';
 import {
   useEffect,
   useId,
@@ -21,25 +29,31 @@ import {
 import {
   ASSISTANT_MODELS,
   createAssistantPort,
+  decideMcpConnection,
   formatPairingCode,
   MCP_TIMEOUT_MS,
   pushMcpContext,
   type AssistantModel,
+  type McpStatus,
 } from '@/adapters/assistant';
 import { cn } from '@/lib/cn';
 import { useAssistantDraft } from '../assistant-draft';
+import { clockTime, ConnectionRequest, SafetyNote } from './ConnectionSafety';
 import { Markdown } from './Markdown';
 import {
   keyStore,
   modelStore,
   providerStore,
   readModel,
-  readPairingCode,
+  readPairing,
+  refreshMcpStatus,
+  rotatePairing,
   useApiKey,
   useLocalCliAvailability,
+  useMcpStatus,
   useModel,
   useOrigin,
-  usePairingCode,
+  usePairing,
   useProvider,
 } from './prefs';
 
@@ -95,7 +109,7 @@ const FIELD = cn(
 function defaultCreatePort(id: AssistantProviderId): AssistantPort {
   return createAssistantPort(id, {
     getKey: keyStore.get,
-    pairingCode: readPairingCode(),
+    pairing: readPairing(),
     model: readModel,
   });
 }
@@ -240,9 +254,12 @@ function ProviderChoice({
 
 function ProviderSetup({
   provider,
+  status,
   onEdit,
 }: {
   provider: AssistantProviderId;
+  /** The Claude app's connection, for MCP. */
+  status: McpStatus;
   /** Typing a key makes the provider ready; the setup stays open until closed. */
   onEdit: () => void;
 }) {
@@ -251,7 +268,7 @@ function ProviderSetup({
   const apiKey = useApiKey();
   const model = useModel();
   const origin = useOrigin();
-  const pairing = usePairingCode();
+  const { code: pairing } = usePairing();
 
   const modelField =
     provider === 'mcp' ? null : (
@@ -314,12 +331,32 @@ function ProviderSetup({
   const prompt = `Answer my Understory question, code ${formatted}`;
   return (
     <div className="flex flex-col gap-3">
-      <div className="bg-raised rounded-panel shadow-edge flex items-center gap-1 py-1 pr-1 pl-2">
-        <div className="flex min-w-0 flex-1 flex-col">
-          <p className="t-label">Pairing code</p>
-          <p className="font-mono text-lg font-semibold">{formatted}</p>
+      <div className="flex flex-col gap-1">
+        <div className="bg-raised rounded-panel shadow-edge flex items-center gap-0.5 py-1 pr-1 pl-2">
+          <div className="flex min-w-0 flex-1 flex-col">
+            <p className="t-label">Pairing code</p>
+            <p className="font-mono text-lg font-semibold">{formatted}</p>
+          </div>
+          <CopyButton value={formatted} label="Copy pairing code" />
+          <button
+            type="button"
+            onClick={rotatePairing}
+            aria-label="New code"
+            title="New code: the old one stops working"
+            className={cn(
+              'text-muted hover:text-fg hover:bg-sunken rounded-control inline-flex size-5 shrink-0 items-center justify-center',
+              'transition-press active:scale-98',
+              FOCUS,
+            )}
+          >
+            <RefreshCw aria-hidden size={16} strokeWidth={2} />
+          </button>
         </div>
-        <CopyButton value={formatted} label="Copy pairing code" />
+        <p className="text-muted text-sm text-pretty" aria-live="polite">
+          {status.allowed
+            ? `Claude connected at ${clockTime(status.allowed.at)}. Keep the code to yourself.`
+            : 'No Claude app connected yet. Keep the code to yourself; it works only in this tab.'}
+        </p>
       </div>
       <ol aria-label="Connect your Claude app" className="flex flex-col gap-3">
         <Step n={1} title={local ? 'Add Understory to Claude Code' : 'Add Understory to Claude'}>
@@ -333,7 +370,8 @@ function ProviderSetup({
           ) : (
             <>
               <p className="text-muted text-sm text-pretty">
-                In Settings, Connectors, add a custom connector with this URL.
+                In Settings, Connectors, add a custom connector with this URL, and choose No
+                sign-in.
               </p>
               <CopyField value={endpoint} label="Copy connector URL" />
               <p className="text-muted text-sm">Or in Claude Code:</p>
@@ -344,7 +382,14 @@ function ProviderSetup({
         <Step n={2} title="Ask here, then tell Claude">
           <CopyField value={prompt} label="Copy the message for Claude" />
         </Step>
+        <Step n={3} title="Allow Claude here">
+          <p className="text-muted text-sm text-pretty">
+            The first time Claude uses the code, Allow appears in this panel. Only the Claude you
+            allow can read this tab.
+          </p>
+        </Step>
       </ol>
+      <SafetyNote />
     </div>
   );
 }
@@ -364,7 +409,7 @@ export function AssistantPanel({
   const storedProvider = useProvider();
   const cli = useLocalCliAvailability();
   const apiKey = useApiKey();
-  const pairing = usePairingCode();
+  const pairing = usePairing();
   // A remembered local provider falls back while it is unavailable (another machine).
   const provider: AssistantProviderId =
     storedProvider === 'claude-cli' && cli !== 'available' ? 'mcp' : storedProvider;
@@ -385,12 +430,24 @@ export function AssistantPanel({
   const setupOpen = setupChoice ?? !ready;
   const busy = streaming !== null;
 
-  const port = useMemo(() => (createPort ?? defaultCreatePort)(provider), [createPort, provider]);
+  // A new code makes a new port, so questions go to the new session.
+  const port = useMemo(
+    () => (createPort ?? defaultCreatePort)(provider),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- pairing is read inside defaultCreatePort
+    [createPort, provider, pairing],
+  );
+  const mcpStatus = useMcpStatus(provider === 'mcp' && !createPort);
+  const decide = async (allow: boolean) => {
+    const request = mcpStatus.request;
+    if (!request) return;
+    await decideMcpConnection(pairing, request.id, allow);
+    refreshMcpStatus();
+  };
 
   // The connected app reads the code through the bridge; keep it current between
   // questions. This syncs an external system, it sets no React state.
   useEffect(() => {
-    if (provider !== 'mcp' || !pairing || createPort) return;
+    if (provider !== 'mcp' || !pairing.code || createPort) return;
     const timer = setTimeout(() => void pushMcpContext(pairing, context), 1000);
     return () => clearTimeout(timer);
   }, [provider, pairing, context, createPort]);
@@ -547,7 +604,7 @@ export function AssistantPanel({
                   {waitingOnApp ? (
                     <span className="text-faint text-pretty">
                       Waiting for your Claude app. Tell it to answer code{' '}
-                      {formatPairingCode(pairing)}. It gives up after {MCP_TIMEOUT_MS / 60_000}{' '}
+                      {formatPairingCode(pairing.code)}. It gives up after {MCP_TIMEOUT_MS / 60_000}{' '}
                       minutes.
                     </span>
                   ) : null}
@@ -595,10 +652,19 @@ export function AssistantPanel({
             />
             <ProviderSetup
               provider={provider}
+              status={mcpStatus}
               onEdit={() => setSetupChoice((choice) => choice ?? true)}
             />
           </div>
         </div>
+      ) : null}
+
+      {mcpStatus.request ? (
+        <ConnectionRequest
+          code={pairing.code}
+          at={mcpStatus.request.at}
+          onDecide={(allow) => void decide(allow)}
+        />
       ) : null}
 
       {error ? (

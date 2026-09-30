@@ -5,9 +5,15 @@ import type { AssistantProviderId } from '@/core/ports/assistant';
 import {
   ASSISTANT_MODELS,
   createPairingCode,
+  createTabSecret,
   DEFAULT_ASSISTANT_MODEL,
+  endMcpSession,
+  fetchMcpStatus,
   localCliAvailable,
+  NO_MCP_STATUS,
   type AssistantModel,
+  type McpStatus,
+  type Pairing,
 } from '@/adapters/assistant';
 
 /*
@@ -121,18 +127,106 @@ export function useModel(): AssistantModel {
   return useSyncExternalStore(modelStore.subscribe, readModel, () => DEFAULT_ASSISTANT_MODEL);
 }
 
-/** This tab's pairing code, made on first read and kept for the tab's life. */
-export function readPairingCode(): string {
-  let code = pairingStore.get();
-  if (!code) {
-    code = createPairingCode();
-    pairingStore.set(code);
-  }
-  return code;
+/*
+ * This tab's pairing: the code it shows and the secret it keeps, stored together as
+ * "CODE:secret". Made on first read and kept for the tab's life, or until the learner
+ * asks for a new code.
+ */
+let pairingCache: { raw: string; pairing: Pairing } | undefined;
+
+function makePairing(): string {
+  return `${createPairingCode()}:${createTabSecret()}`;
 }
 
-export function usePairingCode(): string {
-  return useSyncExternalStore(pairingStore.subscribe, readPairingCode, noServer);
+export function readPairing(): Pairing {
+  let raw = pairingStore.get();
+  // A tab from before the secret existed holds a bare code: it gets a fresh pair.
+  if (!/^[A-Z0-9]{8}:[0-9a-f]{64}$/.test(raw)) {
+    raw = makePairing();
+    pairingStore.set(raw);
+  }
+  // The same object for the same value, as useSyncExternalStore needs.
+  if (pairingCache?.raw !== raw) {
+    const [code = '', secret = ''] = raw.split(':');
+    pairingCache = { raw, pairing: { code, secret } };
+  }
+  return pairingCache.pairing;
+}
+
+const NO_PAIRING: Pairing = { code: '', secret: '' };
+
+export function usePairing(): Pairing {
+  return useSyncExternalStore(pairingStore.subscribe, readPairing, () => NO_PAIRING);
+}
+
+/** A new code and secret. The old session ends at once, so the old code stops working. */
+export function rotatePairing(): void {
+  const old = readPairing();
+  void endMcpSession(old);
+  pairingStore.set(makePairing());
+}
+
+/*
+ * The app's connection as the panel shows it: polled every two seconds while a panel that
+ * uses MCP is on screen and the page is visible, so an Allow request shows up without the
+ * learner asking first.
+ */
+const STATUS_POLL_MS = 2000;
+let status: McpStatus = NO_MCP_STATUS;
+let statusKey = '';
+const statusListeners = new Set<() => void>();
+let statusTimer: ReturnType<typeof setTimeout> | undefined;
+
+async function pollStatus() {
+  statusTimer = undefined;
+  if (statusListeners.size === 0) return;
+  if (document.visibilityState === 'visible') {
+    const pairing = readPairing();
+    const key = `${pairing.code}:${pairing.secret}`;
+    const next = await fetchMcpStatus(pairing);
+    if (next && readPairing() === pairing) {
+      // A code another tab took is no use here: this tab moves to a fresh one.
+      if (next.taken) rotatePairing();
+      status = next.taken ? NO_MCP_STATUS : next;
+      statusKey = key;
+      statusListeners.forEach((notify) => notify());
+    }
+  }
+  if (statusListeners.size > 0) statusTimer ??= setTimeout(pollStatus, STATUS_POLL_MS);
+}
+
+/** Polls at once, for after an Allow or Deny. */
+export function refreshMcpStatus(): void {
+  clearTimeout(statusTimer);
+  void pollStatus();
+}
+
+function subscribeStatus(notify: () => void) {
+  statusListeners.add(notify);
+  if (statusListeners.size === 1) refreshMcpStatus();
+  return () => {
+    statusListeners.delete(notify);
+    if (statusListeners.size === 0) {
+      clearTimeout(statusTimer);
+      statusTimer = undefined;
+    }
+  };
+}
+
+function readStatus(): McpStatus {
+  // After a new code the old code's status no longer applies.
+  const pairing = readPairing();
+  return statusKey === `${pairing.code}:${pairing.secret}` ? status : NO_MCP_STATUS;
+}
+
+const noSubscription = () => () => {};
+
+export function useMcpStatus(enabled: boolean): McpStatus {
+  return useSyncExternalStore(
+    enabled ? subscribeStatus : noSubscription,
+    enabled ? readStatus : () => NO_MCP_STATUS,
+    () => NO_MCP_STATUS,
+  );
 }
 
 /*

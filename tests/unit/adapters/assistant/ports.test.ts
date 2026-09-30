@@ -224,7 +224,29 @@ describe('local CLI port', () => {
   });
 });
 
+const PAIRING = { code: 'ABCD2345', secret: 'a'.repeat(64) };
+
 describe('mcp port', () => {
+  it('sends the code and the tab secret in headers, never in the URL', async () => {
+    const calls: { url: string; headers: Headers }[] = [];
+    const fetcher = async (url: string, init?: RequestInit) => {
+      calls.push({ url, headers: new Headers(init?.headers) });
+      return url.startsWith('/api/assistant/bridge?')
+        ? Response.json({
+            replies: [{ n: 1, text: 'Hi', questionId: 1, at: 0 }],
+            agentSeenAt: null,
+          })
+        : Response.json({ questionId: 1, since: 0 });
+    };
+    const port = createMcpPort({ pairing: PAIRING, fetcher: fetcher as unknown as typeof fetch });
+    expect(await collect(port.send(REQUEST))).toEqual(['Hi']);
+    for (const call of calls) {
+      expect(call.url).not.toContain(PAIRING.code);
+      expect(call.headers.get('x-pairing-code')).toBe(PAIRING.code);
+      expect(call.headers.get('x-tab-secret')).toBe(PAIRING.secret);
+    }
+  });
+
   it('gives up after the timeout with a plain message', async () => {
     let now = 0;
     const fetcher = async (url: string) =>
@@ -232,7 +254,7 @@ describe('mcp port', () => {
         ? Response.json({ replies: [], agentSeenAt: null })
         : Response.json({ questionId: 1, since: 0 });
     const port = createMcpPort({
-      code: 'ABCD2345',
+      pairing: PAIRING,
       fetcher: fetcher as unknown as typeof fetch,
       timeoutMs: 3000,
       now: () => now,
@@ -253,7 +275,7 @@ describe('mcp port', () => {
         : Response.json({ questionId: 1, since: 0 }),
     );
     const port = createMcpPort({
-      code: 'ABCD2345',
+      pairing: PAIRING,
       fetcher: fetcher as unknown as typeof fetch,
       sleep: async () => controller.abort(),
     });
@@ -264,7 +286,7 @@ describe('mcp port', () => {
 
 describe('createAssistantPort', () => {
   it('makes the adapter for each provider', () => {
-    const settings = { getKey: () => '', pairingCode: 'ABCD2345' };
+    const settings = { getKey: () => '', pairing: PAIRING };
     expect(createAssistantPort('api-key', settings).id).toBe('api-key');
     expect(createAssistantPort('claude-cli', settings).id).toBe('claude-cli');
     expect(createAssistantPort('mcp', settings).id).toBe('mcp');

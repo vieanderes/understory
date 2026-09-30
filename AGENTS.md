@@ -46,7 +46,11 @@ code, and heed deprecation notices.
     or their clients. See `docs/AUTHOR-BRIEF.md`, "Examples"; the validator enforces it.
 11. Lesson text follows `docs/WRITING-GUIDE.md`: conversational, one idea per screen,
     short sentences, short choices and feedback. `pnpm content:readability` measures it.
-12. Done means `pnpm check` and `pnpm test:e2e` are green.
+12. Size the check to the change. Every change: `pnpm check:fast` (about a minute; it runs
+    solutions only for the lessons you changed). A screen change: also that screen's specs,
+    `pnpm test:e2e tests/e2e/<name>.spec.ts`. Only a release, or a change to the build, the
+    content pipeline, the gates or the runners, needs the full `pnpm check` and `pnpm test:e2e`,
+    which take about fifteen minutes and an hour. Run long commands in the background.
 
 ## Commits
 

@@ -113,12 +113,14 @@ Screenshots live in `docs/assets/readme/`, one per theme: `<name>-light.png` and
 ## Before you open a pull request
 
 ```sh
-pnpm check         # content, audit, lint, typecheck, unit tests, build
-pnpm test:e2e      # for any change to a screen
+pnpm check:fast                            # every change, about a minute
+pnpm test:e2e tests/e2e/<name>.spec.ts     # any screen you changed
 ```
 
-CI on GitHub runs only the fast part of this, so a green badge is not the whole check. The
-full check can also be run on GitHub by a maintainer.
+`check:fast` runs the content rules, lint, types and unit tests side by side, and runs
+solutions only for the lessons you changed. A change to the build, the content pipeline, the
+solution gates or the code runners needs the full `pnpm check` and `pnpm test:e2e`; a
+maintainer also runs those before a release.
 
 ## Commits
 

@@ -65,7 +65,8 @@ a SQL step or a figure cannot.
 
 ## 4. How to run the work
 
-- Definition of done for any change: `pnpm check` and `pnpm test:e2e` green.
+- Definition of done: `pnpm check:fast`, plus the specs of any screen you changed. The full
+  `pnpm check` and `pnpm test:e2e` are for releases and pipeline changes (`AGENTS.md`, law 12).
 - CI on GitHub is only the fast gate (content rules, lint, types, unit tests; a few
   minutes). The solution gates, coverage, build and end-to-end suite run locally and in the
   "Full check" workflow, started by hand before a release.

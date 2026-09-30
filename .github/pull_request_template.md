@@ -10,8 +10,9 @@
 
 <!-- Commands you ran and what you checked by hand. -->
 
-- [ ] `pnpm check` passes
-- [ ] `pnpm test:e2e` passes (for any change to a screen)
+- [ ] `pnpm check:fast` passes
+- [ ] The end-to-end specs of any screen I changed pass
+- [ ] For a build, pipeline, gate or runner change: `pnpm check` and `pnpm test:e2e` pass
 - [ ] New or changed rules in `src/core` have tests, written first
 
 ## Screenshots

@@ -1019,7 +1019,8 @@ pnpm dev           # http://localhost:3000
 server starts, so the first run takes a minute.
 
 ```sh
-pnpm check         # content, audit, lint, typecheck, unit tests, build
+pnpm check:fast    # the everyday check, about a minute
+pnpm check         # everything, before a release: every solution, coverage, build
 pnpm test:e2e      # Playwright on desktop Chromium and phone WebKit, with axe
 ```
 
@@ -1158,11 +1159,12 @@ for the `good first issue` label.
 ### Before you open a pull request
 
 ```sh
-pnpm check         # content, audit, lint, typecheck, unit tests, build
-pnpm test:e2e      # for any change to a screen
+pnpm check:fast                            # every change, about a minute
+pnpm test:e2e tests/e2e/<name>.spec.ts     # any screen you changed
 ```
 
-CI on GitHub runs only the fast part of this, so a green badge is not the whole check.
+A change to the build, the content pipeline, the solution gates or the code runners needs
+the full `pnpm check` and `pnpm test:e2e`.
 
 ### Commits and pull requests
 

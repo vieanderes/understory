@@ -1,0 +1,185 @@
+summary: >-
+  A reliability target turns "the site should be reliable" into a number you can design
+  for, measure and trade against speed of change. The SLI measures what users feel, the SLO
+  sets a target on it over a window, and the error budget is the failure the target
+  allows. The lesson shows how the budget shapes a design and how burn-rate alerts page for
+  real trouble.
+
+
+  These notes add the arithmetic behind the nines, why the availability of your
+  dependencies caps yours, how to choose SLIs and why averages mislead, the full
+  multi-window alert table, and what telemetry a design should mention.
+
+
+  Set an SLO for anything users depend on: checkout, login, search, an AI assistant's
+  answers. Don't set one for internal batch jobs nobody waits on; give those a freshness
+  target instead, such as "the report is ready by 7:00".
+remember:
+  - An SLI is good events divided by valid events, such as checkouts that succeed within 500 ms out of all checkouts.
+  - 99.9% over 30 days allows 43.2 minutes of full outage, 99.99% allows 4.3 minutes, and 99% allows 7.2 hours.
+  - Hard dependencies in series multiply their availabilities, so a 99.9% service calling a 99.5% one can promise at most about 99.4% unless it survives that dependency's failures.
+  - The burn rate is the observed error rate divided by the allowed error rate, and a burn rate of 1 spends the budget exactly over the window.
+  - Page when the burn rate exceeds 14.4 over both the last hour and the last 5 minutes, which is 2% of a 30-day budget spent in an hour.
+  - Set latency SLIs on the share of requests under a threshold, or on p95 and p99, never on the average.
+  - When the budget runs out, the error budget policy shifts the team from features to reliability until it recovers.
+sections:
+  - title: The arithmetic of nines
+    body: |-
+      Allowed downtime for common targets, over a 30-day window and over a year:
+
+      ```text
+      99%      7.2 hours a month     3.65 days a year
+      99.9%    43.2 minutes          8.8 hours
+      99.95%   21.6 minutes          4.4 hours
+      99.99%   4.3 minutes           53 minutes
+      ```
+
+      Each extra nine cuts the budget tenfold and usually costs far more than tenfold in
+      engineering: redundant zones, automated failover, careful rollouts. So the target
+      should be what users need, not the highest you can say.
+
+      Dependencies compound. A request that needs every one of its hard dependencies is up
+      only when all of them are:
+
+      ```ts
+      const budgetMinutes = (slo: number, days = 30) => (1 - slo) * days * 24 * 60;
+      const inSeries = (...parts: number[]) => parts.reduce((all, part) => all * part, 1);
+      const redundant = (part: number, copies: number) => 1 - (1 - part) ** copies;
+
+      inSeries(0.9995, 0.999, 0.995);              // 0.9935, about 280 minutes a month
+      redundant(0.995, 2);                         // 0.999975
+      inSeries(0.9995, 0.999, redundant(0.995, 2)); // 0.9985, about 66 minutes
+      ```
+
+      A balancer at 99.95%, a database at 99.9% and a provider at 99.5% give about 99.35%,
+      nowhere near a 99.9% promise. A second, independent provider lifts the provider term to
+      99.9975%, and the total is still 99.85%, because the balancer and database alone spend
+      more than the budget. The lesson from the numbers: your hard dependencies must be more
+      reliable than your target, or you must be able to serve without them.
+
+      The redundancy formula assumes copies fail independently. Two servers in one zone
+      share power and network, so they fail together more often than the formula says.
+  - title: Choosing good SLIs
+    body: |-
+      A good SLI is measured as close to the user as you can manage and counts events users
+      would call good or bad.
+
+      Common kinds:
+
+      - **Availability**: share of valid requests that succeed. Decide what counts: a `500`
+        is bad, a `400` for invalid input is usually excluded, a `429` depends on whether the
+        limit was fair.
+      - **Latency**: share of requests faster than a threshold, such as 95% under 300 ms.
+        Often two thresholds, one for most requests and one for the tail.
+      - **Quality**: share of responses that weren't degraded, such as answers served by the
+        main model rather than a fallback.
+      - **Freshness**: share of reads that see data updated within a bound, for pipelines and
+        caches.
+
+      Averages hide the problem. If 98 requests take 50 ms and 2 take 5 seconds, the average
+      is 149 ms and looks healthy, while 2% of users waited five seconds. Percentiles and
+      threshold ratios show it.
+
+      Tails compound across fan-out. If each backend is slow on 1% of calls and a page calls
+      100 backends in parallel, the page is slow whenever any one call is:
+
+      ```text
+      chance all 100 calls are fast = 0.99^100 ≈ 0.366
+      chance the page is slow       ≈ 63%
+      ```
+
+      That's why systems with wide fan-out care about p99 and p99.9 of every component, and
+      use techniques such as sending a backup request after a short delay.
+  - title: Multi-window burn-rate alerts
+    body: |-
+      The lesson's page rule is one line of a standard table for a 30-day SLO. Each row pairs
+      a long window with a short one, a twelfth of its length, so the alert fires on
+      sustained burn and clears soon after recovery.
+
+      ```text
+      burn rate  long window  short window  budget spent  action
+      14.4       1 hour       5 minutes     2%            page
+      6          6 hours      30 minutes    5%            page
+      1          3 days       6 hours       10%           ticket
+      ```
+
+      Where the numbers come from: a 30-day window has 720 hours. Burning at 14.4 for one
+      hour spends 14.4 ÷ 720 = 2% of the budget, and at that pace the whole budget lasts
+      50 hours, about two days. Burning at 6 for six hours spends 36 ÷ 720 = 5%. Burning at 1
+      for three days spends 72 ÷ 720 = 10%.
+
+      The fast row catches outages within minutes. The slow row catches a steady leak, such
+      as 0.3% errors against a 0.1% budget, which no fast alert would notice until the month
+      was gone.
+
+      Low-traffic services need care. At 10 requests an hour, one failure is a 10% error
+      rate and a burn rate of 100. Options: require a minimum number of events before
+      alerting, or generate synthetic traffic so there's always a signal.
+  - title: Telemetry a design should mention
+    body: |-
+      In a design review, telemetry is how you prove the SLO is met and find out why when
+      it isn't. Three signals, each for a different question.
+
+      - **Metrics** answer "is something wrong, and how badly". For request-driven services,
+        the **RED** set: rate, errors, duration. For resources such as a database or queue,
+        **USE**: utilisation, saturation, errors. Add business metrics: bookings per minute
+        falls before any error rate rises.
+      - **Logs** answer "what happened to this request". Structured JSON, with a request id
+        on every line, and no personal data or secrets.
+      - **Traces** answer "where did the time go". Each service reports spans with a shared
+        trace id, through OpenTelemetry to a collector, so one slow request can be followed
+        across services.
+
+      Keep label cardinality under control. A metric labelled by user id creates one time
+      series per user and can overwhelm the metrics store. User ids belong in logs and
+      traces, not metric labels.
+
+      For a design interview, one sentence covers it: "Each service emits RED metrics and
+      traces through OpenTelemetry, the SLO is computed from the balancer's logs, and we page
+      on the burn-rate rules." Then name two business metrics you'd watch.
+pitfalls:
+  - "**SLIs users can't feel.** CPU and memory describe machines, not experiences. Measure requests that succeed within a threshold, at the edge."
+  - "**Aiming for 100%.** It freezes releases and is unreachable anyway. Pick the target users need and spend the rest on shipping."
+  - "**Ignoring dependency availability.** A 99.9% promise on top of a 99.5% hard dependency can't hold. Add a fallback, loosen the target, or remove the dependency from the path."
+  - "**Alerting on a single long window.** It keeps paging for an hour after recovery. Pair it with a short window."
+  - "**Averages as latency SLIs.** They hide the slow tail. Use a threshold ratio or percentiles."
+  - "**Metrics labelled by user or request id.** Cardinality explodes. Put ids in logs and traces."
+interview:
+  - question: How would you set an SLO for a checkout service?
+    answer: >-
+      Start from what users feel and what the business can tolerate, then check the design
+      can meet it. I'd define two SLIs measured at the load balancer: the share of valid
+      checkout requests that succeed, and the share that complete within, say, 800 ms. A
+      target such as 99.9% over 30 days gives about 43 minutes of budget a month. Then I'd
+      audit the path: every hard dependency must be more reliable than that or have a
+      fallback, so receipt emails move to a queue and a flaky fraud check gets a default
+      rule. I'd page on burn rate over two windows and agree an error budget policy with
+      product. The trade-off is velocity: a tighter target means slower, more careful
+      releases.
+  - question: What's an error budget and how does a team use it?
+    answer: >-
+      It's the failure the SLO allows: at 99.9% over 30 days, 0.1% of requests, or about 43
+      minutes of full outage. It turns reliability into a shared resource rather than an
+      argument. While budget remains, the team ships features and takes reasonable risks.
+      When it's spent early, the agreed policy applies: risky releases pause and the time
+      goes on the causes, such as flaky dependencies or bad rollouts, until the budget
+      recovers. It also tells you when you're too reliable: a budget never touched suggests
+      the target is tighter than users need, or releases are overly cautious.
+  - question: Why alert on burn rate rather than on error rate crossing a threshold?
+    answer: >-
+      Because burn rate ties the alert to the SLO, so it pages in proportion to how much the
+      problem threatens the promise. A static "errors above 1%" threshold fires on short
+      blips that barely touch the budget and misses a steady 0.3% that drains a 0.1% budget
+      over the month. With burn rates, 14.4 over an hour means 2% of the monthly budget gone,
+      worth waking someone for, and a rate of 1 over three days is a ticket. Pairing each long
+      window with a short one makes alerts clear quickly after recovery. The cost is more
+      configuration and care for low-traffic services, where a single error is a huge rate.
+  - question: Your service promises 99.9%, and it depends on a service that promises 99.5%. What do you do?
+    answer: >-
+      Recognise that the promise can't hold as designed, then either remove the dependency
+      from the critical path or change the promise. 99.5% allows about 3.6 hours of downtime
+      a month against my 43 minutes, and a hard dependency's outages are mine. Options, in
+      order of preference: make the call asynchronous if users needn't wait; add a fallback,
+      such as a default decision, cached data or a second provider; negotiate a better SLO
+      from the owner; or loosen my own target. For a fraud check, I might accept small orders
+      during an outage and review them later, which keeps checkout up and caps the risk.

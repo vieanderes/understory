@@ -1,0 +1,145 @@
+summary: |-
+  Choosing a language is a filtering problem, not a beauty contest. Hard constraints come first: where the code must run, whether a runtime can be installed there, and limits on start-up, memory or latency. A language that fails one is out, however pleasant it is. Among what's left, the ecosystem decides: the libraries and official SDKs the job needs, the tools, the hosting, and the people who know it. The team's current skills matter, but they're a cost that falls with time, while a missing library is a cost that doesn't.
+
+  For AI work the common confusion is thinking AI means Python. Python owns data work and model training. Calling a model API is an HTTP request, and the major providers ship official SDKs for TypeScript and other languages, so a TypeScript product team can build AI features without a second language.
+
+  WebAssembly widens the browser's options: code compiled from Rust, C++ or Go can run in a page beside JavaScript. It suits heavy code you already have, not everyday UI. These notes add worked decisions, the real cost of adding a language to a stack, what crosses the WebAssembly boundary, and how to write and defend the decision.
+remember:
+  - Rule languages out by hard constraints first, where the code runs, whether a runtime may be installed, and start-up, memory or latency limits.
+  - Among the survivors, the ecosystem usually decides, meaning libraries, official SDKs, tools, hosting and hiring, more than the language's own features.
+  - Calling a model API needs only an HTTP client or an official SDK, so a TypeScript team doesn't need Python to ship an AI feature.
+  - Python is the default for model training, evaluation notebooks and data pipelines, because that's where the libraries are.
+  - Every extra language in a stack costs CI, dependency updates, security patching, on-call knowledge and hiring, so it needs a reason that outweighs those.
+  - WebAssembly runs compiled Rust, C++ or Go in the browser, and suits heavy existing code such as image, audio or small-model work.
+  - Numbers cross the WebAssembly boundary directly, while strings and images must be copied into the module's memory, which is why generated bindings exist.
+sections:
+  - title: Four worked decisions
+    body: |-
+      Each follows the same order: hard constraints, then ecosystem, then team.
+
+      **A command-line tool customers run on locked-down machines.** Hard constraint: nothing may be installed, and it must run on Windows, macOS and Linux. That rules out scripts that need Node or Python present. Go and Rust both produce single binaries and cross-compile. The team knows neither; Go is quicker to learn and its standard library covers HTTP and JSON. Choice: Go. Rejected: Node with a bundled runtime, because the download grows large and start-up is slower.
+
+      **A retrieval-backed assistant for a TypeScript product team.** Hard constraints: runs on the team's existing Node servers. Every serious option runs there. Ecosystem: the model providers' official TypeScript SDKs, a Postgres client with pgvector support, the team's existing auth and logging. Choice: TypeScript. Rejected: a separate Python service, which would add a deployment, an on-call surface and a network hop for no library the job needs.
+
+      **Fine-tuning a small classifier on support tickets.** No runtime constraint; it runs in a batch job. Ecosystem decides outright: the training, evaluation and data libraries are Python. Choice: Python, with the trained model served behind an HTTP endpoint the TypeScript product calls.
+
+      **An image editor's filters, running in the browser.** Hard constraint: runs in the page, on the user's device. JavaScript runs there; so does WebAssembly. The team has a mature C++ filter library. Choice: compile it to WebAssembly. Rejected: rewriting it in JavaScript, which would cost months and run slower.
+  - title: The real cost of one more language
+    body: |-
+      "Use the best language for each service" sounds sensible, and every new language has a bill attached. List it before agreeing.
+
+      - **Build and CI.** A second toolchain, a second set of linters, formatters and test runners, and pipelines to maintain.
+      - **Dependencies and security.** A second package ecosystem to audit, update and patch when a vulnerability lands.
+      - **Shared code.** Validation rules, types and API clients now exist twice or need generating from a shared schema, such as OpenAPI.
+      - **On-call.** Whoever is paged at night must be able to read the stack trace. A service only one person understands is a risk.
+      - **Hiring and moving people.** Engineers can move between teams less freely.
+
+      So a new language needs a reason that outweighs that bill: a hard constraint (the browser, a phone, no runtime), or a library that doesn't exist elsewhere and would take months to replace.
+
+      The common, healthy split for AI products is two languages with a clear boundary: the product in TypeScript, and Python only where its libraries are essential, such as training, heavy data processing or a model you host yourself. The boundary is an HTTP API or a queue with a documented schema, so each side can change internally without the other noticing. What to avoid is a third and fourth language added because someone liked it.
+  - title: What crosses the WebAssembly boundary
+    body: |-
+      A WebAssembly module is a compact binary with its own linear memory and a list of exported functions. Here is a complete module, written out byte by byte, that exports `add`:
+
+      ```js
+      // A complete WebAssembly module, written out byte by byte: it exports add(a, b).
+      const bytes = new Uint8Array([
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // magic number "\0asm", version 1
+        0x01, 0x07, 0x01, 0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f, // type: (i32, i32) -> i32
+        0x03, 0x02, 0x01, 0x00, // one function, of that type
+        0x07, 0x07, 0x01, 0x03, 0x61, 0x64, 0x64, 0x00, 0x00, // export it as "add"
+        0x0a, 0x09, 0x01, 0x07, 0x00, 0x20, 0x00, 0x20, 0x01, 0x6a, 0x0b, // body: a + b
+      ]);
+
+      const { instance } = await WebAssembly.instantiate(bytes);
+      console.log(instance.exports.add(2, 3)); // 5
+      console.log(instance.exports.add(2 ** 31 - 1, 1)); // -2147483648, i32 wraps round
+      console.log(instance.exports.add('2', '3')); // 5, JavaScript converts to numbers first
+      ```
+
+      Run in Node 24, it prints `5`, `-2147483648` and `5`. Three lessons hide in those lines. Exported functions deal in numeric values, typed as 32- or 64-bit integers or floats (a 64-bit integer arrives in JavaScript as a BigInt); they can't read a JavaScript string or array directly. Integer maths wraps round silently, unlike JavaScript's numbers. And arguments are converted at the boundary, so a string becomes a number without complaint.
+
+      Anything richer, such as text, an image or an array, must be written into the module's memory as bytes, and the function receives a pointer and a length. That copying is why real projects use generated bindings, such as wasm-bindgen for Rust or Emscripten for C++, rather than calling exports by hand. It's also a performance consideration: a function that is called thousands of times with small inputs can spend more time crossing the boundary than computing. WebAssembly wins when each call does substantial work on data that stays inside the module.
+  - title: Writing and defending the decision
+    body: |-
+      A language choice is expensive to reverse, so write it down. A short decision record is enough:
+
+      ```text
+      Decision: build the export CLI in Go.
+      Context: customers run it on locked-down Windows, macOS and Linux
+        machines; nothing may be installed.
+      Hard constraints: single file, no runtime, three platforms.
+      Options: Go, Rust, Node with a bundled runtime.
+      Choice: Go. Single static binary, cross-compiles with GOOS and
+        GOARCH, standard library covers HTTP and JSON.
+      Rejected: Rust (slower for this team to learn, no feature we need);
+        bundled Node (large download, slower start-up).
+      Costs accepted: a second language in CI; two engineers to learn Go.
+      Revisit if: we need to share much code with the TypeScript backend.
+      ```
+
+      In a review or an interview, lead with the constraint, not the language: "It must run with nothing installed, so it's Go or Rust, and Go is quicker for this team to learn." That sentence invites a challenge on the constraint, which is where challenges belong.
+
+      Expect "why not X?" and answer with the filter: X failed a hard constraint, lacked a library, or cost more to adopt. If X genuinely ties, say so and name the tie-breaker. Avoid performance claims you haven't measured; "Go is faster" is rarely the real reason and invites a benchmark argument you don't need.
+pitfalls:
+  - >-
+    **Choosing by taste first.** The team's favourite may not run where the code must.
+    Apply hard constraints before preferences.
+  - >-
+    **"AI means Python."** For calling a model API, any language with an HTTP client works,
+    and official SDKs exist for TypeScript and others. Add Python where its libraries are
+    needed, such as training.
+  - >-
+    **Adding a language for one small service.** The CI, security and on-call costs are the
+    same whether the service is big or small. Prefer the stack's existing language unless a
+    constraint forces otherwise.
+  - >-
+    **WebAssembly for ordinary UI.** A chart or a form gains nothing from it and pays in
+    build complexity. Use it for heavy computation or code you already have.
+  - >-
+    **Chatty WebAssembly calls.** Thousands of tiny calls with strings spend their time
+    copying across the boundary. Batch the work so each call does a lot.
+  - >-
+    **Unmeasured speed claims.** "Rust is faster" rarely decides a web service limited by
+    network and database. Measure, or argue from constraints instead.
+interview:
+  - question: How would you choose a language for a new service?
+    answer: >-
+      "Hard constraints first, then ecosystem, then team." I'd ask where it runs, whether a
+      runtime can be installed, and whether start-up, memory or latency limits rule anything
+      out. Among what survives, I'd check the libraries and SDKs the job needs, the hosting,
+      tooling and observability we already have, and who can support it on call. The team's
+      existing language wins ties, because every extra language costs CI, security patching
+      and on-call knowledge. For example, a new API in a TypeScript company stays TypeScript
+      unless it needs something only another ecosystem has. I'd write the decision down with
+      rejected options and what would make us revisit it.
+  - question: Should our AI backend be in Python or TypeScript?
+    answer: >-
+      It depends on what the backend does. If it orchestrates model API calls, retrieval,
+      tools and business logic, TypeScript is fine: providers ship official TypeScript SDKs,
+      and staying in the product's language avoids a second deployment, duplicated types and
+      a network hop. If it trains or fine-tunes models, runs heavy data processing, or hosts
+      open models, Python is the right choice, because the libraries are there. Many teams do
+      both with a clear boundary: the product and orchestration in TypeScript, and a Python
+      service for training or model serving behind an HTTP API with a documented schema. The
+      mistake is adding Python by default because the feature involves AI.
+  - question: When would you use WebAssembly?
+    answer: >-
+      When heavy computation must run in the browser and I have, or need, code in a language
+      that compiles to it. Examples are image or video filters, audio processing, a PDF
+      renderer, a physics engine, or running a small model on the user's device to keep data
+      private. An existing C++ or Rust library compiled to WebAssembly avoids a rewrite and
+      runs close to native speed. I wouldn't use it for ordinary UI, since it adds a toolchain
+      and gains nothing. The trade-off to watch is the boundary: numbers pass directly,
+      and strings or images are copied into the module's memory, so the design should batch
+      work into few calls that each do a lot.
+  - question: A teammate wants to write a new service in Rust. The rest of the stack is TypeScript. What do you say?
+    answer: >-
+      I'd ask what the service needs that TypeScript can't provide, and weigh that against the
+      cost of a second language. If there's a hard constraint, such as a CPU-heavy workload
+      Node handles badly, strict memory limits, or code that must ship as a single binary,
+      Rust may be right. If the reason is preference or an unmeasured speed claim, the costs
+      dominate: another toolchain in CI, another dependency ecosystem to patch, and on-call
+      engineers who can't read the code. I'd suggest measuring the bottleneck in TypeScript
+      first. If Rust still wins, I'd want at least two people able to maintain it and a
+      written decision record, so the choice doesn't rest on one enthusiast.

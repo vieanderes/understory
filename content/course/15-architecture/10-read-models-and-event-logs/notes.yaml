@@ -1,0 +1,219 @@
+summary: >-
+  A read model is a second copy of your data, shaped for one kind of question: a search
+  index, a dashboard's totals table, a denormalised list for a busy page. A projection
+  builds it from the writes, a little behind them. **CQRS** is the name for deliberately
+  giving reads their own model, separate from the one that validates and applies commands.
+
+
+  **Event sourcing** goes one step further: the log of events becomes the source of truth,
+  and every table of current state is a projection that can be thrown away and rebuilt.
+  It gives you a full history, time travel to any past state, and new read models built
+  from old events. It also gives you schema evolution for data you can never edit, and a
+  harder story for deleting personal data.
+
+
+  Both patterns trade simplicity for flexibility. Most applications need neither, or need
+  one read model for one painful query, such as search. Reach for event sourcing when the
+  history itself is what the business sells or must prove: ledgers, stock movements, audit
+  trails. The notes cover how projections stay correct, how an event store prevents
+  conflicting writes, and how events and snapshots evolve over the years.
+remember:
+  - A read model is data shaped for one query, built by a projection, and it always lags the writes a little.
+  - Show users their own change from the write's reply, or wait for the read model to reach the write's position, never a blind re-read.
+  - A projection stores its checkpoint in the same transaction as its updates, so a crash can't apply an event twice or skip one.
+  - CQRS separates the write model from read models and doesn't need event sourcing; a search index is CQRS.
+  - In event sourcing the append-only log is the truth, current state is a fold over it, and mistakes are fixed by appending a correcting event.
+  - An event store prevents lost updates with an expected version per stream, enforced by a unique constraint on stream and version.
+  - Old events must stay readable for ever, so version them and convert old shapes as they load.
+  - Snapshots make replay fast by saving state at a position and replaying only the events after it.
+sections:
+  - title: A projection that survives crashes and replays
+    body: |-
+      The lesson's dashboard skipped repeats by remembering the last sequence number in
+      memory. In production, that number must survive restarts, and it must move in the
+      same transaction as the read model, or a crash between the two either loses an
+      update or applies one twice.
+
+      ```sql
+      CREATE TABLE stock_view (sku text PRIMARY KEY, on_hand integer NOT NULL);
+      CREATE TABLE checkpoints (projection text PRIMARY KEY, last_seq bigint NOT NULL);
+      INSERT INTO checkpoints VALUES ('stock_view', 0);
+
+      -- one catch-up pass, in a single transaction
+      BEGIN;
+      SELECT last_seq FROM checkpoints WHERE projection = 'stock_view' FOR UPDATE;
+      SELECT seq, type, data FROM events WHERE seq > $1 ORDER BY seq LIMIT 500;
+      -- for each event:
+      INSERT INTO stock_view (sku, on_hand) VALUES ($2, $3)
+      ON CONFLICT (sku) DO UPDATE SET on_hand = stock_view.on_hand + EXCLUDED.on_hand;
+      -- after the batch:
+      UPDATE checkpoints SET last_seq = $4 WHERE projection = 'stock_view';
+      COMMIT;
+      ```
+
+      Run twice over "received 10 kettles" and "shipped 3", the view held 7 kettles both
+      times. The second pass found no events past the checkpoint.
+
+      `FOR UPDATE` on the checkpoint row means two copies of the projector can't process
+      the same batch at once. To rebuild a read model after a bug, truncate it, reset the
+      checkpoint to 0 and let it catch up. That ability is the main operational gift of
+      projections: a read model is disposable.
+
+      One subtle trap: identity values are handed out when a row is inserted, not when it
+      commits. With concurrent writers, event 11 can commit before event 10. A projector
+      that has read 11 moves its checkpoint past 10 and never sees it. Event stores avoid
+      this by serialising appends, or by reading only events older than a short safety
+      margin. It's worth asking about any home-grown event table.
+  - title: Appending safely, with an expected version
+    body: |-
+      Two people ship the last kettle at the same moment. Each loads the kettle's events,
+      sees one in stock, and appends `StockShipped`. Without a guard, stock goes to minus
+      one. An event store guards with **optimistic concurrency**: every event in a stream
+      has a version, and an append says which version it expects to follow.
+
+      ```sql
+      CREATE TABLE events (
+        seq        bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        stream_id  text    NOT NULL,
+        version    integer NOT NULL,
+        type       text    NOT NULL,
+        data       jsonb   NOT NULL,
+        UNIQUE (stream_id, version)
+      );
+
+      -- the writer loaded version 1, so it appends version 2
+      INSERT INTO events (stream_id, version, type, data)
+      VALUES ('sku-kettle', 2, 'StockShipped', '{"sku":"kettle","qty":1}');
+      ```
+
+      The second writer, which also loaded version 1, tries to insert version 2 again and
+      gets "duplicate key value violates unique constraint". It reloads the stream, sees
+      zero in stock, and refuses the shipment. This is the optimistic locking from the
+      concurrency chapter, applied to a log.
+
+      A **stream** is the unit of consistency, like an aggregate in domain modelling: one
+      kettle, one account, one booking. Rules inside a stream are enforced this way. Rules
+      across streams, such as "no two bookings for one room on one night", need a stream
+      that owns the rule, such as one per room and night, or a separate constraint.
+
+      `seq` gives the global order for projections. `version` gives the per-stream order
+      for writers. You need both.
+  - title: Events that change shape, and snapshots
+    body: |-
+      Events are immutable, but the code reading them keeps changing. The usual answer is
+      **upcasting**: convert each old shape to the current one as it loads, so the rest of
+      the code sees one shape only.
+
+      ```ts
+      type StoredEvent =
+        | { seq: number; type: 'StockShipped'; v: 1; data: { sku: string; qty: number } }
+        | { seq: number; type: 'StockShipped'; v: 2; data: { sku: string; quantity: number; warehouse: string } };
+
+      type Shipped = { seq: number; sku: string; quantity: number; warehouse: string };
+
+      function upcast(event: StoredEvent): Shipped {
+        if (event.v === 1) {
+          return { seq: event.seq, sku: event.data.sku, quantity: event.data.qty, warehouse: 'main' };
+        }
+        return { seq: event.seq, ...event.data };
+      }
+
+      type Snapshot = { upToSeq: number; shipped: Record<string, number> };
+
+      function fold(snapshot: Snapshot, events: StoredEvent[]): Snapshot {
+        const shipped = { ...snapshot.shipped };
+        let upToSeq = snapshot.upToSeq;
+        for (const stored of events) {
+          if (stored.seq <= upToSeq) continue; // already inside the snapshot
+          const e = upcast(stored);
+          shipped[e.sku] = (shipped[e.sku] ?? 0) + e.quantity;
+          upToSeq = e.seq;
+        }
+        return { upToSeq, shipped };
+      }
+      ```
+
+      With a version 1 event at seq 1 and version 2 events at seq 2 and 3, folding the
+      first two gave `{ upToSeq: 2, shipped: { kettle: 5 } }`. Folding the whole log from
+      that snapshot skipped seq 1 and 2 and gave `{ kettle: 5, toaster: 1 }`.
+
+      The upcaster has to invent a value for the missing field, here `'main'`. That's a
+      business decision, and it belongs in a code review, not a default someone forgets.
+
+      A **snapshot** is a cache of state at a position. It must record the position, and
+      it must be discarded when the fold logic changes, because a snapshot built by old
+      code bakes in old rules. Rebuilding from the log is always the safe fallback.
+  - title: When event sourcing earns its cost
+    body: |-
+      Event sourcing is chosen for what it records, not for speed or scale. It fits when
+      the questions people ask are about history: "what was this account's balance on 3
+      March?", "who changed this price, and what did they see?", "why is stock 12 when we
+      counted 10?". Banking ledgers, stock movements, insurance claims and audit-heavy
+      workflows are the usual homes.
+
+      It fits badly when the business thinks in current state and rarely asks about the
+      past. A content management system, a user profile page or a to-do list gains little
+      from a log and pays for it in every feature.
+
+      The costs arrive late. Event schemas can't be migrated with an `ALTER TABLE`, so
+      every shape ever written must stay readable. Queries across entities need
+      projections, since the log is useless for "all bookings in October" until one is
+      built. Deleting personal data from an append-only log needs a plan in advance,
+      usually storing personal fields outside the log, or encrypting them per person and
+      deleting the key, sometimes called crypto-shredding.
+
+      A middle path covers many needs: keep ordinary tables as the source of truth, and
+      write an audit or history table in the same transaction, or publish events through
+      an outbox for other systems. You get most of the history for a fraction of the
+      complexity. Choose full event sourcing per module, never for a whole system by
+      default.
+pitfalls:
+  - "**Reading your own write from the read model.** The projection hasn't caught up, so the user sees old data and thinks the save failed. Return the new state from the write, or wait until the read model reaches the write's sequence number."
+  - "**Keeping the checkpoint somewhere else.** A checkpoint in Redis while the view lives in Postgres drifts after a crash. Commit the checkpoint and the view updates together."
+  - "**Projections that aren't safe to replay.** Adding on every delivery doubles counts after a restart. Skip events at or below the checkpoint, or write projections as upserts that set values."
+  - "**Editing or deleting events to fix a mistake.** It breaks every read model already built and destroys the audit trail. Append a correcting event."
+  - "**Appending without an expected version.** Two writers both pass the business check and both append. Enforce a unique stream and version, and reload on conflict."
+  - "**Event sourcing the whole system because one part needs history.** Every feature then pays the cost. Use it where history is the product, and an audit table elsewhere."
+interview:
+  - question: What is CQRS, and when would you use it?
+    answer: >-
+      CQRS separates the model that handles writes from the models that serve reads, so
+      each can be shaped for its job. The write side validates commands and enforces
+      invariants on normalised tables. Read sides are projections: a search index, a
+      denormalised table for a dashboard, a cache of a product page. I'd use it when reads
+      and writes pull the data in different directions, such as a catalogue with heavy
+      full-text search and rare edits, or when read volume dwarfs writes. The cost is
+      eventual consistency and one more thing to keep correct. So users need to see their
+      own changes from the write's reply, and projections must be replay-safe. For a
+      typical CRUD app, one model with good indexes is simpler and enough.
+  - question: What are the trade-offs of event sourcing?
+    answer: >-
+      The gain is a complete, trustworthy history: you can rebuild any past state, answer
+      audit questions exactly, and build new read models from old events. The costs are
+      real. Every query beyond one entity needs a projection. Event schemas live for ever,
+      so you version events and upcast old shapes on load. Concurrency needs expected
+      versions per stream. Replay gets slow, so you add snapshots and must invalidate them
+      when logic changes. And deleting personal data from an append-only log needs a plan,
+      such as keeping personal fields outside the log. I'd use it for a ledger or stock
+      movements, where history is the product, and use ordinary tables plus an audit table
+      almost everywhere else.
+  - question: A user saves a change and the page still shows the old value. What's happening and how do you fix it?
+    answer: >-
+      Almost certainly the page reads from something that lags the write: a projection, a
+      search index, a cache or a read replica. The write succeeded, but the read raced it.
+      The cheapest fix is to render the user's own change from the write's response
+      instead of re-reading. If the page must re-query, the write can return its position,
+      a sequence number or a timestamp, and the read waits until the read model reaches
+      it, or falls back to the primary for that user for a few seconds. I wouldn't make
+      the whole read path synchronous, because that throws away the reason for the read
+      model. Other users seeing the change a second later is usually fine.
+  - question: How do you rebuild a read model after you find a bug in its projection?
+    answer: >-
+      Fix the projection, then replay the events into a fresh copy and switch over. If the
+      source of truth is an event log, that's the designed path: create a new table, run
+      the fixed projector from sequence 0 with its own checkpoint, and when it has caught
+      up, point readers at it and drop the old one. Building beside the old table avoids
+      serving a half-built view. The projection must be deterministic and replay-safe,
+      with no calls to the clock or external services while folding. If the source of
+      truth is ordinary tables, rebuild from those instead. Either way, a read model
+      should be treated as disposable, and nothing should be stored only there.

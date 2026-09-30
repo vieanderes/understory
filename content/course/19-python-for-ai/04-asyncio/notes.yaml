@@ -1,0 +1,281 @@
+summary: >-
+  `asyncio` runs many waiting jobs on one thread. Each job is a coroutine, and an event loop
+  switches between them at every `await`. While one model call waits for the network, the
+  loop runs another. The work doesn't happen faster: the waits overlap, so 200 calls of 2
+  seconds finish in a few rounds instead of 400 seconds.
+
+
+  It's cooperative. A coroutine gives the loop back only when it awaits something. That
+  makes shared state simpler to reason about, since nothing interrupts you between two awaits, but it also
+  means one blocking call or one long calculation freezes every other task.
+
+
+  Reach for it when a job is mostly waiting and your libraries have async versions: model
+  calls, HTTP requests, database queries, a web server handling many connections. Bound it
+  with a semaphore, give each call a timeout, and use `TaskGroup` when one failure should
+  stop the rest. Don't reach for it to speed up computing. That needs processes, which the
+  next lesson covers.
+remember:
+  - asyncio overlaps waiting on one thread, and a coroutine only gives control back at an `await`.
+  - Calling an `async def` function runs nothing; the body starts when you await it or wrap it in a task.
+  - '`asyncio.gather` returns results in the order you passed them, and `TaskGroup` cancels the other tasks when one fails.'
+  - A shared `asyncio.Semaphore` caps how many calls are in flight, not how many start per minute.
+  - '`async with asyncio.timeout(seconds)` cancels the wait and raises `TimeoutError` when time runs out.'
+  - A blocking call inside a coroutine stalls the whole loop, so await an async client or move the call off with `asyncio.to_thread`.
+  - Re-raise `asyncio.CancelledError` after cleaning up, or cancellation and timeouts stop working.
+sections:
+  - title: The event loop, and how it differs from Node's
+    body: |-
+      The model is the one you know from JavaScript. One thread runs a loop. The loop picks
+      a ready task and runs it until it hits an `await` on something that isn't ready. Then
+      it parks that task and picks another. When the network answers, the parked task
+      becomes ready again.
+
+      Three differences matter in practice. First, Node's loop is always running. Python's
+      exists only inside `asyncio.run(main())`, which creates a loop, runs `main` to the end
+      and closes the loop. Calling `asyncio.run` from code that's already inside a loop, such
+      as a Jupyter cell or a FastAPI handler, raises `RuntimeError`. There you `await`
+      instead.
+
+      Second, a JavaScript `async` function starts running the moment you call it and hands
+      back a promise. A Python coroutine is lazy: calling it builds an object and runs no
+      code. A **task** is the Python equivalent of a promise that's already running.
+      `asyncio.create_task` schedules a coroutine now, and you collect the result later.
+
+      ```python
+      import asyncio
+      import time
+
+
+      async def fetch(name, seconds):
+          print(f"start {name}")
+          await asyncio.sleep(seconds)
+          print(f"done {name}")
+          return name
+
+
+      async def main():
+          started = time.perf_counter()
+
+          coro = fetch("coroutine", 0.2)  # nothing runs yet
+          task = asyncio.create_task(fetch("task", 0.2))  # scheduled now
+
+          await asyncio.sleep(0.1)  # the task starts while we wait here
+          print("awaiting both")
+          print(await coro, await task)
+          print(f"{time.perf_counter() - started:.1f}s")
+
+
+      asyncio.run(main())
+      ```
+
+      ```text
+      start task
+      awaiting both
+      start coroutine
+      done task
+      done coroutine
+      coroutine task
+      0.3s
+      ```
+
+      The task ran during the sleep. The coroutine started only when awaited, so the whole
+      thing took 0.3 seconds, not 0.2. Third, the loop keeps only a weak reference to a task.
+      Keep your own reference, in a variable, a list or a `TaskGroup`, or a fire-and-forget
+      task can be garbage collected before it finishes.
+  - title: gather or TaskGroup, and what happens when one call fails
+    body: |-
+      Both run coroutines together. They differ in what a failure does to the others.
+
+      By default, `gather` raises the first exception to whoever awaits it, but the other
+      calls keep running with nobody waiting for their results. With
+      `return_exceptions=True` it waits for everything and puts each exception in the result
+      list, in its slot. That suits a batch where you want every label you can get and a list
+      of failures to retry.
+
+      `asyncio.TaskGroup`, new in Python 3.11, is structured concurrency. The `async with`
+      block doesn't exit until every task in it has finished. If one task fails, the group
+      cancels the rest, waits for them, and raises an `ExceptionGroup` holding every error.
+      You catch it with `except*`, which matches by exception type inside the group.
+
+      ```python
+      import asyncio
+
+
+      async def call(name, seconds, fail=False):
+          try:
+              await asyncio.sleep(seconds)
+              if fail:
+                  raise ValueError(f"{name} failed")
+              return name
+          except asyncio.CancelledError:
+              print(f"{name} cancelled")
+              raise  # always let cancellation through
+
+
+      async def with_gather():
+          results = await asyncio.gather(
+              call("slow", 0.2), call("broken", 0.05, fail=True),
+              return_exceptions=True,
+          )
+          print(results)
+
+
+      async def with_task_group():
+          try:
+              async with asyncio.TaskGroup() as tg:
+                  tg.create_task(call("slow", 0.2))
+                  tg.create_task(call("broken", 0.05, fail=True))
+          except* ValueError as group:
+              print("errors:", [str(e) for e in group.exceptions])
+
+
+      asyncio.run(with_gather())
+      asyncio.run(with_task_group())
+      ```
+
+      ```text
+      ['slow', ValueError('broken failed')]
+      slow cancelled
+      errors: ['broken failed']
+      ```
+
+      Cancellation is an exception too: `CancelledError` is raised at the `await` where the
+      task was paused. It inherits from `BaseException`, so a plain `except Exception` doesn't
+      catch it. Clean up in `finally` or in an `except` that re-raises. If you swallow it,
+      `TaskGroup` and `asyncio.timeout` can't stop your task.
+  - title: Semaphores and timeouts together
+    body: |-
+      A real batch needs both a cap and a clock, and the order you nest them changes the
+      meaning. Put the timeout inside the semaphore and the clock starts once a call holds a
+      slot, so time spent queueing doesn't count. Put it outside and it limits the total
+      wait, queue included, which suits a request with a deadline.
+
+      ```python
+      import asyncio
+
+
+      async def summarise(doc):
+          # Stands in for a model call. The "stuck" document never answers in time.
+          await asyncio.sleep(5 if doc == "stuck" else 0.1)
+          return doc.upper()
+
+
+      async def summarise_all(docs, limit=3, seconds=0.5):
+          slots = asyncio.Semaphore(limit)
+
+          async def one(doc):
+              async with slots:
+                  # The clock starts once a slot is held, so queueing doesn't count.
+                  try:
+                      async with asyncio.timeout(seconds):
+                          return await summarise(doc)
+                  except TimeoutError:
+                      return None
+
+          return await asyncio.gather(*(one(d) for d in docs))
+
+
+      print(asyncio.run(summarise_all(["cart", "stuck", "order", "refund"])))
+      # ['CART', None, 'ORDER', 'REFUND']
+      ```
+
+      `asyncio.timeout` works by cancelling the task at the deadline, then turning that
+      cancellation into `TimeoutError` as it leaves the block. That's why swallowing
+      `CancelledError` breaks timeouts. The older `asyncio.wait_for(coro, timeout)` does the
+      same job for a single awaitable.
+
+      A semaphore bounds concurrency, not rate. Five slots with calls of 0.2 seconds still
+      start 25 calls a second. For a per-minute quota, add a token bucket or back off on
+      `429` with the `Retry-After` header. If you want results as they arrive instead of all
+      at the end, `asyncio.as_completed` yields them in finishing order.
+  - title: Blocking code in async code
+    body: |-
+      The loop can only switch at an `await`. An ordinary function that waits, such as
+      `time.sleep`, `requests.get`, a synchronous database driver or the non-async model
+      client, holds the only thread until it returns. Every other task stops, including a
+      web server's other requests. Long pure-Python calculations do the same.
+
+      You have three ways out. Use the library's async version, which is the best fix. If
+      there isn't one, `asyncio.to_thread` runs the blocking function in a worker thread and
+      gives you something to await, so the loop stays free. For heavy computing, a thread
+      doesn't help because of the GIL, so send the work to a process pool with
+      `loop.run_in_executor`.
+
+      ```python
+      import asyncio
+      import time
+
+
+      def resize_image(name):
+          time.sleep(0.2)  # a blocking library call with no async version
+          return f"{name}-small"
+
+
+      async def main():
+          started = time.perf_counter()
+          names = await asyncio.gather(
+              *(asyncio.to_thread(resize_image, n) for n in ["a", "b", "c", "d"])
+          )
+          print(names, f"{time.perf_counter() - started:.1f}s")
+
+
+      asyncio.run(main())
+      # ['a-small', 'b-small', 'c-small', 'd-small'] and about 0.2s, not 0.8s
+      ```
+
+      To find a hidden blocker, run with `asyncio.run(main(), debug=True)` or set
+      `PYTHONASYNCIODEBUG=1`. Debug mode logs any step that holds the loop for more than 0.1
+      seconds, with the task's name, and shows where a never-awaited coroutine was created.
+pitfalls:
+  - '**Awaiting in a loop and expecting overlap.** `for r in reviews: await classify(r)` waits for each call before starting the next. Build all the coroutines and hand them to `gather` or a `TaskGroup`.'
+  - '**Firing a task and dropping it.** `asyncio.create_task(save(log))` with no reference can be garbage collected mid-run, and its errors vanish. Keep tasks in a `TaskGroup` or a set you clear when they finish.'
+  - '**Creating the semaphore inside the per-call function.** Each call gets its own slots, so nothing is capped. Create it once per batch and share it.'
+  - '**Calling `time.sleep` or a sync client in a coroutine.** It freezes every task. Use `await asyncio.sleep`, the async client, or `asyncio.to_thread` for a library with no async version.'
+  - '**Swallowing `CancelledError`.** A broad `except BaseException` or a bare `except:` that returns stops timeouts and task groups from cancelling you. Clean up, then re-raise.'
+  - '**Gathering 10,000 coroutines at once.** Every call opens a connection and the provider answers with `429`. Bound concurrency with a semaphore, and retry with backoff.'
+  - '**Calling `asyncio.run` inside a running loop.** In Jupyter or a FastAPI handler a loop already runs, so you get `RuntimeError`. Use `await` there.'
+interview:
+  - question: How does Python's asyncio compare with the Node.js event loop?
+    answer: >-
+      Same model, different defaults. Both run one thread with an event loop that switches
+      tasks when they wait on I/O, so both overlap waiting and neither speeds up
+      computation. The differences: Node's loop is always running, while Python's exists
+      inside `asyncio.run`. A JavaScript async function runs eagerly and returns a promise,
+      whereas calling a Python coroutine function does nothing until you await it or wrap it
+      with `create_task`, which is the closest thing to a promise. And Node's ecosystem is
+      async by default, while in Python many libraries are synchronous. One blocking call in
+      a coroutine stalls the whole loop, so in Python I check every I/O library has an async
+      version, or push it to `asyncio.to_thread`.
+  - question: You need to classify 10,000 documents with a model API that allows 50 concurrent requests. How do you build it?
+    answer: >-
+      An async client, a shared semaphore of 50, a timeout per call and retries with backoff.
+      I'd write one coroutine per document that takes a semaphore slot, wraps the call in
+      `asyncio.timeout`, and retries on `429` and timeouts with exponential backoff and
+      jitter, honouring `Retry-After`. I'd run them through `gather` with
+      `return_exceptions=True`, or process `as_completed` results and write each one out as
+      it lands, so a crash at document 9,000 doesn't lose the rest. Failures go on a list to
+      retry. A semaphore caps concurrency, not rate, so if the provider also has a
+      per-minute token quota I'd add a token bucket. For a job this size I'd consider the
+      provider's batch API, which is slower but usually cheaper.
+  - question: When would you use gather and when TaskGroup?
+    answer: >-
+      `TaskGroup` when the tasks succeed or fail together, `gather` with
+      `return_exceptions=True` when each result stands alone. A `TaskGroup` gives structured
+      concurrency: the block doesn't exit until every task is done, and if one fails the rest
+      are cancelled and all errors are raised as an `ExceptionGroup`. That fits fetching the
+      three pieces of one page, where a missing piece makes the rest useless. For a batch of
+      independent model calls I want every result I can get, so I use `gather` with
+      `return_exceptions=True` and sort successes from failures. Plain `gather` without that
+      flag is the risky middle: it raises the first error and leaves the other calls running
+      unobserved.
+  - question: Our async service gets slow under load, but CPU is low. What do you look for?
+    answer: >-
+      A blocking call on the event loop, first. Low CPU with high latency means tasks are
+      waiting, and in asyncio the usual cause is a synchronous call inside a coroutine, such
+      as `requests`, a sync database driver or `time.sleep`. It holds the only thread, so
+      every request queues behind it. I'd turn on asyncio debug mode, which logs any step that
+      holds the loop over 0.1 seconds, and look at those tasks. Fixes: the async library, or
+      `asyncio.to_thread` as a stopgap. Next I'd check pool limits, such as an HTTP client or
+      database pool with too few connections, and unbounded fan-out that makes the upstream
+      throttle us.

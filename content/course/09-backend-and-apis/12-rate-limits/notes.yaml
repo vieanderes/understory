@@ -1,0 +1,227 @@
+summary: >-
+  A rate limit caps how many requests one caller may make in a stretch of time. On your own
+  API it protects three things: the server from overload, other customers from one noisy
+  neighbour, and your bill from anything that costs money per call, such as a model API. A
+  refused request is cheap: it gets `429 Too Many Requests` and a `Retry-After` header before
+  any real work runs.
+
+
+  The lesson builds the simplest limiter, a fixed window in a `Map`, and the polite client
+  that waits when it's the one refused. These notes take the implementer's view of both
+  sides: where the check sits in a handler, the headers that tell callers where they stand,
+  keeping the limiter's memory bounded, a retry helper that reads `Retry-After` in both its
+  forms, and limits on concurrency and cost rather than request counts. The system design
+  chapter covers the algorithms and shared limiters in Redis.
+
+
+  Reach for a limit on every endpoint that is expensive or abusable: sign-in, sign-up,
+  password reset, search, uploads and anything that calls a paid provider. A per-process
+  `Map` is fine for one server and for tests. The moment you run two servers, the count must
+  move to a shared store, or each server hands out the full allowance.
+remember:
+  - The limiter runs right after the caller is identified and before any expensive work, so a refused request costs almost nothing.
+  - Key the count by an identity the server trusts, such as the session's user id or an API key, never by a value the caller writes.
+  - A refused request gets `429 Too Many Requests` with `Retry-After`, in whole seconds rounded up, or as an HTTP date.
+  - A good client honours `Retry-After`, otherwise backs off exponentially with random jitter, caps the wait and gives up after a few tries.
+  - Only retry requests that are safe to repeat, or ones that carry an idempotency key.
+  - A `Map` of windows grows with every caller ever seen unless something removes expired entries.
+  - An in-memory limiter counts per process, so N servers allow N times the limit.
+  - Limit what costs you, such as concurrent calls and tokens for model APIs, not only requests per minute.
+sections:
+  - title: Where the check sits, and what the response says
+    body: |-
+      Order matters in a handler. Authenticate first, so you know who is asking. Rate limit
+      second, so a flood never reaches validation, the database or the model. Unauthenticated
+      endpoints such as sign-in are keyed by something else, usually the client IP your own
+      proxy recorded plus the account name being tried.
+
+      Many APIs also report the caller's standing on every response, not only on the refusal.
+      The `X-RateLimit-*` names below are a widespread convention rather than a standard; an
+      IETF draft proposes standard `RateLimit` fields, so check what your platform expects.
+
+      ```ts
+      type Window = { start: number; count: number };
+
+      const LIMIT = 30;
+      const WINDOW_MS = 60_000;
+      const windows = new Map<string, Window>();
+
+      export function limit(caller: string, now: number) {
+        let w = windows.get(caller);
+        if (!w || now - w.start >= WINDOW_MS) {
+          w = { start: now, count: 0 };
+          windows.set(caller, w);
+        }
+        w.count += 1;
+        const resetSeconds = Math.ceil((w.start + WINDOW_MS - now) / 1000);
+        return { allowed: w.count <= LIMIT, remaining: Math.max(0, LIMIT - w.count), resetSeconds };
+      }
+
+      // Without this, every caller ever seen stays in memory for good.
+      export function sweep(now: number) {
+        for (const [caller, w] of windows) {
+          if (now - w.start >= WINDOW_MS) windows.delete(caller);
+        }
+      }
+
+      export function handle(userId: string, now: number): Response {
+        const verdict = limit(userId, now);
+        const headers = {
+          'X-RateLimit-Limit': String(LIMIT),
+          'X-RateLimit-Remaining': String(verdict.remaining),
+          'X-RateLimit-Reset': String(verdict.resetSeconds),
+        };
+        if (!verdict.allowed) {
+          return Response.json(
+            { error: 'Too many requests' },
+            { status: 429, headers: { ...headers, 'Retry-After': String(verdict.resetSeconds) } },
+          );
+        }
+        return Response.json({ answer: '...' }, { headers });
+      }
+      ```
+
+      The 31st call in a minute returns `429` with `Retry-After: 60` and a remaining count
+      of `0`. Call `sweep` on a timer, or on every thousandth request, so memory stays
+      proportional to active callers. Passing `now` in, as the lesson does, is what makes the
+      limiter testable without waiting a real minute.
+  - title: A retry helper that behaves
+    body: |-
+      `Retry-After` has two forms: a number of seconds, or an HTTP date such as
+      `Wed, 21 Oct 2015 07:28:00 GMT`. A client must read both. When the header is missing,
+      use exponential backoff with **full jitter**: a random wait between zero and the
+      exponential ceiling. The randomness spreads out clients that all failed in the same
+      second.
+
+      ```ts
+      export function retryAfterMs(header: string | null, now = Date.now()): number | undefined {
+        if (header === null) return undefined;
+        if (/^\d+$/.test(header.trim())) return Number(header) * 1000;
+        const at = Date.parse(header);
+        return Number.isNaN(at) ? undefined : Math.max(0, at - now);
+      }
+
+      const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+      export async function withRetries(
+        send: () => Promise<Response>,
+        { attempts = 4, baseMs = 500, capMs = 20_000 } = {},
+      ): Promise<Response> {
+        for (let attempt = 0; ; attempt++) {
+          const response = await send();
+          const retryable = response.status === 429 || response.status === 503;
+          if (!retryable || attempt === attempts - 1) return response;
+          const told = retryAfterMs(response.headers.get('Retry-After'));
+          const backoff = Math.random() * Math.min(capMs, baseMs * 2 ** attempt);
+          await sleep(told ?? backoff);
+        }
+      }
+      ```
+
+      `send` is a function, not a `Response`, because each attempt needs a fresh request: a
+      request body can only be read once. The helper returns the last response rather than
+      throwing, so the caller decides what the user sees. Only wrap requests that are safe to
+      repeat. A `POST` that creates an order needs an idempotency key before it goes near a
+      retry loop, or a lost response turns into two orders.
+  - title: Limiting concurrency and cost, not only rate
+    body: |-
+      Requests per minute is the wrong unit when requests differ wildly in cost. One model
+      call might take 200 ms and 300 tokens, the next 40 seconds and 30,000. Two extra limits
+      fix that.
+
+      A **concurrency limit** caps calls in flight per caller. It protects against slow,
+      expensive work far better than a rate does, because a caller can't pile up long
+      streams.
+
+      ```ts
+      const inFlight = new Map<string, number>();
+
+      export async function withConcurrencyLimit<T>(
+        userId: string,
+        max: number,
+        work: () => Promise<T>,
+      ): Promise<T | 'busy'> {
+        const current = inFlight.get(userId) ?? 0;
+        if (current >= max) return 'busy';
+        inFlight.set(userId, current + 1);
+        try {
+          return await work();
+        } finally {
+          const left = (inFlight.get(userId) ?? 1) - 1;
+          if (left === 0) inFlight.delete(userId);
+          else inFlight.set(userId, left);
+        }
+      }
+      ```
+
+      Three simultaneous calls with a maximum of two give two results and one `'busy'`, which
+      the handler turns into a `429`. The `finally` is the important line: a call that throws
+      must still hand its slot back, or the user is locked out for good.
+
+      A **cost budget** counts what you pay for. For a model API, charge each user's budget
+      with the tokens the provider reports after the call, and refuse new calls once the
+      budget for the day is spent. The check happens before the call; the charge happens
+      after, because the output length isn't known in advance.
+  - title: 429 or 503, and who is at fault
+    body: |-
+      Both statuses mean "not now", and both may carry `Retry-After`. They say different
+      things about whose fault it is.
+
+      - **`429 Too Many Requests`** says this caller asked too often. Other callers are fine.
+        The fix is on the client side: slow down.
+      - **`503 Service Unavailable`** says the server can't serve anyone right now, because it's
+        overloaded or in maintenance. The fix is on the server side.
+
+      Getting this right matters to monitoring. A spike of `429`s is usually one client
+      misbehaving, and is often fine. A spike of `503`s is an outage. Load shedding, where a
+      server refuses work because its own queue is full, is a `503`, not a `429`.
+
+      Don't use `403 Forbidden` for rate limiting. `403` says "you may never do this", so a
+      well-behaved client stops trying, and it carries no hint about when to return.
+pitfalls:
+  - '**Keying by a header the client sends.** A fresh `X-Client-Id` on each request resets the count every time. Key by the session user, the API key, or an address your own proxy recorded.'
+  - '**Limiting after the expensive work.** A limiter placed after the model call saves nothing. Put it straight after authentication.'
+  - '**A `Map` that never shrinks.** Every caller ever seen stays in memory. Sweep expired windows, or use a store with expiry.'
+  - '**Rounding `Retry-After` down.** A client told to come back in 0 seconds comes back before the window ends and is refused again. Round up with `Math.ceil`.'
+  - '**Retrying at once, forever.** Each instant retry is another request over the limit, and some providers suspend keys that do it. Wait, add jitter, cap the attempts.'
+  - '**Releasing a concurrency slot only on success.** A thrown error leaks the slot. Release it in `finally`.'
+interview:
+  - question: Where in the request pipeline does a rate limiter go, and what does it key on?
+    answer: >-
+      Straight after authentication and before any expensive work, keyed by the identity the
+      server trusts. After authentication, because then I can key by user id or API key,
+      which the caller can't forge and which is fair to people sharing an IP. Before
+      validation, database queries or model calls, because the point is that a refusal costs
+      nothing. For unauthenticated routes like sign-in, I key by the IP my own proxy recorded
+      and by the account being tried, which catches both one attacker trying many passwords
+      and one password tried across many accounts. The trade-off with IP keys is collateral
+      damage: an office or mobile carrier can put thousands of users behind one address.
+  - question: A client of your API keeps hitting 429. What should the client do, and what can the server do to help?
+    answer: >-
+      The client should honour `Retry-After`, and without it back off exponentially with
+      jitter, capped, and give up after a few tries. Jitter matters because clients that
+      failed together otherwise retry together. It should only retry idempotent requests or
+      ones with an idempotency key. The server can help by sending `Retry-After` on every
+      `429`, and remaining-quota headers on every response so a client can slow down before
+      it hits the wall. For batch workloads I'd also offer a bulk endpoint, since fifty
+      single-item calls are often one request in disguise. The risk of generous retry advice
+      is a thundering herd at the reset time, which jitter spreads out.
+  - question: Your endpoint calls a paid LLM. Is requests per minute the right limit?
+    answer: >-
+      No, on its own it isn't, because one request can cost a hundred times another. I'd
+      combine three limits. A request rate stops runaway loops cheaply. A concurrency cap per
+      user, two or three calls in flight, stops one person holding many long streams. A token
+      budget per user per day tracks the real cost: check the budget before the call and
+      charge the tokens the provider reports afterwards, since output length isn't known up
+      front. Limits differ by plan. The trade-off is that a budget checked before the call can
+      be overshot by one large response, which is usually acceptable, or you cap the maximum
+      output tokens per call so the overshoot is bounded.
+  - question: Why would you answer 429 rather than 503 or 403?
+    answer: >-
+      Because `429` says this caller is over its limit, while others are fine. `503` says the
+      server can't serve anyone right now, which is an outage signal and changes what
+      monitoring does. `403` says the caller may never do this, so a well-written client stops
+      retrying altogether and gets no hint about when to return. With `429` plus
+      `Retry-After`, the client knows it's its own rate and exactly how long to wait. Where it
+      gets subtle is load shedding: if I refuse work because my own queue is full, that's
+      `503`, even though the caller sees the same "not now".

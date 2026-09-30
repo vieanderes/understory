@@ -1,0 +1,279 @@
+summary: >-
+  Defence in depth means stacking independent controls, so an attacker must beat every one of
+  them to reach the data. Zero trust means no request is trusted because of where it comes
+  from: every request proves who is making it and is checked against policy, whether it
+  arrives from the internet or from the machine next door. Least privilege ties them together.
+  Each user, service and key gets only the access its job needs, so whatever gets through
+  reaches as little as possible.
+
+
+  The problem they solve is the hard shell with a soft centre. A firewall and a VPN make one
+  wall, and everything inside trusts everything else, so one phished password or one
+  vulnerable server hands over the lot. The lesson shows that failure and fixes it with a
+  service token checked on every call.
+
+
+  These notes go further: what makes layers independent, what NIST SP 800-207 actually says
+  zero trust is, how services prove identity with short-lived tokens and mutual TLS, and how
+  least privilege looks in a database. Reach for all of it when data or money is at stake. The
+  cost is real: more identity plumbing, certificate rotation and policy to maintain. A
+  weekend prototype with no users needs a login and ownership checks, not a service mesh.
+remember:
+  - Layers only count as defence in depth when one failure, such as one stolen credential or one bug, can't defeat several of them at once.
+  - Zero trust, as NIST SP 800-207 puts it, grants no implicit trust based on network location or asset ownership, and decides access per request from identity, device and context.
+  - Services prove identity with short-lived, audience-bound tokens or mutual TLS, never with their IP address.
+  - Mutual TLS proves which service is calling, and the receiving service still has to decide what that caller may do.
+  - Least privilege gives each user, service and key only the permissions its job needs, which shrinks the blast radius of any compromise.
+  - A control close to the data, such as database permissions or row-level security, survives a bug in the code above it.
+  - Compare secrets in constant time with `crypto.timingSafeEqual`, over equal-length digests, because it throws on buffers of different lengths.
+  - Network segmentation is still a useful layer under zero trust, but it never replaces checking identity.
+sections:
+  - title: What makes layers independent
+    body: |-
+      Three layers that share one weakness are one layer. If the firewall, the VPN and the
+      admin tool all accept the same single-sign-on password with no second factor, a
+      phished password beats all three at once. Security engineers call this a common-mode
+      failure. The test for each pair of layers is: what single event defeats both?
+
+      Independent layers differ in kind. Against cross-site scripting, a stack might be:
+      output encoding in templates (stops most injections), a Content Security Policy
+      without `unsafe-inline` (stops injected scripts from running), and `HttpOnly` session
+      cookies (a script that does run can't read the session). Each fails for a different
+      reason, so a slip in one template doesn't become a stolen session.
+
+      Against account takeover: a rate limit on sign-in, a second factor, an alert on a
+      success after many failures, and a re-authentication prompt before changing the email
+      or payout details. An attacker with the right password still meets the second factor.
+      One who steals a live session still meets the re-authentication prompt.
+
+      Put at least one layer close to the data. An ownership check in every route handler is
+      a layer, but a route someone forgets skips it. Database permissions and row-level
+      security apply to every query, whichever code path sent it.
+
+      Layers also fail safe or unsafe. A control that errors should deny: if the
+      authorisation service times out, the request is refused, not waved through. Saltzer
+      and Schroeder called this fail-safe defaults in 1975, next to least privilege and
+      complete mediation, which means checking every access, not only the first.
+  - title: What NIST SP 800-207 says zero trust is
+    body: |-
+      NIST SP 800-207 (2020) defines zero trust as a set of principles, not a product. It
+      lists seven tenets, which in short are:
+
+      1. All data sources and computing services are resources, including personal devices
+         that reach company data.
+      2. All communication is secured regardless of network location. Being on the internal
+         network doesn't earn trust.
+      3. Access to each resource is granted per session, and access to one resource doesn't
+         grant another.
+      4. Access is decided by dynamic policy: the client's identity, the application, the
+         state of the requesting device, and behavioural and environmental signals.
+      5. The organisation monitors the integrity and security posture of every asset it owns
+         or that connects.
+      6. Authentication and authorisation are dynamic and strictly enforced before access.
+      7. The organisation collects information about assets, network traffic and requests,
+         and uses it to improve its security posture.
+
+      It also names the parts. A **policy enforcement point** sits in front of each resource
+      and lets a request through or not. It asks the **policy decision point**, made of a
+      policy engine that decides and a policy administrator that opens or closes the path.
+      In a web system the enforcement point is often an identity-aware proxy in front of an
+      internal tool, or middleware in each service.
+
+      Google's BeyondCorp was an early large deployment: internal applications were moved
+      off the VPN and put behind a proxy that checks the user's identity and the device's
+      state on every request, from any network.
+
+      Zero trust doesn't mean trusting nothing. It means trust is earned by evidence on each
+      request, not granted by position. Session length, device checks and re-authentication
+      are tuned to the risk of the resource.
+  - title: Service identity beyond a shared token
+    body: |-
+      The lesson's static service token is a real improvement on trusting an address. It
+      still has weaknesses: `includes` compares in a way whose timing can leak, the token
+      never expires, and one token accepted by every service means one leak opens them all.
+      Three changes fix that: constant-time comparison, an expiry measured in minutes, and
+      an **audience** naming the one service the token is for.
+
+      ```ts
+      import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
+
+      // Equal-length digests let timingSafeEqual compare without leaking where they differ.
+      const sameSecret = (a: string, b: string) =>
+        timingSafeEqual(createHash('sha256').update(a).digest(), createHash('sha256').update(b).digest());
+
+      const b64 = (data: string) => Buffer.from(data).toString('base64url');
+      const sign = (body: string, key: string) => createHmac('sha256', key).update(body).digest('base64url');
+
+      type Claims = { sub: string; aud: string; exp: number };
+
+      function issue(claims: Claims, key: string): string {
+        const body = b64(JSON.stringify(claims));
+        return `${body}.${sign(body, key)}`;
+      }
+
+      function verify(token: string, key: string, audience: string, nowSeconds: number): Claims | null {
+        const [body, mac] = token.split('.');
+        if (!body || !mac || !sameSecret(mac, sign(body, key))) return null;
+        const claims = JSON.parse(Buffer.from(body, 'base64url').toString()) as Claims;
+        if (claims.aud !== audience) return null; // minted for another service
+        if (claims.exp <= nowSeconds) return null; // expired
+        return claims;
+      }
+
+      const key = 'shared-with-the-token-issuer-only';
+      const now = Math.floor(Date.now() / 1000);
+      const token = issue({ sub: 'svc:reports', aud: 'orders', exp: now + 300 }, key);
+
+      console.log(verify(token, key, 'orders', now)?.sub); // svc:reports
+      console.log(verify(token, key, 'billing', now)); // null: wrong audience
+      console.log(verify(token, key, 'orders', now + 301)); // null: expired
+      console.log(verify(token.slice(0, -2) + 'xx', key, 'orders', now)); // null: tampered
+      ```
+
+      `timingSafeEqual` throws a `RangeError` when its buffers differ in length, so hashing
+      both sides first gives it equal lengths and hides the length too.
+
+      This shows the checks, not a format to ship. In production, services get signed JWTs
+      from an identity provider through the OAuth client credentials flow, or credentials
+      from the platform itself: cloud workload identities hand each service temporary keys
+      that rotate automatically. Prefer asymmetric signatures there, so services that verify
+      tokens can't mint them. What stays the same is the rule: short-lived, bound to one
+      audience, verified on every call.
+  - title: Mutual TLS between services
+    body: |-
+      Ordinary TLS proves the server's identity to the client. **Mutual TLS** also proves the
+      client's identity to the server: both present certificates signed by a certificate
+      authority the other trusts. Node supports it directly.
+
+      ```js
+      import https from 'node:https';
+      import { readFileSync } from 'node:fs';
+
+      const file = (name) => readFileSync(new URL(`./mtls/${name}`, import.meta.url));
+      const ALLOWED_CALLERS = new Set(['URI:spiffe://shop.example/reports']);
+
+      const server = https.createServer(
+        {
+          key: file('server.key'),
+          cert: file('server.crt'),
+          ca: file('ca.crt'), // trust only client certificates signed by this CA
+          requestCert: true, // ask every caller for a certificate
+          rejectUnauthorized: true, // end the handshake if it's missing or not from the CA
+        },
+        (req, res) => {
+          // TLS proved the certificate is genuine. Authorisation is still our job.
+          const caller = req.socket.getPeerCertificate().subjectaltname;
+          if (!ALLOWED_CALLERS.has(caller)) {
+            res.writeHead(403).end('forbidden\n');
+            return;
+          }
+          res.end(`orders for ${caller}\n`);
+        },
+      );
+
+      server.listen(8443);
+      ```
+
+      With certificates made by `openssl` for a test CA, a client presenting the reports
+      certificate got `200 orders for URI:spiffe://shop.example/reports`, and a client with
+      no certificate was refused during the handshake with
+      `ERR_SSL_TLSV13_ALERT_CERTIFICATE_REQUIRED`. Real certificates can carry several names,
+      so parse `subjectaltname` rather than matching the whole string.
+
+      The identity in that certificate follows **SPIFFE**, a standard for naming workloads
+      as `spiffe://trust-domain/path`. Its reference implementation, SPIRE, issues
+      certificates that last hours, so a stolen one soon stops working.
+
+      Few teams write this by hand. A service mesh such as Istio or Linkerd puts a proxy
+      beside each service that performs mTLS and rotates certificates automatically. Check
+      the mode: Istio accepts plain text as well by default until you set its policy to
+      strict. mTLS answers "which service is this". The handler still decides what that
+      service may do.
+  - title: Least privilege and blast radius
+    body: |-
+      Least privilege asks, for every identity: what is the smallest set of permissions that
+      lets it do its job? The answer sets the **blast radius**, how much an attacker gets by
+      taking that identity over.
+
+      A database is the clearest place to see it. Most apps connect as the owner of every
+      table, so an SQL injection can drop them. Separate roles cost a few lines:
+
+      ```sql
+      CREATE TABLE orders (id int PRIMARY KEY, customer_id int NOT NULL, total_pence int NOT NULL);
+
+      -- The web app reads and writes rows. It can't change the schema or drop tables.
+      CREATE ROLE shop_app LOGIN;
+      GRANT SELECT, INSERT, UPDATE ON orders TO shop_app;
+
+      -- Reporting only reads.
+      CREATE ROLE shop_reports LOGIN;
+      GRANT SELECT ON orders TO shop_reports;
+      ```
+
+      Run in PostgreSQL, `shop_reports` can count orders but a `DELETE` fails with
+      `permission denied for table orders`, and `shop_app` can update a row but `DROP TABLE`
+      fails with `must be owner of table orders`. Migrations run as a separate owner role,
+      from the deploy pipeline, not from the running app.
+
+      The same thinking applies everywhere. Each service gets its own cloud role, scoped to
+      the buckets and queues it uses, with no wildcard actions. Each API key gets the
+      narrowest scope the provider offers: a key that only sends email can't read your
+      contact list. Human admin rights are granted for a task and expire, and a break-glass
+      account for emergencies is locked away, alerted on and reviewed after every use.
+
+      Least privilege decays. Permissions get added during incidents and never removed. Cloud
+      providers can report which granted permissions a role has actually used, which gives
+      you a list to trim.
+pitfalls:
+  - '**Counting layers that share one credential.** VPN, admin tool and database all behind one password is one layer. Ask what single event defeats two layers, and make them differ.'
+  - '**Trusting a request because of its address.** Any compromised machine inside the network has an inside address. Authenticate the caller on every request, with a token or a client certificate.'
+  - '**Treating mTLS as authorisation.** It proves which service is calling, not what it may do. Check the caller''s identity against a policy in the handler.'
+  - '**One long-lived token for every service.** A single leak opens everything, forever. Issue short-lived tokens with an audience per receiving service.'
+  - '**Connecting the app to the database as its owner.** An injection can then drop tables. Give the app a role with only the row operations it needs, and run migrations separately.'
+  - '**Failing open when the policy check errors.** A timeout that allows the request turns an outage into a bypass. Deny on error, and alert.'
+interview:
+  - question: What is zero trust, and how is it different from a VPN-based model?
+    answer: >-
+      Zero trust means no request is trusted because of where it comes from; each one is
+      authenticated and authorised on its own. In the VPN model, getting onto the network is
+      the main check, and internal services trust each other. So one phished VPN password or
+      one compromised server gives access to everything inside. NIST SP 800-207 describes the
+      alternative: every resource sits behind a policy enforcement point, and access is
+      decided per session from the user's identity, the device's state and context. In
+      practice that's an identity-aware proxy in front of internal tools, and service tokens
+      or mTLS between services. The trade-off is cost: identity plumbing, device management
+      and certificate rotation. Segmentation stays as a layer; it stops being the thing you
+      rely on.
+  - question: How should one microservice authenticate to another?
+    answer: >-
+      With a short-lived credential tied to the calling service's identity, checked on every
+      call, never with its IP address. Two common patterns: mutual TLS, where each service
+      has a certificate, often a SPIFFE identity issued by a mesh and rotated every few hours;
+      or signed tokens, such as JWTs from the OAuth client credentials flow, with an audience
+      naming the receiving service and an expiry in minutes. Either way the receiver then
+      authorises: the reports service may read orders, not refund them. I'd avoid one static
+      shared secret for all services, because one leak opens everything and never expires.
+      mTLS through a mesh is transparent to application code but adds infrastructure; tokens
+      are simpler to adopt but every service must verify them correctly.
+  - question: Explain defence in depth with a concrete example. What makes it work?
+    answer: >-
+      Defence in depth is independent controls, so an attacker has to beat all of them.
+      For a customer's orders: a firewall exposes only port 443, sign-in requires a password
+      and a second factor, each route checks the order belongs to the caller, and row-level
+      security in the database returns only the caller's rows anyway. What makes it work is
+      independence. If one stolen credential opened the firewall, the app and the database,
+      those would be one layer counted four times. So I ask what single event defeats two
+      layers, and change one of them. I'd also put a layer near the data, because it
+      survives a forgotten check in code. The cost is overhead, so I'd weight the layers
+      toward the data and actions that matter most.
+  - question: What does least privilege look like in a typical web application?
+    answer: >-
+      Every identity gets only the permissions its job needs, so a compromise reaches as
+      little as possible. The app's database user can read and write rows but not change the
+      schema; migrations run under a separate role from the pipeline. Each service has its
+      own cloud role scoped to its own buckets and queues, with no wildcards. Third-party API
+      keys use the narrowest scope offered. Humans get admin rights for a task, with expiry,
+      and a break-glass account is alerted on every use. Then I'd review regularly, because
+      permissions granted during an incident rarely get removed, and cloud tooling can show
+      which permissions are unused. The trade-off is friction: too tight and people share
+      credentials to get work done, which is worse.

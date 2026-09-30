@@ -1,0 +1,341 @@
+id: cloud.serverless
+title: Serverless functions
+objective: Plan for cold starts, time limits, connection exhaustion and pricing.
+level: advanced
+minutes: 10
+concepts: [cloud.serverless-functions, cloud.cold-starts, cloud.connection-exhaustion]
+prerequisites: [cloud.hosting-models, db.storage-and-pooling]
+opening:
+  text: >-
+    You'll know what you gain when a platform runs your code once per request, and pay
+    nothing while nobody calls. It comes with three surprises, and one can take your
+    database down.
+
+steps:
+  - type: prose
+    id: what-a-function-is
+    body: |-
+      With a **serverless function** you deploy one function, not a whole server. The
+      platform calls it once per request. That function is the **handler**:
+
+      ```js
+      export const handler = async (event) => {
+        return { statusCode: 200, body: 'ok' };
+      };
+      ```
+
+      The platform supplies the **runtime**, the program that runs your code, here Node. You
+      never start, patch or restart a machine.
+
+  - type: prose
+    id: instances-and-cold-starts
+    body: |-
+      Behind the scenes the platform starts **instances**, running copies of your handler,
+      as requests arrive. When traffic stops, it removes them, down to zero. You pay per call
+      and per millisecond of running.
+
+      ```text
+      first call    1.59 s    a new instance starts
+      second call   0.026 s   the same instance answers
+      ```
+
+      That slow first call is a **cold start**. Later calls reuse the warm instance.
+
+  - type: multiple-choice
+    id: pick-idle-bill
+    concept: cloud.serverless-functions
+    difficulty: 1
+    question: An internal tool gets no requests between midnight and 6 a.m. What do those hours cost?
+    choices:
+      - text: Six hours of instance time
+        feedback: >-
+          That's a VPS or a managed platform, where a process sits waiting. Here no instance
+          exists while nobody calls.
+      - text: Nothing
+        correct: true
+        feedback: >-
+          Right. Scaled to zero, billed for zero. The 6 a.m. caller pays a cold start.
+      - text: A reduced standby rate
+        feedback: >-
+          Some platforms sell warm standby as an extra. The plain model charges only for calls
+          that run.
+
+  - type: prose
+    id: time-limits
+    body: >-
+      Every call also has a **time limit**. When it runs out, the platform stops the call,
+      finished or not, and the caller gets an error.
+
+
+      On AWS Lambda the default is 3 seconds. You can raise it to 15 minutes in the
+      function's settings. That default is short for anything that waits on a language
+      model.
+
+  - type: bug-hunt
+    id: hunt-model-call-timeout
+    concept: cloud.serverless-functions
+    difficulty: 2
+    language: js
+    code: |
+      // summarise.mjs, deployed with the default settings
+      export const handler = async (event) => {
+        const { text } = JSON.parse(event.body);
+        const summary = await callModel(text); // replies take 4 to 8 s
+        return { statusCode: 200, body: summary };
+      };
+
+      // $ curl -s $FUNCTION_URL -d '{"text":"..."}'
+      // Task timed out after 3.00 seconds
+    prompt: >-
+      The summary endpoint worked on a laptop. Deployed, every call fails. Tap the line that
+      can't finish in time.
+    lines: [4]
+    reasons:
+      - text: The model call outlasts the 3-second limit
+        correct: true
+        feedback: >-
+          Yes. Raise the limit above the slowest reply, or stream the answer.
+      - text: '`JSON.parse` fails on the request body'
+        feedback: >-
+          A parse error would say so. The platform's message names the clock, not a syntax error.
+      - text: The handler must return a plain string
+        feedback: >-
+          This object shape is what the platform expects. The call never got as far as returning.
+    fix: |
+      // function settings: timeout 30 s, above the slowest model reply
+      const summary = await callModel(text); // replies take 4 to 8 s
+
+  - type: prose
+    id: connection-exhaustion
+    body: >-
+      On a server, one process shares a small pool of database connections between all its
+      requests. Functions can't do that. Each instance is its own process, with its own
+      connections, and the platform decides how many instances exist.
+
+
+      So a spike in traffic becomes a spike in connections. That's **connection exhaustion**.
+
+  - type: predict-output
+    id: predict-past-the-limit
+    concept: cloud.connection-exhaustion
+    difficulty: 2
+    language: js
+    code: |
+      import pg from 'pg';
+      // runs once per new instance, which keeps its connection
+      const db = new pg.Client({ connectionString: process.env.DATABASE_URL });
+      const ready = db.connect();
+
+      export const handler = async () => {
+        await ready;
+        const result = await db.query('SELECT count(*) AS n FROM tickets');
+        return { statusCode: 200, body: String(result.rows[0].n) };
+      };
+      // the database allows max_connections = 50
+    question: A sale starts and 200 instances start at once. What happens to those past the limit?
+    choices:
+      - text: They wait for a free connection
+        feedback: >-
+          PostgreSQL doesn't queue connections past its limit. It turns them away, as the
+          pooling lesson showed.
+      - text: 'They fail with "too many clients already"'
+        correct: true
+        feedback: >-
+          Right. 50 worked and 150 failed. A pooler in front turns that into a queue.
+      - text: The database crashes for everyone
+        feedback: >-
+          It stays up and serves the 50 it accepted. The rest are refused at the door.
+
+  - type: ai-review
+    id: review-connect-per-invocation
+    concept: cloud.connection-exhaustion
+    difficulty: 3
+    language: js
+    request: Write a function that returns how many tickets are left.
+    flawClass: performance
+    code: |
+      import pg from 'pg';
+
+      export const handler = async () => {
+        const db = new pg.Client({ connectionString: process.env.DATABASE_URL });
+        await db.connect();
+        const result = await db.query('SELECT count(*) AS n FROM tickets');
+        await db.end();
+        return { statusCode: 200, body: String(result.rows[0].n) };
+      };
+    prompt: >-
+      The count is right, and one test call felt quick enough. Under load, even warm
+      instances are slow. Tap the lines at fault.
+    lines: [4, 5]
+    reasons:
+      - text: It opens a new connection inside every call
+        correct: true
+        feedback: >-
+          Yes. Connecting took about 300 ms a call. Reusing one took under 1 ms.
+      - text: '`count(*)` is too slow to run per request'
+        feedback: >-
+          It may need a cache one day. Here the query took under a millisecond. The
+          connecting didn't.
+      - text: '`db.end()` should be left out'
+        feedback: >-
+          Leaving it out would leak a connection per call, which is worse. Move the client out
+          of the handler.
+    fix: |
+      // created once per instance, reused by every warm call
+      const db = new pg.Client({ connectionString: process.env.DATABASE_URL });
+      const ready = db.connect();
+
+      export const handler = async () => {
+        await ready;
+        const result = await db.query('SELECT count(*) AS n FROM tickets');
+        return { statusCode: 200, body: String(result.rows[0].n) };
+      };
+
+  - type: code-challenge
+    id: write-connection-plan
+    concept: cloud.connection-exhaustion
+    difficulty: 4
+    language: ts
+    prompt: >-
+      Write `connectionPlan(instances, poolSize, maxConnections, reserved)`. Each instance
+      opens `poolSize` connections. The database allows `maxConnections`, and keeps
+      `reserved` of them for admins.
+
+
+      Return `needed`, the total the instances would open, and `fits`, whether that's within
+      what's available. Return `maxInstances`, the most whole instances that fit. Throw if
+      `poolSize` is under 1.
+
+
+      So 10 instances of 5, against 50 with 3 reserved, need `50`, don't fit, and the most is
+      `9`.
+    hints:
+      - Work out what's available first. It's the limit less the reserved ones, and never below 0.
+      - Needed is a product. Fits is one comparison, and equal still fits.
+      - '`Math.floor(available / poolSize)` gives the whole instances that fit.'
+
+  - type: explain-back
+    id: explain-cold-start
+    concept: cloud.cold-starts
+    difficulty: 4
+    prompt: >-
+      A function answers in 20 ms all afternoon. The first request each morning takes over a
+      second. Why is that one request so much slower?
+    rubric:
+      - Overnight the platform scaled the function to zero, so no warm instance existed in the morning.
+      - The first request had to wait for a new instance, which means starting the runtime and loading the code.
+      - Later requests reuse that warm instance, so only the handler's own work is left.
+    modelAnswer: >-
+      Nobody called it overnight, so the platform removed every instance. That's why the
+      night cost nothing. The first request in the morning found nothing warm. The platform
+      had to start a runtime and load the code and its packages. Then it ran the set-up
+      outside the handler, such as opening a database connection. Only then did the handler
+      run. Every
+      request after it reused the warm instance and paid for the handler alone. To shrink it
+      I'd ship less code, or pay to keep one instance warm.
+
+recap:
+  - Use functions for spiky, short work, and expect a bill of zero when nobody calls.
+  - Plan for cold starts, and set the time limit above your slowest model reply.
+  - Create database clients outside the handler, and put a pooler between functions and PostgreSQL.
+
+recall:
+  - id: card-serverless
+    concept: cloud.serverless-functions
+    front: How does a serverless platform scale and bill your function?
+    back: >-
+      It starts instances as requests arrive and removes them when idle, down to zero. It
+      bills per call and per millisecond.
+  - id: card-cold-start
+    concept: cloud.cold-starts
+    front: What is a cold start?
+    back: >-
+      A request that needs a new instance waits for the runtime and the code to load. Warm
+      instances skip that.
+  - id: card-time-limit
+    concept: cloud.serverless-functions
+    front: A function calls a model that takes 8 seconds. What must you check first?
+    back: >-
+      The function's time limit. On AWS Lambda the default is 3 seconds, so raise it above
+      the slowest reply, or stream.
+  - id: card-connection-exhaustion
+    concept: cloud.connection-exhaustion
+    front: Why can a traffic spike on functions take down a database?
+    back: >-
+      Each instance opens its own connections, so instances times pool size can pass the
+      database's limit. PostgreSQL then refuses new clients.
+  - id: card-pooler-for-functions
+    concept: cloud.connection-exhaustion
+    front: What goes between serverless functions and PostgreSQL?
+    back: >-
+      A pooler such as PgBouncer in transaction mode, or the host's managed one. Many
+      instances then share a few real connections.
+
+references:
+  - kind: docs
+    title: Understanding the Lambda execution environment lifecycle
+    authors: Amazon Web Services
+    venue: AWS Lambda Developer Guide
+    url: https://docs.aws.amazon.com/lambda/latest/dg/lambda-runtime-environment.html
+    note: What a platform does before your handler runs, and its section on cold starts.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Configure Lambda function timeout
+    authors: Amazon Web Services
+    venue: AWS Lambda Developer Guide
+    url: https://docs.aws.amazon.com/lambda/latest/dg/configuration-timeout.html
+    note: The 3-second default and the 900-second maximum.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Lambda quotas
+    authors: Amazon Web Services
+    venue: AWS Lambda Developer Guide
+    url: https://docs.aws.amazon.com/lambda/latest/dg/gettingstarted-limits.html
+    note: The timeout, reply size and memory limits.
+    verified: true
+  - kind: docs
+    title: PgBouncer config
+    authors: PgBouncer
+    venue: pgbouncer.org
+    url: https://www.pgbouncer.org/config.html
+    note: '`pool_mode`, `default_pool_size` and `max_client_conn`.'
+    verified: true
+  - kind: docs
+    title: 19.3. Connections and Authentication
+    authors: The PostgreSQL Global Development Group
+    venue: PostgreSQL 17 Documentation
+    url: https://www.postgresql.org/docs/17/runtime-config-connection.html
+    note: '`max_connections`, and the connections reserved for superusers.'
+    verified: true
+
+deepDive: >-
+  The timings are real, from the AWS Lambda Node 22 image (`public.ecr.aws/lambda/nodejs:22`,
+  Node 22.23) and its runtime interface emulator on a laptop. Timed with `curl -w
+  '%{time_total}'`, the first call took 1.59 s and the next two 0.026 s and 0.034 s. The
+  emulator's log agreed: an init of 1275 ms, then 4 ms of handler time. A real platform also
+  fetches your code and starts a sandbox, so cold starts vary.
+
+
+  For the timeout we set `AWS_LAMBDA_FUNCTION_TIMEOUT=3` and a handler that waited 5 s,
+  standing in for a model call. The reply was `Task timed out after 3.00 seconds`, billed
+  3000 ms. With the limit at 30 s it returned the summary. Streaming the model's answer
+  helps the user too, since the first words arrive long before the last.
+
+
+  The spike was real: PostgreSQL 17.11 with `max_connections = 50`, and 200 clients started at
+  once from Node 24 with `pg` 8, each keeping its connection. 50 connected and 150 got "sorry,
+  too many clients already". It fails fast rather than slowly. Connecting per call cost
+  301.5 ms on average over 200 calls, most of it password hashing in the handshake, against
+  0.86 ms per query on one kept connection.
+
+
+  A pooler such as PgBouncer in `transaction` mode lends a real connection for one
+  transaction only, so a thousand instances can share ten. Its price, as the databases
+  chapter said, is that session state doesn't survive between transactions. Managed hosts
+  sell the same thing as a pooled connection string.
+
+
+  Pricing is per request plus duration times memory, often quoted in GB-seconds. Other
+  platforms differ on limits, so read yours.

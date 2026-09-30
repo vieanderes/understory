@@ -1,0 +1,210 @@
+summary: >-
+  The question "monolith or microservices?" is really a question about where you put
+  network boundaries. A monolith ships every module in one deployable unit, and modules
+  call each other in process. Services are deployed separately, each owns its data, and
+  they talk over the network. A modular monolith sits between: one deployable, with module
+  boundaries enforced as strictly as if they were services.
+
+
+  A network boundary buys independence. A service can be deployed, scaled and allowed to
+  fail on its own, and a team can own it end to end. It costs latency on every call,
+  partial failure, versioning between sides that deploy at different times, and the loss
+  of the shared database transaction. Those costs are paid on every request, for ever.
+
+
+  So the default for a new product and a small team is a modular monolith. You split out a
+  service when you've measured a need that only independence meets: a part that must scale
+  differently, deploy on its own schedule, be isolated for security, or belong to a
+  separate team. Clean module boundaries make that split cheap when the day comes.
+remember:
+  - A modular monolith is one deployable unit whose modules meet only through enforced public entry points, and it's the right default for most new systems.
+  - A network boundary costs latency, partial failure, versioning and the loss of a shared transaction, on every call.
+  - A service owns its data, and no other service reads its tables, because a shared table couples two teams to one schema.
+  - 'Across services, all-or-nothing needs a saga: each completed step gets a compensating action, run newest first when a later step fails.'
+  - Every remote call needs a timeout, and a retry only when the call is idempotent or carries an idempotency key.
+  - Availability multiplies along a chain of required services, so three services at 99.9% each give about 99.7%.
+  - Split a service out for a measured need to scale, deploy, fail or be owned independently, never for tidiness.
+  - Remote interfaces should be coarse, one call for a batch, because each call pays a network round trip.
+sections:
+  - title: The bill in numbers
+    body: |-
+      The costs of a network boundary sound abstract until you put numbers on them. Four sums are worth being able to do at a whiteboard.
+
+      ```text
+      latency       in-process call        ~0.0001 ms
+                    same-host HTTP         ~0.2 ms
+                    same data centre       ~0.5 ms per round trip
+      chains        10 sequential calls at 5 ms = 50 ms before any work is done
+      availability  0.999 x 0.999 x 0.999 = 0.997, about 26 hours down a year, not 9
+      fan-out       1% of calls are slow; a page calls 100 services in parallel
+                    chance at least one is slow = 1 - 0.99^100, about 63%
+      ```
+
+      The chain line is why the lesson's batching challenge matters: sequential calls add
+      up, so a remote interface should take a list, not one item at a time.
+
+      The availability line is the one people forget. A request that needs three services
+      is up only when all three are. Each extra dependency in the request path lowers the
+      ceiling, unless its failure is handled with a fallback, such as showing a page
+      without recommendations.
+
+      The fan-out line explains **tail latency**. When a request waits for many calls, the
+      slowest one decides the response time. Rare slowness in one service becomes common
+      slowness for the user. Teams answer it with timeouts, hedged requests that send a
+      second copy after a delay, and by cutting the fan-out.
+
+      None of this counts the operational bill: a pipeline, dashboards, alerts, an on-call
+      rota and a rollback plan per service, and distributed tracing to follow one request
+      across processes.
+  - title: Calling across the boundary without hanging
+    body: |-
+      A function call either returns or throws. A network call has a third outcome: it
+      doesn't answer. Without a timeout, a slow dependency holds your request, its memory
+      and often a database connection until the operating system gives up, which can take
+      minutes. Every remote call gets a deadline.
+
+      ```ts
+      async function stockLeft(sku: string): Promise<number | undefined> {
+        try {
+          const reply = await fetch(`${STOCK_URL}/stock/${sku}`, {
+            signal: AbortSignal.timeout(300),
+          });
+          if (!reply.ok) return undefined;
+          return (await reply.json()).left;
+        } catch (error) {
+          if (error instanceof DOMException && error.name === 'TimeoutError') return undefined;
+          throw error;
+        }
+      }
+      ```
+
+      On Node 24, against a server that took two seconds to reply, this returned
+      `undefined` after 300 ms. The caller decides what `undefined` means: hide the stock
+      count, show "check availability", or fail the page.
+
+      Timeouts raise the next question: did the other side do the work? A timeout on a
+      `POST /reserve` doesn't say whether the reservation happened. So retries are safe
+      only for idempotent calls, or when the request carries an idempotency key the
+      receiver uses to recognise a repeat, as in the concurrency chapter. Retries also need
+      exponential backoff with jitter and a cap. Without them, a struggling service gets
+      hit harder by every client at once, which turns a slowdown into an outage.
+
+      When a dependency fails repeatedly, a **circuit breaker** stops calling it for a
+      while and fails fast instead, then lets a trial request through to see whether it
+      has recovered. It protects both sides: you stop waiting, and it gets room to recover.
+  - title: Sagas, the replacement for the lost transaction
+    body: |-
+      Inside one database, `ROLLBACK` undoes everything. Across services, each step
+      commits on its own, so undoing means running a second, opposite action. A **saga** is
+      a sequence of local steps, each paired with a compensating step.
+
+      ```ts
+      type Step = { name: string; run: () => Promise<void>; undo: () => Promise<void> };
+
+      async function runSaga(steps: Step[]): Promise<void> {
+        const done: Step[] = [];
+        for (const step of steps) {
+          try {
+            await step.run();
+            done.push(step);
+          } catch (error) {
+            for (const finished of done.reverse()) {
+              await finished.undo(); // newest first; each undo must be safe to retry
+            }
+            throw new Error(`${step.name} failed, saga compensated`, { cause: error });
+          }
+        }
+      }
+      ```
+
+      With steps "create order", "reserve stock" and "charge card", where the charge
+      fails, this logs: do create order, do reserve stock, undo reserve stock, undo create
+      order.
+
+      Real sagas need more than this sketch. The process running it can crash halfway, so
+      its progress is stored, and a restart carries on from the last recorded step. Every
+      step and every undo is idempotent, because a crash after a step and before recording
+      it means the step runs again. Compensations are visible: the customer may see a
+      reservation appear and vanish. And some actions can't be compensated, such as a sent
+      email, so they go last, after every step that might fail.
+
+      Sagas come in two styles. **Orchestration** has one coordinator calling each step,
+      as above, which keeps the flow readable in one place. **Choreography** has each
+      service react to the previous one's event, which avoids a central coordinator and
+      makes the overall flow harder to see.
+  - title: How to split, when the time comes
+    body: |-
+      A good split usually follows a boundary that already exists inside the monolith. If
+      the module has its own entry file, its own tables and no other module joins against
+      those tables, extraction is mostly moving code and replacing a function call with a
+      network call. If other modules read its tables, you have to untangle the data first,
+      and that is the expensive part.
+
+      So the preparation happens in the monolith. Give each module its own schema or table
+      prefix, and forbid cross-module joins and foreign keys. Other modules ask through the
+      module's public functions, which later become its API. Make those functions coarse,
+      taking batches, since they'll become network calls.
+
+      For the move itself, the **strangler fig** pattern is the standard route. Put a
+      routing layer in front, build the new service beside the old code, move one route
+      or one flow at a time, and delete the old path once traffic has moved. At every step
+      the system works, and a bad move is reversed by routing back.
+
+      Good reasons to split, in roughly the order teams meet them: a part with very
+      different load, such as image processing next to a CRUD app; a part that needs its
+      own release pace or its own team; a part that needs stronger isolation, such as
+      payment handling; a part in a different language or runtime, such as a Python model
+      server. "The codebase feels big" isn't on the list. That's a module-boundary
+      problem, and services make it worse if the boundaries are wrong.
+pitfalls:
+  - "**The distributed monolith.** Services that must be deployed together, share a database or call each other in long synchronous chains have every cost of services and none of the independence. If two services always change together, they're one module."
+  - "**Reading another service's tables for a report.** It works until the owner renames a column. Ask through its API, or have it publish events that a reporting store consumes."
+  - "**Chatty interfaces carried over from in-process code.** A loop that called `getPrice` per line was free in process and costs a round trip per line over the network. Design remote calls to take batches."
+  - "**Remote calls with no timeout.** One slow dependency holds requests and connections until everything backs up. Set a deadline on every call and decide what the caller shows when it passes."
+  - "**Retrying a non-idempotent call.** A timed-out `POST` may have worked, and the retry does it twice. Retry only idempotent operations, or send an idempotency key."
+  - "**Splitting early to be ready for scale.** The boundaries you guess on day one are usually wrong, and moving a boundary between services is far harder than between folders. Start modular, measure, then split."
+interview:
+  - question: Would you start a new product as microservices or a monolith?
+    answer: >-
+      A modular monolith, unless there's a specific, measured reason otherwise. Early on,
+      the domain boundaries are guesses, and moving a boundary between folders is a
+      refactor, while moving one between services is a migration with two APIs and two
+      databases. A monolith also keeps calls cheap and lets related writes share one
+      transaction. I'd still enforce module boundaries from day one: an entry file per
+      module, a lint rule against deep imports, and each module owning its tables. That
+      keeps the option to extract a service open. I'd split when a part needs to scale,
+      deploy or fail independently, or needs its own team, and I'd use the strangler fig
+      to move it route by route.
+  - question: What changes when a function call becomes a network call?
+    answer: >-
+      Four things: latency, partial failure, versioning and transactions. Latency goes from
+      nanoseconds to milliseconds, so chatty interfaces must become batch calls. The call
+      can now fail or hang while the caller is fine, so it needs a timeout, a decision
+      about what to show when it fails, and retries only with idempotency. The two sides
+      deploy separately, so the API must accept old and new shapes during a rollout. And
+      there's no shared transaction, so all-or-nothing becomes a saga with compensating
+      actions, or an outbox and eventual consistency. On top of that, you now need
+      tracing to follow a request across processes. None of that is a reason never to
+      split, but it's the bill.
+  - question: How do you keep data consistent across two services without a distributed transaction?
+    answer: >-
+      With a saga: a series of local transactions, each with a compensating action, plus
+      reliable messaging between steps. For example, the order service commits a pending
+      order and writes an event to its outbox in the same transaction. Stock reserves and
+      publishes the result. If payment then fails, the saga releases the stock and cancels
+      the order. Each step is idempotent, because messages arrive at least once, and the
+      saga's progress is stored so a crash resumes rather than restarts. The trade-off is
+      that the system is briefly inconsistent and compensations are visible to users.
+      Two-phase commit exists, but it blocks when the coordinator fails and most brokers
+      and APIs don't support it, so it's rarely used between services.
+  - question: What's a distributed monolith, and how do you recognise one?
+    answer: >-
+      It's a system split into services that still behave as one unit, so it pays the
+      network costs without gaining independence. The signs are services that must be
+      deployed together, several services writing the same database tables, long
+      synchronous call chains where one slow service stalls a whole page, and features
+      that always need changes in three repositories at once. The fix is usually to
+      redraw boundaries around data ownership: merge services that always change together,
+      give each table exactly one owner, and replace synchronous chains with events where
+      the caller doesn't need an immediate answer. Sometimes the honest fix is merging
+      back into a modular monolith.

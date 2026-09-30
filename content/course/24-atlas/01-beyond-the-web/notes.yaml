@@ -1,0 +1,146 @@
+summary: |-
+  A platform is a place code runs with its own rules: the browser, a server, an iPhone, an Android phone, a desktop. Native code uses the platform's own language and toolkit; cross-platform code runs on several from one codebase. As soon as a job, or an AI feature, lands outside the browser and the Node server, you need a way to get your bearings fast.
+
+  The lesson gives you two questions that read any language: when does it catch a wrong type, and how does it run? Static languages check types before the program runs; dynamic ones check each operation as it runs. Scripts need their runtime installed; ahead-of-time compiled languages ship a binary of machine code that runs alone. Add two more, who frees memory and how it does several things at once, and you can place almost any language on the map in a minute.
+
+  These notes add that fuller map, what "TypeScript is typed" really guarantees at run time, how runtimes and binaries shape deployment, and how to talk about these trade-offs in an interview without turning it into a language war.
+remember:
+  - A static type system rejects a wrong type before the program runs, and a dynamic one discovers it when that line runs with that input.
+  - Every Python and JavaScript value has a type, and what dynamic languages lack is a check before running, not types.
+  - TypeScript's types are erased at build time, so data from outside the program, such as JSON, must be checked at run time at the boundary.
+  - A script needs its runtime installed on the machine, while an ahead-of-time compiled binary is machine code that runs with nothing else installed.
+  - Start-up time and steady-state speed are separate questions, since a JIT can run a hot loop close to compiled code but pays to start.
+  - Four questions place any language, when types are checked, how it runs, who frees memory, and how it does several things at once.
+  - Python's type hints, like TypeScript's types, are read by a checker and ignored by the running program.
+sections:
+  - title: A map of the languages you'll meet
+    body: |-
+      The four questions, answered for the languages most likely to come up. Each row is a starting point, not the whole story.
+
+      ```text
+      Language    Types             Runs as                    Memory              Concurrency
+      JavaScript  dynamic           JIT in V8 and others       garbage collector   event loop, workers
+      TypeScript  static, erased    compiles to JavaScript     garbage collector   event loop, workers
+      Python      dynamic, hints    interpreter (CPython)      ref counts + GC     threads with a GIL, async
+      Go          static            AOT binary                 garbage collector   goroutines, channels
+      Rust        static            AOT binary                 ownership           threads, async
+      Swift       static            AOT binary                 reference counting  async/await, actors
+      Kotlin      static            JVM, or native binaries    garbage collector   coroutines
+      Java        static            JVM with a JIT             garbage collector   threads, virtual threads
+      C#          static            .NET with a JIT, or AOT    garbage collector   async/await, threads
+      ```
+
+      A few rows need a footnote. Python's global interpreter lock (the GIL) stops two threads running Python bytecode at the same moment, which is why CPU-heavy Python uses processes or native libraries. Python 3.13 added an optional build without the GIL, but the standard build still has it. Kotlin compiles to JVM bytecode for Android and servers, and to native binaries through Kotlin/Native, which is how it reaches iOS. Java and C# both run on a virtual machine with a JIT, and both can also be compiled ahead of time with the right tooling.
+
+      The value of the map is the questions, not memorising the table. Faced with a language you've never used, ask the four questions, and you'll know what its errors, deployment, memory bugs and scaling look like.
+  - title: What static types guarantee, and where they stop
+    body: |-
+      A static checker proves things about your code, given its assumptions about the data coming in. When data arrives from outside (a request body, a file, a model's JSON output), those assumptions are only claims.
+
+      ```ts
+      type Order = { id: string; total: number };
+
+      // The compiler trusts this annotation. Nothing checks it when the program runs.
+      const trusted = JSON.parse('{"id": "A1", "total": "12.50"}') as Order;
+      console.log(trusted.total + 1); // "12.501", a string join
+
+      // A check at the boundary turns unknown data into a real Order, or refuses it.
+      function parseOrder(data: unknown): Order {
+        if (typeof data !== 'object' || data === null) throw new Error('Not an object');
+        const { id, total } = data as Record<string, unknown>;
+        if (typeof id !== 'string' || typeof total !== 'number') throw new Error('Bad order');
+        return { id, total };
+      }
+
+      try {
+        parseOrder(JSON.parse('{"id": "A1", "total": "12.50"}'));
+      } catch (error) {
+        console.log((error as Error).message); // Bad order
+      }
+      ```
+
+      The `as Order` compiled without complaint, and the program printed `12.501`. TypeScript's types are erased, so at run time there is only JavaScript. The fix is a runtime check at the boundary. In real code a schema library such as Zod does the same job and gives you the type from the schema.
+
+      Python's hints behave the same way:
+
+      ```python
+      def label(count: int) -> str:
+          return "items: " + str(count)
+
+
+      print(label("seven"))  # runs happily: the hint says int, nothing checks it
+      ```
+
+      That prints `items: seven`. A checker such as mypy or Pyright would flag the call; the interpreter doesn't. For AI features this matters every day: a model's structured output is outside data, so validate it against a schema before you trust it.
+  - title: Runtimes and binaries in deployment
+    body: |-
+      How a language runs decides what you ship and where it can go.
+
+      **Scripts ship with their runtime.** A Node or Python service needs the right runtime version on the machine, plus its installed packages. Containers solve this by shipping both together: the image starts from a base with the runtime, such as `node:24-slim` or `python:3.13-slim`, and adds your code and dependencies. The cost is image size and a start-up that loads the runtime first.
+
+      **Binaries ship alone.** A Go program built with `CGO_ENABLED=0` is statically linked: one file you can copy into an otherwise empty container image or onto a server with nothing installed. Rust can produce the same with a static target. That's why command-line tools are so often written in Go or Rust: users download one file and run it.
+
+      **Cross-compiling.** A binary is machine code for one operating system and processor. Go makes building for another a matter of two environment variables, `GOOS` and `GOARCH`; Rust uses targets. A script is portable wherever its runtime runs, which is its quiet advantage.
+
+      **Start-up.** Short-lived processes feel start-up most: a command-line tool, a serverless function started per request, an app on a phone. That's where ahead-of-time binaries shine. Long-running servers amortise start-up, and a warm JIT narrows the speed gap considerably.
+
+      A useful rule of thumb in a design review: if the code runs on machines you control, the runtime is a packaging detail. If it runs on machines you don't (a customer's laptop, a locked-down server, a phone), a self-contained binary or a bundled runtime becomes a requirement.
+pitfalls:
+  - >-
+    **"Python has no types."** Every value has a type, and adding a string to a number
+    fails. What's missing is a check before running. Say "dynamically typed", and add a
+    checker such as mypy if you want the early check.
+  - >-
+    **Trusting `as` on outside data.** A type assertion tells the compiler to stop checking;
+    it converts nothing. Validate JSON, form input and model output at run time.
+  - >-
+    **Assuming a script will run where it lands.** A slim base image or a fresh server has
+    no Node or Python. Ship the runtime in the image, or ship a binary.
+  - >-
+    **Confusing start-up with speed.** A binary starting in 9 ms says nothing about how fast
+    a hot loop runs. Measure the thing that matters for your workload.
+  - >-
+    **Treating static typing as correctness.** Types catch a class of mistakes, not logic
+    errors. A correctly typed function can still charge the wrong price, so tests remain.
+interview:
+  - question: What are the trade-offs between static and dynamic typing?
+    answer: >-
+      Static typing moves a class of errors from run time to build time, at the cost of
+      writing and maintaining types. The checker rejects a wrong call before it ships, editors
+      can refactor safely across a large codebase, and types document intent. Dynamic typing
+      lets you run code before it's complete and write less ceremony, which suits scripts,
+      notebooks and exploration. The cost is where errors land: a type mistake reaches
+      whoever runs that line with that input, possibly a customer. In practice the line has
+      blurred: TypeScript and Python's type hints add optional static checking to dynamic
+      languages. For a large, long-lived codebase with many contributors I'd want static
+      checks; for a one-off data script, not necessarily.
+  - question: If our backend is TypeScript, is it type-safe at run time?
+    answer: >-
+      No. TypeScript's types are erased when it compiles, so the running program is plain
+      JavaScript with no type checks. The compiler proves your code is consistent with its
+      own annotations, but anything that enters from outside, such as request bodies, database
+      rows, third-party responses or model output, is only as trustworthy as the claim you
+      made about it. An `as` assertion or a typed `JSON.parse` result can be wrong without
+      any error. So validate at every boundary with a runtime schema, for example Zod, and
+      derive the TypeScript type from the schema so the two can't drift apart. Inside the
+      boundary, the static types then hold.
+  - question: Why is so much developer tooling now written in Rust or Go?
+    answer: >-
+      Mainly distribution and start-up. Rust and Go compile ahead of time to a single binary,
+      so users download one file and run it, with no runtime or package installation to go
+      wrong. Tools like linters, formatters and package managers run many times a day for a
+      few hundred milliseconds each, so start-up dominates, and a binary starts much faster
+      than a script that must load Node or Python first. Both also make it practical to use
+      every CPU core. The trade-off is contributor reach: a tool for a JavaScript ecosystem
+      written in Rust has fewer people in that community able to contribute to it, and
+      plugins in the host language get harder.
+  - question: What's the difference between an interpreter, a JIT and ahead-of-time compilation?
+    answer: >-
+      They differ in when source becomes machine code. An interpreter executes the program
+      step by step, often from bytecode, as CPython does; it starts quickly but runs loops
+      slowly. A JIT, like V8's, starts by interpreting, watches which code runs hot, and
+      compiles that to optimised machine code while the program runs, so a long-running
+      server gets close to compiled speed after warming up. Ahead-of-time compilation, as in
+      Go, Rust and Swift, produces machine code before the program ever runs, so start-up is
+      fast and there's no runtime to install. The trade-off: AOT can't optimise using what it
+      sees at run time, and a JIT pays in start-up time and memory.

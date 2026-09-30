@@ -1,0 +1,289 @@
+id: ai.agents
+title: Agents
+objective: "Build an agent loop over tools with a turn cap, keep a plan and memory in context, and know where MCP fits."
+level: advanced
+minutes: 10
+concepts: [ai.agents, ai.planning-and-memory, ai.mcp]
+prerequisites: [ai.tools, ai.rag]
+opening:
+  text: >-
+    You'll build the loop behind every AI agent, from coding assistants to travel bots, in
+    about fifteen lines. Then you'll make sure it can't run up a bill all night.
+
+steps:
+  - type: prose
+    id: what-an-agent-is
+    body: >-
+      In the tool lesson, the model asked for a tool once, then answered. Real tasks take
+      more: find the trains, check the fares, then book one.
+
+
+      An **agent** is a model called in a loop with tools. Each turn it either asks for more
+      tools or gives its final answer. Your code runs the tools, keeps the loop going, and sets the limits.
+    figure:
+      id: agent-loop
+      caption: The loop runs until a reply has no tool call, or until the step cap stops it.
+
+  - type: prose
+    id: loop-shape
+    body: |-
+      The whole loop, with each reply kept in `messages`:
+
+      ```python
+      for step in range(MAX_STEPS):
+          reply = client.messages.create(**request, tools=TOOLS, messages=messages)
+          messages.append({"role": "assistant", "content": reply.content})
+          if reply.stop_reason != "tool_use":
+              return final_text(reply)   # an answer, a cut-off or a refusal
+          results = [run_tool(b) for b in reply.content if b.type == "tool_use"]
+          messages.append({"role": "user", "content": results})
+      raise RuntimeError("Too many steps")
+      ```
+
+      This pattern has a name: **ReAct**, short for reason and act. The model thinks, calls
+      a tool, reads the result, and goes round again.
+
+  - type: ai-review
+    id: review-loop-without-cap
+    concept: ai.agents
+    difficulty: 2
+    language: python
+    request: Write the agent loop for the travel bot.
+    flawClass: edge-case
+    code: |
+      while True:
+          reply = client.messages.create(**request, tools=TOOLS, messages=messages)
+          messages.append({"role": "assistant", "content": reply.content})
+          if reply.stop_reason == "end_turn":
+              break
+          results = [run_tool(b) for b in reply.content if b.type == "tool_use"]
+          messages.append({"role": "user", "content": results})
+    prompt: >-
+      An assistant wrote this. Tests passed. In production one conversation ran all night,
+      calling `search_flights` again and again, and the bill followed. Tap the line at fault.
+    lines: [1]
+    reasons:
+      - text: Nothing limits how many times the loop runs
+        correct: true
+        feedback: >-
+          Yes. A model that keeps asking for tools is an endless bill. Cap the steps.
+      - text: '`end_turn` is the wrong stop reason'
+        feedback: >-
+          It's the right one for an answer. The trouble is there's no other way out.
+      - text: Tool results belong in the assistant message
+        feedback: >-
+          Results come from your side, so they're a user message. That part is right.
+    fix: |
+      for step in range(12):
+          reply = client.messages.create(**request, tools=TOOLS, messages=messages)
+          messages.append({"role": "assistant", "content": reply.content})
+          if reply.stop_reason != "tool_use":
+              break
+          results = [run_tool(b) for b in reply.content if b.type == "tool_use"]
+          messages.append({"role": "user", "content": results})
+      else:
+          raise RuntimeError("Agent gave up after 12 steps")
+
+  - type: bug-hunt
+    id: hunt-dropped-tool-use
+    concept: ai.agents
+    difficulty: 3
+    language: python
+    code: |
+      reply = client.messages.create(**request, tools=TOOLS, messages=messages)
+      text = "".join(b.text for b in reply.content if b.type == "text")
+      messages.append({"role": "assistant", "content": text})
+      results = [run_tool(b) for b in reply.content if b.type == "tool_use"]
+      messages.append({"role": "user", "content": results})
+      reply = client.messages.create(**request, tools=TOOLS, messages=messages)
+    prompt: >-
+      The second call fails with a 400: each `tool_result` block must have a corresponding
+      `tool_use` block in the previous message. Tap the line to fix.
+    lines: [3]
+    reasons:
+      - text: The saved reply drops its `tool_use` blocks
+        correct: true
+        feedback: >-
+          Right. Save `reply.content` whole, so each result has its request.
+      - text: The results need the role `"tool"`
+        feedback: >-
+          Results go in a user message here. The request they answer went missing.
+      - text: The second call needs `tools` removed
+        feedback: >-
+          The tools stay. The history before the results is what's broken.
+    fix: |
+      messages.append({"role": "assistant", "content": reply.content})
+
+  - type: code-challenge
+    id: write-run-agent
+    concept: ai.agents
+    difficulty: 4
+    language: python
+    starter: agent.starter.py
+    solution: agent.solution.py
+    tests: agent.tests.py
+    prompt: >-
+      Write `run_agent(call_model, tools, messages, max_steps=8)`. Replies and blocks are
+      dicts shaped like the SDK's. Call `call_model(messages)`, and add each reply's
+      `content` to `messages` as an assistant message.
+
+
+      If `stop_reason` isn't `"tool_use"`, return the reply's joined text. Otherwise run every
+      `tool_use` block, returning failures as `is_error` results, send them in one user
+      message, and loop. After `max_steps` calls, raise `RuntimeError`.
+    hints:
+      - '`for step in range(max_steps):`, with the `raise` after the loop.'
+      - >-
+        A result is `{"type": "tool_result", "tool_use_id": ..., "content": ...}`.
+      - 'Wrap `tools[block["name"]](**block["input"])` in `try`, as in the tool lesson.'
+
+  - type: prose
+    id: planning-and-memory
+    body: >-
+      A goal like "cheapest train to Leeds on Friday" takes several steps. The model
+      **plans** by writing the steps in its replies, where they stay in `messages` for the
+      next turn.
+
+
+      **Memory** is different. Each call sees only what you send. Within one task, that's
+      `messages`. Across sessions, memory is a store your code writes to and searches, like
+      the retrieval lessons.
+
+  - type: multiple-choice
+    id: pick-what-it-remembers
+    concept: ai.planning-and-memory
+    difficulty: 2
+    question: Last week the bot booked a customer's train. Today they open a new chat. What does it know about that?
+    choices:
+      - text: Nothing, unless your code stored and retrieved it
+        correct: true
+        feedback: >-
+          Right. Memory is a store you own, fetched into the prompt when it's relevant.
+      - text: Everything, since the model remembers users
+        feedback: >-
+          The model has no memory between calls. It knows only what's in this request.
+      - text: The provider keeps the chat history for you
+        feedback: >-
+          Each request stands alone. Your code sends the history, or it isn't there.
+
+  - type: prose
+    id: mcp
+    body: >-
+      Tools don't have to live in your code. The **Model Context Protocol**, **MCP**, is an
+      open standard for offering tools and data to AI apps. A calendar, a ticket system or a
+      database can be one **MCP server**, written once.
+
+
+      Then any app that speaks MCP can use it: a chat app, a code editor or your own
+      agent. Chapter 21 builds one.
+
+  - type: multiple-choice
+    id: pick-mcp
+    concept: ai.mcp
+    difficulty: 2
+    question: Your team wants the same stock-lookup tools in a chat app, a code editor and a support bot. What fits?
+    choices:
+      - text: One MCP server that all three connect to
+        correct: true
+        feedback: >-
+          Yes. Written once, used by every app that speaks MCP.
+      - text: Paste the tool code into each app
+        feedback: >-
+          Three copies drift apart. A shared server keeps one version.
+      - text: Put the stock levels in each system prompt
+        feedback: >-
+          The prompt would go stale by lunchtime. Tools fetch live data.
+
+  - type: explain-back
+    id: explain-when-agent
+    concept: ai.agents
+    difficulty: 3
+    prompt: >-
+      A task always runs the same three steps: look up the order, check the refund rules,
+      draft a reply. Would you build an agent loop or plain code calling the model? Why?
+    rubric:
+      - When the steps are known, plain code calling the model is simpler and predictable.
+      - An agent loop earns its cost when the steps depend on what it finds.
+      - Fewer model decisions mean fewer surprises, lower cost and easier testing.
+    modelAnswer: >-
+      Plain code. The steps never change. My code can run them in order, and call the model only
+      to draft the reply. It's cheaper, faster and simpler to test. I'd reach for an
+      agent loop when the next step depends on what the last one found.
+
+recap:
+  - Build an agent as a model and tools in a loop, with a cap on steps.
+  - Keep each reply whole in `messages`, and stop on any stop reason but `tool_use`.
+  - Keep memory in a store you own, and share tools across apps with MCP.
+
+recall:
+  - id: card-agent-loop
+    concept: ai.agents
+    front: What is an agent, in one sentence?
+    back: >-
+      A model called in a loop with tools, where each turn it asks for tools or gives a
+      final answer, and code caps the turns.
+  - id: card-keep-tool-use
+    concept: ai.agents
+    front: Why save the whole `reply.content`, not only its text?
+    back: >-
+      Each `tool_result` must follow the `tool_use` block that asked for it. Drop the block
+      and the API rejects the next call.
+  - id: card-memory
+    concept: ai.planning-and-memory
+    front: Where does an agent's memory live between sessions?
+    back: >-
+      In a store your code owns, searched and put back into the prompt when relevant. The
+      model keeps nothing.
+  - id: card-mcp
+    concept: ai.mcp
+    front: What does MCP let you do?
+    back: >-
+      Offer tools and data once, as an MCP server, to any AI app that speaks the protocol.
+
+references:
+  - kind: essay
+    title: Building effective agents
+    authors: Erik Schluntz and Barry Zhang
+    year: 2024
+    venue: Anthropic Engineering blog
+    url: https://www.anthropic.com/engineering/building-effective-agents
+    note: Workflows against agents, and when each is worth it.
+    primary: true
+    verified: true
+  - kind: spec
+    title: Model Context Protocol specification
+    authors: Model Context Protocol contributors
+    venue: modelcontextprotocol.io
+    url: https://modelcontextprotocol.io/specification
+    note: Servers, clients, tools and resources.
+    primary: true
+    verified: true
+  - kind: paper
+    title: 'ReAct: Synergizing Reasoning and Acting in Language Models'
+    authors: Shunyu Yao et al.
+    year: 2023
+    venue: ICLR 2023
+    url: https://arxiv.org/abs/2210.03629
+    note: Interleaving reasoning with tool calls, the pattern behind agent loops.
+    verified: true
+  - kind: essay
+    title: "Introducing A2UI: an open project for agent-driven interfaces"
+    authors: Google
+    year: 2025
+    venue: Google Developers Blog
+    url: https://developers.googleblog.com/introducing-a2ui-an-open-project-for-agent-driven-interfaces/
+    note: Agents send a declarative UI as data, and the client renders it with its own components.
+    verified: false
+
+deepDive: >-
+  **Step caps are the minimum.** Production agents also cap spend in tokens. They stop when the
+  same tool is called with the same input twice. And they ask a person before anything
+  that can't be undone. Chapter 21's agent harness lesson covers these.
+
+
+  **The SDK's tool runner** runs this loop for you and can stream each turn. Writing it by
+  hand once is how you learn to debug it.
+
+
+  **for and else.** The review's fix uses `for ... else`: the `else` runs only when the
+  loop finished without `break`, here meaning every step was used up.

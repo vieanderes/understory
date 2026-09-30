@@ -1,0 +1,292 @@
+summary: >-
+  Deploying Next.js means running the output of `next build` somewhere users can reach. The
+  minimum is modest: a Node.js server running `next start` supports every feature, from
+  Server Components and Server Actions to Cache Components, the proxy and `after()`. A
+  Docker image of the standalone output is the same thing in a smaller box. A static
+  export drops everything that needs a server.
+
+
+  What changes is everything around that one process. A managed host serves hashed assets
+  from a CDN, runs one build everywhere, shares a cache between copies, drains old copies
+  gently and streams responses end to end. On your own servers, each of those is now your
+  job. Most self-hosting bugs are one of them missing: unstyled pages, a cache that
+  disagrees between servers, `Failed to find Server Action` after a deploy, a rate limit
+  that lets three times the traffic through, or a streamed page that arrives all at once.
+
+
+  The senior view is a checklist, not a command. Build once, run the same artefact
+  everywhere, keep shared state out of process memory, give instances what they must share,
+  and make sure every hop between the user and Node passes a stream through unbuffered.
+remember:
+  - A single `next start` process supports every Next.js feature; CDNs, shared caches and edge compute add speed and consistency across instances, not correctness.
+  - '`next start` serves the last build, and `NEXT_PUBLIC_` variables are inlined into the browser bundle at build time, so changing either needs a rebuild.'
+  - '`output: ''standalone''` writes `.next/standalone` with `server.js` and only the traced `node_modules`, and leaves `public` and `.next/static` for a CDN or for you to copy in.'
+  - Build once and ship that artefact everywhere, because each build has its own Server Action ids, encryption key and build id.
+  - Several instances need the same Server Action encryption key, a `deploymentId` for version skew, and a shared cache handler that syncs tags.
+  - Anything kept in one process's memory, such as a rate-limit counter or the default `'use cache'` store, is per instance, so shared state belongs in a shared store.
+  - Streaming works only if every hop passes chunks through, so turn off buffering in nginx and check the load balancer.
+  - Put a reverse proxy in front of the Node server to absorb malformed requests, slow clients, oversized bodies and abusive traffic.
+sections:
+  - title: What a build fixes in place
+    body: |-
+      A build is more than compiled code. Knowing what it freezes explains most deployment
+      rules.
+
+      - **Browser-visible configuration.** `process.env.NEXT_PUBLIC_API_URL` is replaced by
+        its value during `next build`. After that, the bundle ignores the environment. One
+        image promoted from staging to production carries staging's public values unless it
+        was built with production's.
+      - **Server configuration.** `next.config.ts` is read at build time and serialised into
+        the standalone `server.js`.
+      - **Identities.** Each build gets a build id, Server Action ids, and a fresh key that
+        encrypts the variables inline actions capture. A page rendered by one build posts
+        action references only that build understands.
+
+      Server-only variables are different. Read during a request, for example after
+      `await connection()`, they come from the environment at runtime. That's what lets one
+      image run in several environments with different secrets.
+
+      ```ts
+      import { connection } from 'next/server';
+
+      export default async function StatusPage() {
+        await connection(); // render per request, so the value is read at runtime
+        return <p>Region: {process.env.REGION ?? 'unknown'}</p>;
+      }
+      ```
+
+      So the reliable pipeline is: build one artefact per commit, with the production
+      public values, then promote that same artefact through environments, changing only
+      server-side variables. A deploy script that runs `npm run build` on each server
+      breaks the identity rule, as the lesson's bug hunt showed.
+  - title: A production image from standalone output
+    body: |-
+      The lesson's Dockerfile works. Here it is with the settings a production image adds.
+
+      ```text
+      FROM node:24-slim AS build
+      WORKDIR /app
+      COPY package.json package-lock.json ./
+      RUN npm ci
+      COPY . .
+      ARG NEXT_DEPLOYMENT_ID
+      ENV NEXT_DEPLOYMENT_ID=$NEXT_DEPLOYMENT_ID
+      RUN npm run build
+
+      FROM node:24-slim
+      WORKDIR /app
+      ENV NODE_ENV=production PORT=3000 HOSTNAME=0.0.0.0
+      COPY --from=build --chown=node:node /app/.next/standalone ./
+      COPY --from=build --chown=node:node /app/public ./public
+      COPY --from=build --chown=node:node /app/.next/static ./.next/static
+      USER node
+      EXPOSE 3000
+      CMD ["node", "server.js"]
+      ```
+
+      Line by line, the choices that matter:
+
+      - Two stages, so compilers, dev dependencies and source stay out of the final image.
+        Standalone output traces which files each route loads and copies only those.
+      - `server.js` listens on the address in `HOSTNAME`, and Docker sets `HOSTNAME` to the
+        container's own name. Setting it to `0.0.0.0` makes the server listen on every
+        interface, whatever the container is called.
+      - `NEXT_DEPLOYMENT_ID` at build time sets the deployment id used for version skew. A
+        `deploymentId` in `next.config.ts` wins if both are set.
+      - `USER node` drops root, so a compromised process has less to play with.
+      - `CMD ["node", "server.js"]` in exec form makes Node the process that receives
+        `SIGTERM`. Next.js then finishes in-flight requests and pending `after()` callbacks
+        before exiting. Give the orchestrator a drain period; the docs suggest 10 to 30
+        seconds.
+
+      No `NEXT_SERVER_ACTIONS_ENCRYPTION_KEY` here, on purpose. Every container runs the same
+      build, so they already share its key. Set the variable when you can't avoid building
+      more than once, and remember the docs say it's embedded in the build output, so treat
+      the image as secret material.
+
+      In a monorepo, tracing starts at the app folder. Set `outputFileTracingRoot` to include
+      shared packages, and `outputFileTracingIncludes` for files loaded in ways tracing
+      can't see.
+  - title: From one server to several
+    body: |-
+      A single instance with a persistent disk works with no extra setup. Add a second copy
+      behind a load balancer and four things can split.
+
+      - **Server Action encryption.** Instances from different builds can't decrypt each
+        other's action references, and posts fail with `Failed to find Server Action`. One
+        build solves it. Otherwise set the same `NEXT_SERVER_ACTIONS_ENCRYPTION_KEY`, a base64
+        value decoding to 16, 24 or 32 bytes, for example from `openssl rand -base64 32`.
+      - **The cache.** `'use cache'` entries live in each process's memory. An `updateTag` on
+        one instance invalidates only that one. Configure `'use cache: remote'` with a handler
+        in `cacheHandlers`, and implement `refreshTags()` so each instance syncs invalidated
+        tags before a request. The older ISR and route handler cache uses the singular
+        `cacheHandler` option.
+      - **Version.** During a rolling deploy, a browser holding the old version can reach a
+        new server. A `deploymentId` adds `?dpl=` to asset URLs and an `x-deployment-id`
+        header to navigations. On a mismatch, the client does a full page load instead of a
+        broken navigation. Unsaved component state is lost in that reload.
+      - **Your own state.** Any `Map`, counter, session store or queue in module scope is per
+        instance. The lesson's rate limiter allowed three times its limit. Move it to Redis or
+        the database, and let the host's rate limiting help too.
+
+      A quick audit for any codebase: search for module-level `new Map(`, arrays that grow,
+      and `setInterval`. Each one is either a cache that may disagree, or a bug waiting for
+      the second instance.
+  - title: Rolling deploys and Server Actions
+    body: |-
+      Server Actions have a deployment wrinkle that route handlers don't. The browser calls
+      them by id, and a new deployment usually brings new ids. Next.js also rotates them at
+      most every 14 days, even when the source hasn't changed. A tab opened before a deploy
+      can post an id the new servers don't know, and the user sees "Failed to find Server
+      Action".
+
+      The docs give three mitigations, and a senior answer names all of them:
+
+      - Prefer rolling deployments to an abrupt cutover while users are likely to be
+        mid-form.
+      - Keep `NEXT_SERVER_ACTIONS_ENCRYPTION_KEY` stable across instances, so action
+        references stay decryptable everywhere.
+      - Treat the failure as retryable in the UI: tell the user the app was updated and offer
+        a reload that keeps their input.
+
+      A `deploymentId` completes the picture. Without it, a stale client navigates with old
+      assumptions. With it, the mismatch is detected and the page reloads cleanly. The docs
+      add a caveat: Next.js doesn't route by `?dpl=`, so keeping each user on their own
+      deployment during a rollout is the job of your host or CDN. Without that routing,
+      clients that reach a new instance reload rather than navigate.
+
+      Put form drafts that matter in the URL or local storage, not only in component state,
+      if a mid-deploy reload would cost the user real work.
+  - title: Behind nginx and a CDN
+    body: |-
+      The self-hosting guide recommends a **reverse proxy** such as nginx in front of Node. It
+      handles malformed requests, slow-connection attacks, payload size limits and rate
+      limiting, so the Next.js process spends its time rendering.
+
+      Two settings trip people up.
+
+      **Buffering.** nginx buffers responses by default, so a streamed page arrives all at
+      once, and Partial Prerendering loses its fast first byte. Send `X-Accel-Buffering: no`
+      from the app, for example through `headers()` in `next.config.ts`, or turn buffering
+      off in nginx. Check every hop: some cloud load balancers buffer too.
+
+      **Origins.** Server Actions compare `Origin` with `Host` or `X-Forwarded-Host`. If the
+      proxy rewrites the host, or the public domain differs from the one the app sees, list
+      the trusted domains in `serverActions.allowedOrigins`.
+
+      Next.js sets `Cache-Control` so a CDN can do the right thing:
+
+      ```text
+      hashed assets (/_next/static)   public, max-age=31536000, immutable
+      fully prerendered page          public, cacheable by the CDN
+      page that used request data     private, no-cache, no-store, max-age=0, must-revalidate
+      ```
+
+      The hashed files are why standalone output leaves `.next/static` out: they're ideal
+      for a CDN, and `assetPrefix` points the app at them on another domain. The cost is an
+      extra DNS lookup and TLS handshake for that domain. A CDN must also respect the cache
+      headers and cache keys Next.js relies on, or it may mix variants during client
+      navigation.
+  - title: Adapters, platforms and static export
+    body: |-
+      Not every target runs a long-lived Node process. The docs list four deployment
+      options: a Node.js server and a Docker container support everything, a static export
+      supports a limited set, and **adapters** vary by platform.
+
+      The Deployment Adapter API lets a platform turn a standard build into its own output
+      at build time. Together with the cache handler interfaces, it's the whole integration
+      surface. Vercel's adapter uses the same public API as everyone else. **Verified**
+      adapters are open source and run the full Next.js compatibility test suite; the docs
+      list Vercel and Bun, with Cloudflare and Netlify working towards it. Other platforms
+      ship their own integrations with varying support.
+
+      The docs separate two ideas worth using in an interview. **Functional fidelity** means
+      every feature works, and passing the adapter test suite proves it. **Performance
+      fidelity** means features reach their best speed, such as a static shell served from
+      the CDN edge. Platforms differ mostly in the second.
+
+      A static export, `output: 'export'`, writes plain files any web server can host. It
+      gives up everything that needs a server at request time: Server Actions, the proxy,
+      cookies, rewrites, redirects and headers from the config, ISR, default image
+      optimisation, draft mode, and route handlers that read the request. It suits a
+      marketing site or documentation. It doesn't suit an app with sign-in and forms.
+pitfalls:
+  - >-
+    **Building on every server.** Each build has its own action ids and keys, so forms fail
+    at random with `Failed to find Server Action`. Build once and copy the artefact, or share
+    `NEXT_SERVER_ACTIONS_ENCRYPTION_KEY`.
+  - >-
+    **Forgetting `public` and `.next/static`.** Standalone output leaves them out, so pages
+    load without styles, scripts or images. Copy them beside `server.js`, or serve them
+    from a CDN.
+  - >-
+    **Setting `NEXT_PUBLIC_` values at runtime.** They were inlined at build time, so the
+    container ignores the new value. Build with the right public values, or serve runtime
+    configuration from the server.
+  - >-
+    **State in module memory.** A `Map` of rate-limit counts or sessions works on one server
+    and fails quietly on three. Use a shared store.
+  - >-
+    **nginx buffering streams.** Suspense fallbacks never show, and the whole page arrives
+    at the end. Disable buffering with `X-Accel-Buffering: no` or in the proxy config.
+  - >-
+    **Exposing the Node server directly.** Slow clients, huge bodies and malformed requests
+    then land on the process that renders pages. Put a reverse proxy such as nginx in front.
+  - >-
+    **Killing instances without a drain.** In-flight requests and `after()` callbacks are
+    cut off. Send `SIGTERM`, run Node as the container's main process, and allow 10 to 30
+    seconds.
+  - >-
+    **A shared cache without tag sync.** Entries are shared, but invalidations still don't
+    reach every instance. Implement `refreshTags()` in the cache handler.
+interview:
+  - question: What do you need to self-host a Next.js app well?
+    answer: >-
+      Functionally, one Node process: `next build`, then `next start` or the standalone
+      `server.js`, which supports every feature. Doing it well is the list around it. A
+      reverse proxy in front for slow clients, body limits and rate limiting. Hashed assets
+      on a CDN with long-lived cache headers. One build artefact promoted through
+      environments. Streaming allowed through every hop. Graceful shutdown on `SIGTERM`.
+      With more than one instance: a shared encryption key or a single build, a
+      `deploymentId` for version skew, a shared cache handler with `refreshTags`, and no
+      state in process memory. The trade-off against a managed host is control and cost
+      versus doing this work yourself.
+  - question: Users report "Failed to find Server Action" after deploys. What's happening and how do you fix it?
+    answer: >-
+      A browser is calling an action id that the server handling the request doesn't know.
+      Two causes are common. Servers running different builds, because each built for
+      itself, have different ids and encryption keys; the fix is to build once and ship that
+      artefact, or share `NEXT_SERVER_ACTIONS_ENCRYPTION_KEY`. Or a tab opened before a
+      deploy posts an old id to a new server; ids usually change per deployment and rotate
+      at most every 14 days. For that I prefer rolling deploys, set a `deploymentId` so
+      stale clients reload cleanly, and show a retry path in the UI that keeps the user's
+      input.
+  - question: Why does standalone output leave out `public` and `.next/static`?
+    answer: >-
+      Because those files are best served by a CDN, not by Node. Standalone output traces
+      exactly what the server needs, `server.js` plus the used parts of `node_modules`,
+      which shrinks a deployment from hundreds of megabytes to tens. The browser assets in
+      `.next/static` have content hashes in their names and get
+      `max-age=31536000, immutable`, so a CDN can keep them for a year and never ask Node.
+      If there's no CDN, I copy `public` into the standalone root and `.next/static` into
+      its `.next` folder, and `server.js` serves them. Forgetting that copy gives unstyled
+      pages.
+  - question: Your rate limiter works in tests but not in production. Why might that be?
+    answer: >-
+      Most likely it counts in process memory, and production runs several instances. The
+      test sends six requests to one process and gets `429` on the sixth. With three
+      instances behind a load balancer, each keeps its own count, so the real limit is three
+      times higher, and serverless instances may start with an empty count. The fix is a
+      shared store with an atomic increment and an expiry, such as Redis, keyed by user or
+      IP and route. I'd also turn on the host's or reverse proxy's rate limiting as an outer
+      layer. The same audit applies to caches and sessions in module scope.
+  - question: How do environment variables behave in a Next.js deployment?
+    answer: >-
+      Server-only variables are read from the environment when server code runs, so one
+      image can run in several environments. Variables prefixed `NEXT_PUBLIC_` are different:
+      `next build` replaces them with their values in the browser bundle, and after that the
+      app ignores changes. So I build with production's public values and keep secrets
+      server-only, ideally read in a data access layer. For values the browser needs that
+      differ per environment, I serve them from the server rather than rebuilding. Runtime
+      reads must happen during request-time rendering, for example after
+      `await connection()`, or they're frozen into prerendered HTML.

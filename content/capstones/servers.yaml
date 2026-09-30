@@ -1,0 +1,1301 @@
+summary: >-
+  The solution is a booking API for meeting rooms: one fetch-style handler in TypeScript on
+  Node 24, with PostgreSQL behind it through `pg`. Guests sign in with a session cookie, book
+  rooms for whole hours, see and cancel only their own bookings, and pay through Stripe
+  Checkout. The database carries the rules that must hold under load: an exclusion
+  constraint makes double booking impossible, and a row lock caps each guest's unpaid
+  bookings. The webhook verifies Stripe's signature on the raw body and claims each event id
+  in the same transaction that marks the booking paid, so a redelivery changes nothing. Two
+  migrations build the schema, the second with a tested down file. Twenty-four Vitest tests,
+  unit and integration on a real PostgreSQL, and one Playwright journey prove it.
+remember:
+  - Rules that must hold when two requests arrive together live in the database, because no app check can close the gap between its own read and write.
+  - An exclusion constraint on `(room_id WITH =, during WITH &&)` refuses overlapping bookings, and half-open ranges let one booking end exactly when the next starts.
+  - A rule across many rows, such as "at most three unpaid bookings", needs a lock or serializable isolation, so the transaction locks the guest's row with `FOR UPDATE`.
+  - Every lookup includes the owner, `WHERE id = $1 AND user_id = $2`, so someone else's booking is a 404 and there's no second check to forget.
+  - A transaction runs on one client from `pool.connect()` and always ends in `COMMIT` or `ROLLBACK`, with the client released in `finally`.
+  - The webhook claims the event id and does the work in one transaction, so a failure releases the claim and Stripe's retry can succeed.
+  - A down migration refuses rather than destroys data, so it restores the old constraint first and lets PostgreSQL reject it while paid bookings exist.
+  - Integration tests run on the production database engine, and concurrency tests fire requests with `Promise.all`, then check the invariant.
+sections:
+  - title: 1. What gets built, and in what order
+    body: |-
+      The build goes from the bottom up, because each layer leans on the one below: the schema,
+      the database helpers, sessions, bookings and payments, the router, then the tests.
+
+      The API, all JSON, errors as problem details:
+
+      - `POST /login` checks an email and password, and sets an `HttpOnly` session cookie.
+      - `POST /logout` deletes the session.
+      - `GET /bookings` lists the caller's bookings; `POST /bookings` creates one.
+      - `GET /bookings/:id` shows one of the caller's bookings.
+      - `POST /bookings/:id/cancel` cancels an unpaid booking.
+      - `POST /bookings/:id/checkout` returns a Stripe Checkout URL for an unpaid booking.
+      - `POST /webhooks/stripe` receives Stripe's events.
+
+      The code sits in `migrations/`, `src/` (one file per concern), `test/unit/`,
+      `test/integration/` and `e2e/`.
+
+      Out of scope, on purpose: staff roles, refunds, email, rate limits and deployment.
+  - title: 2. The schema, in the first migration
+    body: |-
+      The first migration creates four tables. Every rule that matters under load is a
+      constraint here, not an `if` in TypeScript.
+
+      ```sql
+      -- migrations/0001_rooms_and_bookings.up.sql
+      SET lock_timeout = '5s';
+
+      CREATE EXTENSION IF NOT EXISTS btree_gist;
+
+      CREATE TABLE users (
+        id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        email text NOT NULL UNIQUE CHECK (email = lower(email)),
+        password_hash text NOT NULL
+      );
+
+      CREATE TABLE sessions (
+        id text PRIMARY KEY,
+        user_id bigint NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+        expires_at timestamptz NOT NULL
+      );
+      CREATE INDEX sessions_user_id_idx ON sessions (user_id);
+
+      CREATE TABLE rooms (
+        id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        name text NOT NULL UNIQUE,
+        pence_per_hour integer NOT NULL CHECK (pence_per_hour > 0)
+      );
+
+      CREATE TABLE bookings (
+        id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        room_id bigint NOT NULL REFERENCES rooms (id),
+        user_id bigint NOT NULL REFERENCES users (id),
+        during tstzrange NOT NULL,
+        amount_pence integer NOT NULL CHECK (amount_pence > 0),
+        status text NOT NULL DEFAULT 'pending',
+        created_at timestamptz NOT NULL DEFAULT now(),
+        CONSTRAINT bookings_during_bounded
+          CHECK (NOT isempty(during) AND NOT lower_inf(during) AND NOT upper_inf(during)),
+        CONSTRAINT bookings_status_check CHECK (status IN ('pending', 'cancelled')),
+        CONSTRAINT bookings_no_overlap
+          EXCLUDE USING gist (room_id WITH =, during WITH &&) WHERE (status <> 'cancelled')
+      );
+      CREATE INDEX bookings_user_id_idx ON bookings (user_id);
+      ```
+
+      **The overlap rule.** `during` is a `tstzrange`, a range of instants. The exclusion
+      constraint says no two rows may have equal `room_id` and overlapping (`&&`) `during`: a
+      `UNIQUE` that understands time. `btree_gist` lets a GiST index compare the `bigint` with
+      `=` alongside the range.
+
+      **Half-open ranges.** The app always builds `[start, end)`: the start is included, the end
+      is not. So a booking from 10:00 to 11:00 and one from 11:00 to 12:00 don't overlap, and
+      back-to-back meetings work. `bookings_during_bounded` refuses empty ranges and ranges
+      that run for ever.
+
+      **Cancelled bookings free the slot.** The `WHERE (status <> 'cancelled')` makes the
+      constraint partial, like a partial unique index. A cancelled row stays for history but no
+      longer blocks anyone.
+
+      **Money in integer pence**, fixed when the booking is made, so a later price change never
+      alters what a guest owes. The email `CHECK` makes `Ana@` and `ana@` one account.
+
+      The down file drops the tables, children first. It leaves `btree_gist` installed, since
+      other schemas in the database might use it.
+
+      ```sql
+      -- migrations/0001_rooms_and_bookings.down.sql
+      SET lock_timeout = '5s';
+
+      DROP TABLE bookings;
+      DROP TABLE rooms;
+      DROP TABLE sessions;
+      DROP TABLE users;
+      ```
+
+      Each rule was run on PGlite and on PostgreSQL 15: an overlapping booking fails with
+      `23P01`, an adjacent one succeeds, an empty or unbounded range fails
+      `bookings_during_bounded`, and rebooking a cancelled slot succeeds.
+  - title: 3. A reversible migration, and the runner
+    body: |-
+      Payments arrive in a second migration. It widens the status rule to allow `paid`, adds
+      `paid_at`, ties the two together, and creates the table the webhook uses to remember
+      events.
+
+      ```sql
+      -- migrations/0002_payments.up.sql
+      SET lock_timeout = '5s';
+
+      ALTER TABLE bookings DROP CONSTRAINT bookings_status_check;
+      ALTER TABLE bookings ADD CONSTRAINT bookings_status_check
+        CHECK (status IN ('pending', 'paid', 'cancelled'));
+
+      ALTER TABLE bookings ADD COLUMN paid_at timestamptz;
+      ALTER TABLE bookings ADD CONSTRAINT bookings_paid_has_time
+        CHECK (status <> 'paid' OR paid_at IS NOT NULL);
+
+      CREATE TABLE payment_events (
+        event_id text PRIMARY KEY,
+        type text NOT NULL,
+        booking_id bigint REFERENCES bookings (id),
+        outcome text NOT NULL,
+        received_at timestamptz NOT NULL DEFAULT now()
+      );
+      ```
+
+      The down file is where reversibility gets real. The hard question is bookings already
+      `paid`, since the old schema has no such status. Setting them back to `pending` would
+      lose the fact that a guest paid. So the down file restores the old `CHECK` before it drops
+      anything. PostgreSQL validates it against every row, fails on the first paid booking, and
+      the transaction around the file rolls everything back.
+
+      ```sql
+      -- migrations/0002_payments.down.sql
+      SET lock_timeout = '5s';
+
+      DROP TABLE payment_events;
+
+      ALTER TABLE bookings DROP CONSTRAINT bookings_paid_has_time;
+      ALTER TABLE bookings DROP CONSTRAINT bookings_status_check;
+      -- Fails, and rolls the whole file back, while any booking is still 'paid'.
+      ALTER TABLE bookings ADD CONSTRAINT bookings_status_check
+        CHECK (status IN ('pending', 'cancelled'));
+      ALTER TABLE bookings DROP COLUMN paid_at;
+      ```
+
+      `SET lock_timeout` at the top of each file means an `ALTER TABLE` that can't get its lock
+      within five seconds gives up, instead of queueing every query on `bookings` behind it.
+
+      The runner records applied versions in `schema_migrations` and runs each file in its own
+      transaction, so a file applies whole or not at all. `client.query` without parameters
+      allows several statements in one string.
+
+      ```ts
+      // src/migrate.ts
+      import { readdir, readFile } from 'node:fs/promises';
+      import { join } from 'node:path';
+      import { type Pool, withTransaction } from './db.js';
+
+      const DIR = new URL('../migrations/', import.meta.url).pathname;
+
+      async function applied(pool: Pool): Promise<string[]> {
+        await pool.query(`CREATE TABLE IF NOT EXISTS schema_migrations (
+          version text PRIMARY KEY,
+          applied_at timestamptz NOT NULL DEFAULT now()
+        )`);
+        const { rows } = await pool.query('SELECT version FROM schema_migrations ORDER BY version');
+        return rows.map((row) => row.version);
+      }
+
+      // Runs every .up.sql file not yet applied, in order, each in its own transaction.
+      export async function migrateUp(pool: Pool): Promise<string[]> {
+        const done = new Set(await applied(pool));
+        const files = (await readdir(DIR)).filter((f) => f.endsWith('.up.sql')).sort();
+        const ran: string[] = [];
+        for (const file of files) {
+          const version = file.slice(0, -'.up.sql'.length);
+          if (done.has(version)) continue;
+          const sql = await readFile(join(DIR, file), 'utf8');
+          await withTransaction(pool, async (client) => {
+            await client.query(sql);
+            await client.query('INSERT INTO schema_migrations (version) VALUES ($1)', [version]);
+          });
+          ran.push(version);
+        }
+        return ran;
+      }
+
+      // Reverts the latest migration with its .down.sql file.
+      export async function migrateDown(pool: Pool): Promise<string | undefined> {
+        const version = (await applied(pool)).at(-1);
+        if (version === undefined) return undefined;
+        const sql = await readFile(join(DIR, `${version}.down.sql`), 'utf8');
+        await withTransaction(pool, async (client) => {
+          await client.query(sql);
+          await client.query('DELETE FROM schema_migrations WHERE version = $1', [version]);
+        });
+        return version;
+      }
+      ```
+
+      A short script calls `migrateUp` or `migrateDown` with `DATABASE_URL`, so a deploy
+      runs `tsx src/migrate-cli.ts` before the new code starts.
+
+      Many teams ship forward-only migrations and fix mistakes with a new file. A tested down
+      file for the latest migration is still the fastest way back from a bad deploy, and
+      writing it forces you to think about the data.
+  - title: 4. The database helpers
+    body: |-
+      `withTransaction` borrows one client, because a transaction lives on one connection;
+      `pool.query` could send `BEGIN` and `COMMIT` down different ones. It commits when the work
+      returns, rolls back when it throws, and always releases the client, so nothing is left
+      idle in a transaction.
+
+      ```ts
+      // src/db.ts
+      import pg from 'pg';
+
+      export type Pool = pg.Pool;
+      export type Client = pg.PoolClient;
+
+      export function createPool(connectionString: string): Pool {
+        return new pg.Pool({ connectionString });
+      }
+
+      // One connection for the whole transaction, and it always ends.
+      export async function withTransaction<T>(
+        pool: Pool,
+        work: (client: Client) => Promise<T>,
+      ): Promise<T> {
+        const client = await pool.connect();
+        try {
+          await client.query('BEGIN');
+          const result = await work(client);
+          await client.query('COMMIT');
+          return result;
+        } catch (error) {
+          await client.query('ROLLBACK');
+          throw error;
+        } finally {
+          client.release();
+        }
+      }
+
+      // pg puts the five-character SQLSTATE on the error as `code`.
+      export function isPgError(error: unknown, code: string): boolean {
+        return error instanceof Error && 'code' in error && error.code === code;
+      }
+      ```
+
+      `isPgError` reads the SQLSTATE code, not the message text, which varies by version and
+      language: `23P01` is an exclusion violation, `23505` a unique one, `23514` a failed
+      `CHECK`. The HTTP helpers give one error shape and parse input without throwing.
+
+      ```ts
+      // src/http.ts
+      // One error shape for the whole API: problem details.
+      export function problem(status: number, title: string, detail: string): Response {
+        return Response.json(
+          { title, status, detail },
+          { status, headers: { 'Content-Type': 'application/problem+json' } },
+        );
+      }
+
+      export async function readJson(request: Request): Promise<unknown> {
+        try {
+          return await request.json();
+        } catch {
+          return undefined;
+        }
+      }
+
+      export function readCookie(header: string | null, name: string): string | undefined {
+        for (const part of (header ?? '').split(';')) {
+          const [key, ...rest] = part.trim().split('=');
+          if (key === name) return rest.join('=');
+        }
+        return undefined;
+      }
+      ```
+  - title: 5. Sessions and passwords
+    body: |-
+      Sessions live in the database, not a `Map`, so they survive restarts and several server
+      processes share them. The cookie carries only the id: 32 random bytes, unguessable.
+
+      ```ts
+      // src/sessions.ts
+      import { randomBytes, scrypt, timingSafeEqual } from 'node:crypto';
+      import { promisify } from 'node:util';
+      import type { Pool } from './db.js';
+      import { readCookie } from './http.js';
+
+      const scryptAsync = promisify(scrypt) as (password: string, salt: string, length: number) => Promise<Buffer>;
+      const SESSION_DAYS = 14;
+
+      export async function hashPassword(password: string): Promise<string> {
+        const salt = randomBytes(16).toString('hex');
+        const hash = await scryptAsync(password, salt, 64);
+        return `${salt}:${hash.toString('hex')}`;
+      }
+
+      export async function verifyPassword(password: string, stored: string): Promise<boolean> {
+        const [salt, hex] = stored.split(':');
+        if (!salt || !hex) return false;
+        const expected = Buffer.from(hex, 'hex');
+        const actual = await scryptAsync(password, salt, expected.length);
+        return timingSafeEqual(actual, expected);
+      }
+
+      // Returns the Set-Cookie value for a new session, or null for a wrong email or password.
+      export async function logIn(pool: Pool, email: string, password: string): Promise<string | null> {
+        const { rows } = await pool.query('SELECT id, password_hash FROM users WHERE email = $1', [
+          email.toLowerCase(),
+        ]);
+        const user = rows[0];
+        if (!user || !(await verifyPassword(password, user.password_hash))) return null;
+        const id = randomBytes(32).toString('base64url');
+        await pool.query(
+          `INSERT INTO sessions (id, user_id, expires_at)
+           VALUES ($1, $2, now() + make_interval(days => $3))`,
+          [id, user.id, SESSION_DAYS],
+        );
+        const maxAge = SESSION_DAYS * 24 * 60 * 60;
+        return `sid=${id}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${maxAge}`;
+      }
+
+      // The signed-in user's id, or null. Expired sessions count as none.
+      export async function currentUserId(pool: Pool, request: Request): Promise<number | null> {
+        const sid = readCookie(request.headers.get('cookie'), 'sid');
+        if (!sid) return null;
+        const { rows } = await pool.query(
+          'SELECT user_id FROM sessions WHERE id = $1 AND expires_at > now()',
+          [sid],
+        );
+        return rows[0] ? Number(rows[0].user_id) : null;
+      }
+
+      export async function logOut(pool: Pool, request: Request): Promise<void> {
+        const sid = readCookie(request.headers.get('cookie'), 'sid');
+        if (sid) await pool.query('DELETE FROM sessions WHERE id = $1', [sid]);
+      }
+      ```
+
+      `HttpOnly` keeps it from scripts, `Secure` keeps it on HTTPS, and `SameSite=Lax` stops a
+      form on another site posting with it, the CSRF defence. `currentUserId` checks
+      `expires_at > now()`, so an old cookie stops working even if a browser keeps it.
+
+      Passwords are salted scrypt hashes from `node:crypto`, compared with `timingSafeEqual`.
+      The async `scrypt` runs off the main thread, so hashing doesn't block other requests.
+      Logging out deletes the row, which is why sessions beat a JWT here: revoking a stolen
+      session is one `DELETE`.
+  - title: 6. Checking a booking at the trust boundary
+    body: |-
+      A request body is untrusted. `checkBooking` checks the shape with zod, then the booking
+      rules, and returns a clean `BookingRequest` or a message for a 400. It takes the time as
+      an argument and touches no database, so unit tests cover it fully.
+
+      ```ts
+      // src/bookings.ts
+      import { z } from 'zod';
+      import { type Pool, isPgError, withTransaction } from './db.js';
+
+      const HOUR = 60 * 60 * 1000;
+      export const MAX_HOURS = 8;
+      export const MAX_PENDING = 3;
+
+      const BookingBody = z.object({
+        roomId: z.number().int().positive(),
+        start: z.iso.datetime({ offset: true }),
+        end: z.iso.datetime({ offset: true }),
+      });
+
+      export interface BookingRequest {
+        roomId: number;
+        start: Date;
+        end: Date;
+      }
+
+      export type Checked = { ok: true; value: BookingRequest } | { ok: false; detail: string };
+
+      // The trust boundary: shape first with zod, then the booking rules. `now` is passed in.
+      export function checkBooking(body: unknown, now: Date): Checked {
+        const parsed = BookingBody.safeParse(body);
+        if (!parsed.success) return { ok: false, detail: parsed.error.issues[0]?.message ?? 'Invalid body' };
+        const start = new Date(parsed.data.start);
+        const end = new Date(parsed.data.end);
+        if (start.getTime() % HOUR !== 0 || end.getTime() % HOUR !== 0) {
+          return { ok: false, detail: 'Bookings start and end on the hour' };
+        }
+        if (end <= start) return { ok: false, detail: 'end must be after start' };
+        if (end.getTime() - start.getTime() > MAX_HOURS * HOUR) {
+          return { ok: false, detail: `A booking lasts at most ${MAX_HOURS} hours` };
+        }
+        if (start <= now) return { ok: false, detail: 'start must be in the future' };
+        return { ok: true, value: { roomId: parsed.data.roomId, start, end } };
+      }
+
+      export function pricePence(pencePerHour: number, start: Date, end: Date): number {
+        return ((end.getTime() - start.getTime()) / HOUR) * pencePerHour;
+      }
+      ```
+
+      `z.iso.datetime({ offset: true })` accepts `2030-01-02T10:00:00Z` and
+      `2030-06-02T10:00:00+01:00` but refuses a time with no offset, which would mean whatever
+      the server's time zone is. These rules concern the request alone, so code can give
+      friendly messages. The overlap and pending limits depend on other rows, so the database
+      decides them.
+  - title: 7. Taking a booking in a safe transaction
+    body: |-
+      Creating a booking involves two rules that depend on other rows: no overlap in the room,
+      and at most three unpaid bookings for this guest. They need different tools.
+
+      ```ts
+      // src/bookings.ts (continued)
+      export interface Booking {
+        id: number;
+        roomId: number;
+        start: Date;
+        end: Date;
+        amountPence: number;
+        status: 'pending' | 'paid' | 'cancelled';
+      }
+
+      const COLUMNS = `id::int, room_id::int AS "roomId", lower(during) AS start, upper(during) AS "end",
+        amount_pence AS "amountPence", status`;
+
+      export type CreateResult =
+        | { kind: 'created'; booking: Booking }
+        | { kind: 'no-such-room' }
+        | { kind: 'too-many-pending' }
+        | { kind: 'taken' };
+
+      export async function createBooking(
+        pool: Pool,
+        userId: number,
+        request: BookingRequest,
+      ): Promise<CreateResult> {
+        try {
+          return await withTransaction(pool, async (client) => {
+            // Lock this user's row, so two requests from one user can't both pass the limit.
+            await client.query('SELECT id FROM users WHERE id = $1 FOR UPDATE', [userId]);
+            const pending = await client.query(
+              `SELECT count(*)::int AS n FROM bookings WHERE user_id = $1 AND status = 'pending'`,
+              [userId],
+            );
+            if (pending.rows[0].n >= MAX_PENDING) return { kind: 'too-many-pending' };
+
+            const room = await client.query('SELECT pence_per_hour FROM rooms WHERE id = $1', [
+              request.roomId,
+            ]);
+            if (room.rowCount === 0) return { kind: 'no-such-room' };
+
+            const amount = pricePence(room.rows[0].pence_per_hour, request.start, request.end);
+            const { rows } = await client.query(
+              `INSERT INTO bookings (room_id, user_id, during, amount_pence)
+               VALUES ($1, $2, tstzrange($3, $4, '[)'), $5)
+               RETURNING ${COLUMNS}`,
+              [request.roomId, userId, request.start, request.end, amount],
+            );
+            return { kind: 'created', booking: rows[0] };
+          });
+        } catch (error) {
+          // 23P01: exclusion_violation. Another booking holds an overlapping slot.
+          if (isPgError(error, '23P01')) return { kind: 'taken' };
+          throw error;
+        }
+      }
+
+      // The owner is part of every lookup, so someone else's booking doesn't exist for you.
+      export async function listBookings(pool: Pool, userId: number): Promise<Booking[]> {
+        const { rows } = await pool.query(
+          `SELECT ${COLUMNS} FROM bookings WHERE user_id = $1 ORDER BY lower(during)`,
+          [userId],
+        );
+        return rows;
+      }
+
+      export async function findBooking(pool: Pool, userId: number, id: number): Promise<Booking | null> {
+        const { rows } = await pool.query(
+          `SELECT ${COLUMNS} FROM bookings WHERE id = $1 AND user_id = $2`,
+          [id, userId],
+        );
+        return rows[0] ?? null;
+      }
+
+      export async function cancelBooking(
+        pool: Pool,
+        userId: number,
+        id: number,
+      ): Promise<'cancelled' | 'not-found' | 'not-pending'> {
+        const { rowCount } = await pool.query(
+          `UPDATE bookings SET status = 'cancelled'
+           WHERE id = $1 AND user_id = $2 AND status = 'pending'`,
+          [id, userId],
+        );
+        if (rowCount === 1) return 'cancelled';
+        return (await findBooking(pool, userId, id)) ? 'not-pending' : 'not-found';
+      }
+      ```
+
+      **The overlap is the constraint's job.** At the default isolation, read committed, two
+      transactions inserting overlapping bookings at once don't both succeed. The second insert
+      finds the first one's uncommitted row in the exclusion index, waits for that transaction
+      to finish, then fails with `23P01`, which the code maps to a 409. If the first rolls back,
+      the second goes through. There's no "check for a clash, then insert": that gap is where
+      double bookings come from.
+
+      **The pending limit needs a lock.** Counting then inserting is a read, a decision and a
+      write. Two requests from one guest could both count two and both insert. No constraint
+      expresses "at most three rows", so the transaction first locks the guest's `users` row
+      with `FOR UPDATE`. A second booking by the same guest waits there until the first commits,
+      then counts three. Guests don't block each other.
+
+      Serializable isolation would also catch this without an explicit lock, but PostgreSQL
+      then cancels one of two conflicting transactions with `40001`, and the code must retry
+      the whole transaction. For one rule, a targeted lock is simpler.
+
+      **The price comes from the database**, read inside the same transaction, never from the
+      request body.
+
+      **Owner-scoped reads.** `findBooking` puts `user_id = $2` inside the lookup, so another
+      guest's booking gets the same 404 as an id never used. `cancelBooking` does the same in its
+      `UPDATE`, and queries again only to choose between 404 and 409.
+  - title: 8. Payments, and the idempotent webhook
+    body: |-
+      `POST /bookings/:id/checkout` returns a Stripe Checkout URL, so card numbers never reach
+      this server. The webhook then says the money moved.
+
+      ```ts
+      // src/payments.ts
+      import type Stripe from 'stripe';
+      import { type Client, type Pool, withTransaction } from './db.js';
+      import { problem } from './http.js';
+
+      // Throws when the signature doesn't match. In production: stripe.webhooks.constructEvent.
+      export type VerifyWebhook = (rawBody: string, signature: string) => Stripe.Event;
+
+      type Outcome = 'paid' | 'ignored' | 'unknown booking' | 'already paid' | 'wrong amount' | 'needs refund';
+
+      export async function stripeWebhook(
+        request: Request,
+        pool: Pool,
+        verify: VerifyWebhook,
+      ): Promise<Response> {
+        const raw = await request.text(); // the exact bytes that were signed
+        let event: Stripe.Event;
+        try {
+          event = verify(raw, request.headers.get('stripe-signature') ?? '');
+        } catch {
+          return problem(400, 'Bad signature', 'The webhook signature did not match.');
+        }
+
+        // Claim and work share one transaction: if the work fails, the claim rolls back with it.
+        await withTransaction(pool, async (client) => {
+          const claim = await client.query(
+            `INSERT INTO payment_events (event_id, type, outcome) VALUES ($1, $2, 'received')
+             ON CONFLICT (event_id) DO NOTHING`,
+            [event.id, event.type],
+          );
+          if (claim.rowCount === 0) return; // a redelivery: already handled
+          const { outcome, bookingId } = await apply(client, event);
+          await client.query(
+            'UPDATE payment_events SET outcome = $2, booking_id = $3 WHERE event_id = $1',
+            [event.id, outcome, bookingId],
+          );
+        });
+        return Response.json({ received: true });
+      }
+
+      async function apply(
+        client: Client,
+        event: Stripe.Event,
+      ): Promise<{ outcome: Outcome; bookingId: number | null }> {
+        if (event.type !== 'checkout.session.completed') return { outcome: 'ignored', bookingId: null };
+        const session = event.data.object;
+        if (session.payment_status !== 'paid') return { outcome: 'ignored', bookingId: null };
+
+        const bookingId = Number(session.client_reference_id);
+        const { rowCount } = await client.query(
+          `UPDATE bookings SET status = 'paid', paid_at = now()
+           WHERE id = $1 AND status = 'pending' AND amount_pence = $2`,
+          [bookingId, session.amount_total],
+        );
+        if (rowCount === 1) return { outcome: 'paid', bookingId };
+
+        // Nothing changed: record why, for a person to follow up.
+        const { rows } = await client.query(
+          'SELECT status, amount_pence FROM bookings WHERE id = $1',
+          [bookingId],
+        );
+        const booking = rows[0];
+        if (!booking) return { outcome: 'unknown booking', bookingId: null };
+        if (booking.status === 'paid') return { outcome: 'already paid', bookingId };
+        if (booking.status === 'cancelled') return { outcome: 'needs refund', bookingId };
+        return { outcome: 'wrong amount', bookingId };
+      }
+      ```
+
+      Four decisions make this handler safe to receive the same event any number of times, in
+      any order, at the same instant:
+
+      - **The signature is checked on the raw body.** `request.text()` gives the exact bytes
+        Stripe signed; re-serialised JSON can differ in spacing or key order. A bad signature is
+        a 400, and nothing is written.
+      - **The claim is a unique insert.** `ON CONFLICT (event_id) DO NOTHING` creates the row or
+        reports zero rows. A simultaneous second delivery waits on the primary key for the
+        first transaction, then does nothing. An in-memory `Set` would only protect one process.
+      - **Claim and work share one transaction.** If the work throws, the rollback removes the
+        claim too, the router answers 500, and Stripe's retry can succeed later.
+      - **The state change is conditional.** The `UPDATE` only matches a `pending` booking
+        with the expected amount. Anything else changes nothing, and the outcome column records
+        why, for a person to refund or investigate.
+
+      Unhandled events are recorded as `ignored` and still get a 200, or Stripe would keep
+      resending them. So is a session whose `payment_status` isn't `paid` yet, such as a slow
+      bank debit.
+
+      Creating the Checkout Session passes the amount in pence and an idempotency key.
+
+      ```ts
+      // src/payments.ts (continued)
+      export type StartCheckout = (booking: { id: number; amountPence: number }) => Promise<string>;
+
+      export function stripeCheckout(stripe: Stripe, baseUrl: string): StartCheckout {
+        return async (booking) => {
+          const session = await stripe.checkout.sessions.create(
+            {
+              mode: 'payment',
+              client_reference_id: String(booking.id),
+              line_items: [
+                {
+                  quantity: 1,
+                  price_data: {
+                    currency: 'gbp',
+                    unit_amount: booking.amountPence, // pence, never pounds
+                    product_data: { name: `Room booking ${booking.id}` },
+                  },
+                },
+              ],
+              success_url: `${baseUrl}/bookings/${booking.id}`,
+            },
+            // A retried request returns the same session instead of making a second one.
+            { idempotencyKey: `checkout-${booking.id}` },
+          );
+          if (!session.url) throw new Error('Stripe returned no checkout URL');
+          return session.url;
+        };
+      }
+      ```
+
+      The webhook does no slow work, so it answers well within Stripe's timeout. A receipt email
+      would go on a queue after `COMMIT`, never inside the transaction.
+  - title: 9. The router and the server
+    body: |-
+      The app is one function from `Request` to `Response`, like the backend chapter's handlers.
+      Its dependencies are passed in, so tests fake only what the API doesn't own.
+
+      ```ts
+      // src/app.ts
+      import { cancelBooking, checkBooking, createBooking, findBooking, listBookings } from './bookings.js';
+      import type { Pool } from './db.js';
+      import { problem, readJson } from './http.js';
+      import { type StartCheckout, type VerifyWebhook, stripeWebhook } from './payments.js';
+      import { currentUserId, logIn, logOut } from './sessions.js';
+
+      export interface Deps {
+        pool: Pool;
+        verifyWebhook: VerifyWebhook;
+        startCheckout: StartCheckout;
+        now: () => Date;
+      }
+
+      export type Handler = (request: Request) => Promise<Response>;
+
+      const noSuchBooking = () => problem(404, 'Not found', 'No such booking');
+
+      export function createApp(deps: Deps): Handler {
+        const { pool } = deps;
+        const route = async (request: Request): Promise<Response> => {
+          const { method } = request;
+          const path = new URL(request.url).pathname;
+
+          if (method === 'POST' && path === '/webhooks/stripe') {
+            return stripeWebhook(request, pool, deps.verifyWebhook);
+          }
+          if (method === 'POST' && path === '/login') {
+            const body = (await readJson(request)) as { email?: unknown; password?: unknown } | undefined;
+            if (typeof body?.email !== 'string' || typeof body.password !== 'string') {
+              return problem(400, 'Invalid login', 'email and password are required');
+            }
+            const cookie = await logIn(pool, body.email, body.password);
+            if (!cookie) return problem(401, 'Unauthorized', 'Wrong email or password');
+            return new Response(null, { status: 204, headers: { 'Set-Cookie': cookie } });
+          }
+
+          // Everything below needs a session.
+          const userId = await currentUserId(pool, request);
+          if (userId === null) return problem(401, 'Unauthorized', 'Sign in first');
+
+          if (method === 'POST' && path === '/logout') {
+            await logOut(pool, request);
+            return new Response(null, { status: 204, headers: { 'Set-Cookie': 'sid=; Path=/; Max-Age=0' } });
+          }
+          if (method === 'GET' && path === '/bookings') {
+            return Response.json(await listBookings(pool, userId));
+          }
+          if (method === 'POST' && path === '/bookings') {
+            const checked = checkBooking(await readJson(request), deps.now());
+            if (!checked.ok) return problem(400, 'Invalid booking', checked.detail);
+            const result = await createBooking(pool, userId, checked.value);
+            switch (result.kind) {
+              case 'created':
+                return Response.json(result.booking, {
+                  status: 201,
+                  headers: { Location: `/bookings/${result.booking.id}` },
+                });
+              case 'taken':
+                return problem(409, 'Slot taken', 'The room is already booked for part of that time');
+              case 'too-many-pending':
+                return problem(409, 'Too many unpaid bookings', 'Pay or cancel a booking first');
+              case 'no-such-room':
+                return problem(404, 'Not found', 'No such room');
+            }
+          }
+
+          const match = path.match(/^\/bookings\/(\d+)(\/cancel|\/checkout)?$/);
+          if (match) {
+            const id = Number(match[1]);
+            const action = match[2];
+            if (method === 'GET' && !action) {
+              const booking = await findBooking(pool, userId, id);
+              return booking ? Response.json(booking) : noSuchBooking();
+            }
+            if (method === 'POST' && action === '/cancel') {
+              const outcome = await cancelBooking(pool, userId, id);
+              if (outcome === 'not-found') return noSuchBooking();
+              if (outcome === 'not-pending') {
+                return problem(409, 'Cannot cancel', 'Only unpaid bookings can be cancelled here');
+              }
+              return new Response(null, { status: 204 });
+            }
+            if (method === 'POST' && action === '/checkout') {
+              const booking = await findBooking(pool, userId, id);
+              if (!booking) return noSuchBooking();
+              if (booking.status !== 'pending') return problem(409, 'Cannot pay', 'This booking is not awaiting payment');
+              return Response.json({ url: await deps.startCheckout(booking) });
+            }
+          }
+          return problem(404, 'Not found', `No route for ${method} ${path}`);
+        };
+
+        // The last line of defence: log the details, show a generic 500.
+        return async (request) => {
+          try {
+            return await route(request);
+          } catch (error) {
+            console.error(error);
+            return problem(500, 'Internal Server Error', 'Something went wrong on our side.');
+          }
+        };
+      }
+      ```
+
+      The webhook route comes before the session check: Stripe has no session, its signature is
+      its proof. Every booking function requires `userId`, so a new route can't call one without
+      deciding whose bookings it means. The outer `try` logs errors and answers a generic 500,
+      so no SQL or stack trace leaks.
+
+      ```ts
+      // src/server.ts
+      import { serve } from '@hono/node-server';
+      import Stripe from 'stripe';
+      import { createApp } from './app.js';
+      import { createPool } from './db.js';
+      import { stripeCheckout } from './payments.js';
+
+      function required(name: string): string {
+        const value = process.env[name];
+        if (!value) throw new Error(`${name} is not set`);
+        return value;
+      }
+
+      const stripe = new Stripe(required('STRIPE_SECRET_KEY'));
+      const webhookSecret = required('STRIPE_WEBHOOK_SECRET');
+
+      const app = createApp({
+        pool: createPool(required('DATABASE_URL')),
+        verifyWebhook: (raw, signature) => stripe.webhooks.constructEvent(raw, signature, webhookSecret),
+        startCheckout: stripeCheckout(stripe, required('PUBLIC_URL')),
+        now: () => new Date(),
+      });
+
+      const port = Number(process.env.PORT ?? 3000);
+      serve({ fetch: app, port });
+      console.log(`Listening on http://localhost:${port}`);
+      ```
+  - title: 10. Unit tests for the pure rules
+    body: |-
+      Unit tests cover the logic without side effects: validation, pricing and cookie parsing.
+      Each refused case is one row of a `test.each` table, named so a failure reads as a
+      sentence.
+
+      ```ts
+      // test/unit/bookings.test.ts
+      import { describe, expect, test } from 'vitest';
+      import { checkBooking, pricePence } from '../../src/bookings.js';
+      import { readCookie } from '../../src/http.js';
+
+      const now = new Date('2030-01-01T09:00:00Z');
+      const body = (start: string, end: string) => ({ roomId: 1, start, end });
+
+      describe('checkBooking', () => {
+        test('accepts a future booking on the hour', () => {
+          const result = checkBooking(body('2030-01-02T10:00:00Z', '2030-01-02T12:00:00Z'), now);
+          expect(result).toEqual({
+            ok: true,
+            value: { roomId: 1, start: new Date('2030-01-02T10:00:00Z'), end: new Date('2030-01-02T12:00:00Z') },
+          });
+        });
+
+        test('reads a time zone offset as the instant it names', () => {
+          const result = checkBooking(body('2030-06-02T10:00:00+01:00', '2030-06-02T11:00:00+01:00'), now);
+          expect(result.ok && result.value.start.toISOString()).toBe('2030-06-02T09:00:00.000Z');
+        });
+
+        test.each([
+          ['an end before the start', '2030-01-02T12:00:00Z', '2030-01-02T10:00:00Z', 'end must be after start'],
+          ['a zero-length booking', '2030-01-02T10:00:00Z', '2030-01-02T10:00:00Z', 'end must be after start'],
+          ['half past the hour', '2030-01-02T10:30:00Z', '2030-01-02T12:00:00Z', 'Bookings start and end on the hour'],
+          ['more than eight hours', '2030-01-02T08:00:00Z', '2030-01-02T17:00:00Z', 'A booking lasts at most 8 hours'],
+          ['a start in the past', '2029-12-31T10:00:00Z', '2029-12-31T11:00:00Z', 'start must be in the future'],
+        ])('refuses %s', (_name, start, end, detail) => {
+          expect(checkBooking(body(start, end), now)).toEqual({ ok: false, detail });
+        });
+
+        test('refuses a time without an offset, which would depend on the server', () => {
+          expect(checkBooking(body('2030-01-02T10:00:00', '2030-01-02T11:00:00'), now).ok).toBe(false);
+        });
+      });
+
+      test('prices whole hours in pence', () => {
+        expect(pricePence(2500, new Date('2030-01-02T10:00:00Z'), new Date('2030-01-02T13:00:00Z'))).toBe(7500);
+      });
+
+      test('finds one cookie among several', () => {
+        expect(readCookie('theme=dark; sid=abc=; lang=en', 'sid')).toBe('abc=');
+        expect(readCookie(null, 'sid')).toBeUndefined();
+      });
+      ```
+
+      With the real clock, these tests would start failing once the dates slipped into the past.
+  - title: 11. Integration tests on a real database
+    body: |-
+      Overlap, the pending limit, ownership and idempotency live in SQL, so a fake database
+      would test none of them. The suite runs the real router against a real PostgreSQL at
+      `TEST_DATABASE_URL`.
+
+      The testing chapter wraps each test in a rolled-back transaction. That can't work here:
+      the code under test commits its own transactions, and concurrency tests need connections
+      that see each other's commits. So `resetDatabase` truncates the tables before each test,
+      and the files run one at a time.
+
+      ```ts
+      // vitest.config.ts
+      import { defineConfig } from 'vitest/config';
+
+      export default defineConfig({
+        test: {
+          include: ['test/**/*.test.ts'],
+          fileParallelism: false, // the integration files share one database
+        },
+      });
+      ```
+
+      The helpers use a real Stripe object offline: `generateTestHeaderString` signs payloads
+      with a test secret, and `constructEvent` really verifies them.
+
+      ```ts
+      // test/helpers.ts
+      import Stripe from 'stripe';
+      import { createApp } from '../src/app.js';
+      import { createPool } from '../src/db.js';
+      import { hashPassword } from '../src/sessions.js';
+
+      export const pool = createPool(process.env.TEST_DATABASE_URL ?? 'postgres://localhost:5432/booking_test');
+
+      const stripe = new Stripe('sk_test_unused'); // no network call is made
+      const secret = 'whsec_test_secret';
+
+      export const app = createApp({
+        pool,
+        verifyWebhook: (raw, signature) => stripe.webhooks.constructEvent(raw, signature, secret),
+        startCheckout: async (booking) => {
+          return `https://checkout.test/${booking.id}`;
+        },
+        now: () => new Date('2030-01-01T09:00:00Z'),
+      });
+
+      export async function resetDatabase(): Promise<void> {
+        await pool.query(
+          'TRUNCATE payment_events, bookings, sessions, rooms, users RESTART IDENTITY CASCADE',
+        );
+        await pool.query(`INSERT INTO rooms (name, pence_per_hour) VALUES ('Oak', 2500)`);
+        const hash = await hashPassword('correct horse');
+        await pool.query(
+          `INSERT INTO users (email, password_hash) VALUES ('ana@example.com', $1), ('ben@example.com', $1)`,
+          [hash],
+        );
+      }
+
+      export async function signIn(email: string): Promise<string> {
+        const response = await app(
+          new Request('http://test/login', {
+            method: 'POST',
+            body: JSON.stringify({ email, password: 'correct horse' }),
+          }),
+        );
+        const cookie = response.headers.get('set-cookie') ?? '';
+        return cookie.split(';')[0]; // "sid=..."
+      }
+
+      export function send(cookie: string, method: string, path: string): Promise<Response> {
+        return app(new Request(`http://test${path}`, { method, headers: { cookie } }));
+      }
+
+      export function book(cookie: string, start: string, end: string): Promise<Response> {
+        return app(
+          new Request('http://test/bookings', {
+            method: 'POST',
+            headers: { cookie },
+            body: JSON.stringify({ roomId: 1, start, end }),
+          }),
+        );
+      }
+
+      export function paidEvent(id: string, bookingId: number, amountTotal: number): string {
+        return JSON.stringify({
+          id,
+          object: 'event',
+          type: 'checkout.session.completed',
+          data: {
+            object: {
+              object: 'checkout.session',
+              client_reference_id: String(bookingId),
+              payment_status: 'paid',
+              amount_total: amountTotal,
+            },
+          },
+        });
+      }
+
+      export function deliver(payload: string, signature?: string): Promise<Response> {
+        const header = signature ?? stripe.webhooks.generateTestHeaderString({ payload, secret });
+        return app(
+          new Request('http://test/webhooks/stripe', {
+            method: 'POST',
+            headers: { 'stripe-signature': header },
+            body: payload,
+          }),
+        );
+      }
+      ```
+
+      The two `Promise.all` tests matter most: with the `FOR UPDATE` line removed, the
+      pending-limit test failed on every run we tried.
+
+      ```ts
+      // test/integration/bookings.test.ts
+      import { afterAll, beforeAll, beforeEach, expect, test } from 'vitest';
+      import { migrateUp } from '../../src/migrate.js';
+      import { book, pool, resetDatabase, send, signIn } from '../helpers.js';
+
+      let ana: string;
+      let ben: string;
+
+      beforeAll(async () => {
+        await migrateUp(pool);
+      });
+      beforeEach(async () => {
+        await resetDatabase();
+        ana = await signIn('ana@example.com');
+        ben = await signIn('ben@example.com');
+      });
+      afterAll(async () => {
+        await pool.end();
+      });
+
+      test('books a free slot and prices it from the room', async () => {
+        const response = await book(ana, '2030-01-02T10:00:00Z', '2030-01-02T12:00:00Z');
+        expect(response.status).toBe(201);
+        expect(await response.json()).toMatchObject({ id: 1, amountPence: 5000, status: 'pending' });
+      });
+
+      test('refuses an overlapping slot and allows the next one', async () => {
+        await book(ana, '2030-01-02T10:00:00Z', '2030-01-02T12:00:00Z');
+        const overlap = await book(ben, '2030-01-02T11:00:00Z', '2030-01-02T13:00:00Z');
+        expect(overlap.status).toBe(409);
+        const next = await book(ben, '2030-01-02T12:00:00Z', '2030-01-02T13:00:00Z');
+        expect(next.status).toBe(201);
+      });
+
+      test('two requests for one slot at once: exactly one wins', async () => {
+        const results = await Promise.all([
+          book(ana, '2030-01-02T10:00:00Z', '2030-01-02T11:00:00Z'),
+          book(ben, '2030-01-02T10:00:00Z', '2030-01-02T11:00:00Z'),
+        ]);
+        expect(results.map((r) => r.status).sort()).toEqual([201, 409]);
+        const { rows } = await pool.query('SELECT count(*)::int AS n FROM bookings');
+        expect(rows[0].n).toBe(1);
+      });
+
+      test("someone else's booking is a 404, to read and to cancel", async () => {
+        await book(ana, '2030-01-02T10:00:00Z', '2030-01-02T11:00:00Z');
+        expect((await send(ben, 'GET', '/bookings/1')).status).toBe(404);
+        expect(await (await send(ben, 'GET', '/bookings')).json()).toEqual([]);
+        const response = await send(ben, 'POST', '/bookings/1/cancel');
+        expect(response.status).toBe(404);
+        expect((await send(ana, 'GET', '/bookings/1')).status).toBe(200);
+      });
+
+      test('a cancelled slot can be booked again', async () => {
+        await book(ana, '2030-01-02T10:00:00Z', '2030-01-02T11:00:00Z');
+        expect((await send(ana, 'POST', '/bookings/1/cancel')).status).toBe(204);
+        expect((await book(ben, '2030-01-02T10:00:00Z', '2030-01-02T11:00:00Z')).status).toBe(201);
+      });
+
+      test('a fourth unpaid booking is refused, even when sent all at once', async () => {
+        const days = ['02', '03', '04', '05', '06'];
+        const results = await Promise.all(
+          days.map((d) => book(ana, `2030-01-${d}T10:00:00Z`, `2030-01-${d}T11:00:00Z`)),
+        );
+        expect(results.filter((r) => r.status === 201)).toHaveLength(3);
+      });
+
+      test('no session, no bookings', async () => {
+        expect((await send('sid=made-up', 'GET', '/bookings')).status).toBe(401);
+      });
+      ```
+
+      The payment tests deliver signed events, including one event twice at once.
+
+      ```ts
+      // test/integration/payments.test.ts
+      import { afterAll, beforeAll, beforeEach, expect, test } from 'vitest';
+      import { migrateUp } from '../../src/migrate.js';
+      import { book, deliver, paidEvent, pool, resetDatabase, send, signIn } from '../helpers.js';
+
+      let ana: string;
+
+      beforeAll(async () => {
+        await migrateUp(pool);
+      });
+      beforeEach(async () => {
+        await resetDatabase();
+        ana = await signIn('ana@example.com');
+        await book(ana, '2030-01-02T10:00:00Z', '2030-01-02T12:00:00Z'); // booking 1, 5000 pence
+      });
+      afterAll(async () => {
+        await pool.end();
+      });
+
+      test('a paid checkout marks the booking paid', async () => {
+        expect((await deliver(paidEvent('evt_1', 1, 5000))).status).toBe(200);
+        expect(await (await send(ana, 'GET', '/bookings/1')).json()).toMatchObject({ status: 'paid' });
+      });
+
+      test('the same event twice, and twice at once, is handled once', async () => {
+        const payload = paidEvent('evt_1', 1, 5000);
+        const statuses = await Promise.all([deliver(payload), deliver(payload)]);
+        expect((await deliver(payload)).status).toBe(200);
+        expect(statuses.map((r) => r.status)).toEqual([200, 200]);
+        const { rows } = await pool.query('SELECT event_id, outcome FROM payment_events');
+        expect(rows).toEqual([{ event_id: 'evt_1', outcome: 'paid' }]);
+      });
+
+      test('a bad signature is refused and changes nothing', async () => {
+        const response = await deliver(paidEvent('evt_1', 1, 5000), 't=1,v1=forged');
+        expect(response.status).toBe(400);
+        const { rows } = await pool.query('SELECT count(*)::int AS n FROM payment_events');
+        expect(rows[0].n).toBe(0);
+      });
+
+      test('a wrong amount leaves the booking unpaid and says why', async () => {
+        await deliver(paidEvent('evt_1', 1, 50));
+        expect(await (await send(ana, 'GET', '/bookings/1')).json()).toMatchObject({ status: 'pending' });
+        const { rows } = await pool.query('SELECT outcome FROM payment_events');
+        expect(rows).toEqual([{ outcome: 'wrong amount' }]);
+      });
+
+      test('checkout is offered only for your own unpaid booking', async () => {
+        const response = await send(ana, 'POST', '/bookings/1/checkout');
+        expect(await response.json()).toEqual({ url: 'https://checkout.test/1' });
+        const ben = await signIn('ben@example.com');
+        expect((await send(ben, 'POST', '/bookings/1/checkout')).status).toBe(404);
+        await deliver(paidEvent('evt_1', 1, 5000));
+        expect((await send(ana, 'POST', '/bookings/1/checkout')).status).toBe(409);
+      });
+      ```
+
+      The migration tests move `0002` down and up, and prove the down file refuses to lose a
+      paid booking.
+
+      ```ts
+      // test/integration/migrations.test.ts
+      import { afterAll, beforeEach, expect, test } from 'vitest';
+      import { migrateDown, migrateUp } from '../../src/migrate.js';
+      import { pool, resetDatabase } from '../helpers.js';
+
+      async function schema(): Promise<string[]> {
+        const { rows } = await pool.query(`
+          SELECT table_name || '.' || column_name AS col FROM information_schema.columns
+          WHERE table_schema = 'public' AND table_name <> 'schema_migrations'
+          ORDER BY 1`);
+        return rows.map((r) => r.col);
+      }
+
+      beforeEach(async () => {
+        await migrateUp(pool);
+        await resetDatabase();
+      });
+      afterAll(async () => {
+        await migrateUp(pool);
+        await pool.end();
+      });
+
+      test('0002 goes down and up again to the same schema', async () => {
+        const before = await schema();
+        expect(await migrateDown(pool)).toBe('0002_payments');
+        expect(await schema()).not.toContain('bookings.paid_at');
+        expect(await migrateUp(pool)).toEqual(['0002_payments']);
+        expect(await schema()).toEqual(before);
+      });
+
+      test('0002 refuses to go down while a booking is paid', async () => {
+        await pool.query(`
+          INSERT INTO bookings (room_id, user_id, during, amount_pence, status, paid_at)
+          VALUES (1, 1, tstzrange('2030-01-02 10:00Z', '2030-01-02 11:00Z'), 2500, 'paid', now())`);
+        await expect(migrateDown(pool)).rejects.toThrow(/bookings_status_check/);
+        expect(await schema()).toContain('bookings.paid_at'); // nothing half-done
+      });
+      ```
+
+      All twenty-four tests pass on PostgreSQL 15 with a pool of ten connections, so the
+      concurrent requests really run at once. Every feature used is older than PostgreSQL 17.
+  - title: 12. One end-to-end journey
+    body: |-
+      The end-to-end test starts the real server and drives it over HTTP with Playwright's
+      `request` fixture. There's no browser, because the API has no pages. `webServer` waits
+      until the server answers, with no sleep.
+
+      ```ts
+      // playwright.config.ts
+      import { defineConfig } from '@playwright/test';
+
+      const DATABASE_URL = process.env.E2E_DATABASE_URL ?? 'postgres://localhost:5432/booking_e2e';
+
+      export default defineConfig({
+        testDir: 'e2e',
+        use: { baseURL: 'http://localhost:3000' },
+        webServer: {
+          command: 'npx tsx src/server.ts',
+          url: 'http://localhost:3000/bookings', // answers 401 once it's up
+          env: {
+            DATABASE_URL,
+            STRIPE_SECRET_KEY: 'sk_test_unused',
+            STRIPE_WEBHOOK_SECRET: 'whsec_e2e',
+            PUBLIC_URL: 'http://localhost:3000',
+          },
+        },
+      });
+      ```
+
+      ```ts
+      // e2e/journey.spec.ts
+      import { expect, test } from '@playwright/test';
+      import Stripe from 'stripe';
+      import { createPool } from '../src/db.js';
+      import { migrateUp } from '../src/migrate.js';
+      import { hashPassword } from '../src/sessions.js';
+      import { paidEvent } from '../test/helpers.js';
+
+      const pool = createPool(process.env.E2E_DATABASE_URL ?? 'postgres://localhost:5432/booking_e2e');
+
+      test.beforeAll(async () => {
+        await migrateUp(pool);
+        await pool.query('TRUNCATE payment_events, bookings, sessions, rooms, users RESTART IDENTITY CASCADE');
+        await pool.query(`INSERT INTO rooms (name, pence_per_hour) VALUES ('Oak', 2500)`);
+        await pool.query(`INSERT INTO users (email, password_hash) VALUES ('ana@example.com', $1)`, [
+          await hashPassword('correct horse'),
+        ]);
+      });
+      test.afterAll(async () => {
+        await pool.end();
+      });
+
+      test('a guest signs in, books a room, pays, and sees it paid', async ({ request }) => {
+        const login = await request.post('/login', {
+          data: { email: 'ana@example.com', password: 'correct horse' },
+        });
+        expect(login.status()).toBe(204);
+        const cookie = login.headers()['set-cookie'].split(';')[0];
+        const headers = { cookie };
+
+        const created = await request.post('/bookings', {
+          headers,
+          data: { roomId: 1, start: '2030-01-02T10:00:00Z', end: '2030-01-02T12:00:00Z' },
+        });
+        expect(created.status()).toBe(201);
+        const booking = await created.json();
+        expect(booking).toMatchObject({ status: 'pending', amountPence: 5000 });
+
+        // What Stripe sends once the guest has paid on the hosted page.
+        const payload = paidEvent('evt_e2e_1', booking.id, 5000);
+        const signature = new Stripe('sk_test_unused').webhooks.generateTestHeaderString({
+          payload,
+          secret: 'whsec_e2e',
+        });
+        const webhook = await request.post('/webhooks/stripe', {
+          headers: { 'stripe-signature': signature, 'content-type': 'application/json' },
+          data: payload,
+        });
+        expect(webhook.status()).toBe(200);
+
+        const mine = await request.get('/bookings', { headers });
+        expect(await mine.json()).toEqual([expect.objectContaining({ id: booking.id, status: 'paid' })]);
+
+        const logout = await request.post('/logout', { headers });
+        expect(logout.status()).toBe(204);
+        expect((await request.get('/bookings', { headers })).status()).toBe(401);
+      });
+      ```
+
+      One journey is enough here. It proves the parts connect: the login cookie works, the
+      booking reaches the database, the signed webhook passes the real check in the running
+      server, and logout ends the session. Edge cases stay in the faster integration tests.
+
+      The test signs the webhook itself, because paying on a third party's page makes a test
+      slow and flaky.
+  - title: 13. Decisions and trade-offs
+    body: |-
+      **Constraint, not code, for the overlap.** Double booking stays impossible whatever the
+      code does, including a future endpoint or a manual SQL fix. The cost, a GiST index and
+      `btree_gist`, is small for a booking table.
+
+      **Ranges, not a row per hour.** One row per room and hour would make overlap a plain
+      `UNIQUE (room_id, hour)`, but it multiplies rows and fixes the granularity. Ranges keep one
+      row per booking and allow half hours later without a data migration.
+
+      **A pending booking holds the slot**, or two guests could both pay for one hour. But
+      abandoned checkouts block rooms, so the next step is a scheduled job that cancels pending
+      bookings older than 30 minutes. A payment landing after that is recorded as `needs
+      refund`.
+
+      **A row lock, not serializable.** It serialises one guest's bookings and needs no retry
+      loop. Serializable wins once several multi-row rules exist.
+
+      **Server sessions, not JWTs.** One primary-key read per request buys instant logout and
+      revocation.
+
+      **404 for other people's bookings.** A 403 would confirm the id exists. With ids that
+      count up, that leaks how many bookings the system holds.
+
+      Known gaps: a login answers faster for an unknown email than a wrong password, which reveals who has an account; session ids are stored as they are,
+      where storing a hash would make a leaked table useless; nothing limits login attempts; and
+      the migration runner has no lock, so two deploys starting at once could race.
+checklist:
+  - Overlapping bookings of one room are refused by a database constraint, and adjacent ones are accepted.
+  - Every query that reads or changes a booking filters by the signed-in user's id, and another user's booking answers 404.
+  - Transactions use one client from `pool.connect()`, and every path ends in `COMMIT` or `ROLLBACK` and releases it.
+  - The unpaid-booking limit is protected by a row lock, with a concurrent test that fails without it.
+  - Database errors are recognised by SQLSTATE code, and a conflict answers 409 with problem details.
+  - Prices are computed on the server from the database, in integer pence.
+  - The session cookie has `HttpOnly`, `Secure` and `SameSite=Lax`, and logout deletes the session.
+  - Passwords are stored as salted hashes and compared in constant time.
+  - The webhook verifies the signature on the raw body before trusting anything in it.
+  - Each event id is claimed with a unique insert in the same transaction as the work, and a test delivers one event twice at once.
+  - A booking becomes paid only from a verified webhook with the matching amount.
+  - Each migration has an up and a down file, runs in a transaction with a lock timeout, and the down file refuses rather than lose data.
+  - Unit tests cover the pure rules and pass the clock in.
+  - Integration tests run against a real PostgreSQL, and one end-to-end test goes from sign-in to a paid booking.
+  - Secrets and connection strings come from environment variables, never the code.

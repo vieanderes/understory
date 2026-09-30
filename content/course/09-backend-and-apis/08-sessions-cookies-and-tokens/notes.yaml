@@ -1,0 +1,246 @@
+summary: >-
+  HTTP has no memory, so every request after sign-in must carry proof of who sent it. The two
+  common shapes of that proof are a **server session**, where the browser holds a random id
+  and the server holds the facts, and a **signed token** such as a JWT, where the token holds
+  the facts and a signature stops anyone changing them. Both usually travel in a cookie.
+
+
+  A session is the default for a web app with its own backend. It is simple, it can be
+  revoked instantly by deleting one row, and the cookie carries nothing worth reading. The
+  cost is a lookup per request, which a database index or Redis makes cheap. A JWT saves that
+  lookup and lets separate services check identity without calling back to one store, but it
+  can't be taken back before it expires, and its claims go stale when a role changes.
+
+
+  Whichever you pick, the cookie that carries it is as valuable as a password. The flags
+  `HttpOnly`, `Secure` and `SameSite` decide who can read it, where it travels and when it's
+  sent. These notes add the lifecycle a production session needs, every cookie attribute,
+  what a JWT library does when it verifies, and how to choose between the two.
+remember:
+  - Authentication proves who is making a request; because HTTP forgets between requests, every request must carry that proof again.
+  - A session id is a long random key into server-side state, so it reveals nothing and is revoked by deleting the entry.
+  - Make session ids with at least 128 bits from a cryptographic random source, such as `crypto.randomBytes(32)`, and issue a fresh id at every sign-in.
+  - A session cookie gets `HttpOnly`, `Secure` and `SameSite=Lax` or `Strict`, and ideally the `__Host-` prefix.
+  - A JWT's payload is readable by anyone, so verify its signature and expiry before trusting a claim, and pin the algorithm you expect.
+  - A JWT can't be revoked before `exp` without a server-side lookup, so keep access tokens short-lived and pair them with a revocable refresh token.
+  - Tokens in `localStorage` can be read by any script that runs on the page, so an XSS bug becomes account takeover; an `HttpOnly` cookie can't be read that way.
+  - Choose sessions for a web app with one backend, and signed tokens when many independent services must check identity without a shared store.
+sections:
+  - title: A session store that holds up in production
+    body: |-
+      The lesson's `Map` shows the idea. A real store adds four things: unguessable ids,
+      hashed ids at rest, timeouts and rotation.
+
+      ```ts
+      import { createHash, randomBytes } from 'node:crypto';
+
+      interface Session {
+        userId: string;
+        createdAt: number;
+        lastSeenAt: number;
+      }
+
+      const IDLE_MS = 30 * 60 * 1000; // signed out after 30 minutes without a request
+      const ABSOLUTE_MS = 12 * 60 * 60 * 1000; // and after 12 hours whatever happens
+
+      // The store keeps a hash of each id, so a leaked table holds no usable cookies.
+      const store = new Map<string, Session>();
+      const hash = (id: string) => createHash('sha256').update(id).digest('hex');
+
+      export function createSession(userId: string, now = Date.now()): string {
+        const id = randomBytes(32).toString('base64url');
+        store.set(hash(id), { userId, createdAt: now, lastSeenAt: now });
+        return id;
+      }
+
+      export function readSession(id: string, now = Date.now()): Session | undefined {
+        const key = hash(id);
+        const session = store.get(key);
+        if (!session) return undefined;
+        if (now - session.lastSeenAt > IDLE_MS || now - session.createdAt > ABSOLUTE_MS) {
+          store.delete(key);
+          return undefined;
+        }
+        session.lastSeenAt = now;
+        return session;
+      }
+
+      export function destroySession(id: string): void {
+        store.delete(hash(id));
+      }
+      ```
+
+      Thirty-two random bytes give 256 bits, far beyond guessing, and encode to 43
+      characters of base64url. Hashing with SHA-256 is enough here, unlike for passwords,
+      because the id is already random and long.
+
+      **Rotate the id at sign-in.** If an attacker can plant a known id in a victim's
+      browser before they sign in, and the server keeps that id afterwards, the attacker is
+      now signed in as the victim. That's session fixation. Creating a new session on every
+      sign-in, and on any change of privilege, closes it.
+
+      Logout deletes the server entry and also clears the cookie, with the same name, `Path`
+      and `Domain` and `Max-Age=0`. In production the store is a database table with an
+      index on the hashed id, or Redis with a TTL, so every server sees the same sessions.
+  - title: Every cookie attribute, and what it's for
+    body: |-
+      A `Set-Cookie` header is a name, a value and a list of attributes. Each one narrows
+      where the browser sends the cookie.
+
+      ```http
+      Set-Cookie: __Host-sid=q9LLVKsrtaIsWO3q3OmgNvU; Path=/; Max-Age=43200; HttpOnly; Secure; SameSite=Lax
+      ```
+
+      - **`HttpOnly`** hides the cookie from `document.cookie`, so an injected script can't
+        read and send it away. It still rides along on requests, so it doesn't stop an
+        injected script acting on the page.
+      - **`Secure`** sends the cookie only over HTTPS.
+      - **`SameSite=Strict`** never sends it on a request started by another site.
+        **`Lax`** also sends it on top-level navigations with a safe method, such as
+        clicking a link to your site, which keeps people signed in when they arrive from an
+        email. **`None`** always sends it and requires `Secure`.
+      - **`Domain`**, if set, shares the cookie with every subdomain. Leave it out and the
+        cookie is host-only, which is safer.
+      - **`Path`** limits the cookie to a path prefix. It's an organising tool, not a
+        security boundary.
+      - **`Max-Age`** is a lifetime in seconds and wins over **`Expires`**, a date. With
+        neither, the cookie lasts until the browser session ends.
+
+      The **`__Host-`** name prefix makes the browser refuse the cookie unless it has
+      `Secure`, `Path=/` and no `Domain`. That stops a compromised or careless subdomain
+      from setting a cookie that overrides yours.
+
+      Browsers are required to support at least 4,096 bytes per cookie, and many stop
+      there, which is one reason a large JWT in a cookie can fail. And every cookie is sent
+      on every matching request, images included, so keep them small.
+  - title: What verifying a JWT does
+    body: |-
+      A JWT is `header.payload.signature`, each part base64url-encoded. With HS256, the
+      signature is an HMAC-SHA256 of the first two parts under a server secret. Writing
+      verification out by hand shows each check a library makes for you.
+
+      ```ts
+      import { createHmac, timingSafeEqual } from 'node:crypto';
+
+      const b64 = (data: string | Buffer) => Buffer.from(data).toString('base64url');
+
+      function sign(claims: object, secret: string): string {
+        const head = b64(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
+        const body = b64(JSON.stringify(claims));
+        const mac = createHmac('sha256', secret).update(`${head}.${body}`).digest('base64url');
+        return `${head}.${body}.${mac}`;
+      }
+
+      function verify(token: string, secret: string, nowSeconds: number) {
+        const [head, body, mac] = token.split('.');
+        if (!head || !body || !mac) throw new Error('Malformed token');
+        // Pin the algorithm. Never let the token choose how it is checked.
+        if (JSON.parse(Buffer.from(head, 'base64url').toString()).alg !== 'HS256') {
+          throw new Error('Unexpected algorithm');
+        }
+        const expected = createHmac('sha256', secret).update(`${head}.${body}`).digest();
+        const given = Buffer.from(mac, 'base64url');
+        if (given.length !== expected.length || !timingSafeEqual(given, expected)) {
+          throw new Error('Bad signature');
+        }
+        const claims = JSON.parse(Buffer.from(body, 'base64url').toString());
+        if (typeof claims.exp !== 'number' || claims.exp <= nowSeconds) throw new Error('Expired');
+        return claims;
+      }
+      ```
+
+      Swap the payload for one saying `"role":"admin"` and keep the old signature, and
+      `verify` throws `Bad signature`. Call it at or after `exp` and it throws `Expired`.
+
+      The algorithm check matters. Early libraries trusted the header's `alg`, so a token
+      saying `"alg":"none"` needed no signature at all, and a token switched from RS256 to
+      HS256 could be signed with the server's public key as the HMAC secret. Real libraries
+      take the allowed algorithms as an option; always pass it. `timingSafeEqual` compares in
+      constant time, so response timing doesn't leak how many bytes matched.
+
+      In production use a maintained library rather than this code, and check `iss` and `aud`
+      too when tokens come from another service.
+  - title: Sessions or tokens, and where to keep them
+    body: |-
+      The honest comparison is about revocation and topology, not speed.
+
+      ```text
+                        server session              signed token (JWT)
+      state lives       on the server               in the token
+      per request       one lookup by id            a signature check, no lookup
+      revoke now        delete the entry            needs a deny-list lookup
+      role change       seen on the next request    seen when the token is reissued
+      size on the wire  about 43 characters         hundreds of bytes and growing
+      fits best         one app and its backend     many services, or third parties
+      ```
+
+      Most systems that use JWTs end up with a hybrid. A short-lived **access token**,
+      minutes long, is checked by signature alone. A long-lived **refresh token** is stored
+      on the server, is revocable, and is swapped for a new access token when the old one
+      expires. Rotating the refresh token on each use, and treating reuse of an old one as
+      theft, limits the damage of a stolen one. That design has brought back the server-side
+      state the JWT was meant to remove, which is a fair price for revocation.
+
+      Where the browser keeps the proof matters as much. A token in `localStorage` is
+      readable by every script on the page, so one XSS bug hands it to an attacker who can
+      use it from anywhere until it expires. An `HttpOnly` cookie can't be read by script.
+      Cookies bring their own risk, cross-site request forgery, which `SameSite` handles
+      for most cases, with CSRF tokens for the rest. For a browser app, an `HttpOnly`
+      cookie is the safer default for either a session id or a token.
+pitfalls:
+  - '**Making session ids from something predictable.** A user id, a timestamp or `Math.random()` can be guessed or reproduced. Use `crypto.randomBytes(32)` or `crypto.randomUUID()` at the least.'
+  - '**Keeping the same session id across sign-in.** An id planted before sign-in becomes a signed-in session, which is session fixation. Issue a new id at sign-in and on privilege changes.'
+  - '**Logging out only on the client.** Deleting the cookie leaves the session valid for anyone who copied it. Delete the server entry, then clear the cookie.'
+  - '**Calling `jwt.decode` where `jwt.verify` belongs.** `decode` reads claims without checking the signature, so anyone can write their own. Verify, with the algorithm pinned.'
+  - '**Putting secrets or personal data in a JWT payload.** The payload is base64url, not encrypted. Put an id in it and look up the rest.'
+  - '**Long-lived JWTs with no revocation.** A stolen seven-day token works for seven days. Keep access tokens to minutes and refresh through a token the server can revoke.'
+  - '**Setting `Domain` on a session cookie by habit.** It shares the cookie with every subdomain, including a forgotten one. Leave it out, or use the `__Host-` prefix, which forbids it.'
+interview:
+  - question: Sessions or JWTs for a new web app. Which would you pick, and why?
+    answer: >-
+      For a web app with its own backend, server sessions in an `HttpOnly` cookie. They're
+      revocable instantly by deleting one entry, a role change takes effect on the next
+      request, and the cookie leaks nothing. The per-request lookup is one indexed read or a
+      Redis get, which is not a bottleneck at almost any scale. I'd reach for JWTs when many
+      independent services must check identity without a shared store, or when a third party
+      has to verify tokens. Then I'd keep access tokens short, a few minutes, and pair them
+      with a server-stored refresh token so I can still revoke. The trade-off is revocation
+      and freshness against avoiding a shared lookup.
+  - question: How do you log a user out everywhere if you use JWTs?
+    answer: >-
+      You need server-side state, because a valid signature and an unexpired `exp` are all a
+      JWT has. The usual design is short-lived access tokens plus refresh tokens stored on
+      the server. Logging out everywhere revokes all of the user's refresh tokens, so no new
+      access token is issued, and the existing ones die within their few minutes. If even
+      that window is too long, keep a token version or a "valid after" timestamp per user and
+      check it on each request, or a deny-list of token ids until they expire. Both put a
+      lookup back on the hot path, which is the cost of instant revocation.
+  - question: What do `HttpOnly`, `Secure` and `SameSite` each protect against, and what don't they?
+    answer: >-
+      `HttpOnly` stops page scripts reading the cookie, so an XSS bug can't steal it and use
+      it elsewhere, but the script can still make requests from the page with the cookie
+      attached. `Secure` stops the cookie travelling over plain HTTP, where anyone on the
+      network could read it. `SameSite=Lax` stops the browser attaching it to cross-site
+      subresource requests and form posts, which defeats most CSRF, while still sending it
+      when someone follows a link to the site. None of them fix XSS itself; for that you need
+      output encoding and a Content Security Policy. I'd also add the `__Host-` prefix so a
+      subdomain can't overwrite the cookie.
+  - question: Where should a single-page app store its access token?
+    answer: >-
+      In an `HttpOnly`, `Secure`, `SameSite` cookie set by its own backend, not in
+      `localStorage`. Anything in `localStorage` is readable by any script on the page, so
+      one XSS bug, including one in a third-party script, lets an attacker copy the token and
+      use it from their own machine. An `HttpOnly` cookie can't be exfiltrated that way. The
+      cost is CSRF exposure and needing the API on the same site, which `SameSite` and, if
+      needed, a CSRF token handle. Where the API is on another site, a backend-for-frontend
+      that holds the tokens and gives the browser only a session cookie is the common
+      pattern. Keeping the token in memory is a middle option, lost on refresh.
+  - question: What is session fixation, and how do you prevent it?
+    answer: >-
+      Session fixation is when an attacker gets a victim to use a session id the attacker
+      already knows, and the server keeps that id after the victim signs in, so the attacker
+      shares the signed-in session. It works when ids can be set from outside, such as from a
+      URL parameter or a cookie written by a sibling subdomain. The fix is to issue a brand
+      new session id at every sign-in and privilege change, and discard the old one. The
+      `__Host-` cookie prefix and never accepting ids from URLs remove the ways of planting
+      one. Rotation costs nothing, so there's no reason to skip it.

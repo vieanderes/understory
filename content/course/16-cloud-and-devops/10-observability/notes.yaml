@@ -1,0 +1,246 @@
+summary: >-
+  Observability is being able to explain what a running system is doing from the signals it
+  already sends out, without attaching a debugger or shipping new code. It rests on three
+  signals. Metrics are cheap numbers over time that tell you something is wrong and when it
+  started. Traces follow single requests across functions and services and show where the
+  time went. Logs are detailed events that say what happened inside one request.
+
+
+  The signals are most useful when they are joined. A log line carries the request id and
+  the trace id, so you can jump from a slow trace to its logs. A metric's labels match the
+  attributes on spans, so a spike on a graph leads to example traces from that moment.
+
+
+  These notes cover the mechanics the lesson doesn't: carrying a request id through async
+  code without passing it around, linking logs to traces, keeping metrics cheap and honest,
+  and what to measure for features that call a language model.
+remember:
+  - Metrics tell you that something is wrong and when, traces tell you where, and logs tell you why for one request.
+  - Every log line is one JSON object carrying the request id and the trace id, and never carries personal data such as emails or prompts.
+  - "`AsyncLocalStorage` lets any function read the current request's context without it being passed down as an argument."
+  - Every distinct combination of metric labels is a separate time series, so never label a metric with a user id, request id or free text.
+  - Averages hide the slow tail, so read latency as percentiles from a histogram, and never average percentiles from different instances.
+  - A span is exported only when it ends, so end spans in `finally`, or use `startActiveSpan` with a callback.
+  - Services pass trace context in the W3C `traceparent` header, which instrumentation adds and reads for you.
+  - For a model call, measure time to first token, total duration, tokens in and out, and errors by kind, labelled by model.
+sections:
+  - title: Carrying the request id without passing it
+    body: |-
+      A request id is only useful if every line of the request carries it. Passing it as an
+      argument through every function is noisy and often forgotten. Node's
+      `AsyncLocalStorage` holds a value for the rest of an async call chain, much like a
+      thread-local in other languages.
+
+      ```js
+      import { AsyncLocalStorage } from 'node:async_hooks';
+      import { randomUUID } from 'node:crypto';
+      import http from 'node:http';
+
+      const requestContext = new AsyncLocalStorage();
+
+      function log(event, fields = {}) {
+        const ctx = requestContext.getStore() ?? {};
+        console.log(JSON.stringify({ time: new Date().toISOString(), requestId: ctx.requestId, event, ...fields }));
+      }
+
+      const ID = /^[A-Za-z0-9-]{8,64}$/; // accept an upstream id only if it looks like one
+
+      async function findRoom(roomId) {
+        log('db.query', { table: 'rooms' }); // no requestId passed, still logged
+        return { roomId, free: true };
+      }
+
+      const server = http.createServer((req, res) => {
+        const incoming = req.headers['x-request-id'];
+        const requestId = typeof incoming === 'string' && ID.test(incoming) ? incoming : randomUUID();
+        res.setHeader('x-request-id', requestId);
+
+        requestContext.run({ requestId }, async () => {
+          const started = performance.now();
+          const room = await findRoom('r-12');
+          res.end(JSON.stringify(room));
+          log('request.done', { status: 200, ms: Math.round(performance.now() - started) });
+        });
+      });
+
+      server.listen(8080);
+      ```
+
+      A request with `x-request-id: req-7f3a9c21` logged that id on both lines, including the
+      one inside `findRoom`. A request with a header of `<script>` got a fresh UUID instead.
+      Validating the incoming id matters: it lands in logs, and a log viewer is a place where
+      injected text can do harm.
+
+      Returning the id in the response header lets a user or a support ticket quote it, and
+      you can find every line in seconds. Logging libraries such as pino build the same idea
+      in as child loggers. OpenTelemetry uses `AsyncLocalStorage` underneath for its own
+      context, which is how the next section's trace id arrives without being passed.
+  - title: Joining logs to traces
+    body: |-
+      With tracing in place, put the trace id on every log line too. Then a slow trace leads
+      to its logs, and an error log leads to the whole trace.
+
+      ```js
+      import { context, trace, SpanStatusCode } from '@opentelemetry/api';
+      import { AsyncLocalStorageContextManager } from '@opentelemetry/context-async-hooks';
+      import { BasicTracerProvider, InMemorySpanExporter, SimpleSpanProcessor } from '@opentelemetry/sdk-trace-base';
+
+      const exporter = new InMemorySpanExporter();
+      context.setGlobalContextManager(new AsyncLocalStorageContextManager().enable());
+      trace.setGlobalTracerProvider(
+        new BasicTracerProvider({ spanProcessors: [new SimpleSpanProcessor(exporter)] }),
+      );
+      const tracer = trace.getTracer('booking-api');
+
+      function log(event, fields = {}) {
+        const traceId = trace.getActiveSpan()?.spanContext().traceId;
+        console.log(JSON.stringify({ traceId, event, ...fields }));
+      }
+
+      function inSpan(name, work) {
+        return tracer.startActiveSpan(name, async (span) => {
+          try {
+            return await work(span);
+          } catch (error) {
+            span.recordException(error);
+            span.setStatus({ code: SpanStatusCode.ERROR });
+            throw error;
+          } finally {
+            span.end();
+          }
+        });
+      }
+
+      await inSpan('POST /bookings', async () => {
+        await inSpan('db.insert booking', async () => log('booking.saved'));
+        await inSpan('model.summarise', async () => {
+          throw new Error('provider timeout');
+        }).catch(() => log('summary.skipped'));
+      });
+      ```
+
+      With `@opentelemetry/api` 1.9.1 and the 2.11.0 SDK, both log lines carried the same
+      trace id, all three spans shared it, and only `model.summarise` had status code 2,
+      `ERROR`. `startActiveSpan` makes the span current inside the callback, so children and
+      log lines find it on their own.
+
+      Across services, the trace id travels in `traceparent`, for example
+      `00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01`: version, trace id, parent
+      span id and flags. The last `01` means sampled.
+
+      **Sampling** keeps tracing affordable. Head sampling decides at the start, say one
+      trace in ten, and is cheap, but it throws away most errors. Tail sampling waits until a
+      trace finishes and keeps every error and every slow one, at the cost of buffering
+      traces in a collector.
+  - title: Metrics that stay cheap and honest
+    body: |-
+      For every service, start with **RED**: the rate of requests, the rate of errors and the
+      distribution of durations, per route. For resources such as a pool or a queue, the
+      matching set is **USE**: utilisation, saturation and errors.
+
+      Metric systems store one time series per unique set of label values. A request counter
+      with `route` (20 values) and `status` (5 values) is 100 series. Add `userId` with
+      50,000 users and it's five million, which is slow, expensive and sometimes refused.
+      That's the **cardinality** problem. Labels are for small, fixed sets. Anything unique
+      per request belongs on spans and log lines.
+
+      Averages hide the slow tail, and percentiles don't combine. Here, one instance is busy
+      and fast, the other quiet and slow:
+
+      ```js
+      function p95(values) {
+        const sorted = [...values].sort((a, b) => a - b);
+        return sorted[Math.ceil(sorted.length * 0.95) - 1];
+      }
+
+      const a = Array.from({ length: 950 }, () => 40).concat(Array(50).fill(60));
+      const b = Array.from({ length: 30 }, () => 900).concat(Array(20).fill(100));
+
+      console.log('p95 A', p95(a), 'p95 B', p95(b));
+      console.log('average of the two p95s', (p95(a) + p95(b)) / 2);
+      console.log('true p95 of all requests', p95([...a, ...b]));
+      ```
+
+      It printed 40 and 900, an average of 470, and a true p95 of 60. A dashboard that
+      averages per-instance percentiles shows a number no request experienced. Histograms
+      fix this: bucket counts from every instance add up, and the percentile is estimated
+      from the total. That's why the lesson recorded durations in a histogram rather than
+      reporting a percentile from each server.
+
+      Read more than one percentile. p50 is the typical user, p95 and p99 the unlucky ones,
+      and the maximum mostly shows outliers you can find in traces.
+  - title: Observing features that call a model
+    body: |-
+      A model call behaves unlike most dependencies. It is slow, its latency varies with the
+      length of the answer, it costs money per token, and it fails in its own ways. Measure
+      accordingly.
+
+      - **Time to first token** for streamed replies, because it decides how fast the
+        feature feels. Total duration matters less when words appear quickly.
+      - **Total duration**, as a histogram labelled by model and operation.
+      - **Tokens in and out**, as counters labelled by model and feature. Multiplied by the
+        price, they are the bill, and a sudden rise in input tokens usually means a prompt
+        or retrieval change stuffed in more context.
+      - **Errors by kind**: rate limited (`429`), timed out, refused, and replies that failed
+        your validation. Each needs a different fix.
+      - **Retries and fallbacks**, since a silent fallback to a smaller model is a quality
+        change nobody sees otherwise.
+
+      OpenTelemetry has semantic conventions for this, with attribute names such as
+      `gen_ai.request.model`, `gen_ai.usage.input_tokens` and `gen_ai.usage.output_tokens`.
+      They were still marked as in development when this was written, so check the current
+      names before building dashboards on them.
+
+      Prompts and replies are the hardest call. They're what you need to debug a bad answer,
+      and they often contain personal data. Keep them out of logs and metrics. If you must
+      store them for evaluation, do it in a separate store with access control, a short
+      retention period and a record of who looked.
+pitfalls:
+  - "**Logging sentences instead of fields.** \"Booking failed for room 12\" can't be filtered or counted. Log `{\"event\":\"booking.failed\",\"roomId\":\"r-12\"}` with a fixed event name."
+  - "**Putting user ids or request ids in metric labels.** Each value creates a new time series, and the metrics bill or the database falls over. Keep those on spans and logs."
+  - "**Averaging per-instance percentiles.** The result matches no real request. Record histograms and compute percentiles from the combined buckets."
+  - "**Spans that never end on errors.** A span without `end()` is never exported, so failures vanish from tracing. End in `finally`, or use `startActiveSpan` with a callback."
+  - "**Logging whole prompts and emails to debug model calls.** Logs are copied widely and kept for months. Log lengths, token counts and ids; keep content in a controlled store if you need it."
+  - "**Trusting any incoming request id.** It ends up in log viewers and search indexes. Accept it only if it matches a strict pattern, and generate your own otherwise."
+  - "**Head sampling at a low rate and expecting to find errors.** A one-in-a-hundred sample drops 99 of every 100 failures. Use tail sampling to keep errors and slow traces."
+interview:
+  - question: A request that touches four services is sometimes slow. How do you find out why?
+    answer: >-
+      I start from the latency metric to see when and on which route the tail grew, then
+      open traces of slow requests from that window. Distributed tracing links the spans
+      from all four services through the `traceparent` header, so the waterfall shows which
+      service and which call took the time, and whether calls ran in sequence that could
+      run in parallel. Then I take that trace id to the logs for the detail: the query, the
+      retry, the payload size. If only some requests are slow, I compare slow and fast
+      traces for a difference, such as a cold cache or one tenant's large data. This needs
+      tail sampling, or the slow traces may not have been kept.
+  - question: What is high cardinality in metrics, and why does it matter?
+    answer: >-
+      It's a label with many distinct values, and it matters because every unique
+      combination of labels is stored as its own time series. A request counter labelled by
+      route and status might be a hundred series; add a user id label and it becomes
+      millions. Storage, memory and query time grow with the series count, so dashboards
+      slow down, bills jump, and some systems start dropping data. So metric labels stay
+      small and bounded: route templates rather than raw URLs, status classes, model names.
+      Per-user or per-request detail goes on spans and structured logs, which are built for
+      high-cardinality data and can be sampled.
+  - question: What would you monitor for a feature built on an LLM API?
+    answer: >-
+      Speed, cost, errors and quality, each split by model and feature. For speed, time to
+      first token and total duration as histograms, because users feel the first token. For
+      cost, input and output token counters, which multiplied by price give spend, with a
+      budget alert. For errors, rate limits, timeouts and replies that fail validation,
+      counted separately because each has a different fix, plus how often we retried or fell
+      back to another model. Quality needs its own signals: user feedback, and a sample of
+      conversations scored offline. I'd keep prompt text out of logs because it holds
+      personal data, and record lengths and ids instead.
+  - question: Why structured logs rather than plain text?
+    answer: >-
+      Because machines have to read logs before people do. A JSON line with named fields
+      such as `requestId`, `event`, `status` and `ms` can be filtered, grouped and counted
+      by a log tool without fragile regular expressions: every failed booking in the last
+      hour for one tenant is a query, not a grep. Fixed event names stay stable when someone
+      rewords a message. The request and trace ids join lines from one request across
+      services. The trade-off is that raw JSON is harder to read in a terminal, which a
+      pretty-printer solves locally, and that it's tempting to log everything, so volume
+      and personal data need rules.

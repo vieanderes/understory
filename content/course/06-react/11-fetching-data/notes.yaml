@@ -1,0 +1,308 @@
+summary: >-
+  A component that shows server data has to cope with time. The first render happens before
+  any request has started, the answer arrives later or never, and by the time it lands the
+  component may be asking a different question. Fetching in an effect is React's built-in way
+  to load data because the component is on screen, and the effect's cleanup is how you make
+  sure an old answer never overwrites a newer one.
+
+
+  So every loading component has the same skeleton: a state that starts empty, an effect that
+  depends on what it asks for, three visible states (loading, failed, ready), and a cleanup
+  that either ignores or aborts the request it started. Requests a person causes, like
+  pressing Pay or Send, don't belong in an effect at all: they go in the event handler, so
+  they run once, when the person acts.
+
+
+  The effect pattern is the foundation, not the ceiling. It has no cache, it starts late
+  (after the component has rendered), and nested components fetch in a waterfall. That is
+  why production apps usually load data on the server with a framework such as Next.js, or
+  through a data library that adds caching and retries. Knowing the effect version well is
+  what lets you judge those tools.
+remember:
+  - The first render always runs before the data exists, so the component must render a loading state from an empty start.
+  - An effect that fetches returns a cleanup that ignores or aborts its request, because answers can arrive out of order.
+  - React runs the previous effect's cleanup before the next effect runs, and on unmount, so the flag or abort always hits the stale request.
+  - "`fetch` rejects only when the network fails; a 404 or 500 resolves, so check `response.ok` and throw yourself."
+  - A request caused by a person's action goes in the event handler, not in an effect that watches state.
+  - Model loading as one status value, such as a discriminated union of loading, error and ready, so impossible combinations can't exist.
+  - In development, Strict Mode mounts, cleans up and mounts again, so you see two requests and the cleanup must drop the first.
+  - Effect fetching has no cache and fetches in waterfalls, which is why frameworks load on the server and libraries add caching.
+sections:
+  - title: Cancelling instead of ignoring, with AbortController
+    body: |-
+      The `ignore` flag stops a stale answer from reaching state, but the request still runs
+      to the end and its bytes still download. An `AbortController` cancels the request
+      itself. Create it inside the effect, pass its `signal` to `fetch`, and call `abort()`
+      in the cleanup. The aborted `fetch` promise rejects, so the `catch` has to tell your
+      own abort apart from a real failure.
+
+      ```tsx
+      import { useEffect, useState } from 'react';
+
+      type Result = { id: string; title: string };
+
+      export function SearchResults({ query }: { query: string }) {
+        const [results, setResults] = useState<Result[]>([]);
+        const [failed, setFailed] = useState(false);
+
+        useEffect(() => {
+          const controller = new AbortController();
+          setFailed(false);
+          fetch(`/api/search?q=${encodeURIComponent(query)}`, { signal: controller.signal })
+            .then((response) => {
+              if (!response.ok) throw new Error(`HTTP ${response.status}`);
+              return response.json() as Promise<Result[]>;
+            })
+            .then((data) => setResults(data))
+            .catch(() => {
+              // Our own abort is not a failure: a newer query replaced this one.
+              if (controller.signal.aborted) return;
+              setFailed(true);
+            });
+          return () => controller.abort();
+        }, [query]);
+
+        if (failed) return <p role="alert">Search failed</p>;
+        return (
+          <ul>
+            {results.map((result) => (
+              <li key={result.id}>{result.title}</li>
+            ))}
+          </ul>
+        );
+      }
+      ```
+
+      We tested this with a fake `fetch`: searching `tea`, then `coffee`, and letting `tea`
+      answer last shows only the coffee results and no error. Checking
+      `controller.signal.aborted` is sturdier than checking the error's name, because it asks
+      the one question you care about: did I cancel this myself? The signal also cancels
+      `response.json()` if the abort lands while the body is still downloading.
+
+      Which to choose? The flag works with any promise, including a `load` prop that knows
+      nothing about signals. Aborting also saves bandwidth and server work, which matters
+      for search-as-you-type. Many teams do both: abort when they can, and let the abort
+      guard state as the flag would.
+  - title: One status value instead of three booleans
+    body: |-
+      Separate `loading`, `error` and `data` states allow combinations that make no sense:
+      loading and failed at once, or an error next to old data. A **discriminated union**
+      makes those states unrepresentable, and TypeScript then knows `data` exists only when
+      the status is `ready`. Wrapping it in a custom hook keyed by a URL string keeps the
+      component short.
+
+      ```tsx
+      import { useEffect, useState } from 'react';
+
+      export type Load<T> =
+        | { status: 'loading' }
+        | { status: 'error'; error: Error }
+        | { status: 'ready'; data: T };
+
+      export function useJson<T>(url: string): Load<T> {
+        const [state, setState] = useState<Load<T>>({ status: 'loading' });
+
+        useEffect(() => {
+          let ignore = false;
+          setState({ status: 'loading' });
+          fetch(url)
+            .then((response) => {
+              if (!response.ok) throw new Error(`HTTP ${response.status}`);
+              return response.json() as Promise<T>;
+            })
+            .then(
+              (data) => {
+                if (!ignore) setState({ status: 'ready', data });
+              },
+              (error: unknown) => {
+                if (!ignore) setState({ status: 'error', error: error instanceof Error ? error : new Error(String(error)) });
+              },
+            );
+          return () => {
+            ignore = true;
+          };
+        }, [url]);
+
+        return state;
+      }
+
+      type Order = { id: string; total: number };
+
+      export function OrderSummary({ id }: { id: string }) {
+        const order = useJson<Order>(`/api/orders/${id}`);
+        if (order.status === 'loading') return <p>Loading order</p>;
+        if (order.status === 'error') return <p role="alert">Couldn't load the order</p>;
+        // Here TypeScript knows order.data exists.
+        return <p>Order {order.data.id}: £{order.data.total}</p>;
+      }
+      ```
+
+      The dependency is a string, and strings compare by value, so the effect reruns only
+      when the URL really changes. That detail matters: if the hook took a loader function
+      and a component called it as `useLoad(() => fetchBooks())`, every render would create a
+      new function, the effect would rerun, set `loading`, render again, and loop for ever.
+      We ran that version and it never settled.
+  - title: Resetting when the question changes
+    body: |-
+      When the city changes, the old forecast must not sit under the new city's name. The
+      lesson's solution clears state at the start of the effect. That works, but the
+      component first renders once with the new city and the old forecast, and only then
+      does the effect clear it.
+
+      A **key** makes the reset structural instead. React treats a component with a new key
+      as a different component: it throws away the old one's state and mounts a fresh one.
+
+      ```tsx
+      <Forecast key={city} city={city} load={loadForecast} />
+      ```
+
+      Now `Forecast` always starts with `forecast` as `null` for each city, and its effect
+      needs no reset lines. The cleanup still matters, because the old instance's request
+      can still answer after it unmounts; the flag or abort drops it.
+
+      The trade-off: a key resets everything inside, including any state in children, such
+      as an expanded panel or a half-typed note. That is often what you want when the whole
+      view is about one item. When only one value should reset, reset that value instead.
+  - title: Strict Mode, double requests and what they tell you
+    body: |-
+      In development, `<StrictMode>` mounts each component, runs its effects, cleans them up,
+      and runs them again. In the network tab you see two requests for one page. This is on
+      purpose. It simulates the component leaving and coming back, which really happens in
+      production when a person navigates away and back or when React reuses a hidden tree.
+
+      A correct fetching effect behaves well under it: the first request's cleanup sets
+      `ignore` or aborts, so only the second answer reaches state. A broken one shows its
+      bug at once, for example two copies of each item appended to a list, or an analytics
+      event counted twice.
+
+      Two things follow. Don't switch off Strict Mode to hide the second request; fix the
+      effect so running it twice is harmless. And don't put non-repeatable work, like
+      charging a card or sending a message, in an effect at all. That work belongs in the
+      handler for the click that caused it, where it runs exactly once per click.
+  - title: Where effect fetching stops, and what React 19 adds
+    body: |-
+      Effect fetching has three structural costs. It starts late: the component renders,
+      the browser paints, then the request begins. It **waterfalls**: a child that fetches
+      can't start until its parent has fetched and rendered it. And nothing is cached, so
+      going back to a page fetches it all again.
+
+      Frameworks fix the first two by loading on the server before the HTML is sent, which
+      the Next.js chapter covers. Data libraries fix the third with a shared cache, retries
+      and deduplication.
+
+      React 19 also lets a component read a promise with `use`, showing the nearest
+      `<Suspense>` fallback until it settles. The promise must be the same object on every
+      render, so it has to come from a cache or from a Server Component, never be created
+      fresh during a client render.
+
+      ```tsx
+      import { Suspense, use } from 'react';
+
+      type Weather = { summary: string };
+
+      const cache = new Map<string, Promise<Weather>>();
+
+      function getForecast(city: string, fetchForecast: (city: string) => Promise<Weather>) {
+        let promise = cache.get(city);
+        if (!promise) {
+          promise = fetchForecast(city);
+          cache.set(city, promise);
+        }
+        return promise;
+      }
+
+      function Forecast({ city, fetchForecast }: { city: string; fetchForecast: (city: string) => Promise<Weather> }) {
+        // Suspends until the promise settles. The same promise comes back on every render.
+        const forecast = use(getForecast(city, fetchForecast));
+        return <p>{forecast.summary}</p>;
+      }
+
+      export function WeatherPanel({ city, fetchForecast }: { city: string; fetchForecast: (city: string) => Promise<Weather> }) {
+        return (
+          <Suspense fallback={<p>Loading</p>}>
+            <Forecast city={city} fetchForecast={fetchForecast} />
+          </Suspense>
+        );
+      }
+      ```
+
+      This toy cache never forgets and keeps a rejected promise for ever, and a rejection
+      needs an error boundary above it. Those gaps are what real data libraries fill, which
+      is why you rarely write this cache yourself.
+pitfalls:
+  - >-
+    **Reading a field before the data exists.** `user.name` on the first render throws,
+    because the effect hasn't even started. Render a loading state first, or start from a
+    value that has the right shape.
+  - >-
+    **Treating every resolved `fetch` as success.** A 500 page parsed as JSON throws a
+    confusing parse error, or worse, parses into the wrong shape. Check `response.ok` and
+    throw with the status.
+  - >-
+    **No cleanup on a fetching effect.** Out-of-order answers show results for an old query,
+    and in development Strict Mode adds duplicates. Return a cleanup that sets a flag or
+    aborts.
+  - >-
+    **An effect that fires a request when a flag flips.** Setting `submitted` to true so an
+    effect posts the form sends it again whenever the component remounts. Send it in the
+    submit handler.
+  - >-
+    **A function or object in the dependency list that is new every render.** The effect
+    reruns after each render, and if it sets state, it loops. Depend on primitive values like
+    a URL or an id, or keep the function stable.
+  - >-
+    **Keeping old data after the input changed.** The previous item's details flash under
+    the new heading. Reset in the effect, or give the component a `key` so it remounts.
+interview:
+  - question: How do you avoid a race condition when a component fetches data in an effect?
+    answer: >-
+      Give the effect a cleanup that makes the old request harmless. React runs the previous
+      effect's cleanup before the next one starts, so when the query changes from `tea` to
+      `coffee`, the `tea` effect's cleanup runs first. The cleanup either sets a local
+      `ignore` flag that the `.then` checks before calling `setState`, or aborts an
+      `AbortController` whose signal was passed to `fetch`. The flag works with any promise;
+      aborting also cancels the network work, which I prefer for search-as-you-type. In the
+      abort case I check `signal.aborted` in the `catch`, so my own cancellation isn't shown
+      as an error. In a larger app I'd rather use a data library or server loading, which
+      handle this for me.
+  - question: Why does my component fetch twice in development?
+    answer: >-
+      Because Strict Mode mounts, cleans up and remounts every component in development, to
+      prove that effects clean up after themselves. Production never does the extra cycle on
+      first mount, but a component can still unmount and mount again when someone navigates
+      back, so the effect must survive it. If the effect has a proper cleanup, the first
+      request is ignored or aborted and only one answer reaches state, so the double request
+      is harmless. If it shows duplicate items or double events, that's a real bug the check
+      exposed. The fix is never to turn off Strict Mode; it's to make the effect symmetrical,
+      and to move non-repeatable work like a payment into an event handler.
+  - question: When should a request go in an effect, and when in an event handler?
+    answer: >-
+      An effect is for data the component needs because it's on screen; a handler is for
+      anything a person caused. Loading a product's reviews when the product page shows is an
+      effect, keyed on the product id. Submitting a review is a handler: it should happen once,
+      when the person presses Post. Putting the post in an effect that watches a
+      `submitted` flag means it runs again whenever the component remounts or the dependencies
+      change, which can send duplicates. A quick test: if you can name the click or key press
+      that caused it, it belongs in that event's handler.
+  - question: What's wrong with fetching every piece of data in useEffect in a large app?
+    answer: >-
+      Effects start late, fetch in waterfalls and cache nothing. The request begins only after
+      the component has rendered, and a child that loads its own data waits for its parent to
+      finish first, so three nested levels mean three round trips in sequence. Navigating back
+      refetches everything, and two components that need the same data make two requests.
+      Loading on the server with a framework removes the waterfall and sends data with the
+      HTML; a data library adds a shared cache, deduplication and retries on the client. I
+      still write effect fetching for small widgets or when a team has no such tool, with the
+      three states and a cleanup, but I'd flag the cost as the app grows.
+  - question: Where should server data live in a React app, and what do libraries like TanStack Query or SWR add?
+    answer: >-
+      Server data is a cache of something another system owns, so it deserves a tool built
+      for caching rather than `useState`. TanStack Query and SWR key each request, share one
+      cached result between every component that asks, de-duplicate identical requests,
+      refetch when data goes stale or the window regains focus, retry failures, and expose
+      loading and error states. Mutations invalidate the keys they affect, and optimistic
+      updates roll back on failure. The rest of the state has other homes: local state as
+      close as possible to where it's used, context for rarely changing values like the
+      theme, a store such as Zustand for complex shared client state, and the URL for
+      anything people should share or bookmark. In Next.js, server components can fetch on
+      the server, which removes much client caching altogether.

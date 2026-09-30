@@ -1,0 +1,302 @@
+summary: >-
+  Infrastructure as code writes servers, DNS records, databases and permissions down in
+  files, reviews them like any other code, and lets a tool make reality match. The tool
+  keeps a state file that maps each declared resource to the real thing, compares the files
+  with reality, prints a plan, and changes only what the plan says.
+
+
+  The value is repeatability and review. A setup written in code can be rebuilt after a
+  mistake, copied for a staging environment, and changed through a pull request that
+  someone else reads. The risks are also real: a one-line edit can replace a database, the
+  state file holds secrets, and a role with broad permissions in CI is a key to the whole
+  account.
+
+
+  These notes cover how the tool builds its plan from references, the settings that stop a
+  plan from destroying data, how teams lay out state and environments, a CI pipeline that
+  plans on every pull request and applies on merge, and the IAM trust policy that lets that
+  pipeline in without stored keys.
+remember:
+  - Infrastructure as code declares desired state in versioned files, and the tool computes and applies the difference from reality.
+  - Read the plan before every apply, above all any `-/+` replacement or destroy, because the code diff doesn't show what the tool will do.
+  - State maps declared resources to real ids, holds secrets in plain text, and lives in a remote, locked, encrypted store, never in Git.
+  - References between resources create the dependency graph, so the tool knows what to create first without being told.
+  - Protect data with `prevent_destroy` and the provider's deletion protection, and rename resources with `moved` blocks instead of letting them be replaced.
+  - CI plans on every pull request and applies a saved plan after merge, with short-lived OIDC credentials instead of stored keys.
+  - Each role gets only the actions it needs on named resources, with a read-only role for plans and a separate, guarded role for applies.
+sections:
+  - title: How the plan is built
+    body: |-
+      The tool reads every file in a directory as one configuration. Each reference, such
+      as `module.web.public_ip`, is an edge in a **dependency graph**, so the DNS record waits
+      for the server without any ordering in the files. Independent resources are created in
+      parallel.
+
+      Configurations grow with **variables**, **outputs** and **modules**. A module is a
+      directory of resources with inputs and outputs, called like a function. This validated
+      with `tofu validate` on OpenTofu 1.12:
+
+      ```text
+      variable "environment" {
+        type = string
+      }
+
+      module "web" {
+        source        = "./modules/web"
+        environment   = var.environment
+        instance_type = var.environment == "production" ? "t3.medium" : "t3.small"
+      }
+
+      resource "aws_route53_record" "www" {
+        zone_id = "Z0123456789ABCDEFGHIJ"
+        name    = "www.example.com"
+        type    = "A"
+        ttl     = 300
+        records = [module.web.public_ip]
+      }
+
+      output "web_ip" {
+        value = module.web.public_ip
+      }
+      ```
+
+      Planning happens in three moves. **Refresh** reads the real state of each resource
+      from the provider's API. **Diff** compares that with the configuration. **Order**
+      walks the graph to decide what can run in parallel. Values that only exist after
+      creation, such as a new server's address, show as `(known after apply)`.
+
+      When a reference can't express a dependency, for example a policy that must exist
+      before an app starts using it, `depends_on` adds the edge by hand. Use it rarely: most
+      needs for it disappear when you reference the attribute you really depend on.
+  - title: Settings that protect data
+    body: |-
+      The lesson's replaced database container is the classic accident. Several settings
+      make it much harder.
+
+      ```text
+      resource "aws_db_instance" "orders" {
+        identifier                  = "orders"
+        engine                      = "postgres"
+        instance_class              = "db.t4g.medium"
+        allocated_storage           = 50
+        username                    = "app"
+        manage_master_user_password = true
+        deletion_protection         = true
+
+        lifecycle {
+          prevent_destroy = true
+        }
+      }
+
+      moved {
+        from = aws_instance.web
+        to   = module.web.aws_instance.this
+      }
+      ```
+
+      `prevent_destroy` makes any plan that would destroy this resource fail with an error,
+      including a forced replacement. `deletion_protection` is the provider's own guard: AWS
+      refuses to delete the database even if a plan or a person asks. Two locks, owned by
+      two systems. `manage_master_user_password` asks AWS to generate the password and keep
+      it in Secrets Manager, so it never appears in your files.
+
+      The `moved` block handles renames. Without it, moving `aws_instance.web` into a module
+      looks to the tool like one resource removed and a new one added, so it plans a destroy
+      and a create. With it, the tool updates the address in state and changes nothing real.
+
+      Two more lifecycle settings are worth knowing. `create_before_destroy` builds the
+      replacement first, so a server swap doesn't leave a gap. `ignore_changes` tells the
+      tool to leave an attribute alone when something else manages it, such as an
+      autoscaler's instance count. Use it narrowly, because it hides drift.
+  - title: State, environments and imports
+    body: |-
+      A team shares one state per environment in a remote backend. The S3 backend now locks
+      with a lock file in the bucket itself:
+
+      ```text
+      terraform {
+        backend "s3" {
+          bucket       = "example-tofu-state"
+          key          = "bookings/production.tfstate"
+          region       = "eu-west-2"
+          encrypt      = true
+          use_lockfile = true
+        }
+      }
+      ```
+
+      Turn on bucket versioning so a corrupted state can be rolled back, and restrict who can
+      read the bucket, since the state holds secrets. Marking a variable `sensitive = true`
+      hides it from plan output but not from state.
+
+      Split state by environment and by blast radius. A common layout is one directory per
+      environment that calls shared modules, each with its own state key. Staging and
+      production then can't be changed by the same apply, and a mistake in the networking
+      state can't touch the application state. One huge state is also slow: every plan
+      refreshes every resource in it.
+
+      Existing resources made by hand can be adopted. An `import` block names the real id
+      and the address it should have:
+
+      ```text
+      import {
+        to = aws_route53_record.www
+        id = "Z0123456789ABCDEFGHIJ_www.example.com_A"
+      }
+      ```
+
+      The next plan shows the import, and if your resource block doesn't match reality, the
+      changes it would make. Adjust the code until the plan is clean, then apply.
+  - title: A pipeline that plans and applies
+    body: |-
+      The pull request is the review. CI posts the plan on it, a person reads the plan, and
+      the merge triggers the apply. This workflow parses as valid YAML; the role ARNs are
+      placeholders.
+
+      ```yaml
+      name: infrastructure
+      on:
+        pull_request:
+          paths: ['infra/**']
+        push:
+          branches: [main]
+          paths: ['infra/**']
+
+      permissions:
+        contents: read
+        id-token: write # lets the job request an OIDC token
+        pull-requests: write
+
+      jobs:
+        plan:
+          if: github.event_name == 'pull_request'
+          runs-on: ubuntu-latest
+          defaults:
+            run:
+              working-directory: infra
+          steps:
+            - uses: actions/checkout@v5
+            - uses: opentofu/setup-opentofu@v1
+            - uses: aws-actions/configure-aws-credentials@v4
+              with:
+                role-to-assume: arn:aws:iam::123456789012:role/infra-plan
+                aws-region: eu-west-2
+            - run: tofu init -input=false
+            - run: tofu plan -input=false -no-color -out=pr.plan
+            - run: tofu show -no-color pr.plan > plan.txt
+            - run: gh pr comment ${{ github.event.pull_request.number }} --body-file plan.txt
+              env:
+                GH_TOKEN: ${{ github.token }}
+
+        apply:
+          if: github.event_name == 'push'
+          runs-on: ubuntu-latest
+          environment: production # required reviewers approve before this job runs
+          concurrency: infra-production
+          defaults:
+            run:
+              working-directory: infra
+          steps:
+            - uses: actions/checkout@v5
+            - uses: opentofu/setup-opentofu@v1
+            - uses: aws-actions/configure-aws-credentials@v4
+              with:
+                role-to-assume: arn:aws:iam::123456789012:role/infra-apply
+                aws-region: eu-west-2
+            - run: tofu init -input=false
+            - run: tofu plan -input=false -out=release.plan
+            - run: tofu apply -input=false release.plan
+      ```
+
+      The apply job plans again, because main may have moved since the pull request, and
+      applies exactly that saved plan. The `production` environment can require an approver
+      who sees the job before it starts. `concurrency` stops two applies overlapping, on top
+      of the state lock.
+  - title: Letting CI in without stored keys
+    body: |-
+      With OIDC, the pipeline proves who it is with a token GitHub signs for each run, and
+      AWS swaps it for credentials that expire within the hour. The role's **trust policy**
+      decides which runs may do that:
+
+      ```json
+      {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Principal": {
+              "Federated": "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com"
+            },
+            "Action": "sts:AssumeRoleWithWebIdentity",
+            "Condition": {
+              "StringEquals": {
+                "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+                "token.actions.githubusercontent.com:sub": "repo:example-org/bookings:environment:production"
+              }
+            }
+          }
+        ]
+      }
+      ```
+
+      The `sub` condition is the one that matters. It limits the apply role to jobs in one
+      repository running in the `production` environment. Leave it out, or use a wildcard
+      like `repo:example-org/*`, and any workflow in the organisation, including one in a
+      pull request from a branch, could take the role.
+
+      Split the power between two roles. The **plan role** gets read-only access, since a
+      plan only reads, and can be used by every pull request. The **apply role** can change
+      things, and is trusted only from the protected environment. Its permissions policy
+      still names services and resources rather than `*`, and a permissions boundary can cap
+      the most it could ever be granted. Least privilege for pipelines is the same rule as for
+      the photo resizer in the lesson, applied to the identity with the most access you have.
+pitfalls:
+  - '**Reviewing the diff and skipping the plan.** A one-line change can force a replacement that empties a database. Post the plan on the pull request and read every `-/+` and destroy.'
+  - '**Committing state to Git.** It holds passwords and keys in plain text. Use a remote, encrypted, versioned backend with locking, and restrict who can read it.'
+  - '**Renaming a resource without a `moved` block.** The tool sees a removal and an addition, and plans to destroy the real thing. Add a `moved` block with every rename or refactor into a module.'
+  - '**Fixing things by hand in the console.** The next plan undoes the change, or the code no longer describes reality. Make the change in code, or check drift with `tofu plan -refresh-only` and copy it into the code.'
+  - '**One state for everything.** Plans get slow and one bad apply can touch every environment. Split state by environment and by blast radius.'
+  - '**Long-lived admin keys in CI secrets.** A leaked key is a leaked account. Use OIDC with a trust policy pinned to the repository and environment, and separate plan and apply roles.'
+interview:
+  - question: Why use infrastructure as code rather than configuring the cloud console by hand?
+    answer: >-
+      Because it makes infrastructure reviewable, repeatable and recoverable. Every change
+      goes through a pull request with a plan that shows exactly what will be created,
+      changed or destroyed, so a second person catches mistakes before they happen. The same
+      code builds staging and production, so they don't drift apart, and after an accident
+      or for a new region, you rebuild from the files instead of from memory. Git history
+      records who changed what and why. The costs are a learning curve, a state file to
+      protect, and a stricter process for urgent changes: a hot fix in the console must be
+      copied back into code, or the next apply undoes it.
+  - question: A plan shows a database will be replaced. What do you do?
+    answer: >-
+      Stop, and find out which attribute forces the replacement, because replacing a database
+      creates an empty one. The plan marks the attribute with "forces replacement". Often
+      it's avoidable: a rename that needs a `moved` block, a default that changed in a
+      provider upgrade, or an attribute that can be set with `ignore_changes` if something
+      else manages it. If the change is truly needed, such as a major version upgrade, I'd
+      plan it as a migration: backup, restore into the new resource or use the provider's
+      in-place upgrade path, then switch traffic. To stop this reaching production by
+      accident, the database gets `prevent_destroy` and the provider's deletion protection,
+      so the apply fails instead.
+  - question: How do you manage state for a team?
+    answer: >-
+      In a remote backend with locking, encryption and versioning, split by environment and
+      blast radius. Remote so everyone and CI use the same state; locking so two applies
+      can't interleave and corrupt it; encryption and tight read access because it holds
+      secrets in plain text; versioning so a bad write can be rolled back. On AWS that's an
+      S3 bucket with `use_lockfile`. I'd give each environment and each major area, such as
+      networking and application, its own state key, so plans stay fast and one mistake has
+      a limited reach. Applies run only from CI, so nobody's laptop holds apply credentials.
+      The trade-off of splitting is wiring outputs between states, which adds some plumbing.
+  - question: How should a CI pipeline authenticate to your cloud account?
+    answer: >-
+      With OIDC federation and short-lived credentials, never stored access keys. The CI
+      provider signs a token for each run describing the repository, branch and environment.
+      The cloud account trusts that issuer, and a role's trust policy only accepts tokens
+      whose subject matches, for example one repository's production environment. The run
+      gets credentials that expire within the hour, so there's nothing long-lived to leak or
+      rotate. I'd have separate roles: read-only for plans on pull requests, and a narrower
+      write role for applies, trusted only from a protected environment with required
+      reviewers. The trade-off is setup effort and care with the conditions: a wildcard
+      subject can let any workflow in the organisation assume the role.

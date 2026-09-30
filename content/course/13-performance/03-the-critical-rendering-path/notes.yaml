@@ -1,0 +1,281 @@
+summary: >-
+  The critical rendering path is everything the browser must do between receiving bytes and
+  painting the first pixels: parse the HTML into the DOM, parse the CSS into the CSSOM,
+  compute styles, lay out the boxes, paint and composite. Anything the browser must wait
+  for on that path keeps the screen blank. Stylesheets block rendering, and plain scripts
+  block the parser, so both sit on it by default.
+
+
+  The lesson shows the two biggest blockers and their fixes: slow CSS, plain scripts in the
+  head, a lazy hero image and a late-found font. These notes fill in the rest of the
+  pipeline, the full set of script loading modes, the other resource hints, and how fonts
+  and CSS delivery shape the first paint.
+
+
+  You work on this path when first paint or LCP is slow while the server answers quickly.
+  The method is always the same: open the network waterfall, find what the first paint
+  waited for, and either make it smaller, make it start sooner, or take it off the path.
+remember:
+  - The first paint needs the HTML parsed so far and every render-blocking stylesheet, so slow CSS keeps the screen blank.
+  - A classic script without `defer` or `async` stops the parser until it downloads and runs, and it also waits for pending stylesheets before it runs.
+  - "`defer` scripts download in parallel and run after parsing, in document order, before `DOMContentLoaded`, while `async` scripts run as soon as they arrive, in any order."
+  - Module scripts are deferred by default, and scripts inserted from JavaScript are async by default.
+  - After parsing comes style, layout, paint and composite, and changes to `transform` and `opacity` can skip layout and paint.
+  - "`preload` fetches something needed on this page now, `preconnect` opens a connection early, and `prefetch` fetches something for a likely next page at low priority."
+  - The preload scanner finds resources in the raw HTML early, but it can't see files named inside CSS or added by JavaScript.
+  - Preload sparingly, because every early request competes for bandwidth with the CSS the first paint is waiting for.
+sections:
+  - title: The whole pipeline, from bytes to pixels
+    body: |-
+      The lesson stops at layout and paint. The full sequence in a modern browser runs like
+      this:
+
+      1. **Parse HTML** into the DOM, incrementally, as bytes arrive. The browser doesn't
+         wait for the whole document.
+      2. **Parse CSS** into the CSSOM. Unlike HTML, CSS can't be used half-parsed, because a
+         rule at the end of a file can override one at the start.
+      3. **Style**: match selectors to elements and compute every property's final value.
+      4. **Layout**: work out each box's size and position from the computed styles and the
+         viewport.
+      5. **Paint**: record the drawing commands for text, colours, borders and images.
+      6. **Composite**: split the page into layers, rasterise them and combine them on the
+         GPU into the frame you see.
+
+      This order explains why some updates are cheaper than others. Changing `width` or
+      adding an element invalidates layout, which invalidates paint for everything
+      affected. Changing a colour skips layout but repaints. Changing `transform` or
+      `opacity` on an element with its own layer can skip both, and the compositor thread
+      can even run that animation while the main thread is busy.
+
+      It also explains **layout thrashing**. If your code writes a style, then reads a
+      geometry value such as `offsetHeight`, the browser must run layout right away to give
+      a correct answer. Do that in a loop and you run layout once per item:
+
+      ```js
+      // Slow: each read forces layout because the previous write invalidated it.
+      for (const row of rows) {
+        row.style.height = `${row.scrollHeight}px`;
+      }
+
+      // Fast: read everything first, then write everything.
+      const heights = rows.map((row) => row.scrollHeight);
+      rows.forEach((row, i) => {
+        row.style.height = `${heights[i]}px`;
+      });
+      ```
+
+      The Performance panel flags a forced reflow with a warning on the layout event, which
+      is how you find them.
+  - title: Every way to load a script
+    body: |-
+      The lesson covers plain, `defer` and `async`. The full picture has a few more rows.
+
+      ```text
+      script                       parser blocked   runs                              order kept
+      <script src>                 yes              as soon as it arrives             yes
+      <script src defer>           no               after parsing, before DCL         yes
+      <script src async>           no               as soon as it arrives             no
+      <script type=module src>     no               after parsing, before DCL         yes
+      <script type=module async>   no               once it and its imports arrive    no
+      inline <script>              yes              at once                           yes
+      injected by JavaScript       no               as soon as it arrives             no
+      ```
+
+      DCL is the `DOMContentLoaded` event. Three details matter in practice.
+
+      First, `defer` and `async` do nothing on an inline classic script, because there is
+      nothing to download. Inline module scripts are still deferred.
+
+      Second, a parser-blocking script also waits for any stylesheet above it that is still
+      loading, because the script might read computed styles. So a slow stylesheet followed
+      by an inline script stalls parsing, not only painting. Put inline scripts that don't
+      read styles above the stylesheet link, or defer the work.
+
+      Third, `DOMContentLoaded` waits for deferred scripts to run, but not for async ones.
+      Code that listens for `DOMContentLoaded` inside an async script may register after
+      the event has fired and never run.
+
+      A quick rule: use `defer` (or a module) for your application code, because it needs
+      the DOM and usually depends on order. Use `async` for independent scripts such as
+      analytics. Keep plain blocking scripts for the rare case where something must run
+      before the page renders, such as setting a theme class to avoid a flash, and keep
+      those tiny and inline.
+  - title: Resource hints, and when each one helps
+    body: |-
+      Each hint answers a different question. Getting them confused wastes bandwidth.
+
+      ```html
+      <!-- This page needs this file, and the browser would find it late. -->
+      <link rel="preload" href="/fonts/body.woff2" as="font" type="font/woff2" crossorigin>
+
+      <!-- This page will fetch from this origin soon: do DNS, TCP and TLS now. -->
+      <link rel="preconnect" href="https://images.example.com">
+
+      <!-- A cheaper fallback that only resolves the name. -->
+      <link rel="dns-prefetch" href="https://images.example.com">
+
+      <!-- The next page will probably need this: fetch it when idle, low priority. -->
+      <link rel="prefetch" href="/checkout.js">
+
+      <!-- Fetch an ES module early, ready for a later import. -->
+      <link rel="modulepreload" href="/editor.js">
+      ```
+
+      **Preload** is for this page's late-discovered critical files: fonts named in CSS, a
+      hero image set as a CSS background, a script that another script imports. `as` sets the
+      request's priority and type, and it must match how the file is used, or the browser
+      fetches it twice. Chrome warns in the console when a preloaded file isn't used within
+      a few seconds of load, which is a sign the preload is wasted.
+
+      **Preconnect** saves a connection setup, often a few hundred milliseconds on mobile
+      networks, for a third-party origin you will certainly use early. Keep it to two or
+      three origins, because each open connection costs the device.
+
+      **fetchpriority** doesn't fetch anything earlier by itself. It reorders requests the
+      browser already knows about: `high` for the LCP image, `low` for a carousel's hidden
+      slides.
+
+      The best hint is often no hint. If the hero image is a plain `img` in the HTML, eager,
+      the preload scanner finds it within milliseconds. Hints fix discovery problems you
+      created elsewhere.
+  - title: Delivering CSS and fonts without blocking
+    body: |-
+      All CSS in the head is render-blocking, and the first paint waits for the slowest file.
+      Four techniques shorten that wait.
+
+      **Avoid chains.** A stylesheet that uses `@import` isn't known to the browser until
+      the first file has arrived and been parsed, so the two downloads happen one after the
+      other. Link each file from the HTML instead, or let the build tool combine them.
+
+      **Split by media.** A stylesheet whose `media` doesn't match, such as print, still
+      downloads but doesn't block rendering.
+
+      ```html
+      <link rel="stylesheet" href="/site.css">
+      <link rel="stylesheet" href="/print.css" media="print">
+      <link rel="stylesheet" href="/wide.css" media="(min-width: 1024px)">
+      ```
+
+      **Inline the critical CSS.** For pages where the first view matters most, the styles
+      for above-the-fold content can go in a `style` element in the head, and the rest loads
+      without blocking. This saves a round trip but loses caching for the inlined part, so it
+      suits landing pages more than apps people revisit.
+
+      **Choose a font strategy.** Text using a web font is invisible or in a fallback until
+      the font arrives. `font-display` decides which:
+
+      ```css
+      @font-face {
+        font-family: "Body";
+        src: url("/fonts/body.woff2") format("woff2");
+        font-display: swap; /* show the fallback now, swap when the font arrives */
+      }
+      ```
+
+      `swap` shows text at once but can shift layout when the font lands. `optional` gives
+      the font a very short window and otherwise keeps the fallback for that page view, which
+      avoids both invisible text and the shift. Preloading the font makes either work better.
+      Self-hosting fonts avoids an extra connection to a font provider's origin.
+  - title: A delay lab you can run
+    body: |-
+      Waterfalls make sense fastest when you control the delays. This small server makes
+      every file wait for the time in its query string, so you can watch the first paint
+      move in the Performance panel.
+
+      ```js
+      import { createServer } from "node:http";
+
+      // Every file waits for the delay in its query string: /site.css?delay=2000
+      const pages = {
+        "/": [
+          "text/html",
+          `<!doctype html>
+      <html lang="en">
+        <head>
+          <title>Delay lab</title>
+          <link rel="stylesheet" href="/site.css?delay=2000">
+          <script src="/app.js?delay=1000" defer></script>
+        </head>
+        <body><h1>Opening hours</h1></body>
+      </html>`,
+        ],
+        "/site.css": ["text/css", "h1 { color: teal; }"],
+        "/app.js": ["text/javascript", "console.log('app ran', performance.now());"],
+      };
+
+      createServer((req, res) => {
+        const url = new URL(req.url, "http://localhost");
+        const page = pages[url.pathname];
+        if (!page) return res.writeHead(404).end();
+        const delay = Number(url.searchParams.get("delay") ?? 0);
+        setTimeout(() => {
+          res.writeHead(200, { "content-type": page[0], "cache-control": "no-store" });
+          res.end(page[1]);
+        }, delay);
+      }).listen(8080, () => console.log("http://localhost:8080"));
+      ```
+
+      Save it as `server.mjs`, run `node server.mjs`, open the page and record a reload.
+      The heading paints at about two seconds, when the CSS arrives. Now try variations and
+      predict each result first: add `media="print"` to the link, remove `defer`, then remove
+      it and raise the script's delay to 3000. Some change the first paint and some don't,
+      because the paint waits for the slowest blocker, and the preload scanner starts both
+      downloads at once.
+
+      Then try an image. Add `"/hero.jpg": ["image/jpeg", ""]` to `pages`, and an `img`
+      pointing at `/hero.jpg` with `loading="lazy"` to the body. Its request waits for the
+      CSS, because a lazy image needs layout first. Remove `loading="lazy"` and the request
+      starts within milliseconds. Ten minutes with this lab teaches the waterfall better than any diagram.
+pitfalls:
+  - "**Preloading everything that matters.** Every preload is a high-priority request competing with the CSS the first paint needs. Preload only late-discovered critical files, and check the console for unused-preload warnings."
+  - "**A preload whose `as` or `crossorigin` doesn't match the real request.** The browser can't reuse the preloaded response, so the file downloads twice. Match `as` to the use, and add `crossorigin` for fonts."
+  - "**Chaining stylesheets with `@import`.** The imported file is only found after the first one arrives, so downloads run in series. Link each file from the HTML or bundle them."
+  - "**Using `async` for scripts that depend on each other.** Async scripts run in arrival order, so a plugin can run before its library. Use `defer` or modules when order matters."
+  - "**Reading layout inside a loop of style writes.** Each read of `offsetHeight` or `getBoundingClientRect()` after a write forces a fresh layout. Batch all reads, then all writes."
+  - "**Setting the hero image from JavaScript or as a CSS background.** The preload scanner can't see it, so its download starts late and LCP suffers. Put it in the HTML as an eager `img`, or preload it."
+interview:
+  - question: Walk me through what the browser does from receiving HTML to showing pixels.
+    answer: >-
+      It parses HTML into the DOM and CSS into the CSSOM, computes styles, runs layout,
+      paints and composites. Parsing is incremental, so the browser starts before the
+      document has fully arrived, and a preload scanner reads ahead to start fetching
+      images, scripts and stylesheets early. CSS is render-blocking because a rule anywhere in
+      a file can change any element, so the first paint waits for all stylesheets in the
+      head. A classic script without `defer` or `async` pauses the parser while it downloads
+      and runs, and waits for pending CSS first. After style and layout, paint records drawing
+      commands and the compositor combines layers on the GPU. The practical point is that
+      the first paint waits for the slowest thing on that path, so I'd find it in the
+      waterfall and shrink it, start it sooner or take it off the path.
+  - question: What's the difference between `defer` and `async`, and when would you use each?
+    answer: >-
+      Both download without blocking the parser; they differ in when the script runs.
+      `defer` runs after the document is parsed, in document order, before
+      `DOMContentLoaded`. `async` runs the moment it arrives, possibly mid-parse, in whatever
+      order files arrive. So `defer` suits application code that needs the DOM and depends
+      on other scripts, and `async` suits independent scripts such as analytics or an
+      advert loader. Module scripts behave like `defer` by default. Neither attribute does
+      anything on an inline classic script. The trade-off with `async` is unpredictability:
+      it can run before the DOM you need exists and can interrupt parsing, so for anything
+      with dependencies I'd choose `defer`.
+  - question: A page's first paint is slow even though the server responds in 100 ms. How do you find and fix the cause?
+    answer: >-
+      Something on the critical rendering path is slow, so I'd record the load in the
+      Performance panel and read the network waterfall up to the first paint. Usual
+      suspects are a large or slow stylesheet, a chain of `@import`s, a stylesheet from a
+      slow third-party origin, and a plain script in the head. Fixes follow the cause: shrink
+      and combine CSS, link files directly instead of importing, split non-matching media
+      into their own files, inline critical CSS on landing pages, preconnect to a needed
+      third-party origin, and put `defer` or `async` on scripts. Then I'd check that LCP
+      moved too, since the hero image may be the next bottleneck. I'd avoid adding preloads
+      blindly, because they compete with the CSS the paint is waiting for.
+  - question: When would you use `preload`, `prefetch` and `preconnect`?
+    answer: >-
+      Preload is for a critical file on this page that the browser would find late,
+      prefetch is for the next page, and preconnect is for an origin I'll use soon. A font
+      referenced inside CSS is the classic preload, with `as="font"` and `crossorigin` so the
+      preloaded response is reused. Prefetch fetches at low priority when the browser is idle,
+      for example the checkout script from the cart page. Preconnect does DNS, TCP and TLS
+      ahead of time for a third-party origin such as an image CDN, and I'd keep it to two or
+      three origins. The trade-off is contention: preloads are high priority, so each one
+      delays something else. I'd first try to make resources discoverable in the HTML and use
+      hints only where that isn't possible.

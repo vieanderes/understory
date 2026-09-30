@@ -1,0 +1,293 @@
+summary: >-
+  A shared component is used far more often than it's read. Dozens of people call `Button`
+  without opening its file, so its props are an **API**: a contract that should make the right
+  use obvious and the wrong use impossible or at least loud. The best components build on the
+  matching native element, so keyboard, focus and semantics come free, and they expose a small,
+  closed set of options instead of a pile of style props.
+
+
+  TypeScript is what closes the set. A variant typed as a union of string literals turns
+  `variant="secondary"` into a compile error, a `Record` over that union makes a missing style
+  a compile error, and a discriminated union can forbid combinations, such as a control that's
+  both a link and a button. The type becomes the documentation and the reviewer at once.
+
+
+  The harder questions are about shape. Should a card take a `title` prop, or let callers
+  compose a `CardTitle`? Should a button accept `as="a"`? These choices trade control for
+  flexibility. Configuration keeps the design consistent but grows props forever. Composition
+  stays small but lets people build things the system never intended. Knowing the trade-off is
+  what separates a component library that lasts from one that gets forked.
+remember:
+  - A design system component renders the matching native element, so a `Button` renders `button` and a link renders `a` with a real `href`.
+  - A variant is one value from a closed union of string literals, so an unknown variant fails type checking in the editor.
+  - A `Record` or `satisfies Record` over the variant union makes a missing mapping a compile error.
+  - Extend the native props with `ComponentPropsWithRef<'button'>`, so `onClick`, `disabled`, `aria-*` and, in React 19, `ref` pass through without extra code.
+  - Close what the system owns, such as `className` and `style`, by omitting them from the props type.
+  - A discriminated union with `never` fields forbids impossible prop combinations, such as `href` and `onClick` together.
+  - Configuration props keep a layout consistent but grow without end, while composition with `children` stays small and flexible.
+  - A polymorphic `as` prop is flexible but lets callers break semantics and makes types slower and errors harder to read, so prefer a separate component or a union.
+sections:
+  - title: Extend the native element, close the style
+    body: |-
+      A production `Button` accepts everything a `button` accepts, except what the design
+      system owns. `ComponentPropsWithRef<'button'>` is the element's full prop type, and
+      `Omit` removes the escape hatches:
+
+      ```tsx
+      import type { ComponentPropsWithRef } from 'react';
+
+      export type Variant = 'plain' | 'primary' | 'danger';
+      export type Size = 'small' | 'medium';
+
+      // satisfies checks every variant has a class, and keeps the literal types.
+      const variantClass = {
+        plain: 'button-plain',
+        primary: 'button-primary',
+        danger: 'button-danger',
+      } satisfies Record<Variant, string>;
+
+      type ButtonProps = Omit<ComponentPropsWithRef<'button'>, 'className' | 'style'> & {
+        variant?: Variant;
+        size?: Size;
+      };
+
+      export function Button({ variant = 'plain', size = 'medium', type = 'button', ...rest }: ButtonProps) {
+        // rest carries onClick, disabled, aria-*, ref and children through untouched.
+        return (
+          <button {...rest} type={type} className={`button ${variantClass[variant]}`} data-size={size} />
+        );
+      }
+      ```
+
+      Rendered with `react-dom/server`:
+
+      ```tsx
+      <Button variant="danger" aria-describedby="warn" onClick={() => {}}>Delete</Button>
+      // <button aria-describedby="warn" type="button" class="button button-danger" data-size="medium">Delete</button>
+
+      <Button type="submit">Save</Button>
+      // <button type="submit" class="button button-plain" data-size="medium">Save</button>
+
+      <Button variant="secondary">Back</Button> // type error: not a Variant
+      <Button className="red">Back</Button>     // type error: className is not a prop
+      ```
+
+      Three details matter. `type` defaults to `button`, because a `button` inside a form
+      submits it by default. The spread comes before the props the component controls, so a
+      caller can't override `className` at run time either. And in React 19 `ref` is an ordinary
+      prop on function components, so there's no `forwardRef` wrapper.
+
+      Sizes and variants often combine, such as a small danger button. Libraries such as
+      `class-variance-authority` map each option to classes and support compound rules for
+      combinations. The principle is the same as the `Record`: every allowed value has a
+      mapping, and nothing else is accepted.
+  - title: Make impossible states unrepresentable
+    body: |-
+      Many prop bugs are combinations that make no sense: a link with a click handler that
+      prevents navigation, a loading button that can still be pressed. A **discriminated union**
+      lists the valid shapes, and `never` marks a prop as forbidden in a shape.
+
+      ```tsx
+      import type { ReactNode } from 'react';
+
+      type Common = { children: ReactNode };
+      type AsLink = Common & { href: string; onClick?: never };
+      type AsAction = Common & { onClick: () => void; href?: never };
+      type ActionProps = AsLink | AsAction;
+
+      function Action(props: ActionProps) {
+        // Checking href narrows props to AsLink here, and to AsAction below.
+        if (props.href !== undefined) {
+          return <a className="action" href={props.href}>{props.children}</a>;
+        }
+        return (
+          <button type="button" className="action" onClick={props.onClick}>
+            {props.children}
+          </button>
+        );
+      }
+
+      <Action href="/orders/42">View order</Action>;
+      // <a class="action" href="/orders/42">View order</a>
+      <Action onClick={() => {}}>Cancel order</Action>;
+      // <button type="button" class="action">Cancel order</button>
+      <Action href="/orders/42" onClick={() => {}}>Both</Action>; // type error
+      <Action>Nothing</Action>; // type error
+      ```
+
+      The same idea protects internal mappings. A `switch` over a union with a `never` check in
+      the default branch fails to compile when someone adds a member:
+
+      ```ts
+      type Tone = 'info' | 'success' | 'warning' | 'danger';
+
+      function iconFor(tone: Tone): string {
+        switch (tone) {
+          case 'info':
+            return 'info';
+          case 'success':
+            return 'check';
+          case 'warning':
+            return 'triangle-alert';
+          case 'danger':
+            return 'octagon-x';
+          default: {
+            // Add a Tone without a case and this line stops compiling.
+            const unhandled: never = tone;
+            throw new Error(`Unknown tone: ${String(unhandled)}`);
+          }
+        }
+      }
+
+      console.log(iconFor('warning')); // triangle-alert
+      ```
+
+      Adding `'neutral'` to `Tone` gives `Type '"neutral"' is not assignable to type 'never'`,
+      pointing at the exact place to update.
+  - title: Composition or configuration
+    body: |-
+      A **configured** component takes data and owns the layout. A **composed** component offers
+      small parts and lets callers arrange them with `children`.
+
+      ```tsx
+      import type { ReactNode } from 'react';
+
+      // Configuration: the component owns the layout, callers fill in data.
+      type ConfigCardProps = {
+        title: string;
+        description?: string;
+        primaryAction?: { label: string; onClick: () => void };
+      };
+
+      function ConfigCard({ title, description, primaryAction }: ConfigCardProps) {
+        return (
+          <section className="card">
+            <h2>{title}</h2>
+            {description && <p>{description}</p>}
+            {primaryAction && (
+              <button type="button" onClick={primaryAction.onClick}>
+                {primaryAction.label}
+              </button>
+            )}
+          </section>
+        );
+      }
+
+      // Composition: small parts, callers arrange them.
+      function Card({ children }: { children: ReactNode }) {
+        return <section className="card">{children}</section>;
+      }
+      function CardTitle({ children }: { children: ReactNode }) {
+        return <h2 className="card-title">{children}</h2>;
+      }
+      function CardFooter({ children }: { children: ReactNode }) {
+        return <div className="card-footer">{children}</div>;
+      }
+      ```
+
+      Configuration guarantees consistency: every card has its title in the same place, with
+      the same heading level. But each new need becomes a prop, such as a second action, a badge,
+      an icon or a link in the description, and after a year the props list is long and the
+      combinations untested. Composition absorbs new needs without changes, since a caller can
+      put a `strong` in the text or a link in the footer. The cost is that callers can also put
+      things in the wrong order, or skip the title.
+
+      Most mature systems mix the two. Structural parts that must be right, such as a dialog's
+      title wiring or a field's label and error, are configured, because getting them wrong
+      breaks accessibility. Content areas are composed. A useful test: if two teams would want
+      different markup in a slot, make it `children` or a `ReactNode` prop; if they must get the
+      same markup, own it.
+  - title: Polymorphism and its costs
+    body: |-
+      A **polymorphic** component renders a different element depending on a prop, usually
+      `as`. It's popular for text and layout primitives:
+
+      ```tsx
+      import type { ComponentPropsWithoutRef, ElementType } from 'react';
+
+      type TextOwnProps<E extends ElementType> = {
+        as?: E;
+        tone?: 'default' | 'muted';
+      };
+
+      type TextProps<E extends ElementType> = TextOwnProps<E> &
+        Omit<ComponentPropsWithoutRef<E>, keyof TextOwnProps<E>>;
+
+      function Text<E extends ElementType = 'span'>({ as, tone = 'default', ...rest }: TextProps<E>) {
+        const Tag: ElementType = as ?? 'span';
+        return <Tag data-tone={tone} {...rest} />;
+      }
+
+      <Text>Saved</Text>;
+      // <span data-tone="default">Saved</span>
+      <Text as="label" htmlFor="email" tone="muted">Email</Text>;
+      // <label data-tone="muted" for="email">Email</label>
+      <Text htmlFor="email">Email</Text>; // type error: a span has no htmlFor
+      <Text as="div" onClick={() => {}}>Save</Text>;
+      // <div data-tone="default">Save</div>, compiles, and nobody can reach it by keyboard
+      ```
+
+      The typing works: props follow the chosen element. But the costs are real. Generic prop
+      types slow the type checker and produce long error messages. The `const Tag: ElementType`
+      line throws away type safety inside the component. And the last example compiles: a caller
+      turned text into a clickable `div` with no role and no keyboard support, which is the
+      exact bug the design system existed to prevent.
+
+      So polymorphism suits primitives with no behaviour, such as `Text`, `Box` or `Stack`,
+      where the element choice is about semantics like `h2` or `p`. For interactive components,
+      prefer a closed choice: an `Action` union as in the previous section, or two components,
+      `Button` and `ButtonLink`, sharing the same variant classes. Some libraries offer an
+      `asChild` prop that merges the component's props onto a child element you pass, which
+      keeps the element explicit in the caller's JSX, but it has the same risk if the child isn't
+      interactive.
+pitfalls:
+  - '**Rendering a `div` with `onClick`.** It looks like a button and fails every keyboard and screen reader user. Render `button`, or `a` with `href` for navigation.'
+  - '**Forgetting `type="button"`.** A `button` inside a `form` submits it by default, so a Cancel button saves the form. Default `type` to `button` in the component.'
+  - '**Accepting `className` and `style` on design system components.** Every override is a fork of the design that no token change can reach. Omit them, and add a variant when a real need appears.'
+  - '**Boolean props for variants.** `primary`, `danger` and `ghost` as separate booleans allow `primary danger` together. Use one `variant` prop typed as a union.'
+  - '**Spreading props after the controlled ones.** `<button className={cls} {...rest}>` lets a stray `className` in `rest` replace the system''s classes. Spread first, then set what the component owns.'
+  - '**Using `disabled` when people need to know why.** A disabled button leaves the Tab order, so its explanation can''t be reached. Use `aria-disabled="true"`, refuse the action in the handler, and link the reason with `aria-describedby`.'
+interview:
+  - question: How would you design the props of a shared Button component?
+    answer: >-
+      I'd build it on the native `button`, extend its props, and close everything the design
+      system owns. The props type is `ComponentPropsWithRef<'button'>` with `className` and
+      `style` omitted, plus `variant` and `size` typed as string literal unions with defaults.
+      That keeps `onClick`, `disabled`, `aria-*` and `ref` working with no extra code, while
+      unknown variants fail to compile. Inside, a `Record` or `satisfies Record` maps each
+      variant to classes, so a new variant without styles is also a compile error, and `type`
+      defaults to `button` so it never submits a form by accident. Navigation gets a separate
+      `ButtonLink` or a union with `href`. The trade-off is rigidity: teams can't restyle a
+      button ad hoc, so there needs to be a quick path for proposing a new variant.
+  - question: Composition or configuration for a component API, and how do you choose?
+    answer: >-
+      I choose per slot: configure what must be identical everywhere, compose what varies.
+      Configuration, such as a `title` prop, guarantees consistent structure and correct
+      accessibility wiring, but each new need becomes another prop, and combinations multiply
+      until nobody tests them. Composition with `children` or `ReactNode` slots stays small and
+      absorbs new needs, but callers can arrange parts wrongly or omit required ones. So a form
+      field configures its label, hint and error, because the `id` and `aria-describedby`
+      links must be right, while a card composes its body and footer, because teams want
+      different content there. If two teams would legitimately want different markup in a
+      slot, it should be composable.
+  - question: What are the trade-offs of a polymorphic `as` prop?
+    answer: >-
+      It gives flexibility at the cost of type complexity and safety. With a generic props
+      type, `<Text as="label" htmlFor="email">` type-checks the label's props, which is neat.
+      But generic element types slow down the compiler and produce long, confusing errors,
+      the implementation usually casts to `ElementType` and loses checking inside, and callers
+      can pick elements that break semantics, such as `as="div"` with an `onClick`, which the
+      types happily allow. I'd use it for behaviour-free primitives such as text and layout
+      boxes, where the choice is about semantics like a heading or a paragraph. For interactive
+      components I'd offer closed alternatives, a discriminated union or separate `Button` and
+      `ButtonLink` components, so an inaccessible combination can't be written.
+  - question: How do you stop a component from being given contradictory props?
+    answer: >-
+      With a discriminated union of the valid shapes, using `never` to forbid a prop in the
+      shapes where it doesn't belong. For a control that's either a link or an action, one
+      branch is `{ href: string; onClick?: never }` and the other is `{ onClick: () => void;
+      href?: never }`, so passing both, or neither, fails to compile. Inside, checking `href`
+      narrows the props, and the component renders `a` or `button` accordingly. For values
+      mapped inside the component, a `switch` with a `const unhandled: never` default makes
+      every new union member a compile error until it's handled. The cost is more elaborate
+      types and error messages, so I keep the unions small and name each branch.

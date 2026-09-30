@@ -1,0 +1,323 @@
+summary: >-
+  A test double stands in for a real dependency during a test, so you can test code that
+  charges cards, sends email or reads the clock without doing any of those things. Doubles
+  make tests fast and deterministic, and let you set up cases that are hard to produce for
+  real, such as a declined card or a provider timeout.
+
+
+  Every double is also a claim about how the real thing behaves, and the claim can be
+  wrong. A stub that returns last year's response shape keeps a test green while
+  production breaks. So the skill is knowing where to put them: at the boundary with
+  systems you don't own, behind an interface you do. Your own database is not such a
+  boundary. Its constraints and queries are your logic, and they get tested against a real
+  database engine.
+
+
+  These notes cover the five kinds of double and how Vitest builds them with `vi.fn`,
+  `vi.spyOn` and `vi.mock`, the cost of over-mocking, and a complete integration test on a
+  real PostgreSQL started by Testcontainers, with each test rolled back.
+remember:
+  - A dummy fills a parameter, a stub returns canned answers, a spy records calls, a mock is a spy with expectations about how it's called, and a fake is a working lightweight version.
+  - Replace only what you don't own, such as payment, email and the clock, behind an interface you do own, and keep your own code and database real.
+  - Prefer asserting on results and state, and assert on calls only when the call is the behaviour, such as an email being sent.
+  - '`vi.fn()` creates a spy you can program with `mockResolvedValue` or `mockReturnValueOnce`, and `toHaveBeenCalledWith` asserts on its recorded calls.'
+  - '`vi.spyOn(object, ''method'')` wraps a real method, and `vi.restoreAllMocks()` puts the original back.'
+  - '`vi.mock(path, factory)` is hoisted above the imports and replaces the module for every importer in that test file.'
+  - A stub freezes the other side's API on the day it was written, so pair stubs with contract or integration tests against the real thing.
+  - An integration test on the database uses the production engine, runs migrations once, and wraps each test in a transaction that is rolled back.
+sections:
+  - title: The five doubles, and what Vitest gives you
+    body: |-
+      The names come from Gerard Meszaros's *xUnit Test Patterns*, and interviewers use them
+      loosely, so it helps to know the precise meanings.
+
+      - A **dummy** is passed only to fill a parameter and is never used, such as a logger
+        the path under test never touches.
+      - A **stub** returns canned answers so the code under test can run: `charge` always
+        answers `{ ok: false }`.
+      - A **spy** records how it was called, so the test can assert afterwards.
+      - A **mock** is set up with expectations in advance and fails if the calls don't
+        match. In everyday JavaScript talk, a spy you assert on gets called a mock too.
+      - A **fake** is a working implementation that takes a shortcut, such as an in-memory
+        repository backed by a `Map`.
+
+      Stubs and fakes support **state verification**: run the code, then check the result.
+      Spies and mocks support **behaviour verification**: check which calls were made.
+      State verification survives refactoring better, so reach for it first.
+
+      In Vitest, `vi.fn()` gives one object that can be a stub, a spy or both:
+
+      ```ts
+      import { describe, expect, test, vi } from 'vitest';
+
+      interface Payments { charge(amountPence: number): Promise<{ ok: boolean }> }
+      interface Mail { send(to: string, text: string): Promise<void> }
+
+      async function checkout(
+        order: { email: string; totalPence: number },
+        payments: Payments,
+        mail: Mail,
+      ) {
+        const result = await payments.charge(order.totalPence);
+        if (!result.ok) return { paid: false };
+        await mail.send(order.email, 'Thanks for your order');
+        return { paid: true };
+      }
+
+      const order = { email: 'sam@example.com', totalPence: 1299 };
+
+      describe('checkout', () => {
+        test('charges the total and emails a receipt', async () => {
+          const payments = { charge: vi.fn().mockResolvedValue({ ok: true }) };
+          const mail = { send: vi.fn().mockResolvedValue(undefined) };
+
+          const result = await checkout(order, payments, mail);
+
+          expect(result).toEqual({ paid: true });
+          expect(payments.charge).toHaveBeenCalledWith(1299);
+          expect(mail.send).toHaveBeenCalledExactlyOnceWith('sam@example.com', expect.any(String));
+        });
+
+        test('lets a provider outage reach the caller', async () => {
+          const payments = { charge: vi.fn().mockRejectedValue(new Error('timeout')) };
+          const mail = { send: vi.fn() };
+
+          await expect(checkout(order, payments, mail)).rejects.toThrow('timeout');
+          expect(mail.send).not.toHaveBeenCalled();
+        });
+      });
+      ```
+
+      Note `expect.any(String)` for the email text. The test pins who gets the receipt and
+      leaves the wording free to change, which keeps it from breaking on a copy edit.
+  - title: vi.spyOn and vi.mock, and the state they leave behind
+    body: |-
+      Passing dependencies in, as `checkout` does, is the cleanest way to use doubles. When
+      code reaches for something directly, two tools help.
+
+      `vi.spyOn(object, 'method')` wraps an existing method. By default the real method
+      still runs and the calls are recorded. Chain `mockReturnValue` or
+      `mockImplementation` to replace it.
+
+      `vi.mock(path, factory)` replaces a whole module. Vitest hoists the call above the
+      imports, so every file that imports the module during this test file gets the
+      replacement:
+
+      ```ts
+      // mailer.ts
+      export async function sendEmail(to: string, text: string): Promise<void> {
+        throw new Error(`would send a real email to ${to}: ${text}`);
+      }
+      ```
+
+      ```ts
+      // reminders.ts
+      import { sendEmail } from './mailer';
+
+      export async function remindOverdue(loans: { email: string; daysLate: number }[]) {
+        const overdue = loans.filter((loan) => loan.daysLate > 0);
+        for (const loan of overdue) {
+          await sendEmail(loan.email, `Your book is ${loan.daysLate} days late`);
+        }
+        return overdue.length;
+      }
+      ```
+
+      ```ts
+      // reminders.test.ts
+      import { expect, test, vi } from 'vitest';
+      import { sendEmail } from './mailer';
+      import { remindOverdue } from './reminders';
+
+      vi.mock('./mailer', () => ({
+        sendEmail: vi.fn().mockResolvedValue(undefined),
+      }));
+
+      test('emails only the borrowers who are late', async () => {
+        const sent = await remindOverdue([
+          { email: 'ana@example.com', daysLate: 3 },
+          { email: 'ben@example.com', daysLate: 0 },
+        ]);
+
+        expect(sent).toBe(1);
+        expect(sendEmail).toHaveBeenCalledExactlyOnceWith('ana@example.com', 'Your book is 3 days late');
+      });
+      ```
+
+      Because the call is hoisted, the factory can't use variables declared in the file,
+      which is what `vi.hoisted` is for. `vi.mocked(sendEmail)` gives the imported function
+      its mock type in TypeScript.
+
+      Know what persists between tests. Vitest 5 clears recorded calls before each test by
+      default (`clearMocks: true`), but it keeps replaced implementations. A
+      `vi.spyOn(...).mockReturnValue('stubbed')` in one test still returns `'stubbed'` in
+      the next. Call `vi.restoreAllMocks()` in `afterEach`, or set `restoreMocks: true`
+      in the config, so spies go back to the real methods. Jest doesn't clear calls by
+      default, so check the config of the project in front of you.
+  - title: Over-mocking, and where to draw the line
+    body: |-
+      Mocks are quick to add and expensive to live with. Three failure modes show up in real
+      suites.
+
+      **Tests that restate the code.** When every collaborator is mocked and every call is
+      asserted, the test is the implementation written again with `expect`. Change how the
+      code works and the test breaks, though nothing a user sees changed. Rename a method
+      and you fix it in two places.
+
+      **Mocks that lie.** A mock encodes your belief about a dependency. When the
+      dependency changes, the mock doesn't. The lesson's renamed `total` field is the
+      classic case: green tests, `£NaN` in production. Mocking a database query is worse,
+      because the SQL, the constraint and the transaction are exactly what goes wrong, and
+      a mock skips all three.
+
+      **Mocking what you don't own, directly.** Mocking a third-party SDK's methods couples
+      your tests to its API surface, which you don't control. The standard advice is "don't
+      mock what you don't own". Write a thin adapter with an interface in your terms,
+      `payments.charge(pence)`, mock that interface in unit tests, and test the adapter
+      itself against the real service or its sandbox in a few integration or contract
+      tests.
+
+      A workable rule of thumb:
+
+      ```text
+      real      your own functions and classes, pure logic, your database
+      fake      your own repository or queue, when a real one is too slow for a unit test
+      stub      third-party answers: a payment result, an exchange rate, a feature flag
+      spy/mock  effects you can't observe any other way: an email, a webhook, a metric
+      ```
+
+      If a test needs more than two or three doubles, the unit probably does too much.
+      That's design feedback: split the logic from the effects, test the logic with plain
+      inputs and outputs, and keep a small shell that wires in the real services.
+  - title: Integration tests on a real database
+    body: |-
+      A database test checks the parts of your system that live in the database: unique
+      constraints, foreign keys, the SQL itself, transactions. It needs the same engine and
+      major version as production. SQLite in place of PostgreSQL passes tests that
+      PostgreSQL would fail, and the reverse.
+
+      **Testcontainers** starts a throwaway PostgreSQL in Docker from inside the test run
+      and removes it afterwards. Nothing needs installing beyond Docker, and CI runs the
+      same thing as a laptop. This suite ran against `postgres:17` with
+      `@testcontainers/postgresql` and `pg`:
+
+      ```ts
+      import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testcontainers/postgresql';
+      import { Client } from 'pg';
+      import { afterAll, afterEach, beforeAll, beforeEach, expect, test } from 'vitest';
+
+      // The code under test takes its connection as an argument.
+      async function signUp(db: Client, email: string) {
+        const { rows } = await db.query(
+          'INSERT INTO users (email) VALUES (lower($1)) RETURNING id',
+          [email],
+        );
+        return rows[0].id as number;
+      }
+
+      let container: StartedPostgreSqlContainer;
+      let db: Client;
+
+      beforeAll(async () => {
+        container = await new PostgreSqlContainer('postgres:17').start();
+        db = new Client({ connectionString: container.getConnectionUri() });
+        await db.connect();
+        // In a real project: run your migrations here, once per run.
+        await db.query('CREATE TABLE users (id serial PRIMARY KEY, email text NOT NULL UNIQUE)');
+      }, 120_000);
+
+      afterAll(async () => {
+        await db?.end();
+        await container?.stop();
+      });
+
+      beforeEach(async () => {
+        await db.query('BEGIN');
+      });
+
+      afterEach(async () => {
+        await db.query('ROLLBACK');
+      });
+
+      test('refuses a second account for the same email', async () => {
+        await signUp(db, 'sam@example.com');
+        await expect(signUp(db, 'SAM@example.com')).rejects.toThrow(/duplicate key/);
+      });
+
+      test('starts with an empty table, whatever ran before', async () => {
+        const { rows } = await db.query('SELECT count(*)::int AS n FROM users');
+        expect(rows[0].n).toBe(0);
+      });
+      ```
+
+      The container takes a few seconds to start, so start it once per file or once per
+      run, never per test. The rollback makes each test cost milliseconds.
+
+      The transaction trick has limits you should know:
+
+      - **One connection.** `BEGIN` applies to one connection. If the code under test takes
+        its own connections from a pool, their writes sit outside your transaction. Pass
+        the test's connection in, as `signUp` takes `db`.
+      - **Code that commits.** If the code runs its own `BEGIN` and `COMMIT`, nesting breaks.
+        Use `SAVEPOINT` for inner transactions, or clean up with `TRUNCATE` between tests.
+      - **An error aborts the transaction.** After the duplicate-key error above, PostgreSQL
+        refuses further queries until the rollback. Assert on the error and end the test.
+      - **Sequences don't roll back.** Here a third test's first insert got id 3, not 1. Never
+        assert on generated ids.
+
+      For parallel test files, give each worker its own database, for example with
+      `CREATE DATABASE ... TEMPLATE` from a migrated template, which is fast because
+      PostgreSQL copies the template's data instead of replaying every migration.
+pitfalls:
+  - "**Mocking your own database.** Constraints, SQL and transactions never run, so the bugs that live there pass. Test them against the real engine in rolled-back transactions."
+  - "**Asserting every call to every mock.** The test repeats the implementation and breaks on refactors. Assert on results, and on calls only when the call is the effect."
+  - "**Stubs that drift from the real API.** A renamed field keeps the stub green while production shows `NaN`. Build stubs from shared types and back them with contract tests."
+  - "**Leaving a spy's replacement in place.** Vitest clears recorded calls between tests but keeps a `mockReturnValue`. Call `vi.restoreAllMocks()` in `afterEach` or set `restoreMocks: true`."
+  - "**Referencing file variables in a `vi.mock` factory.** The call is hoisted above them, so they don't exist yet. Define shared values with `vi.hoisted`, or build them inside the factory."
+  - "**A pool in the code, a transaction in the test.** Writes on other connections escape the rollback and leak into later tests. Pass one connection through, or truncate between tests."
+  - "**Asserting on generated ids.** Sequences advance even when a transaction rolls back. Assert on the data you control, such as the email, or look the row up."
+interview:
+  - question: What's the difference between a mock, a stub and a fake?
+    answer: >-
+      A stub supplies canned answers, a mock checks how it was called, and a fake is a real
+      working implementation with a shortcut. I'd stub a payment provider to answer
+      "declined" so I can test that path. I'd use a mock or spy on the mailer to assert a
+      receipt was sent, because the send is the behaviour and returns nothing useful. A fake
+      would be an in-memory repository that stores and finds records like the real one.
+      Stubs and fakes support state verification, where I check results. Mocks support
+      behaviour verification, where I check interactions. I prefer state verification
+      because it survives refactoring; interaction assertions couple the test to how the
+      code does its job. In Vitest, `vi.fn()` covers both stub and spy roles.
+  - question: When do you mock, and when do you use the real thing?
+    answer: >-
+      I mock at the boundary with systems I don't own and keep everything I own real. Card
+      payments, email, SMS, third-party APIs and the clock get doubles, behind a thin
+      interface in my own terms, so tests are fast, free and deterministic and I can force
+      failures such as timeouts. My own code, and my own database, stay real, because the
+      interesting bugs live in how my pieces connect and in the SQL and constraints. That
+      means real-database integration tests, typically with Testcontainers and a rollback
+      per test. The risk of mocking the outside world is drift, so the adapters themselves
+      get a few tests against the provider's sandbox or a contract test. If a unit needs
+      many mocks, I read that as a design smell and split logic from effects.
+  - question: How do you run integration tests against a database without them interfering with each other?
+    answer: >-
+      Start a real database of the production engine once, migrate it once, and isolate each
+      test in a transaction that's rolled back. Testcontainers gives a throwaway PostgreSQL
+      of the same major version per run, locally and in CI. Each test opens `BEGIN` in
+      `beforeEach` and `ROLLBACK` in `afterEach`, so tests start clean and run in
+      milliseconds. The code under test must use the test's connection, since a transaction
+      belongs to one connection. Where code commits on its own, I use savepoints or truncate
+      tables between tests instead. For parallel workers, each gets its own database, cloned
+      from a migrated template. And I never assert on generated ids, because sequences don't
+      roll back.
+  - question: What are the risks of over-mocking?
+    answer: >-
+      False confidence and brittle tests. When a mock encodes an assumption about a
+      dependency and the dependency changes, the test stays green and production breaks;
+      a renamed field in an API response is the textbook case. When every collaborator is
+      mocked and every call asserted, the test restates the implementation, so refactors
+      break it even though behaviour is unchanged, and people stop trusting red. Mocking the
+      database is the worst version, because it skips exactly the constraints and queries
+      most likely to be wrong. I limit doubles to external boundaries, assert on outcomes
+      rather than calls where possible, back stubs with contract or integration tests, and
+      treat a test that needs many mocks as a sign to split the unit.

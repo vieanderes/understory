@@ -1,0 +1,287 @@
+id: scale.backpressure
+title: How many at once
+objective: Cap the calls in flight, batch model calls, and stop a buffer from growing without limit.
+level: essential
+minutes: 10
+concepts: [scale.bounded-concurrency, scale.batching, scale.backpressure]
+prerequisites: [scale.concurrency-vs-parallelism, js.promises, backend.rate-limits]
+opening:
+  text: >-
+    You'll send twenty thousand model calls without getting your key banned or your database
+    swamped. It comes down to deciding how many run at once, and how many go in each call.
+
+steps:
+  - type: prose
+    id: the-flood
+    body: |-
+      Waiting overlaps for free, so it's tempting to start everything at once:
+
+      ```js
+      // 20,000 support tickets, one model call each
+      const summaries = await Promise.all(
+        tickets.map((ticket) => summarise(ticket)),
+      );
+      ```
+
+      `map` calls `summarise` for every ticket before anything is awaited. The model API
+      sees 20,000 requests in the same second.
+
+  - type: multiple-choice
+    id: pick-why-refused
+    concept: scale.bounded-concurrency
+    difficulty: 1
+    question: The model API answers most of these calls with `429`. Why?
+    choices:
+      - text: All 20,000 calls start in the same instant
+        correct: true
+        feedback: >-
+          Right. Nothing limits what's in flight, so the API's rate limit trips at once.
+      - text: '`Promise.all` sends them one after another'
+        feedback: >-
+          It doesn't send anything. `map` already started every call, and all of them run together.
+      - text: An array can't hold 20,000 promises
+        feedback: >-
+          It can, easily. The trouble isn't memory here. It's how many requests hit the API at once.
+
+  - type: prose
+    id: name-bounded-concurrency
+    body: |-
+      The fix is a cap on how many calls are in flight: **bounded concurrency**. You wrote
+      the tool in the promises lesson:
+
+      ```js
+      const summaries = await mapWithLimit(tickets, 8, summarise);
+      ```
+
+      At most 8 run at once, and the next starts as one finishes. Pick the number from the
+      other side: the provider's rate limit, or the size of your database's connection pool.
+
+  - type: ai-review
+    id: review-unbounded-geocode
+    concept: scale.bounded-concurrency
+    difficulty: 2
+    language: js
+    request: Look up the postcode for each of our 10,000 sensors and save it.
+    flawClass: performance
+    code: |
+      async function fillPostcodes(sensors) {
+        const lookups = sensors.map(async (sensor) => {
+          const reply = await fetch(`${GEO_API}?lat=${sensor.lat}&lon=${sensor.lon}`);
+          const place = await reply.json();
+          return { id: sensor.id, postcode: place.postcode };
+        });
+        const rows = await Promise.all(lookups);
+        await savePostcodes(rows);
+      }
+    prompt: >-
+      This passed review with a five-sensor test. With 10,000 sensors, the geocoding service
+      answers `429 Too Many Requests` and the whole run throws. Tap the line at fault.
+    lines: [2]
+    reasons:
+      - text: '`map` starts all 10,000 requests at the same moment'
+        correct: true
+        feedback: >-
+          Yes. Nothing caps what's in flight. Use `mapWithLimit` with a small number.
+      - text: '`reply.json()` should be awaited twice'
+        feedback: >-
+          One `await` is right. It reads the body once. The flaw is how many run together.
+      - text: '`savePostcodes` should run inside the loop'
+        feedback: >-
+          One save at the end is the good part. Saving per sensor would add 10,000 writes.
+    fix: |
+      async function fillPostcodes(sensors) {
+        const rows = await mapWithLimit(sensors, 8, lookUpPostcode);
+        await savePostcodes(rows);
+      }
+
+  - type: prose
+    id: name-batching
+    body: >-
+      Every call has a fixed cost before any real work: a round trip, a key check, a queue.
+      So many APIs take a list. An **embedding** API turns texts into lists of numbers, for
+      search, and takes many texts per call.
+
+
+      Grouping items into one call is **batching**. A batch has limits: the provider's
+      maximum, a longer wait, and one bad item can fail the lot.
+
+  - type: multiple-choice
+    id: pick-batch-size
+    concept: scale.batching
+    difficulty: 2
+    question: An embedding API takes at most 2,048 texts per call. Why not send 10,000 in one call?
+    choices:
+      - text: The API refuses a call over its maximum
+        correct: true
+        feedback: >-
+          Right. Split into batches under the limit, then run a few at once.
+      - text: Batching makes each vector less accurate
+        feedback: >-
+          Each text gets the same vector alone or in a batch. The limit is on size, not quality.
+      - text: Batches must always run one at a time
+        feedback: >-
+          Batches are calls like any other. A few can be in flight together, under a cap.
+
+  - type: code-challenge
+    id: write-embed-all
+    concept: scale.batching
+    difficulty: 3
+    language: ts
+    editable: '26-27'
+    prompt: >-
+      `embedAll` sends one call per text, all at once. Make it split `texts` into batches of
+      `BATCH_SIZE`, and run them with `mapWithLimit`, at most `IN_FLIGHT` at a time.
+
+
+      Return one vector per text, in the order of `texts`. `embedBatch` returns a list of
+      vectors per batch. An empty list makes no call.
+    hints:
+      - Build a list of batches first. `texts.slice(start, start + BATCH_SIZE)` cuts one.
+      - Pass the batches, `IN_FLIGHT` and `embedBatch` to `mapWithLimit`. It keeps their order.
+      - You get a list of lists back. `.flat()` joins them into one list of vectors.
+
+  - type: prose
+    id: name-backpressure
+    body: >-
+      A **buffer** is a list where work waits between the code that makes it and the code
+      that handles it. If uploads arrive faster than you can transcribe them, the buffer only
+      grows, until the server runs out of memory.
+
+
+      **Backpressure** stops that. When the buffer is full, the producer has to wait, or the
+      new work is refused. A server often answers `503 Service Unavailable`.
+
+  - type: bug-hunt
+    id: hunt-unbounded-pending
+    concept: scale.backpressure
+    difficulty: 3
+    language: js
+    code: |
+      const pending = [];
+
+      export async function upload(request) {
+        pending.push(await request.json());
+        return Response.json({ queued: true });
+      }
+
+      // transcribes one recording a second, for ever
+      setInterval(() => {
+        const job = pending.shift();
+        if (job) transcribe(job);
+      }, 1000);
+    prompt: >-
+      A podcast site launched on a Monday. By lunchtime the server ran out of memory and
+      restarted, losing every queued upload. Tap the line at fault.
+    lines: [4]
+    reasons:
+      - text: Nothing stops `pending` growing when uploads outpace transcripts
+        correct: true
+        feedback: >-
+          Yes. The buffer has no limit, so a busy morning fills memory.
+      - text: '`shift` takes jobs from the wrong end'
+        feedback: >-
+          `shift` takes the oldest, which is fair. The order is fine. The size isn't.
+      - text: '`setInterval` should run every millisecond'
+        feedback: >-
+          Checking faster doesn't transcribe faster. Each job still takes its time.
+    fix: |
+      export async function upload(request) {
+        if (pending.length >= 1000) {
+          return Response.json({ error: "Busy, try again soon" }, { status: 503 });
+        }
+        pending.push(await request.json());
+        return Response.json({ queued: true });
+      }
+
+  - type: explain-back
+    id: explain-twenty-thousand-tickets
+    concept: scale.bounded-concurrency
+    difficulty: 3
+    prompt: >-
+      You need a model to label 20,000 support tickets tonight. Explain how you'd decide how
+      many calls run at once, and how many tickets go in each.
+    rubric:
+      - Cap the calls in flight with something like `mapWithLimit`, never one call per ticket all at once.
+      - Choose the cap from the provider's rate limit, and batch up to what the API accepts per call.
+      - Keep batches small enough that one failure or a slow reply costs little, and retry failed batches.
+    modelAnswer: >-
+      I wouldn't start 20,000 calls at once, because the rate limit would trip in the first
+      second. I'd read the provider's limits first: requests per minute, and items per call.
+      Then I'd group tickets into batches under that maximum, and run a few batches at once
+      with `mapWithLimit`. I'd keep batches modest, because one bad ticket can fail its
+      whole batch. Then only that batch needs a retry.
+
+recap:
+  - Cap the calls in flight with `mapWithLimit`, sized to the other side's limit.
+  - Batch items into one call to spread its fixed cost, under the provider's maximum.
+  - Give every buffer a limit, and refuse or wait when it's full.
+
+recall:
+  - id: card-bounded-concurrency
+    concept: scale.bounded-concurrency
+    front: What does `Promise.all(items.map(call))` do to a service when `items` is huge?
+    back: >-
+      It starts every call at once, so the service sees them all together and refuses or
+      slows down. Cap them with `mapWithLimit`.
+  - id: card-pick-the-cap
+    concept: scale.bounded-concurrency
+    front: How do you choose the limit for calls in flight?
+    back: >-
+      From the other side: the provider's rate limit, or the database's connection pool size.
+  - id: card-batching
+    concept: scale.batching
+    front: Why does batching speed up embedding 10,000 texts?
+    back: >-
+      Each call has a fixed cost. Sending many texts per call pays it far fewer times.
+  - id: card-backpressure
+    concept: scale.backpressure
+    front: What is backpressure?
+    back: >-
+      A full buffer makes its producer wait, or refuses new work, so the buffer can't grow
+      until memory runs out.
+
+references:
+  - kind: docs
+    title: Backpressuring in Streams
+    authors: Node.js contributors
+    venue: Node.js documentation
+    url: https://nodejs.org/en/learn/modules/backpressuring-in-streams
+    note: What `write()` returning `false` means, the `drain` event, and what happens when code ignores them.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Populating a Database
+    authors: The PostgreSQL Global Development Group
+    venue: PostgreSQL 17 Documentation
+    url: https://www.postgresql.org/docs/17/populate.html
+    note: Why one commit per row is slow, and the faster ways to load many rows.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Message Formats
+    authors: The PostgreSQL Global Development Group
+    venue: PostgreSQL 17 Documentation
+    url: https://www.postgresql.org/docs/17/protocol-message-formats.html
+    note: The Bind message counts parameters in an `Int16`, the cap a very large batch runs into.
+    verified: true
+
+deepDive: >-
+  Node streams have backpressure built in. `stream.write(chunk)` returns `false` once the
+  stream's buffer passes its `highWaterMark`. Code that respects it stops writing and waits
+  for the `drain` event before the next chunk. Code that ignores it keeps queueing in
+  memory. In one of our runs, ignoring it queued 78 MB. Waiting for `drain` kept one chunk
+  queued, and both finished writing in about the same time. Backpressure didn't slow the
+  work. It moved the waiting out of memory.
+
+
+  Batches have hard limits too. Postgres counts a statement's parameters in 16 bits, so one
+  `INSERT` can carry at most 65,535 values. Before that wall, a giant batch holds its locks
+  for longer, and one bad row rejects every row with it. We loaded 10,000 rows one per
+  commit in about 98 seconds, and in batches of a thousand in under 200 ms.
+
+
+  `mapWithLimit` is a semaphore in disguise: a counter of free slots that callers wait on.
+  Libraries such as `p-limit` package the same idea. Model providers often limit tokens per
+  minute as well as requests, so a batch of long texts can trip a limit that a count of
+  calls never would. Load shedding, in the failure handling lesson, is the other side of
+  backpressure: what an overloaded service does to protect itself.

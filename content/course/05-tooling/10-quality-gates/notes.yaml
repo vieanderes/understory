@@ -1,0 +1,287 @@
+summary: >-
+  A quality gate is an automatic check that must pass before code moves on. Four kinds
+  cover most projects: a formatter for layout, a linter for suspicious patterns, a type
+  checker for mismatched shapes, and tests for behaviour. Each answers a different question,
+  so none replaces another. Together they catch the mistakes human reviewers are worst at
+  noticing, and free review for design and intent.
+
+
+  Every gate speaks the same language: its exit code. Zero means pass, anything else means
+  fail. That's what lets you chain them with `&&` in one `check` script, and what lets a
+  hook or a CI service decide whether to continue.
+
+
+  Where a gate runs matters as much as what it checks. A pre-commit hook gives fast feedback
+  on your laptop, but anyone can skip it. CI runs on every push on a clean machine, and a
+  protected branch can refuse to merge until it's green. Run the same script in both, and
+  let CI be the one that counts.
+remember:
+  - A formatter changes layout only, a linter flags likely bugs, a type checker checks shapes, and tests check behaviour.
+  - Every check reports through its exit code, where 0 means pass and any other number means fail.
+  - Put all checks in one script, and run that same script in the pre-commit hook and in CI.
+  - A pre-commit hook is a convenience anyone can skip, so CI with a required status check is the real gate.
+  - In CI, format and lint run in check mode and never rewrite files, because a fix nobody commits changes nothing.
+  - ESLint warnings don't fail a run unless you pass `--max-warnings 0`.
+  - A suppression comment should name one rule and give a reason, and unused suppressions should fail the check.
+  - Order checks from fastest to slowest so a run fails early and cheaply.
+sections:
+  - title: Four tools, four questions
+    body: |-
+      Each gate asks one question, and each misses what the others catch. Take one small
+      function and see which tool notices which problem.
+
+      ```ts
+      export function priceWithTax(price: number, rate: string) {
+        let total=price*(1+rate)
+        if (total = 0) return 0
+        return total
+      }
+      ```
+
+      - The **formatter** reprints `total=price*(1+rate)` as `total = price * (1 + rate);`.
+        It has no idea anything is wrong. Layout is all it knows.
+      - The **type checker** rejects the multiplication. `1 + rate` is a string, and `tsc`
+        reports `error TS2363: The right-hand side of an arithmetic operation must be of
+        type 'any', 'number', 'bigint' or an enum type.` Only it knows what `rate` holds.
+      - The **linter** flags `if (total = 0)` with `no-cond-assign`: an assignment where a
+        condition belongs. The code is valid JavaScript, so the formatter can't object.
+      - The **tests** catch what's left: say the tax should be rounded to a whole penny and
+        isn't. Nothing but running the code with an expected answer can know that.
+
+      The order in a `check` script usually follows cost. Type checking and linting take
+      seconds and need nothing running. Tests take longer and may need a database. Many
+      teams run formatting first because it's the fastest and its failures are the least
+      interesting. With `&&`, the first failure stops the run and later checks never start.
+
+      One interaction is worth knowing. Prettier prints that condition as `if ((total =
+      0))`. Double brackets are the usual way to say "I meant to assign", and
+      `no-cond-assign` accepts them by default. Here `no-constant-condition` still fires,
+      because `0` is a constant, but read lint results before you format, not after.
+
+      The categories also blur at the edges. Some lint rules use type information, and a
+      strict type checker catches bugs that look like lint findings. That's fine. What
+      matters is that every question gets asked somewhere, and that a reviewer never has
+      to spend attention on a missing semicolon.
+  - title: Exit codes are the contract
+    body: |-
+      Hooks and CI don't read messages. They read exit codes. Here are real runs from
+      ESLint 9.39, Prettier 3.9 and TypeScript 6.0:
+
+      ```text
+      $ tsc --noEmit t.ts
+      t.ts(1,7): error TS2322: Type 'string' is not assignable to type 'number'.
+      $ echo $?
+      2
+
+      $ prettier --check messy.js
+      Checking formatting...
+      [warn] messy.js
+      [warn] Code style issues found in the above file. Run Prettier with --write to fix.
+      $ echo $?
+      1
+      ```
+
+      Each tool picks its own non-zero number, so a script should test for "not 0", never
+      for a particular value.
+
+      ESLint has two severities. An `error` fails the run. A `warn` is printed, but the exit
+      code stays 0:
+
+      ```text
+      $ eslint warn.js
+        2:9  warning  'unused' is assigned a value but never used  no-unused-vars
+      ✖ 1 problem (0 errors, 1 warning)
+      $ echo $?
+      0
+      $ eslint --max-warnings 0 warn.js
+      ESLint found too many warnings (maximum: 0).
+      $ echo $?
+      1
+      ```
+
+      Warnings that never fail anything pile up until nobody reads them. Either make a rule
+      an error, switch it off, or run CI with `--max-warnings 0`.
+
+      npm passes the code through. If a script's command exits with 3, `npm run check`
+      exits with 3 too, which is what lets a hook or CI call `npm run check` and trust the
+      result.
+
+      Check mode versus fix mode is the other half of the contract. `prettier --write` and
+      `eslint --fix` rewrite files. That's what you want in your editor. In a gate, you
+      want `prettier --check` and plain `eslint`, which report and fail. A gate that fixes
+      files in CI changes a copy nobody commits, so the branch stays wrong and the check
+      goes green anyway.
+  - title: Pre-commit hooks that people keep
+    body: |-
+      A hook that's slow or surprising gets skipped, so the aim is fast and predictable.
+
+      Git runs `.git/hooks/pre-commit` before each commit, if the file is executable. A
+      non-zero exit aborts the commit. The `.git` folder isn't committed, so teams keep hooks
+      in a normal folder and point Git at it once per clone:
+
+      ```bash
+      git config core.hooksPath .githooks
+      chmod +x .githooks/pre-commit
+      ```
+
+      Forget the `chmod` and Git ignores the hook, with only a hint to say so:
+
+      ```text
+      hint: The '.githooks/pre-commit' hook was ignored because it's not set as executable.
+      ```
+
+      Running the whole `check` script is the most reliable hook. On a large project that
+      can be slow, so a common speed-up is to check only the files in this commit:
+
+      ```bash
+      #!/bin/sh
+      # .githooks/pre-commit: check only the files this commit adds or changes.
+      files=$(git diff --cached --name-only --diff-filter=ACMR -- '*.js' '*.ts')
+      [ -z "$files" ] && exit 0
+      npx prettier --check $files
+      ```
+
+      `--cached` lists staged changes, and `--diff-filter=ACMR` keeps added, copied,
+      modified and renamed files, skipping deleted ones. This version has two known limits.
+      It checks the copy on disk, which differs from the staged copy if you staged only part
+      of a file. And file names with spaces break the unquoted `$files`. The package
+      lint-staged handles both, and is what many teams use.
+
+      Two rules keep hooks honest. **Check, don't fix**: a hook that runs `--write` tidies
+      the disk but not the staged copy, as the lesson showed. And **the hook is not the
+      gate**: type checking the whole project and running the full test suite belong in CI,
+      where they can't be skipped.
+  - title: CI as the gate that counts
+    body: |-
+      CI runs your checks on a fresh machine for every push and pull request. Fresh matters:
+      it has no files you forgot to commit, no globally installed tools and no stale
+      `node_modules`. If it passes there, it passes for everyone.
+
+      A minimal GitHub Actions workflow lives in `.github/workflows/ci.yml`:
+
+      ```yaml
+      name: CI
+      on:
+        push:
+          branches: [main]
+        pull_request:
+      jobs:
+        check:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-node@v4
+              with:
+                node-version: 24
+                cache: npm
+            - run: npm ci
+            - run: npm run check
+            - run: npm test
+      ```
+
+      Each `run` step fails the job when its command exits non-zero, and later steps are
+      skipped.
+
+      `npm ci` rather than `npm install` is deliberate. It installs exactly what
+      `package-lock.json` says, starts from an empty `node_modules`, and refuses outright if
+      the lockfile and `package.json` disagree:
+
+      ```text
+      npm error `npm ci` can only install packages when your package.json and
+      package-lock.json or npm-shrinkwrap.json are in sync.
+      ```
+
+      A failing workflow on its own only shows a red cross. It becomes a gate when the
+      branch is protected: on GitHub, a branch protection rule or ruleset can require
+      named status checks to pass before a pull request can merge. Without that, CI is
+      advice.
+
+      Parity is the last piece. If CI runs `npm run check` and so does the hook, a green
+      laptop predicts a green CI. When they drift, as in the lesson's bug hunt, someone
+      pushes a type error that the hook would have caught and CI never looks for.
+  - title: Suppressions, and keeping them honest
+    body: |-
+      Sometimes a rule is wrong for one line. Every tool has an escape hatch, and each one
+      is a small hole in the gate. Make the holes narrow, explained and self-closing.
+
+      ESLint accepts a reason after `--`, and should always name the rule:
+
+      ```js
+      // eslint-disable-next-line no-unused-vars -- kept for the API shape, removed in v2
+      const unused = 1;
+      ```
+
+      A bare `// eslint-disable-next-line` with no rule silences everything on that line,
+      including a real bug you haven't written yet.
+
+      Suppressions go stale when the code under them changes. ESLint 9 reports a directive
+      that no longer suppresses anything, as a warning by default. The CLI flag makes it
+      an error:
+
+      ```text
+      $ eslint --report-unused-disable-directives dis.js
+        6:1  error  Unused eslint-disable directive (no problems were reported from 'eqeqeq')
+      ```
+
+      TypeScript has the same pair. `// @ts-ignore` hides the next line's error forever.
+      `// @ts-expect-error` hides it too, but fails once the error is gone:
+
+      ```text
+      exp.ts(1,1): error TS2578: Unused '@ts-expect-error' directive.
+      ```
+
+      So prefer `@ts-expect-error`: it can't outlive its reason.
+
+      On a team, review suppressions as carefully as code. A pull request that adds one
+      should say why in the description. The lesson's case is the classic: a warning about
+      an unused variable was silenced when the real bug was that the variable was never
+      used in the return value.
+pitfalls:
+  - '**Running `--write` or `--fix` in a gate.** It rewrites files on the CI machine or the disk, not in the commit. The problem stays, and the check passes. Gates use `prettier --check` and plain `eslint`; fixing is for the editor.'
+  - '**Letting CI run fewer checks than the hook.** A skipped hook then takes those checks with it. Call one `npm run check` script from both.'
+  - '**Leaving everything as ESLint warnings.** Warnings exit with 0, so they never block anything and pile up unread. Make important rules errors, or run CI with `--max-warnings 0`.'
+  - '**Silencing a rule instead of reading it.** A suppression feels like progress, but the rule usually points at a real bug. Fix the cause; if you must suppress, name the rule and give a reason.'
+  - '**A green CI that nothing enforces.** Without a required status check on the protected branch, anyone can merge on red. Turn on the requirement for the CI job.'
+  - '**Using `npm install` in CI.** It can update the lockfile and install versions nobody tested. Use `npm ci`, which installs the lockfile exactly and fails if it''s out of date.'
+interview:
+  - question: What's the difference between a linter, a formatter, a type checker and tests?
+    answer: >-
+      They answer four different questions, so a healthy project runs all four. A formatter
+      decides layout, such as spacing, quotes and line breaks, and never changes behaviour,
+      which ends style debates in review. A linter looks for patterns that are probably
+      mistakes, such as an assignment inside a condition or an unused variable. A type
+      checker proves that values match their declared shapes across the whole program, so
+      passing a string where a number is expected fails. Tests run the code and compare
+      results with expectations, which is the only way to catch wrong logic that is
+      perfectly typed and tidy. The overlap is real, since some lint rules use types, but
+      each catches a class of bug the others can't see.
+  - question: We already have pre-commit hooks. Why run the same checks in CI?
+    answer: >-
+      Because hooks are optional and CI isn't. A hook lives in each clone: a new teammate
+      may not have set it up, `git commit --no-verify` skips it, and commits made on the
+      hosting site never run it. CI runs on every push and pull request, on a clean machine
+      with a fresh install from the lockfile. So it also catches "works on my machine"
+      problems, like a file nobody committed. With a required status check on the protected
+      branch, nothing merges on red. I keep both, running the same script, because the
+      hook gives feedback in seconds and CI gives the guarantee. The trade-off is that the
+      hook should stay fast, so heavier suites may run only in CI.
+  - question: A teammate adds `// eslint-disable-next-line` or `@ts-ignore` to get CI green. How do you respond in review?
+    answer: >-
+      I ask what the rule was reporting, because a suppression usually hides a real
+      problem. In one common case, an unused-variable warning was silenced when the actual
+      bug was a discount that never reached the return value. If the rule really is wrong
+      for that line, I ask for a narrow suppression: name the single rule, add a reason
+      after `--`, and prefer `@ts-expect-error` over `@ts-ignore`, since it fails once the
+      error disappears. I also like turning on unused-directive reporting in CI, so stale
+      suppressions fail the build. What I avoid is making it personal: the goal is that the
+      gate stays meaningful, not that nobody ever suppresses anything.
+  - question: How would you keep CI fast as a codebase grows?
+    answer: >-
+      Fail early, avoid repeated work and run independent checks in parallel. Cheap checks
+      such as formatting, linting and type checking go first, or in their own jobs. Then a
+      typo fails in seconds, not after the full test suite. Dependency installs are
+      cached, keyed on the lockfile. Tools that support caching, such as ESLint's `--cache`,
+      can reuse results between runs. Long test suites can be split across several machines.
+      On a pre-commit hook, I check only staged files. What I don't do is drop checks from
+      CI to save time, because a gate that skips a check lets that class of bug through. The
+      trade-off is complexity: parallel jobs and caches are more configuration to maintain.

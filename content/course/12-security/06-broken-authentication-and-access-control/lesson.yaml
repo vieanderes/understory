@@ -1,0 +1,271 @@
+id: security.broken-auth
+title: Broken authentication and access control
+objective: "Issue a fresh session at login, make reset links single-use, and prove access rules with owner, stranger and signed-out tests."
+level: essential
+minutes: 10
+concepts: [security.session-fixation, security.reset-flows, security.access-control-tests]
+prerequisites: [security.injection-and-ssrf, backend.sessions-and-tokens, backend.authorisation]
+opening:
+  text: >-
+    You'll close the gaps attackers use most: a planted session, a reset link that works
+    twice, an endpoint that forgets whose data it is. Then you'll prove each fix with a test.
+
+steps:
+  - type: prose
+    id: sessions-recap
+    body: >-
+      Two words from the backend chapter. **Authentication** checks who you are, usually with
+      a password. **Authorisation** decides what you may do once the server knows.
+
+
+      After login, the server remembers you with a **session id**: a long random string in a
+      cookie. Every request carries it, and the server looks up whose it is. Whoever holds that
+      string is you, as far as the server can tell.
+
+  - type: prose
+    id: session-fixation
+    body: >-
+      Now a trick. Some apps accept a session id before login, for example from a link like
+      `/login?sid=abc123`. An attacker sends you that link, with an id they chose.
+
+
+      You log in. If the server keeps the same id and marks it as yours, the attacker holds a
+      signed-in session. That's **session fixation**. The fix: make a fresh id at login, and
+      delete the old one.
+
+  - type: predict-output
+    id: predict-session-kept
+    concept: security.session-fixation
+    difficulty: 1
+    language: text
+    code: |
+      # a login handler that keeps the visitor's existing session id
+      BEFORE  sid=DIXncj_HuB6K   (from the attacker's link)
+      LOGIN   sid=DIXncj_HuB6K   (same id, now marked as the user)
+    question: After this login, who can use the session?
+    choices:
+      - text: The user and the attacker
+        correct: true
+        feedback: >-
+          Right. The id never changed, and the attacker chose it.
+      - text: Only the user, who typed the password
+        feedback: >-
+          The password proved who logged in. The session id stayed the one the attacker knows.
+      - text: Nobody, since the id is now stale
+        feedback: >-
+          Nothing made it stale. The server marked that very id as signed in.
+
+  - type: fill-blank
+    id: fill-fresh-session
+    concept: security.session-fixation
+    difficulty: 2
+    language: js
+    prompt: >-
+      Finish the login so a planted id can't survive it. Drop the old id, make a new random
+      one, and store who it belongs to.
+    template: |
+      function startSession(oldSid, userId) {
+        sessions.{{1}}(oldSid);
+        const sid = crypto.randomBytes(32).toString("base64url");
+        sessions.{{2}}(sid, { userId });
+        return sid; // sent back in a new cookie
+      }
+    blanks:
+      - key: '1'
+        answer: delete
+      - key: '2'
+        answer: set
+    bank: [delete, keep, set, get]
+
+  - type: prose
+    id: reset-flows
+    body: >-
+      "Forgot password" emails a link with a **reset token**: a random string the server
+      stores. A good one is single-use and short-lived. Using it deletes it, and it expires
+      within the hour.
+
+
+      One more rule. The form gives the same answer for every email: "If that account exists,
+      we've sent a link". A different answer would tell anyone which emails are registered.
+
+  - type: code-challenge
+    id: write-check-reset-token
+    concept: security.reset-flows
+    difficulty: 3
+    language: ts
+    prompt: >-
+      Write `checkResetToken(record, now)`. `record` is the stored token, `{ email,
+      expiresAt, usedAt }`, or `null` if it isn't in the store.
+
+
+      Return `'unknown'` for `null`, `'used'` if `usedAt` isn't `null`, `'expired'` if `now` is
+      at or past `expiresAt`, and `'ok'` otherwise. Check used before expired.
+    hints:
+      - Rule out the null record first, so the rest can read the fields safely.
+      - The order of the checks is the order in the prompt.
+      - "Start with `if (record === null) return 'unknown';`"
+
+  - type: prose
+    id: access-control-tests
+    body: >-
+      Access control is the check most often missing. So test it the way an attacker would
+      try it. For every endpoint that returns someone's data, write three tests:
+
+
+      - the **owner** gets `200` and the data
+
+      - a **stranger**, signed in as someone else, gets `404`
+
+      - **nobody**, signed out, gets `401`
+
+
+      Why `404` for the stranger and not `403`? A `403` confirms the item exists. `404` says
+      nothing either way.
+
+  - type: code-challenge
+    id: write-note-access
+    concept: security.access-control-tests
+    difficulty: 3
+    language: ts
+    starter: access.starter.ts
+    solution: access.solution.ts
+    tests: access.tests.ts
+    prompt: >-
+      `getNote(userId, noteId, notes)` answers a request for one note. `userId` is `null` when
+      signed out. Run the tests: the stranger test fails. Make all three pass: `401` when signed
+      out, `404` for a missing note or someone else's, `200` with the note for its owner.
+    hints:
+      - The tests name the three callers. Read which one fails.
+      - The note has an `ownerId`. Compare it with `userId`.
+      - Treat "not yours" exactly like "not found", with the same `404`.
+
+  - type: ai-review
+    id: review-admin-check-missing
+    concept: security.access-control-tests
+    difficulty: 4
+    language: js
+    request: Add an admin endpoint that refunds any order.
+    flawClass: security
+    code: |
+      async function refund(request, session) {
+        if (!session) {
+          return Response.json({ error: "Sign in" }, { status: 401 });
+        }
+        const { orderId } = await request.json();
+        await refundOrder(orderId);
+        return Response.json({ refunded: orderId });
+      }
+    prompt: >-
+      An assistant wrote this. The admin's test passes. Then a signed-in customer calls it and
+      refunds their own order. Tap the line at fault.
+    lines: [6]
+    reasons:
+      - text: It checks signed-in, never admin
+        correct: true
+        feedback: >-
+          Yes. Any session passes. Refuse with `403` unless `session.role` is `"admin"`.
+      - text: '`orderId` should be checked for a number'
+        feedback: >-
+          Worth doing, but a valid id from a customer is the problem. The role is never checked.
+      - text: A `401` should be a `404` here
+        feedback: >-
+          `401` is right for nobody signed in. The gap is for people who are signed in.
+    fix: |
+      async function refund(request, session) {
+        if (!session) {
+          return Response.json({ error: "Sign in" }, { status: 401 });
+        }
+        if (session.role !== "admin") {
+          return Response.json({ error: "Forbidden" }, { status: 403 });
+        }
+        const { orderId } = await request.json();
+        await refundOrder(orderId);
+        return Response.json({ refunded: orderId });
+      }
+
+  - type: explain-back
+    id: explain-three-tests
+    concept: security.access-control-tests
+    difficulty: 4
+    prompt: >-
+      A teammate tests every endpoint by signing in as the owner. Everything passes. Which bugs
+      can those tests never catch, and what would you add?
+    rubric:
+      - Owner-only tests pass even when the ownership check is missing entirely.
+      - A test as a stranger should expect a refusal, such as `404`.
+      - A test while signed out should expect `401`.
+    modelAnswer: >-
+      Signed in as the owner, a handler with no ownership check still returns the right data.
+      So the test passes and proves nothing about access. I'd add a stranger test, signed in as
+      another user, expecting `404`, and a signed-out test expecting `401`. Those fail on
+      exactly the bug an attacker would use.
+
+recap:
+  - Mint a fresh session id at login, so a planted id can't survive it.
+  - Make reset tokens random, single-use and short-lived, with a reply that reveals nothing.
+  - Test every endpoint as its owner, a stranger and nobody, and expect `200`, `404` and `401`.
+
+recall:
+  - id: card-fixation-fix
+    concept: security.session-fixation
+    front: What's the one-line fix for session fixation?
+    back: >-
+      Issue a new session id at login and drop the old one, so a planted id can't carry over.
+  - id: card-reset-token
+    concept: security.reset-flows
+    front: Name the four properties of a safe reset token flow.
+    back: >-
+      Random, single-use, short-lived, and a response identical whether or not the account
+      exists.
+  - id: card-enumeration
+    concept: security.reset-flows
+    front: Why does the forgot-password reply say the same thing for any email?
+    back: >-
+      So it can't be used to learn which addresses have accounts. A different reply would
+      confirm one.
+  - id: card-access-test
+    concept: security.access-control-tests
+    front: What does an access-control test do for one endpoint?
+    back: >-
+      Signs in as the wrong user and as nobody, and expects a refusal. The owner gets in; the
+      rest don't.
+
+references:
+  - kind: docs
+    title: Session Management Cheat Sheet
+    authors: OWASP
+    venue: OWASP Cheat Sheet Series
+    url: https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html
+    note: Renewing the session id on login, and why fixation works without it.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Forgot Password Cheat Sheet
+    authors: OWASP
+    venue: OWASP Cheat Sheet Series
+    url: https://cheatsheetseries.owasp.org/cheatsheets/Forgot_Password_Cheat_Sheet.html
+    note: Random single-use tokens, expiry, and identical responses to prevent enumeration.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Authorization
+    authors: OWASP
+    venue: OWASP Cheat Sheet Series
+    url: https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html
+    note: Enforce access decisions server-side, deny by default, and test each endpoint.
+    verified: true
+
+deepDive: >-
+  Access control fails in more than one direction. Vertical: a customer reaching an admin
+  action, as in the review. Horizontal: one customer reaching another's data, the IDOR from
+  Backend 06. Both come from checking authentication and forgetting authorisation.
+
+
+  The safest place for the ownership check is the query, `WHERE id = $1 AND owner_id = $2`. A
+  foreign row is then never found, so the endpoint answers `404`, not `403`. A `403`
+  confirms the row exists, which is a small leak an attacker can enumerate.
+
+
+  Reset tokens should be compared with `timingSafeEqual`, not `===`, and stored hashed. A
+  leaked database then doesn't hand over live reset links. The token in the email is the secret;
+  the row is only how you check it.

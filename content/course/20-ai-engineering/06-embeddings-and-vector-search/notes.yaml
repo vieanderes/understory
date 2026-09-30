@@ -1,0 +1,291 @@
+summary: >-
+  An embedding is a list of numbers that an embedding model produces for a piece of text,
+  arranged so that texts with similar meaning get vectors pointing in similar directions.
+  Vector search uses that: embed every passage once, embed each question with the same
+  model, and return the passages whose vectors are closest, usually by cosine similarity.
+  It finds "Refunds take five working days" for "I want my money back", which keyword
+  search can't, because the two share no words.
+
+
+  It's the retrieval half of most AI features: the step that picks which few passages a
+  chat model gets to read (the RAG lesson builds on it), and the engine behind semantic
+  search, "similar items", duplicate detection and clustering of support tickets. At small
+  scale it's a loop or one matrix product. At millions of vectors you use an approximate
+  index, such as HNSW in pgvector or a dedicated vector database, which trades a little
+  recall for a large drop in latency.
+
+
+  Embeddings are weak at exactly what keyword search does well: exact identifiers, error
+  codes, product numbers, rare names, and sometimes negation ("not refundable" can sit
+  close to "refundable"). So production search usually combines both, which is the next
+  lesson. Don't use vector search when the question is a filter ("orders over 100 pounds
+  last week"): that's a SQL query.
+remember:
+  - An embedding places text on a map of meaning, and only vectors from the same model and version can be compared.
+  - Cosine similarity compares direction, and on unit-length vectors it equals the dot product and gives the same ranking as Euclidean distance.
+  - Vector search is embed passages once at write time, embed the question at read time, score, and keep the top k.
+  - Exact search scores every vector, which is fine up to roughly hundreds of thousands, and an approximate index takes over beyond that.
+  - An approximate index such as HNSW or IVF trades recall for speed, so measure recall at k against exact search on your data.
+  - Store the model name with every vector, because changing models means re-embedding everything before you switch queries.
+  - Embeddings miss exact identifiers, numbers and some negations, which is why production retrieval adds keyword search.
+  - A filter applied after an approximate search can return fewer than k results, so filter inside the search where the index supports it.
+sections:
+  - title: What the numbers are, and why cosine
+    body: |-
+      An embedding model is a neural network trained so that related texts end up near each
+      other. Training typically shows it pairs that belong together, a question and its answer, a
+      title and its article, and pairs that don't, and nudges the vectors of matching pairs
+      together and the others apart. No single number means "about refunds". Meaning is
+      spread across all the dimensions, which is why you can only compare vectors, never read
+      one.
+
+      Cosine similarity measures the angle between two vectors and ignores their length. It
+      runs from -1 to 1, and for text embeddings most scores fall in a narrower band that
+      depends on the model. So a raw score of 0.8 means different things for different
+      models: compare scores within one model, and pick any threshold ("below this, say we
+      found nothing") by looking at real results.
+
+      Many embedding APIs return vectors already scaled to length 1. On such **unit
+      vectors**, three common measures agree: the dot product equals the cosine, and squared
+      Euclidean distance is `2 - 2 × cosine`, so all three rank passages the same way. That's
+      why vector databases offer cosine, inner product and L2, and why normalising once at
+      write time lets you use the cheapest one.
+
+      Three practical facts about the model itself. Inputs have a maximum length, and text
+      beyond it is cut off or rejected, which is one reason documents are split into chunks
+      (the next lesson). Vectors have a fixed dimension per model, from a few hundred to a
+      few thousand, and storage grows with it. And some providers take a hint about whether
+      the input is a query or a document, because short questions and long passages are
+      phrased differently. Check your provider's documentation for what it offers.
+  - title: Exact search with a matrix, and what it costs
+    body: |-
+      Before reaching for an index, know how far exact search goes. With vectors normalised
+      once, scoring every passage is a single matrix-vector product.
+
+      ```python
+      import numpy as np
+
+      rng = np.random.default_rng(0)
+      passages = rng.normal(size=(100_000, 256)).astype(np.float32)  # stand-in embeddings
+
+      # Normalise once, at write time. Then cosine is a plain dot product.
+      passages /= np.linalg.norm(passages, axis=1, keepdims=True)
+
+
+      def top_k(query, matrix, k):
+          q = query / np.linalg.norm(query)
+          scores = matrix @ q                         # one dot product per row
+          best = np.argpartition(-scores, k)[:k]      # the k largest, unordered, O(n)
+          return best[np.argsort(-scores[best])]      # order only those k
+
+
+      query = passages[42] + 0.1 * rng.normal(size=256).astype(np.float32)
+      print(top_k(query, passages, 3)[0])  # 42: the nearest neighbour is the row we perturbed
+
+      # On unit vectors, three measures give one ranking: |a - b|² = 2 - 2·cos(a, b).
+      a, b = passages[0], passages[1]
+      cos = float(a @ b)
+      dist_sq = float(np.sum((a - b) ** 2))
+      print(round(dist_sq, 4) == round(2 - 2 * cos, 4))  # True
+      ```
+
+      `argpartition` finds the k best without sorting all 100,000 scores; only those k get
+      sorted. It needs k smaller than the number of rows.
+
+      The cost is n × d multiply-adds per question, and n × d × 4 bytes of memory in 32-bit
+      floats. One million passages at 1,024 dimensions is about 4 GB of vectors, and every
+      question reads all of it. That's why exact search is the right answer for a help centre
+      of 20,000 passages, and the wrong one for 40 million. It's also the ground truth you
+      measure an approximate index against.
+  - title: How approximate indexes work, and measuring recall
+    body: |-
+      An approximate nearest neighbour index avoids scoring everything. Two families
+      dominate.
+
+      **IVF** (inverted file) clusters the vectors, for example with k-means, and stores each
+      vector in its cluster's list. A query scores the cluster centres, then only the vectors
+      in the few nearest clusters. The number of clusters searched, often called probes, is
+      the dial between speed and recall.
+
+      **HNSW** (hierarchical navigable small world) builds a graph where each vector links to
+      some near neighbours, with sparse upper layers for long jumps. A search starts at the
+      top, greedily hops towards the query, and drops a layer at a time. A search-time
+      setting (`hnsw.ef_search` in pgvector, 40 by default) sets how many candidates it
+      keeps, trading latency for recall. HNSW usually gives better recall for the time spent
+      and builds more slowly with more memory.
+
+      Measure instead of trusting defaults. This toy IVF runs on clustered vectors, the way
+      real embeddings cluster by topic:
+
+      ```python
+      import numpy as np
+
+      rng = np.random.default_rng(1)
+      centres = rng.normal(size=(50, 64))
+      data = np.repeat(centres, 400, axis=0) + 0.6 * rng.normal(size=(20_000, 64))
+      data /= np.linalg.norm(data, axis=1, keepdims=True)
+
+      lists_n = 100
+      centroids = data[rng.choice(len(data), lists_n, replace=False)]
+      for _ in range(10):  # a few rounds of k-means
+          assign = np.argmax(data @ centroids.T, axis=1)
+          for c in range(lists_n):
+              members = data[assign == c]
+              if len(members):
+                  centroids[c] = members.mean(axis=0) / np.linalg.norm(members.mean(axis=0))
+      assign = np.argmax(data @ centroids.T, axis=1)
+
+
+      def exact(q, k):
+          return set(np.argsort(-(data @ q))[:k])
+
+
+      def approx(q, k, probes):
+          nearest_lists = np.argsort(-(centroids @ q))[:probes]
+          ids = np.flatnonzero(np.isin(assign, nearest_lists))  # only these rows are scored
+          return set(ids[np.argsort(-(data[ids] @ q))[:k]]), len(ids)
+
+
+      queries = data[rng.choice(len(data), 200, replace=False)] + 0.3 * rng.normal(size=(200, 64))
+      queries /= np.linalg.norm(queries, axis=1, keepdims=True)
+      for probes in (1, 3, 10):
+          hits, scanned = 0, 0
+          for q in queries:
+              found, n = approx(q, 10, probes)
+              hits += len(found & exact(q, 10))
+              scanned += n
+          print(f"probes={probes:2} recall@10={hits / 2000:.2f} rows scored={scanned / 200 / len(data):.0%}")
+      ```
+
+      One run printed recall at 10 of 0.60 scoring 1% of rows, 0.87 at 3%, and 0.99 at 10%.
+      That curve is the decision: pick the cheapest setting whose recall your answers can
+      live with, measured on your own vectors and queries.
+  - title: Vector search in production
+    body: |-
+      **Store the model with the vector.** A column such as `embedding_model` next to each
+      vector makes the lesson's two-model bug impossible to miss, and lets you migrate
+      safely: embed everything with the new model into a new column or index, backfill in
+      batches, compare retrieval quality on your evaluation set, then switch queries in one
+      release. Keep the old vectors until the new ones have proved themselves.
+
+      **Embed on change, not on read.** Passages are embedded when they're written or edited,
+      through a queue, and a content hash skips text that hasn't changed. Only the question
+      is embedded at request time, which adds one model call, commonly tens to a hundred or
+      so milliseconds. Repeated questions can reuse a cached embedding.
+
+      **Filter inside the search.** Real queries have conditions: this tenant, this
+      language, documents the user may read. If an approximate search returns 10 neighbours
+      and a filter then removes 8, the user gets 2. Pass the filter into the search.
+      pgvector since 0.8.0 can keep scanning with `hnsw.iterative_scan`; many vector
+      databases support filtered search directly. For strict separation between customers,
+      a partition or index per tenant is simpler to reason about.
+
+      **Know what similarity can't do.** Nearest is not the same as relevant. There is
+      always a nearest passage, even when none answers the question, so decide what score
+      counts as "no match" and let the application say "I couldn't find that". Exact codes
+      such as `ERR-4012`, SKUs and names are better served by keyword search, and ordering
+      by date or price by SQL.
+
+      **Cost.** Embedding is usually far cheaper per token than generation, and each passage
+      is embedded once, so the recurring cost is storage, index memory and re-embedding when
+      you change models. Plan the dimension with that in mind: some models can return
+      shorter vectors, trading a little quality for less memory.
+pitfalls:
+  - >-
+    **Comparing vectors from two models or versions.** Each model has its own map, and the
+    scores come out as numbers with no error. Store the model name with each vector and
+    re-embed everything when you change.
+  - >-
+    **Filtering after the top k.** A narrow filter applied to 10 approximate neighbours can
+    leave none. Filter inside the search, or fetch more candidates and check the count.
+  - >-
+    **Treating the nearest passage as an answer.** There is always a nearest vector. Set a
+    minimum score from real examples and handle "nothing relevant" in the application.
+  - >-
+    **Using a fixed score threshold across models.** Score ranges differ between models, so a
+    threshold tuned on one is wrong for the next. Re-tune it with every model change.
+  - >-
+    **Trusting an approximate index without measuring recall.** Defaults suit someone else's
+    data. Compare against exact search on a sample of real queries.
+  - >-
+    **Embedding whole documents.** Long text gets cut off at the model's input limit, and one
+    vector blurs many topics together. Split documents into passages first.
+  - >-
+    **Using vector search for exact lookups.** Codes, SKUs, names and numeric filters belong to
+    keyword search and SQL, which get them right every time.
+interview:
+  - question: Explain embeddings and vector search to a backend engineer.
+    answer: >-
+      An embedding model maps text to a fixed-length vector so that similar meanings point
+      in similar directions, and vector search returns the stored vectors closest to the
+      query's. You embed every passage once at write time and store the vectors, embed each
+      question with the same model, score by cosine similarity and keep the top k. It
+      matches meaning rather than words, so "money back" finds "refunds". Up to a few hundred
+      thousand vectors, exact search is one matrix product; beyond that an approximate index
+      like HNSW answers in milliseconds at a small cost in recall. It's weak on exact
+      identifiers and numbers, so in production I'd pair it with keyword search and use SQL
+      for filters.
+  - question: We're changing to a better embedding model. How do you roll that out?
+    answer: >-
+      Re-embed the whole corpus with the new model before any query uses it, because vectors
+      from two models aren't comparable and a mixed index returns near-random results with no
+      error. I store the model name with each vector, build the new embeddings into a
+      separate column or index in batches, and run our retrieval evaluation set, recall at k
+      against labelled questions, on both. If the new model wins, I switch queries in one
+      release and keep the old vectors for a rollback period. Score thresholds get re-tuned,
+      since score ranges differ between models. The cost is a full re-embedding and double
+      storage for a while, which is usually small next to generation costs.
+  - question: How do HNSW and IVF indexes trade speed for accuracy?
+    answer: >-
+      Both avoid scoring every vector, and both expose a dial between latency and recall.
+      IVF clusters the vectors and, at query time, only scores those in the few clusters
+      nearest the query; more probes means higher recall and more work. HNSW builds a
+      layered graph of near neighbours and greedily walks it towards the query; a larger
+      candidate list, `ef_search` in pgvector, finds more true neighbours at more cost. HNSW
+      typically gives better recall for the time but uses more memory and builds more
+      slowly, while IVF needs training on representative data. Whichever I use, I measure
+      recall at k against exact search on real queries and pick the cheapest setting that
+      meets the target.
+  - question: Why might vector search return irrelevant results, and what do you do?
+    answer: >-
+      Usually because nearest isn't relevant, or the vectors can't express what the question
+      needs. There's always a nearest passage, so a question the corpus can't answer still
+      gets confident-looking results; I set a minimum score tuned on real examples. Exact
+      identifiers like error codes and SKUs embed poorly, which hybrid search with keywords
+      fixes. Long, multi-topic chunks blur into vague vectors, so I chunk by structure.
+      Filters applied after an approximate search can empty the list. And a model mismatch
+      between stored vectors and queries makes everything look random. I diagnose with a
+      labelled set of questions, measuring recall at k, so I fix the actual cause.
+  - question: When is a dedicated vector database worth it over Postgres with pgvector?
+    answer: >-
+      Start with pgvector if Postgres is already the system of record, and move when scale
+      or features demand it. Keeping vectors next to the rows means one backup, transactions
+      that update text and vector together, and permission filters in the same SQL query.
+      HNSW in pgvector handles millions of vectors on one well-sized machine. A dedicated
+      vector database earns its place at hundreds of millions of vectors, when you need
+      sharding and replication tuned for vector workloads, or built-in hybrid search and
+      filtering beyond what you want to maintain yourself. The cost of moving is a second
+      data store to keep in sync, which is where stale or leaked results come from.
+terms:
+  - term: Embedding
+    say: The meaning of a text.
+    means: A fixed-length vector a model produces for a text, placed so that similar meanings point in
+      similar directions. Vectors are only comparable when they come from the same model and
+      version.
+  - term: Cosine similarity
+    say: The distance between two vectors.
+    means: The cosine of the angle between two vectors, so it compares direction and ignores length. On
+      unit-length vectors it equals the dot product and ranks the same as Euclidean distance.
+  - term: Vector search
+    say: Search that understands the question.
+    means: Embed passages once, embed the query with the same model, and return the k passages with the
+      highest similarity. It finds paraphrases but can miss exact identifiers, numbers and
+      negations.
+  - term: Approximate index (HNSW, IVF)
+    say: A faster way to do the same search.
+    means: An index that scores only part of the vectors, trading recall for speed. Measure its recall
+      at k against exact search on your own data.
+  - term: Vector database
+    say: You need one for vector search.
+    means: A store built around an approximate vector index. Exact search is fine up to roughly hundreds
+      of thousands of vectors, and Postgres with pgvector adds an index when you outgrow that.

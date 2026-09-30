@@ -1,0 +1,287 @@
+id: perf.cost-of-javascript
+title: The cost of JavaScript
+objective: Say what every byte of script costs, read an interaction's INP, keep clicks answered during heavy work, and see why a server-rendered page can ignore a tap.
+level: essential
+minutes: 10
+concepts: [perf.javascript-cost, perf.long-tasks, perf.inp, perf.hydration-cost]
+prerequisites: [perf.critical-rendering-path, js.event-loop, next.server-and-client-components]
+opening:
+  text: >-
+    You'll see why a page can look finished and still ignore your tap. Then you'll keep a
+    button answering while heavy work runs.
+
+steps:
+  - type: prose
+    id: what-script-costs
+    body: >-
+      Your build turns your code into a **bundle**: the JavaScript files the page loads.
+      Every byte of it is downloaded, **parsed** (read), **compiled** (turned into machine
+      code) and run.
+
+
+      Most of that happens on the **main thread**: the one thread that runs your scripts,
+      answers taps and paints the screen. It does one thing at a time. A mid-range phone
+      does each thing several times slower than your laptop.
+
+  - type: prose
+    id: long-tasks
+    body: >-
+      Any single task over 50 ms is a **long task**. While it runs, every tap and key press
+      waits in the queue, as you saw in the event loop lesson.
+
+
+      Phones make it worse. We slowed Chromium's CPU four times, like a mid-range phone. A
+      sort that took 12 ms on the laptop took 59 ms: now a long task.
+
+  - type: predict-output
+    id: predict-click-during-loop
+    concept: perf.long-tasks
+    difficulty: 1
+    language: js
+    code: |
+      button.addEventListener("click", () => {
+        status.textContent = "Saved";
+      });
+
+      sortRecipes(); // starts at 0 ms and takes 500 ms
+    question: You click the button at 100 ms. When does "Saved" appear?
+    choices:
+      - text: At about 100 ms
+        feedback: >-
+          It feels like it should. But the handler can't start while `sortRecipes` still
+          runs.
+      - text: At about 500 ms
+        correct: true
+        feedback: >-
+          Right. In Chromium the click waited 390 ms for the sort to end.
+      - text: Never, the click is lost
+        feedback: >-
+          The browser keeps the click in the queue. It runs late, not never.
+
+  - type: prose
+    id: what-inp-counts
+    body: |-
+      **INP** times each interaction from the input to the next frame painted. Chrome's Performance panel splits that click into three parts:
+
+      ```text
+      Input delay           390 ms
+      Processing duration     0.3 ms
+      Presentation delay     18 ms
+      ```
+
+      The **input delay** is the wait in the queue. **Processing** is your handler. **Presentation** is the browser drawing the result. A visit's INP is about its slowest interaction.
+
+  - type: multiple-choice
+    id: pick-slow-part
+    concept: perf.inp
+    difficulty: 2
+    question: That click took 408 ms, far over the 200 ms line. What would you fix?
+    choices:
+      - text: The task that ran before the click
+        correct: true
+        feedback: >-
+          Yes. The wait was all queueing behind the sort. Break that task up.
+      - text: The click handler's own code
+        feedback: >-
+          The handler took 0.3 ms. It's innocent. The time went before it could start.
+      - text: How the browser paints "Saved"
+        feedback: >-
+          Painting took 18 ms, about one frame. The 390 ms wait is the problem.
+
+  - type: ai-review
+    id: review-yield-outside-loop
+    concept: perf.long-tasks
+    difficulty: 3
+    language: js
+    request: Our sort freezes the page. Break it up so clicks get through.
+    flawClass: logic
+    code: |
+      const yieldToMain = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+      async function sortRecipes(batches) {
+        for (const batch of batches) {
+          sortBatch(batch);
+        }
+        await yieldToMain();
+        showResults();
+      }
+    prompt: >-
+      An assistant wrote this. The results are right, and with a short list it feels fine.
+      With 5,000 recipes the page still freezes. Tap the line at fault.
+    lines: [7]
+    reasons:
+      - text: The wait sits after the loop, not inside it
+        correct: true
+        feedback: >-
+          Yes. Move it inside, so the queue gets a turn after each batch.
+      - text: '`setTimeout` needs a delay above 0'
+        feedback: >-
+          A 0 ms timer still ends the task and lets waiting clicks run first.
+      - text: '`showResults()` should run before the loop'
+        feedback: >-
+          There's nothing to show until the sorting's done. The order is fine.
+    fix: |
+      async function sortRecipes(batches) {
+        for (const batch of batches) {
+          sortBatch(batch);
+          await yieldToMain();
+        }
+        showResults();
+      }
+
+  - type: code-challenge
+    id: write-save-click
+    concept: perf.inp
+    difficulty: 3
+    language: js
+    starter: starter.js
+    solution: solution.js
+    tests: tests.js
+    editable: '4-6'
+    prompt: >-
+      Clicking Save runs `onSaveClick`, and saving 2,000 notes at once freezes the page. Keep
+      INP low.
+
+
+      Show `"Saving"`, then `await yieldToMain()` so the browser can paint it. Save the notes
+      in batches of 100, and yield after each batch. Show `"Saved"` at the end.
+    hints:
+      - The first yield goes straight after `ui.show("Saving")`, before any saving.
+      - '`notes.slice(start, start + 100)` is one batch. Move `start` on by 100 each time round.'
+      - 'Loop with `for (let start = 0; start < notes.length; start += 100)`, and `await yieldToMain()` inside it.'
+
+  - type: prose
+    id: hydration
+    body: >-
+      Server rendering sends finished HTML, so the page paints early. But its buttons are
+      only markup. Their handlers live in the bundle.
+
+
+      The browser must download, parse and run that bundle, then React attaches the
+      handlers to the HTML already there. That's **hydration**. Until it's done, the page is
+      a picture of a page.
+
+  - type: bug-hunt
+    id: hunt-dead-button
+    concept: perf.javascript-cost
+    difficulty: 3
+    language: html
+    code: |
+      <div id="root">
+        <!-- rendered on the server, visible at 0.1 s -->
+        <button>Save recipe</button>
+      </div>
+      <!-- the whole site's JavaScript, 900 kB -->
+      <script src="app.js" defer></script>
+    prompt: >-
+      On phones, taps on "Save recipe" do nothing for the first three seconds, then work.
+      Tap the line at fault.
+    lines: [6]
+    reasons:
+      - text: No button works until the whole site's script runs
+        correct: true
+        feedback: >-
+          Right. Ship less to this page, and the gap shrinks.
+      - text: '`defer` makes the button wait, so remove it'
+        feedback: >-
+          Without `defer` the script blocks painting as well. The gap comes from its size.
+      - text: The button needs `type="button"`
+        feedback: >-
+          The type doesn't attach a handler. Nothing listens until the script has run.
+    fix: |
+      <!-- only this page's code, 60 kB -->
+      <script src="recipe-page.js" defer></script>
+
+  - type: explain-back
+    id: explain-looks-ready
+    concept: perf.hydration-cost
+    difficulty: 3
+    prompt: >-
+      A server-rendered page shows in one second, yet taps do nothing for three more. What
+      is the browser busy with, and what would you change?
+    rubric:
+      - The HTML came ready-made, so it painted before any JavaScript ran.
+      - Hydration must download, parse and run the bundle to attach the handlers, slower on a phone.
+      - Ship less JavaScript to that page, and break up the long tasks that remain.
+    modelAnswer: >-
+      The server sent finished HTML, so it painted early, but the buttons were only markup.
+      The browser still had to download the bundle, parse it and run the components to
+      attach the handlers. On a slow phone that takes seconds, in long tasks. I'd send less
+      JavaScript to that page and break up whatever long tasks remain.
+
+recap:
+  - Say what every byte of script costs on the main thread, and why phones feel it most.
+  - Read INP as input delay, processing and presentation, and fix the part that's slow.
+  - Show feedback, then yield between batches, so a click is answered during heavy work.
+
+recall:
+  - id: card-long-task
+    concept: perf.long-tasks
+    front: What is a long task, and why does it hurt?
+    back: >-
+      A main-thread task over 50 ms. Input that arrives while it runs waits until it ends.
+  - id: card-inp-parts
+    concept: perf.inp
+    front: What three parts make up an interaction's INP time?
+    back: >-
+      Input delay, processing (the handler), and presentation delay (painting the result).
+  - id: card-hydration-gap
+    concept: perf.hydration-cost
+    front: Why can a server-rendered page look ready but ignore a tap?
+    back: >-
+      The HTML paints first. The handlers exist only once the bundle has loaded and hydration
+      has run.
+  - id: card-js-cost-phone
+    concept: perf.javascript-cost
+    front: What happens to each byte of JavaScript a page loads?
+    back: >-
+      It's downloaded, parsed, compiled and run, mostly on the main thread.
+
+references:
+  - kind: docs
+    title: Interaction to Next Paint (INP)
+    authors: Jeremy Wagner and Barry Pollard
+    venue: web.dev
+    url: https://web.dev/articles/inp
+    note: What INP measures, its three parts, and the 200 ms threshold.
+    primary: true
+    verified: true
+  - kind: spec
+    title: Long Tasks API
+    authors: W3C Web Performance Working Group
+    venue: W3C
+    url: https://www.w3.org/TR/longtasks-1/
+    note: Defines a long task as one over 50 ms.
+    verified: true
+  - kind: docs
+    title: Optimize long tasks
+    authors: Jeremy Wagner and Brendan Kenny
+    venue: web.dev
+    url: https://web.dev/articles/optimize-long-tasks
+    note: Yielding to the main thread between chunks of work.
+    verified: true
+  - kind: docs
+    title: hydrateRoot
+    authors: React team
+    venue: react.dev
+    url: https://react.dev/reference/react-dom/client/hydrateRoot
+    note: How React attaches to HTML rendered on the server.
+    verified: true
+
+deepDive: >-
+  Chromium has a built-in way to yield: `await scheduler.yield()`. It lets waiting input run,
+  then resumes your task ahead of other queued work. Not every browser has it, so code often
+  falls back to the `setTimeout` promise used here.
+
+
+  Work that doesn't touch the page can leave the main thread entirely, in a **web worker**:
+  a script that runs on a thread of its own and sends its results back as messages.
+
+
+  React can hydrate in pieces. Parts wrapped in `Suspense` hydrate separately, and a part
+  someone clicks is hydrated first. Server Components send no JavaScript for the parts that
+  never change, so there's less to hydrate at all.
+
+
+  Throttle the CPU in the Performance panel to see a phone's view. Four times slower is a
+  common setting for a mid-range phone.

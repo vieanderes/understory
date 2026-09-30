@@ -1,0 +1,250 @@
+summary: >-
+  A model call is one HTTPS request. You send the conversation so far, a model name and a cap
+  on the reply's length. You get back a list of content blocks, a stop reason and a count of
+  the tokens you pay for. Every AI feature, from a chat to an agent, is built from this one
+  call made again and again.
+
+
+  The model remembers nothing between calls. A chat works because your code keeps the
+  history and sends all of it every time. That single fact explains most of what follows:
+  why cost grows as a conversation gets longer, why the system prompt is resent on every
+  turn, and why you can test the whole thing with a fake client that records requests.
+
+
+  The SDK is a thin, typed layer over that request. It reads the API key from the
+  environment, sets a timeout and retries failures that are worth retrying. Reach for it
+  whenever your server needs text from a model. Don't reach for it from a browser or a
+  mobile app, where anyone could read the key: the call belongs on a server you control.
+remember:
+  - The model is stateless, so a conversation is a list your code keeps and resends in full on every call.
+  - '`content` is a list of typed blocks, and you join the `text` of the blocks whose `type` is `"text"`.'
+  - Check `stop_reason` before trusting a reply, because `"max_tokens"` means the text was cut off mid-thought.
+  - '`usage.input_tokens` and `usage.output_tokens` are what you pay for, and input grows with every turn you resend.'
+  - The system prompt is a separate `system` argument, not a message, and it sets the rules for the whole conversation.
+  - The API key lives in an environment variable on a server, never in client code or in Git.
+  - The Anthropic Python SDK retries rate limits, server errors and dropped connections twice by default, and `timeout` and `max_retries` change that.
+  - Create one client and reuse it, because it holds a pool of open connections.
+sections:
+  - title: A conversation is a list you resend
+    body: |-
+      Each call is independent. To hold a chat, you append the user's message, send the
+      whole list, then append the model's reply as an `"assistant"` message. The next call
+      carries both. The `system` argument sits outside the list: it's where instructions,
+      a persona and output rules go.
+
+      The fake client below has the same `messages.create` as the real one and records
+      what each call sent.
+
+      ```python
+      from types import SimpleNamespace as Obj
+
+      MODEL = "claude-opus-5"
+      SYSTEM = "You are a support assistant for a bookshop. Answer in one sentence."
+
+
+      class FakeClient:
+          def __init__(self, *replies):
+              self.replies = iter(replies)
+              self.sent = []
+              self.messages = Obj(create=self.create)
+
+          def create(self, **request):
+              # Copy the list, because the caller keeps appending to it.
+              self.sent.append({**request, "messages": list(request["messages"])})
+              block = Obj(type="text", text=next(self.replies))
+              return Obj(content=[block], stop_reason="end_turn")
+
+
+      def chat_turn(client, history, user_text):
+          history.append({"role": "user", "content": user_text})
+          response = client.messages.create(
+              model=MODEL, max_tokens=1024, system=SYSTEM, messages=history
+          )
+          text = "".join(b.text for b in response.content if b.type == "text")
+          history.append({"role": "assistant", "content": text})
+          return text
+
+
+      client = FakeClient("We open at nine.", "Yes, until six on Saturdays.")
+      history = []
+      chat_turn(client, history, "When do you open?")
+      chat_turn(client, history, "Are you open at the weekend?")
+
+      print([len(call["messages"]) for call in client.sent])  # [1, 3]
+      print(client.sent[1]["messages"][1]["content"])          # We open at nine.
+      ```
+
+      The second call sent three messages, including the model's own earlier answer. That
+      is the only reason "at the weekend" makes sense to it.
+
+      This has a cost. Turn ten resends turns one to nine, so input tokens grow with every
+      turn and a long chat costs far more per message than a short one. Real chat apps
+      trim or summarise old turns, and providers offer prompt caching, which makes a
+      repeated prefix cheaper. The reply's `usage` reports cached tokens separately, as
+      `cache_read_input_tokens`.
+  - title: What the stop reason and usage tell you
+    body: |-
+      `stop_reason` says why the model stopped writing. The ones you meet first:
+
+      - `"end_turn"`: it finished. The normal case.
+      - `"max_tokens"`: it hit your cap. The text ends mid-sentence, and JSON is likely
+        broken.
+      - `"stop_sequence"`: it wrote one of the strings you passed in `stop_sequences`.
+      - `"tool_use"`: it wants your code to run a tool. Chapter 20 covers this.
+      - `"refusal"`: it declined for safety reasons.
+
+      The SDK in use here (version 1.8) also lists `"pause_turn"` and
+      `"model_context_window_exceeded"`. Code that branches on the stop reason should
+      treat anything it doesn't recognise as a failure, not as success.
+
+      ```python
+      from types import SimpleNamespace as Obj
+
+
+      class Truncated(Exception):
+          pass
+
+
+      def text_or_raise(response):
+          if response.stop_reason == "max_tokens":
+              used = response.usage.output_tokens
+              raise Truncated(f"reply cut off at {used} tokens")
+          if response.stop_reason not in ("end_turn", "stop_sequence"):
+              raise RuntimeError(f"unexpected stop reason: {response.stop_reason}")
+          return "".join(b.text for b in response.content if b.type == "text")
+
+
+      cut = Obj(
+          content=[Obj(type="text", text='{"category": "ref')],
+          stop_reason="max_tokens",
+          usage=Obj(input_tokens=212, output_tokens=8),
+      )
+      try:
+          text_or_raise(cut)
+      except Truncated as error:
+          print(error)  # reply cut off at 8 tokens
+      ```
+
+      `usage` counts `input_tokens` and `output_tokens`. Output tokens usually cost several
+      times more than input tokens, and the exact prices change, so read them from the
+      provider's price page, not from memory. Log both counts on every call, tagged with the
+      feature that made it. That log is how you find out which feature spends the money.
+  - title: Keys, timeouts and retries in production
+    body: |-
+      Three settings decide how a call behaves when something goes wrong.
+
+      **The key.** `Anthropic()` reads `ANTHROPIC_API_KEY`. In SDK 1.8 a missing key isn't
+      caught when you build the client: it fails on the first request, with a `TypeError`
+      naming the missing authentication. Check the variable at start-up instead, which is
+      what pydantic-settings does in the next lesson. Use a separate key per environment,
+      so a leaked development key can be revoked without taking production down.
+
+      **The timeout.** The SDK's default allows a response up to ten minutes to arrive,
+      which suits long generations but not a request a user is waiting on. Set it on the
+      client, or override it for one group of calls with `with_options`.
+
+      **Retries.** The SDK retries `408`, `409`, `429` and every `5xx`, plus dropped
+      connections and timeouts, twice by default. It waits with exponential backoff and a
+      little randomness, and honours a `retry-after` header when the server sends one.
+
+      ```python
+      import anthropic
+
+      client = anthropic.Anthropic(
+          api_key="sk-test",  # real code leaves this out and sets ANTHROPIC_API_KEY
+          base_url="http://127.0.0.1:9",  # nothing listens here, so the call fails fast
+          timeout=20.0,
+          max_retries=4,
+      )
+      quick = client.with_options(timeout=5.0, max_retries=0)
+      print(client.max_retries, quick.max_retries)  # 4 0
+
+      try:
+          quick.messages.create(
+              model="claude-opus-5",
+              max_tokens=100,
+              messages=[{"role": "user", "content": "Hello"}],
+          )
+      except anthropic.RateLimitError:
+          print("429 after every retry: shed load or queue the work")
+      except anthropic.APIStatusError as error:
+          print("the API answered with an error:", error.status_code)
+      except anthropic.APIConnectionError:
+          print("never reached the API")  # this one prints
+      ```
+
+      Order the `except` clauses from specific to general. `RateLimitError` is a subclass
+      of `APIStatusError`, and `APITimeoutError` is a subclass of `APIConnectionError`, so
+      the general clause first would swallow the specific one.
+  - title: The same call from TypeScript, and what differs
+    body: |-
+      The official TypeScript SDK has the same shape: `new Anthropic()` reads the same
+      environment variable, and `client.messages.create({ model, max_tokens, messages })`
+      returns the same blocks. Three differences are worth knowing.
+
+      First, the Python call above blocks until the reply arrives. In Node every call is a
+      promise you `await`. Python has an async client too, `anthropic.AsyncAnthropic`, used
+      with `await` inside `async def`. Lesson four shows when that matters: running many
+      calls at once.
+
+      Second, Python passes the request as keyword arguments and returns objects with
+      attributes, so you write `response.usage.output_tokens`, not a dictionary lookup.
+      Those objects are Pydantic models, which is the next lesson's subject.
+
+      Third, where the call runs matters more than the language. A Next.js server action
+      or route handler is a server, so the key is safe there. A React component that runs
+      in the browser is not. The rule is the same in both languages: the browser talks to
+      your server, and only your server talks to the provider.
+
+      Keep one client per process. Creating a client per request throws away its pool of
+      open connections, so every call pays for a new TLS handshake.
+pitfalls:
+  - '**Reading `response.text`.** The reply has no such attribute, only `content` blocks. Join the `text` of the blocks whose `type` is `"text"`, and skip the rest.'
+  - '**Taking `content[0].text` as the answer.** The first block may not be text, and there may be several text blocks. Filter by type and join them in order.'
+  - '**Ignoring `stop_reason`.** A reply cut off at `max_tokens` still comes back as a normal response. Check for `"max_tokens"` and raise, retry with a larger cap, or ask for a shorter answer.'
+  - '**Forgetting to resend the history.** The model has no memory, so a follow-up sent alone gets an answer with no context. Keep the list and send all of it, including the assistant''s replies.'
+  - '**Putting the key in code or in the browser.** A key in Git or in a page''s JavaScript is public, and someone will spend your money with it. Read it from the environment on the server, and rotate it if it ever leaks.'
+  - '**Wrapping the SDK in your own retry loop without thinking.** The SDK already retries twice, so three of your attempts can mean nine requests. Lower `max_retries`, or retry only at one layer.'
+  - '**Leaving the default timeout on a user-facing call.** Ten minutes is far longer than anyone waits. Set a timeout that matches what the caller can tolerate.'
+interview:
+  - question: How do you build a multi-turn chat on top of a stateless model API?
+    answer: >-
+      My server keeps the conversation and resends it in full on every call. Each turn, I
+      append the user's message, call the model with the whole list and the system prompt,
+      then append the reply as an assistant message and store the list, keyed by
+      conversation, in a database. The model sees only what I send, so the history is the
+      memory. The catch is cost and length: input tokens grow every turn, and eventually the
+      history won't fit the context window. So I cap it: keep the system prompt and the
+      last N turns, summarise older turns into a short note, and use prompt caching for the
+      unchanging prefix. Trimming loses detail, so for long-lived assistants I'd store facts
+      separately and retrieve only the relevant ones.
+  - question: A model's reply sometimes arrives as broken JSON. What's your first check?
+    answer: >-
+      The stop reason. If it's `"max_tokens"`, the model ran out of room and the JSON was
+      cut off mid-object, which is the most common cause of JSON that fails to parse. The
+      fix is a larger `max_tokens`, a shorter requested output, or both, plus code that
+      raises on truncation instead of passing half a reply on. If the stop reason is
+      `"end_turn"` and the JSON is still wrong, the model drifted from the format: then I
+      validate with a schema at the boundary, use the provider's structured output feature
+      so the reply is held to a schema, and log the failures. I wouldn't fix it by loosening
+      the parser, because that hides the problem.
+  - question: How do you make LLM calls reliable in a production service?
+    answer: >-
+      Timeouts, bounded retries at one layer, and a plan for when retries run out. I set a
+      timeout that matches the caller: a few seconds for a user waiting on a chat's first
+      token, longer for a background job. The SDK already retries `429`, `5xx` and
+      connection failures with backoff and honours `retry-after`, so I tune `max_retries`
+      there instead of stacking my own loop on top. When retries run out, the feature
+      degrades: a fallback model, a queued job, or a clear error. I log token usage,
+      latency and error type per feature. The trade-off is latency against success rate:
+      more retries rescue more calls but make the slowest requests slower.
+  - question: Where should an API key for a model provider live, and why?
+    answer: >-
+      In an environment variable or a secret manager, read by server code only. The key
+      authorises spending on your account, so anything a user can read, a browser bundle, a
+      mobile app or a public repository, is the wrong place. The browser calls my server,
+      which checks who the user is, applies my rate limits and then calls the provider. I
+      use separate keys per environment, so a leaked development key can be revoked
+      without an outage, and I fail at start-up if the key is missing rather than on the
+      first user's request. If a key does leak, I revoke it at once and check usage for
+      spending I didn't make.

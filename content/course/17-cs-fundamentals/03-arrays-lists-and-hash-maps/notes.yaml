@@ -1,0 +1,344 @@
+summary: >-
+  Choosing a container is choosing which operations are cheap. An **array** keeps items in
+  one numbered row, so reading any index is O(1), but inserting or removing near the front
+  shifts everything after it. A **linked list** chains separate nodes together. Inserting next
+  to a node you already hold is O(1), but finding the kth node means walking k links.
+  A **hash map** turns each key into a bucket number, so looking up by key is O(1) on
+  average, with no order by value at all.
+
+
+  Big-O is only half the story. Arrays sit in contiguous memory, which caches love, so they
+  often beat a linked list even on operations where the list wins on paper. Hash maps are
+  fast on average, but a poor hash or keys chosen by an attacker can pile entries into one
+  bucket and bring back O(n).
+
+
+  In JavaScript you'll mostly pick between an array, a `Map`, a `Set` and a plain object. Use
+  an array for ordered items you reach by position. Use a `Map` or `Set` for lookups by a key
+  that comes from data. Keep plain objects for records with a fixed, known shape.
+remember:
+  - An array stores items side by side, so indexing is O(1) and inserting or removing near the front is O(n).
+  - A linked list inserts or removes in O(1) once you hold the right node, but reaching the kth item takes k hops.
+  - Arrays usually outrun linked lists in practice, because contiguous memory makes good use of the CPU cache.
+  - A hash map sends each key through a hash function to a bucket, which gives O(1) average `get`, `set` and `delete`.
+  - Collisions are handled by chaining or by probing, and the table grows when its load factor, entries per bucket, passes a threshold.
+  - A hash map's O(1) is an average, and a bad hash or adversarial keys can push lookups towards O(n).
+  - Use a `Map` for keys that come from data, since it takes any key type, keeps insertion order, knows its `size` and inherits no keys.
+  - A `Map` matches object keys by identity, so two arrays with the same contents are two different keys.
+sections:
+  - title: 'Memory layout: why arrays usually win'
+    body: |-
+      An array's slots sit next to each other in memory. To read index i, the machine
+      computes `start + i × slotSize` and goes there: one step, whatever the length. A walk
+      from index 0 upwards reads memory in order, which is exactly what CPU caches and
+      prefetchers are built for. Each cache line brought in holds several neighbours you're
+      about to use.
+
+      A linked list's nodes are separate objects, allocated wherever the memory allocator
+      found room. Following `next` is **pointer chasing**. The address of the next node isn't
+      known until you've loaded the current one, so the CPU can't fetch ahead. Each hop may
+      be a cache miss. Each node also carries a reference as well as its value, so the
+      list uses more memory.
+
+      Here are the costs side by side:
+
+      - Read by index: array O(1), list O(k).
+      - Add or remove at the end: array O(1) amortised, list O(1) with a tail reference.
+      - Add or remove at the front: array O(n), list O(1).
+      - Insert or remove next to a node you hold: array O(n), list O(1).
+      - Find by value: O(n) for both.
+
+      In JavaScript, V8 typically stores an array of numbers, filled from index 0, as a
+      compact block of raw values. Arrays of objects store a
+      compact block of references, and the objects live elsewhere. Arrays with big holes can
+      fall back to a slower dictionary form.
+
+      So the practical rule: default to an array. Reach for a linked list when you hold references to
+      nodes and need O(1) insertion and removal around them. A queue that removes from the
+      front is the other case. Even then, a ring buffer over an array is often faster.
+      When in doubt, measure with realistic sizes.
+  - title: Where linked structures earn their place
+    body: |-
+      A queue takes items at the back and hands them out from the front. With an array,
+      `shift` is specified as moving every remaining item down a slot. A linked list with a
+      head and a tail does both ends in O(1):
+
+      ```js
+      // A queue on a singly linked list: add at the tail, remove at the head, both O(1).
+      class Queue {
+        #head = null;
+        #tail = null;
+        size = 0;
+        enqueue(value) {
+          const node = { value, next: null };
+          if (this.#tail) this.#tail.next = node;
+          else this.#head = node;
+          this.#tail = node;
+          this.size++;
+        }
+        dequeue() {
+          if (!this.#head) return undefined;
+          const { value } = this.#head;
+          this.#head = this.#head.next;
+          if (!this.#head) this.#tail = null;
+          this.size--;
+          return value;
+        }
+      }
+
+      const jobs = new Queue();
+      jobs.enqueue('resize photo');
+      jobs.enqueue('send email');
+      jobs.enqueue('update index');
+      console.log(jobs.dequeue(), jobs.size); // resize photo 2
+      console.log(jobs.dequeue(), jobs.dequeue(), jobs.dequeue()); // send email update index undefined
+      ```
+
+      The line `if (!this.#head) this.#tail = null;` is the edge case people miss. Without it,
+      the tail still points at a removed node, and the next enqueue links onto nothing.
+
+      The other classic is the **LRU cache**, which evicts the least recently used entry. The
+      textbook design pairs a hash map, for O(1) lookup, with a doubly linked list, for O(1)
+      "move to the most recent end". In JavaScript, a `Map` already iterates in insertion
+      order, so deleting and re-setting a key moves it to the end:
+
+      ```js
+      // An LRU cache on a Map: a Map iterates in insertion order, so the first key is the oldest.
+      class LruCache {
+        #entries = new Map();
+        constructor(limit) {
+          this.limit = limit;
+        }
+        get(key) {
+          if (!this.#entries.has(key)) return undefined;
+          const value = this.#entries.get(key);
+          this.#entries.delete(key); // move to the back: most recently used
+          this.#entries.set(key, value);
+          return value;
+        }
+        set(key, value) {
+          this.#entries.delete(key);
+          this.#entries.set(key, value);
+          if (this.#entries.size > this.limit) {
+            const oldest = this.#entries.keys().next().value;
+            this.#entries.delete(oldest);
+          }
+        }
+        keys() {
+          return [...this.#entries.keys()];
+        }
+      }
+
+      const pages = new LruCache(2);
+      pages.set('/home', 'home html');
+      pages.set('/cart', 'cart html');
+      pages.get('/home');                 // /home is now the most recent
+      pages.set('/help', 'help html');    // over the limit: evicts /cart
+      console.log(pages.keys()); // [ '/home', '/help' ]
+      ```
+  - title: 'Inside a hash map: hashing, chaining and load factor'
+    body: |-
+      A real hash function mixes every character of the key into a number, so similar keys
+      land far apart. The table takes that number modulo its bucket count. Two keys in one
+      bucket are a **collision**, and there are two ways to handle them. **Chaining** keeps a
+      short list per bucket. **Open addressing** stores every entry in the table itself: on a
+      collision it probes the next slot along, or follows some other fixed sequence.
+
+      The **load factor** is entries divided by buckets. As it rises, chains get longer or
+      probe sequences get longer, and lookups slow down. So a table grows when the load factor
+      passes a threshold. Java's `HashMap`, for example, grows at 0.75 by default. Growing
+      means a bigger bucket array and **rehashing** every entry into it, since each bucket
+      number depends on the bucket count. That costs O(n), but like array `push` it happens
+      rarely enough to be O(1) amortised.
+
+      Here's a complete chained map that doubles at a load factor of 0.75:
+
+      ```js
+      // A hash map with chaining. It doubles its buckets when the load factor passes 0.75.
+      function hash(key) {
+        let h = 0;
+        for (let i = 0; i < key.length; i++) {
+          h = (h * 31 + key.charCodeAt(i)) >>> 0; // mix every character, keep 32 bits
+        }
+        return h;
+      }
+
+      class ChainedMap {
+        constructor() {
+          this.buckets = Array.from({ length: 4 }, () => []);
+          this.size = 0;
+        }
+        #bucketFor(key) {
+          return this.buckets[hash(key) % this.buckets.length];
+        }
+        get(key) {
+          const entry = this.#bucketFor(key).find((e) => e[0] === key);
+          return entry ? entry[1] : undefined;
+        }
+        set(key, value) {
+          const bucket = this.#bucketFor(key);
+          const entry = bucket.find((e) => e[0] === key);
+          if (entry) {
+            entry[1] = value;
+            return;
+          }
+          bucket.push([key, value]);
+          this.size++;
+          if (this.size / this.buckets.length > 0.75) this.#grow();
+        }
+        #grow() {
+          const old = this.buckets;
+          this.buckets = Array.from({ length: old.length * 2 }, () => []);
+          for (const bucket of old) {
+            for (const [key, value] of bucket) this.#bucketFor(key).push([key, value]);
+          }
+        }
+      }
+
+      const stock = new ChainedMap();
+      for (const [i, fruit] of ['apple', 'pear', 'plum', 'fig', 'kiwi', 'lime', 'date'].entries()) {
+        stock.set(fruit, i + 1);
+      }
+      console.log(stock.get('kiwi'), stock.get('mango')); // 5 undefined
+      console.log(stock.size, stock.buckets.length);     // 7 16
+      console.log(Math.max(...stock.buckets.map((b) => b.length))); // 2
+      ```
+
+      Seven keys grew the table twice, from 4 to 16 buckets, and no bucket holds more than
+      two. A JavaScript `Map` must also iterate in insertion order, so an engine's table
+      tracks that order as well as the buckets.
+  - title: When O(1) turns into O(n)
+    body: |-
+      Every hash map's speed rests on one assumption: keys spread evenly over the buckets. If
+      they don't, one bucket fills up and a lookup degrades into a linear scan of it.
+
+      There are three ways that happens. The first is a weak hash. The lesson's toy hash used
+      only the key's length, so every three-letter name collided. Real hash functions mix
+      every bit of the key. The second is a table that never grows: with a fixed bucket
+      count, the load factor climbs with every insert. The third is deliberate.
+
+      That third case is called **hash flooding**. An attacker who can predict the hash
+      function can send thousands of keys that all land in one bucket. They might arrive as
+      form fields or JSON properties. Each insert then scans the whole bucket, so n inserts
+      cost O(n²), and a single request can pin a CPU for seconds. A wave of these attacks
+      against popular web platforms led language runtimes to adopt **seeded hashing**: the
+      hash mixes in a random value chosen at start-up, so outsiders can't work out which keys
+      collide. Some libraries also switch a crowded bucket from a list to a balanced tree,
+      capping the damage at O(log n).
+
+      As an application developer you rarely write a hash function. What you do control:
+
+      - Cap the size of untrusted input, such as the number of keys in a JSON body.
+      - Don't build a composite key by adding numbers together, like `x + y`, where different
+        pairs give the same sum. Use a string such as `` `${x},${y}` ``, or nested maps.
+      - When a lookup that should be instant is slow, count how many entries share a key in
+        your own structures before blaming the engine.
+
+      The ECMAScript specification requires `Map` access to be sublinear on average, not
+      O(1) always. The average is what you're promised.
+  - title: 'Map, Set or a plain object?'
+    body: |-
+      Objects and maps both store key-value pairs, but they behave differently in ways that
+      cause real bugs:
+
+      ```js
+      const obj = {};
+      obj.zoe = 1;
+      obj[10] = 2;
+      obj[9] = 3;
+      console.log(Object.keys(obj)); // [ '9', '10', 'zoe' ]
+
+      const map = new Map();
+      map.set('zoe', 1).set(10, 2).set(9, 3);
+      console.log([...map.keys()]); // [ 'zoe', 10, 9 ]
+
+      console.log('constructor' in {}, new Map().has('constructor')); // true false
+      console.log(Object.keys({ 1: 'a', '1': 'b' }).length, new Map([[1, 'a'], ['1', 'b']]).size); // 1 2
+
+      const nan = new Map([[NaN, 'not a number']]);
+      console.log(nan.get(NaN), new Map([[0, 'zero']]).get(-0)); // not a number zero
+
+      console.log(JSON.stringify({ a: 1 }), JSON.stringify(new Map([['a', 1]]))); // {"a":1} {}
+      console.log(JSON.stringify(Object.fromEntries(new Map([['a', 1]])))); // {"a":1}
+
+      const bare = Object.create(null);
+      console.log('toString' in bare); // false
+      ```
+
+      Objects list integer-like keys first, in numeric order, then the rest in insertion
+      order. Maps keep insertion order for every key. Object keys are always strings or
+      symbols, so `1` and `'1'` collide. Maps compare keys with **SameValueZero**: like `===`,
+      except `NaN` matches `NaN`. Objects inherit `constructor`, `toString` and friends from
+      their prototype, unless you create them with `Object.create(null)`. And `JSON.stringify`
+      turns a Map into `{}`, so convert it with `Object.fromEntries` first.
+
+      Performance differs too. V8 optimises objects for a fixed set of properties known up
+      front. An object that has many keys added and deleted at run time can drop into a
+      slower dictionary mode. `Map` is designed for exactly that churn.
+
+      Use a `Set` when you only ask "is it in there?". For a cache keyed by objects, there's
+      `WeakMap`. It doesn't keep its keys alive, so the garbage collector can remove an entry
+      once nothing else refers to its key.
+pitfalls:
+  - '**Using a plain object as a dictionary for user-supplied keys.** Keys like `constructor` already exist, and `obj["__proto__"] = "x"` is silently ignored rather than stored. Use a `Map`, or an object from `Object.create(null)`.'
+  - '**Expecting a `Map` to find an equal-looking key.** `map.get([1, 2])` returns `undefined` for a key set with a different `[1, 2]` array, because object keys match by identity. Build a string key such as `"1,2"`, or keep the original array.'
+  - '**Checking presence with truthiness.** `if (counts[key])` treats a stored `0` or `""` as missing. Use `map.has(key)`, or `Object.hasOwn(obj, key)`.'
+  - '**Serialising a `Map` with `JSON.stringify`.** It prints `{}` and the data is gone. Convert with `Object.fromEntries(map)` for string keys, or `[...map]` for a list of pairs.'
+  - '**Draining a big array with `shift` in a loop.** Each call is specified to move every remaining item, so draining n items can cost O(n²). Keep a read index into the array, or use a linked-list queue.'
+  - '**Reaching for a linked list for speed.** In JavaScript, each node is a separate object and each hop can miss the cache. An array is usually faster unless you really insert in the middle through node references. Measure before switching.'
+interview:
+  - question: How does a hash map work, and what happens when two keys collide?
+    answer: >-
+      A hash map runs each key through a hash function and uses the result, modulo the bucket
+      count, to pick a bucket. A lookup goes straight there, O(1) on average. Two keys landing in one bucket is a collision, and it's normal. With
+      chaining, each bucket holds a small list that's scanned by comparing keys. With open
+      addressing, the entry goes in the next free slot along a probe sequence, and lookups
+      follow the same sequence. To keep buckets short, the table tracks its load factor,
+      entries divided by buckets. Past a threshold it doubles and rehashes, which is O(1)
+      amortised. The catch is that O(1) is an average: a weak hash or deliberately
+      colliding keys can make one bucket hold everything, and lookups become O(n).
+  - question: Arrays versus linked lists. When would you actually use a linked list?
+    answer: >-
+      An array gives O(1) access by index and fast iteration, while a linked list gives O(1)
+      insertion and removal at a node you already hold. Arrays win most real workloads.
+      Their items are contiguous, so iteration uses every cache line it loads. A list chases
+      pointers to scattered nodes and pays in cache misses and per-node overhead. I'd use a
+      linked list when I hold node references and must insert or remove around them in
+      constant time, like the recency list in an LRU cache. A queue is the other case, since
+      removing from the front of an array shifts everything. Even then, a ring buffer
+      over an array often does the queue job faster. In JavaScript specifically, a `Map`'s
+      insertion order gives you an LRU without writing a list at all.
+  - question: When would you use a `Map` instead of a plain object in JavaScript?
+    answer: >-
+      I use a `Map` whenever the keys come from data rather than from my code. It accepts
+      any key type, including objects, which it matches by identity. It keeps insertion order
+      for every key, has a `size`, and has no inherited keys like `constructor` or
+      `__proto__`, which matters for user-supplied keys. It's also built for frequent adds
+      and deletes, where an object can fall into V8's slower dictionary mode. A plain object
+      is right for records with a fixed shape, like `{ id, name, email }`. That's what engines
+      optimise for, and it serialises to JSON directly. The trade-offs of `Map` are
+      that `JSON.stringify` gives `{}`, so you convert with `Object.fromEntries`, and the
+      syntax is a bit wordier. For membership tests alone I'd use a `Set`.
+  - question: What is a load factor, and why does a hash table resize?
+    answer: >-
+      The load factor is the number of entries divided by the number of buckets, and it
+      predicts how long a lookup takes. With chaining, it's the average chain length. With
+      open addressing, a high load factor makes probe sequences long and clustering worse.
+      So a table picks a threshold, 0.75 in Java's `HashMap` for example. When it's crossed,
+      the table allocates a bigger bucket array, usually twice the size. Then it reinserts
+      every entry, because each entry's bucket depends on the bucket count. That rehash is O(n),
+      but since the table doubles, it happens rarely enough that inserts stay O(1) amortised.
+      The trade-off is memory against speed: a lower threshold means shorter chains and more
+      empty buckets. The resize also causes an occasional slow insert, which some systems
+      spread out by rehashing a few buckets at a time.
+  - question: Design a cache that holds at most N entries and evicts the least recently used one, with O(1) get and put.
+    answer: >-
+      Pair a hash map, for O(1) lookup by key, with a doubly linked list ordered by recency.
+      The map stores key to list node. On `get`, I look up the node, unlink it and move it to
+      the recent end. That's O(1), because the list is doubly linked and I hold the node. On
+      `put`, I insert or update the node at the recent end. If the size passes N, I remove
+      the node at the other end and delete its key from the map. In JavaScript I can
+      lean on `Map` itself: it iterates in insertion order, so deleting and re-setting a key
+      moves it to the end, and `map.keys().next().value` is the oldest key. That's shorter
+      and less error-prone. The trade-off is that it relies on a language guarantee, so in
+      an interview I'd explain the textbook structure too.

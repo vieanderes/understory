@@ -1,0 +1,213 @@
+summary: >-
+  Scaling is removing the bottleneck that limits you now, in the order that costs least.
+  A bigger machine is a setting. A missing index, a connection pool or a cache is a small
+  change. More instances need stateless code and a balancer, and they only help when the
+  app itself is what everything waits for. Adding instances in front of a saturated
+  database makes things worse, as the lesson's load test showed.
+
+
+  Capacity and cost are the same plan read two ways. Measure what one instance serves, add
+  headroom for spikes, never run fewer than two, and the instance count is also your
+  monthly bill. Then guard that bill: tags on everything, budgets with alerts, and a cost
+  per unit of business, such as pence per order, that you watch like a latency graph.
+
+
+  These notes add the queueing arithmetic that links throughput, latency and concurrency,
+  how autoscalers decide, the kinds of state that break horizontal scaling besides
+  sessions, the order to scale a database, and the habits that keep a cloud bill honest.
+remember:
+  - Measure first, then fix the cheapest bottleneck, and add instances only when the app itself is the limit.
+  - Scale vertically first because it needs no code changes, and horizontally when one machine can't cope or can't be a single point of failure.
+  - Instances must be stateless, with sessions, uploads, caches that must agree and scheduled jobs moved to shared stores or single owners.
+  - Concurrency equals throughput times latency, so slower requests need more instances, connections and memory for the same traffic.
+  - Plan instances as forecast peak plus headroom, divided by one instance's measured rate, rounded up, and never fewer than two.
+  - Autoscaling reacts in minutes, so headroom or a queue has to absorb spikes that arrive in seconds.
+  - Every resource carries an owner tag, every account has a budget alert, and cost per order is tracked like any other metric.
+sections:
+  - title: Throughput, latency and concurrency
+    body: |-
+      Three numbers describe load, and **Little's law** ties them together: requests in
+      flight equal requests per second times seconds per request. It holds for any stable
+      system, and it explains most scaling surprises.
+
+      ```ts
+      // Connections busy at once = queries per second x seconds each query holds one.
+      function connectionsInUse(queriesPerSecond: number, msPerQuery: number): number {
+        return Math.ceil((queriesPerSecond * msPerQuery) / 1000);
+      }
+
+      function poolPerInstance(maxConnections: number, reserved: number, instances: number): number {
+        return Math.floor((maxConnections - reserved) / instances);
+      }
+
+      connectionsInUse(2000, 5); // 10: two thousand fast queries a second need few connections
+      poolPerInstance(100, 10, 6); // 15 each, at most, for six instances
+      ```
+
+      The first line is why small pools go a long way: at 5 ms per query, ten connections
+      serve two thousand queries a second. The second is the budget the lesson's load test
+      broke: pools times instances must stay under the database limit, or a pooler must sit
+      in between.
+
+      The law also warns you about latency. If a query slows from 5 ms to 50 ms, perhaps
+      because an index is missing, the same traffic needs ten times the connections. Pools
+      run dry, requests queue, latency grows further, and the system tips over. That's why a
+      slow query is often the real cause of an outage that looks like "too much traffic",
+      and why fixing it is cheaper than any amount of hardware.
+
+      Utilisation matters too. As any resource approaches 100% busy, queues and waiting
+      times grow sharply rather than steadily. Plan to run CPU and connection pools well
+      below full at peak, which is what headroom buys.
+  - title: How autoscaling decides
+    body: |-
+      An autoscaler adjusts the instance count to keep a metric near a target. Kubernetes'
+      Horizontal Pod Autoscaler documents its rule, and most cloud autoscalers behave in a
+      similar way.
+
+      ```ts
+      // desired = ceil(current * currentMetric / targetMetric), skipped within a tolerance
+      function desiredReplicas(
+        current: number,
+        currentMetric: number,
+        targetMetric: number,
+        bounds: { min: number; max: number },
+        tolerance = 0.1,
+      ): number {
+        const ratio = currentMetric / targetMetric;
+        if (Math.abs(ratio - 1) <= tolerance) return current;
+        const wanted = Math.ceil(current * ratio);
+        return Math.min(bounds.max, Math.max(bounds.min, wanted));
+      }
+
+      desiredReplicas(4, 90, 60, { min: 2, max: 10 }); // 6: CPU at 90% against a 60% target
+      desiredReplicas(4, 63, 60, { min: 2, max: 10 }); // 4: close enough, no change
+      desiredReplicas(4, 10, 60, { min: 2, max: 10 }); // 2: quiet, held at the floor
+      ```
+
+      The tolerance stops the count flapping on small changes. The minimum keeps redundancy
+      at night. The maximum caps both the bill and the load on the database behind.
+
+      Choose the metric carefully. CPU works for CPU-bound apps. For an app that mostly
+      waits on a model API or database, CPU stays low while requests pile up, so scale on
+      requests in flight per instance or on queue depth instead.
+
+      Autoscaling is slow compared with a spike. Metrics are sampled, new instances boot and
+      pass readiness checks, and scale-down waits to avoid flapping. Minutes pass. So keep
+      enough headroom for the first minutes of a spike, schedule scale-ups before known
+      events such as a sale, and put a queue in front of work that can wait.
+  - title: State that breaks scaling out
+    body: |-
+      Sessions in memory are the famous case. Several others break the same way, often
+      later, when a second instance appears.
+
+      - **Uploaded files on local disk.** The file exists on one instance only, and vanishes
+        when it's replaced. Store uploads in object storage such as S3 and keep the key in
+        the database.
+      - **In-memory caches.** Each instance has its own copy, so after an update some
+        instances serve the old value until expiry. Fine for data that tolerates staleness;
+        use a shared cache like Redis for anything that must agree.
+      - **Scheduled jobs.** A cron inside the app runs once per instance, so the nightly email
+        goes out three times. Run schedules in one place, or take a database lock such as a
+        PostgreSQL advisory lock so only one instance does the work.
+      - **In-process rate limits and counters.** Each instance counts separately, so ten
+        instances allow ten times the limit. Keep counts in one shared store.
+      - **WebSocket connections.** A message for a user must reach the instance holding their
+        socket. Fan out through a shared pub/sub channel.
+
+      Stateless instances also need graceful shutdown. When an instance is removed, it gets
+      a termination signal, `SIGTERM`. It should stop accepting new requests, finish those
+      in flight, close its pools and exit. Otherwise every scale-down drops requests.
+  - title: Scaling the database, in order
+    body: |-
+      The database is usually the last part to scale out, because it holds the state
+      everything else gave up. Work through the cheap steps first, measuring after each.
+
+      1. **Find slow queries.** `pg_stat_statements` ranks queries by total time. A missing
+         index is the most common fix, and `EXPLAIN ANALYZE` confirms it.
+      2. **Pool connections.** A pooler such as PgBouncer lets many app instances share a
+         small number of real connections.
+      3. **Cache hot reads.** Put repeated, read-heavy results in Redis or at the CDN, with a
+         clear expiry or invalidation rule.
+      4. **Scale up.** A bigger database machine with more memory keeps more of the working
+         set in RAM. It's often the best value step.
+      5. **Read replicas.** Send reports and read-heavy endpoints to replicas, accepting
+         replication lag, and keep reads that must see the latest write on the primary.
+      6. **Partition or shard.** Split data by a key, such as tenant or date. This is a large
+         change to the app and to operations, and it's rarely the first answer.
+
+      Moving slow, non-urgent work to background workers belongs early in the list too. A
+      report that runs for 30 seconds inside a request holds a connection and an instance
+      the whole time.
+  - title: Keeping the bill honest
+    body: |-
+      Cost is an operational metric. Treat surprises in it like surprises in error rates:
+      detect early, attribute to an owner, fix the cause.
+
+      - **Tags on everything.** At least owner, service and environment. Enforce them in
+        infrastructure code or with provider policies, and review untagged spend weekly.
+      - **Budgets with alerts.** Alert at thresholds of actual and forecast spend, per
+        account or project. Most providers alert but don't stop spend by default.
+      - **Unit cost.** Divide monthly cost by a business unit: pence per order, per active
+        user, per AI conversation. Total cost rising with growth is healthy; unit cost rising
+        means waste or a regression.
+      - **Idle resources.** Test machines, unattached disks, old snapshots, idle load
+        balancers and non-production environments running at night. Give temporary
+        resources an expiry tag and a job that removes them.
+      - **Commitments for the baseline.** Providers discount capacity you commit to for a
+        year or more. Commit to the steady floor, and leave peaks on demand or autoscaled.
+      - **Data transfer.** Traffic leaving a cloud, and sometimes between zones, is billed.
+        A chatty service split across zones can cost more in transfer than in compute.
+
+      For AI features, model tokens often outgrow compute. Track tokens per request, cache
+      repeated answers, and route simple requests to a smaller model.
+pitfalls:
+  - '**Adding instances before measuring.** When the database is the bottleneck, more instances add load to it and more requests fail. Load test, find the saturated resource, fix that first.'
+  - '**Pools that ignore the instance count.** Ten connections per instance is fine at two instances and fatal at twenty. Budget pools against `max_connections`, or put a pooler in between.'
+  - '**Scaling on CPU for an app that waits.** CPU stays low while requests queue on a slow API. Scale on requests in flight or queue depth.'
+  - '**Cron inside every instance.** Scheduled jobs run once per copy. Run them in one place or guard them with a lock.'
+  - '**Counting on autoscaling for sudden spikes.** New instances take minutes. Keep headroom, pre-scale for known events, and queue what can wait.'
+  - '**Watching only the total bill.** Growth hides waste. Track cost per order or per user, and alert on untagged spend.'
+interview:
+  - question: Your API is slow at peak. How do you decide how to scale it?
+    answer: >-
+      I'd measure before scaling, because the fix depends on which resource is saturated. A
+      load test that reproduces the peak, with metrics on CPU, memory, database connections,
+      query times and downstream latency, tells me where requests wait. If the app's CPU is
+      the limit, a bigger machine is the quickest fix, then stateless instances behind a
+      balancer. If the database is the limit, more instances make it worse, so I'd look for
+      slow queries and missing indexes, then pooling, caching and replicas. If a downstream
+      API is slow, I'd add timeouts, concurrency limits and a queue. The trade-off is time:
+      measuring takes a day, while guessing wrong can take a week and still leave the
+      bottleneck in place.
+  - question: What does it take to make an application horizontally scalable?
+    answer: >-
+      Any instance must be able to serve any request, and instances must be safe to add and
+      remove at any time. That means no local state: sessions in Redis or the database,
+      uploads in object storage, shared caches where values must agree, and rate limits in a
+      shared store. Scheduled jobs run once, not once per instance, so they move to a
+      scheduler or take a lock. Each instance needs health checks and a graceful shutdown on
+      `SIGTERM`. Then the shared pieces need their own capacity plan: connection pools
+      budgeted against the database limit, or a pooler. The trade-off is that shared stores
+      add network hops and new dependencies, so each one needs its own monitoring and
+      failure plan.
+  - question: How would you work out how many instances you need for a launch?
+    answer: >-
+      From a measured rate per instance, not a guess. I'd load test one instance with
+      realistic traffic until latency passes the target, and take the throughput slightly below
+      that as its capacity. Then forecast the peak, for example from marketing numbers or a
+      similar past event, add headroom, often 30 to 50% for a launch, divide and round up,
+      with a floor of two for redundancy. I'd check that the database and any downstream
+      limits cope with that many instances, and pre-scale before the launch because
+      autoscaling reacts in minutes. The instance count times the price is also the cost
+      estimate, so I'd share both. The trade-off is money against risk: more headroom costs
+      more and fails less.
+  - question: The cloud bill jumped 60% this month. How do you find out why and stop it happening again?
+    answer: >-
+      Break the bill down by service and by tag, and compare with last month. The cost
+      explorer usually shows the jump in one or two lines: a new instance type, data
+      transfer, storage, or model tokens. Tags point to an owner; untagged spend is itself a
+      finding. Then I'd sort it into growth, which shows up in cost per order staying flat,
+      and waste, such as forgotten machines or a bug causing retries. To prevent a repeat:
+      enforce owner tags in infrastructure code, set budget alerts on actual and forecast
+      spend, add expiry tags and cleanup for temporary resources, and put unit cost on a
+      dashboard. The trade-off is some friction for engineers creating resources.

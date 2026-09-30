@@ -1,0 +1,196 @@
+summary: >-
+  The URL shortener is the classic first design question because it's small enough to
+  finish in 45 minutes and still has real decisions: how to make short unique ids, how to
+  serve thousands of redirects a second cheaply, which redirect status to send, and how to
+  stop abuse. The lesson walks the method through it. These notes add the probability
+  behind random codes, the schema and write path in code, a click analytics pipeline that
+  doesn't slow redirects, and the follow-up questions interviewers use to go deeper.
+
+
+  The shape of the answer: writes are rare and simple, reads are a hundred times more
+  frequent and must be fast, so the design is a thin write path and a read path built from
+  caches and replicas. The interesting failure is the cache going away, not the write path
+  slowing down.
+
+
+  The same shape fits any read-heavy lookup service: a pastebin, a feature-flag service,
+  public profile pages, a product catalogue.
+remember:
+  - At 100 million new links a month and 100 clicks each, the service does about 39 writes and 3,900 redirects a second on average, with peaks several times higher.
+  - Six base62 characters give about 57 billion codes and seven give about 3.5 trillion.
+  - A counter never collides and is guessable, a random code is unguessable and needs a unique constraint, and a hash gives the same code for the same URL.
+  - Random codes will collide at scale, since with seven characters the first collision is expected after only about 2.4 million codes, so the database's unique constraint and a retry decide correctness.
+  - Use 302 when every click must be counted or the target may change, because browsers may cache a 301 and skip your servers.
+  - Cache codes with cache-aside and a long TTL, since a code's target rarely changes, and size the database or replicas for the day the cache is empty.
+  - Count clicks off the redirect path by sending an event to a queue and aggregating later.
+sections:
+  - title: Random codes and the birthday problem
+    body: |-
+      "Random seven-character codes are unguessable, so collisions won't happen" is half
+      right. Collisions are rare per insert and certain overall.
+
+      The birthday problem says that among codes drawn uniformly from N possibilities, the
+      first collision is expected after about the square root of (π/2 × N) draws. For seven
+      base62 characters, N is 62^7, about 3.5 trillion, so the first collision is expected
+      around 2.35 million codes. A service making 100 million links a month hits that in
+      under a day.
+
+      Per insert, the risk stays small. After 12 billion links, ten years at this rate, a
+      new code collides with probability 12 billion ÷ 3.5 trillion, about 0.34%. So the
+      write path generates a code, inserts it, and retries on a conflict:
+
+      ```ts
+      import { randomInt } from 'node:crypto';
+
+      const ALPHABET = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
+      // randomInt draws without modulo bias, so every character is equally likely.
+      const randomCode = (length = 7) =>
+        Array.from({ length }, () => ALPHABET[randomInt(ALPHABET.length)]).join('');
+
+      type Insert = (code: string, target: string) => Promise<boolean>; // false if taken
+
+      async function shorten(target: string, insert: Insert, attempts = 3) {
+        for (let i = 0; i < attempts; i++) {
+          const code = randomCode();
+          if (await insert(code, target)) return code;
+        }
+        throw new Error('no free code after 3 attempts');
+      }
+      ```
+
+      Three attempts failing in a row at 0.34% each has a probability of about 4 in 100
+      million, so the error is a signal that something else is wrong. `randomInt` matters:
+      picking a character with `byte % 62` favours the first eight characters, because 256
+      isn't a multiple of 62.
+  - title: The schema and the write
+    body: |-
+      One table holds the mapping. The code is the primary key, which gives the unique
+      constraint and the lookup index in one.
+
+      ```sql
+      CREATE TABLE links (
+        code       text PRIMARY KEY,
+        target     text NOT NULL,
+        owner_id   bigint NOT NULL,
+        created_at timestamptz NOT NULL DEFAULT now(),
+        expires_at timestamptz
+      );
+
+      INSERT INTO links (code, target, owner_id)
+      VALUES ($1, $2, $3)
+      ON CONFLICT (code) DO NOTHING
+      RETURNING code;
+      ```
+
+      A taken code returns zero rows instead of an error, which is the signal to retry with
+      a new code. Custom aliases go in the same table, so one constraint covers generated
+      and chosen codes alike.
+
+      Storage stays modest: at about 500 bytes a row, 100 million links is 50 GB a month and
+      6 TB over ten years. One Postgres with partitions by creation month, or a key-value
+      store keyed by code, both fit. The key-value store is a fair choice here because the
+      access pattern is pure lookup by key. Postgres is also fine, and keeps the owner's
+      "list my links" query simple.
+
+      If the product wants the same URL to get the same code, add a unique index on a hash
+      of the target per owner, and look it up before creating.
+  - title: Counting clicks without slowing redirects
+    body: |-
+      Analytics tempts people to write a row per click inside the redirect. At 3,900 clicks a
+      second, and several times that at peak, those writes would dominate the database, and
+      a slow insert would slow every redirect.
+
+      Instead, the redirect handler publishes a small click event and returns:
+
+      ```text
+      GET /aB3xY9q
+        → cache or replica: look up the target
+        → publish {code, time, referrer, country} to a topic, don't wait for processing
+        → 302 with Location: target
+
+      consumer group "click-counter"
+        → batches events, adds per code per day
+        → upserts daily_clicks (code, day, clicks)
+      ```
+
+      The upsert adds to a running count:
+
+      ```sql
+      INSERT INTO daily_clicks (code, day, clicks)
+      VALUES ('aB3xY9q', '2026-09-25', 120)
+      ON CONFLICT (code, day)
+      DO UPDATE SET clicks = daily_clicks.clicks + EXCLUDED.clicks;
+      ```
+
+      This isn't idempotent: a redelivered batch would count twice. Record each batch's id
+      in the same transaction, or accept small overcounts if the product calls counts
+      approximate. Say which in the interview.
+
+      If the broker is down, the redirect must still work. Buffer events briefly in memory
+      and drop them if the buffer fills, because a lost click costs little and a failed
+      redirect costs a user.
+  - title: Follow-ups interviewers ask
+    body: |-
+      Once the core is done, interviewers push on edges. Short answers for the common ones:
+
+      - **Expiry.** An `expires_at` column, checked on read, plus a job that deletes
+        expired rows. The cache TTL must not outlive the link.
+      - **Deleting or blocking a link.** Update the row, then delete the cache key. With a
+        CDN in front, purge it there too, or keep CDN TTLs short.
+      - **Hot links.** One code shared by millions. Local in-process caches absorb it, and a
+        CDN can serve the redirect itself if the product accepts less exact counts.
+      - **Abuse.** Rate-limit creation per account, check new targets against a list of
+        known malicious sites, and scan asynchronously so creation stays fast.
+      - **Multiple regions.** Redirects are reads, so serve them from replicas and caches in
+        every region. Writes can go to one primary region: 39 a second doesn't need more.
+      - **Security of private links.** Private links need long random codes, such as 16
+        characters from 12 random bytes, never counters.
+
+      Each answer should name its trade-off. A CDN on redirects makes them faster and cheaper
+      and makes counts less exact. Longer codes are safer and uglier.
+pitfalls:
+  - "**Counter-based codes for private content.** Anyone can walk the sequence. Use random codes, long enough to be unguessable, for anything not public."
+  - "**Checking for a free code, then inserting.** Two writers can pick the same code between the check and the insert. Insert with a unique constraint and retry on conflict."
+  - "**Sending 301 when clicks are counted.** Browsers may cache it and never come back. Use 302, or accept that repeat clicks go uncounted."
+  - "**Writing analytics inside the redirect.** It puts a database write on the hottest path. Publish an event and aggregate asynchronously."
+  - "**Answering 503 when the cache is down.** Redirects become unavailable though the data is fine. Fall back to replicas sized for the full load."
+  - "**`byte % 62` for random characters.** It biases towards the first characters. Use `crypto.randomInt` or rejection sampling."
+interview:
+  - question: How would you generate the short codes?
+    answer: >-
+      Random seven-character base62 codes with a unique constraint and retry, unless the
+      codes may be guessable, in which case a counter is simpler. Seven characters give 3.5
+      trillion codes; at 12 billion links a new code collides about 0.34% of the time, so a
+      retry loop is cheap. A counter never collides and can be handed out in ranges of a
+      thousand per server to avoid a central bottleneck, but anyone can walk it, which
+      rules it out for private links. Hashing the URL gives deduplication for free, but
+      truncated hashes collide too and need the same handling. The trade-off I'd name:
+      random codes need a database round trip to confirm uniqueness, counters don't.
+  - question: The cache in front of your redirects goes down. What happens?
+    answer: >-
+      Every redirect falls through to the database, about 20 times its usual read load if
+      the cache served 95%. If the database isn't sized for that, redirects fail for
+      everyone. So I plan for it: read replicas able to take the full redirect load at peak,
+      an in-process cache on each server with a short TTL to absorb the hottest codes, and
+      cache calls with short timeouts so a hanging cache is treated as a miss. When the
+      cache returns empty, I'd expect a stampede on hot codes, so misses are coalesced.
+      Answering 503 until the cache recovers would turn a cache incident into a full outage.
+  - question: 301 or 302 for the redirect?
+    answer: >-
+      302 if the product counts clicks or may ever change a link's target; 301 only if
+      neither matters and saving traffic does. A 301 is heuristically cacheable, so browsers
+      may remember it and go straight to the target on repeat clicks, which your servers
+      never see. That saves load and loses the count, and a cached 301 is hard to take back
+      if the link is later blocked for abuse. A 302 isn't cached by default, so every click
+      reaches you. For a shortener with analytics that's decisive. The cost is serving every
+      repeat click yourself, which the read path is designed to absorb anyway.
+  - question: How would you add click analytics without slowing redirects?
+    answer: >-
+      Take the counting off the redirect path. The handler looks up the target, publishes a
+      small click event to a topic without waiting for it to be processed, and returns the
+      302. A consumer group reads the events in batches and upserts per-code, per-day
+      counts, and a separate consumer can feed a warehouse for detailed queries later. If the
+      broker is unavailable, the redirect still succeeds and events are buffered briefly or
+      dropped. The consumer is at-least-once, so I either record batch ids to avoid double
+      counting or state that counts are approximate. The trade-off is freshness: counts lag
+      by seconds.

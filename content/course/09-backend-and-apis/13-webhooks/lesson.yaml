@@ -1,0 +1,285 @@
+id: backend.webhooks
+title: Webhooks
+objective: Receive events from another service, check their signature on the raw body, and handle repeats and reordering.
+level: essential
+minutes: 10
+concepts: [backend.webhook-signatures, backend.webhook-retries, backend.idempotent-handlers]
+prerequisites: [backend.calling-other-apis, backend.http-in-depth]
+opening:
+  text: >-
+    You'll let another service call your server when something happens, and be sure the
+    call is really theirs. When it sends the same event three times, your code will act on
+    it once.
+
+steps:
+  - type: prose
+    id: what-a-webhook-is
+    body: >-
+      Some work finishes later: a payment clears, or an AI model transcribes an hour of
+      audio. You could ask "done yet?" every few seconds. Instead, you give the service a
+      URL of yours.
+
+
+      When the work is done, the service sends a `POST` to that URL, with the news as JSON.
+      That request is a **webhook**. Your side is an ordinary endpoint, such as
+      `POST /webhooks/payments`.
+
+  - type: prose
+    id: why-a-signature
+    body: >-
+      Your webhook URL is public, so anyone can post "payment succeeded" to it with `curl`.
+      You need to know who sent it.
+
+
+      Think of a wax seal that only you and the sender can make. You share a secret when you
+      set the webhook up. The sender stamps every message with a **signature** made from
+      the body and that secret. Change one byte, and the seal no longer fits.
+
+  - type: prose
+    id: verify-with-the-library
+    body: |-
+      The provider's library checks the seal for you. With Stripe:
+
+      ```js
+      const raw = await request.text();
+      const signature = request.headers.get("stripe-signature");
+      let event;
+      try {
+        event = stripe.webhooks.constructEvent(raw, signature, process.env.STRIPE_WEBHOOK_SECRET);
+      } catch {
+        return Response.json({ error: "Bad signature" }, { status: 400 });
+      }
+      ```
+
+      `request.text()` reads the body as the exact text that arrived. A bad seal throws.
+
+  - type: predict-output
+    id: predict-tampered-body
+    concept: backend.webhook-signatures
+    difficulty: 1
+    language: bash
+    code: |
+      $ curl -i -d '{"id":"evt_9","type":"checkout.session.completed"}' \
+          localhost:3000/webhooks/stripe
+    question: Someone fakes an event with `curl`, with no signature. What does your endpoint answer?
+    choices:
+      - text: '`400`, with `{"error":"Bad signature"}`'
+        correct: true
+        feedback: >-
+          Right. `constructEvent` finds no valid seal and throws, so nothing is trusted.
+      - text: '`200`, and the order is marked paid'
+        feedback: >-
+          That's what an endpoint without the check would do. Here the missing seal throws first.
+      - text: '`404`, since only Stripe can see the URL'
+        feedback: >-
+          The URL is public. Anyone who finds it can post to it, which is why the seal matters.
+
+  - type: bug-hunt
+    id: predict-reencoded-body
+    concept: backend.webhook-signatures
+    difficulty: 2
+    language: js
+    code: |
+      const event = await request.json();
+      const signature = request.headers.get("stripe-signature");
+      stripe.webhooks.constructEvent(
+        JSON.stringify(event),
+        signature,
+        process.env.STRIPE_WEBHOOK_SECRET,
+      );
+    prompt: >-
+      Real events from Stripe fail with "No signatures found matching the expected signature
+      for payload". Tap the line at fault.
+    lines: [4]
+    reasons:
+      - text: The re-encoded text isn't the text Stripe signed
+        correct: true
+        feedback: >-
+          Yes. Spaces and order can change. Check the raw `request.text()`, then parse.
+      - text: The header name should be `Stripe-Signature`
+        feedback: >-
+          Header names ignore case, so both spellings find it. The body is what changed.
+      - text: '`request.json()` needs a `try`'
+        feedback: >-
+          A good habit, but the body parsed fine. It was the checking that saw different bytes.
+    fix: |
+      const raw = await request.text();
+      const signature = request.headers.get("stripe-signature");
+      const event = stripe.webhooks.constructEvent(
+        raw,
+        signature,
+        process.env.STRIPE_WEBHOOK_SECRET,
+      );
+
+  - type: prose
+    id: at-least-once
+    body: >-
+      Providers deliver **at least once**. If your endpoint is slow or answers `5xx`, they
+      send the event again, for up to days. So the same event can arrive twice, and events
+      can arrive out of order.
+
+
+      Answer `2xx` quickly. Put slow work, like emails, on a **queue**: a list of jobs your
+      server works through after it has answered.
+
+  - type: ai-review
+    id: review-record-after-work
+    concept: backend.idempotent-handlers
+    difficulty: 3
+    language: js
+    request: Make our webhook handler ignore an event we've already processed.
+    flawClass: race
+    code: |
+      async function handleEvent(event) {
+        if (processed.has(event.id)) return;
+        await markPaid(event.orderId);
+        await sendReceipt(event.orderId);
+        processed.add(event.id);
+      }
+    prompt: >-
+      An assistant wrote this. `processed` is a `Set`. The test sends one event twice, one after
+      the other, and it passes. In production a redelivery arrives while the receipt is still
+      sending. Tap the line at fault.
+    lines: [5]
+    reasons:
+      - text: The id is recorded last, so a repeat slips past
+        correct: true
+        feedback: >-
+          Yes. Record the id before the first `await`, so a second delivery sees it.
+      - text: '`has` should be `get`'
+        feedback: >-
+          A `Set` has no `get`, and `has` is right. The gap is between the check and the record.
+      - text: The receipt should be sent before marking paid
+        feedback: >-
+          Swapping them changes nothing. Both still run twice while the id isn't recorded.
+    fix: |
+      async function handleEvent(event) {
+        if (processed.has(event.id)) return;
+        processed.add(event.id);
+        await markPaid(event.orderId);
+        await sendReceipt(event.orderId);
+      }
+
+  - type: prose
+    id: idempotent-by-id
+    body: >-
+      An **idempotent handler** does its work once, however many times an event arrives.
+      Record the event's `id` before any work. Doing that first is called claiming it.
+
+
+      If the work then fails, release the claim and answer `500`, so the retry can try
+      again. Ignore event types you don't handle, but still answer `200`, or the provider
+      keeps resending them.
+
+  - type: code-challenge
+    id: write-claim-first
+    concept: backend.idempotent-handlers
+    difficulty: 3
+    language: ts
+    editable: '24-27'
+    prompt: >-
+      Finish `receive(event, work)`, which already skips an id it has claimed.
+
+
+      Only `payment.succeeded` calls `work.markPaid`; other types answer `200` with no work.
+      Claim the id before `markPaid`, so two deliveries at once do the work once. If
+      `markPaid` throws, release the claim and answer `500`.
+    hints:
+      - The fix for the race is where `claimed.add` sits. Move it above the `await`.
+      - Check the type right after the repeat check, and return early.
+      - 'Wrap `await work.markPaid(...)` in `try`, and call `claimed.delete(event.id)` in the `catch`.'
+
+  - type: explain-back
+    id: explain-2xx-first
+    concept: backend.webhook-retries
+    difficulty: 3
+    prompt: >-
+      Your webhook handler checks the signature, updates three records and emails a receipt,
+      then answers `200`. The provider keeps resending events you've handled. Why?
+    rubric:
+      - The provider waits only a few seconds for a `2xx`, and the slow work runs past it.
+      - To the provider a timeout is a failure, so it sends the event again.
+      - Answer `2xx` once the event is checked and claimed, and leave slow work to a queue.
+    modelAnswer: >-
+      The provider gives my endpoint a few seconds to answer. Three updates and an email take
+      longer, so it gives up before my `200` arrives. To the provider that's a failure, so it
+      retries, and keeps retrying. I should check the signature, claim the event, answer
+      `200`, and put the email on a queue. The retries stop, and any repeat is caught by its
+      id.
+
+recap:
+  - Check a webhook's signature on the raw body with the provider's library.
+  - Expect every event more than once and in any order, and answer `2xx` fast.
+  - Claim each event id before the work, and release it if the work fails.
+
+recall:
+  - id: card-what-webhook
+    concept: backend.webhook-retries
+    front: What is a webhook?
+    back: >-
+      A request another service sends to your endpoint when something happens, such as a
+      payment succeeding.
+  - id: card-raw-bytes
+    concept: backend.webhook-signatures
+    front: Why must a webhook signature be checked against the raw request body?
+    back: >-
+      The provider signed those exact bytes. Parsing and re-encoding can change spaces or
+      order, and the check fails.
+  - id: card-at-least-once
+    concept: backend.webhook-retries
+    front: What does at-least-once delivery mean for your handler?
+    back: >-
+      The same event can arrive twice, and events can arrive out of order. The handler must
+      cope with both.
+  - id: card-claim-first
+    concept: backend.idempotent-handlers
+    front: When does a handler record an event id, and why then?
+    back: >-
+      Before the work. Recording it after leaves a gap where a repeat slips through and does
+      the work again.
+
+references:
+  - kind: docs
+    title: Receive Stripe events in your webhook endpoint
+    authors: Stripe
+    venue: Stripe documentation
+    url: https://docs.stripe.com/webhooks
+    note: Signature checks on the raw body, retries for up to three days, answering `2xx` quickly, and duplicate events.
+    primary: true
+    verified: true
+  - kind: paper
+    title: Idempotence Is Not a Medical Condition
+    authors: Pat Helland
+    year: 2012
+    venue: ACM Queue 10(4)
+    url: https://doi.org/10.1145/2181796.2187821
+    note: Why messages arrive more than once and out of order, and how to design for it.
+    primary: true
+    verified: true
+  - kind: docs
+    title: 'Request: text() method'
+    authors: MDN contributors
+    venue: MDN Web Docs
+    url: https://developer.mozilla.org/en-US/docs/Web/API/Request/text
+    note: Reading a request body as the exact text that arrived.
+    verified: true
+
+deepDive: >-
+  Under the seal is an HMAC: a hash of the body mixed with the shared secret. Stripe's
+  `Stripe-Signature` header carries `t`, a timestamp, and `v1`, an HMAC-SHA256 of `t.body`.
+  The library refuses a timestamp more than five minutes old, so an old delivery can't be
+  replayed.
+
+
+  Written by hand, the check uses `createHmac` and `timingSafeEqual` from `node:crypto`.
+  `===` stops at the first wrong character, and an attacker who can time that learns the
+  signature one character at a time.
+
+
+  A `Set` only holds claims for one running process. With several servers, the claim is
+  one write to a shared store that fails if the id is already there. The databases chapter
+  shows how.
+
+
+  For order, don't replay what each event says happened. Read the object's current state,
+  which the event includes or the provider lets you fetch, and store that.

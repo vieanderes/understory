@@ -1,0 +1,177 @@
+summary: >-
+  A news feed looks like a query, "recent posts from everyone I follow", and behaves like a
+  scaling problem, because some accounts have millions of followers and some users follow
+  thousands of accounts. The central choice is when to do the work: when a post is written,
+  by pushing it into every follower's stored feed, or when a feed is read, by gathering
+  posts from everyone followed.
+
+
+  The lesson covers both fan-outs, the hybrid that pushes for ordinary accounts and pulls
+  for celebrities, and hot keys. These notes add the arithmetic that decides between them,
+  the storage of pushed feeds, pagination that stays stable while new posts arrive, and how
+  deletion and ranking fit in.
+
+
+  The same trade-off appears in notifications, activity streams, inboxes and any "timeline
+  of things from sources I subscribe to". The estimate comes before the choice, because
+  changing the inputs can flip the answer.
+remember:
+  - Fan-out on write costs one write per follower per post and makes reading a feed one lookup.
+  - Fan-out on read stores each post once and makes every feed open gather and merge posts from everyone followed.
+  - The hybrid pushes posts from ordinary accounts and pulls posts from accounts above a follower threshold, so no single post costs more writes than the threshold.
+  - Fan-out runs in queue workers, never inside the posting request, so a big account's post causes feed lag rather than a timeout.
+  - A hot key lives on one cache shard, so adding shards doesn't help; copy it under several keys or cache it in each server's memory.
+  - Stored feeds are a cache of post ids that can be rebuilt from the posts and follows tables.
+  - Paginate feeds with a cursor on time and id, not page numbers, so new posts don't shift the pages being scrolled.
+sections:
+  - title: The numbers that decide it
+    body: |-
+      Take 10 million daily users, each posting twice and opening the feed ten times a day,
+      with 200 followers and 200 followed accounts on average.
+
+      ```text
+      push: 10M × 2 posts × 200 followers = 4 billion feed writes a day
+            ≈ 46,000 writes a second, before peaks
+      pull: 10M × 10 opens × 200 followed  = 20 billion lookups a day
+      ```
+
+      Pushing is cheaper here, because reads outnumber posts five to one. Now change the
+      inputs: if users posted more than they read, or followed thousands of accounts but
+      rarely opened the app, pull would win. That's why the answer starts with the estimate.
+
+      Averages hide the tail that breaks push. The cost of one post is its author's follower
+      count. At an average of 200, a single account with 10 million followers makes one post
+      cost as much as 50,000 ordinary posts. The hybrid exists for that tail: set a threshold
+      T, and no post ever costs more than T writes. Posts from accounts above T are pulled at
+      read time.
+
+      The pull side of the hybrid stays cheap because celebrities are few. A user following
+      five large accounts adds five small queries, each for recent posts by one author, which
+      an index on `(author_id, at)` serves quickly, and those results cache well because
+      millions of readers share them.
+  - title: Storing pushed feeds
+    body: |-
+      A pushed feed is a list of post ids per user, newest first, capped at a length such as
+      800. Redis lists fit: the fan-out worker runs `LPUSH` to add a post id and `LTRIM` to
+      keep the first 800, batched in a pipeline per group of followers.
+
+      Store ids, not posts. A post is written once in the posts store and read by id, so an
+      edit changes one row, and the feed stays small. Rendering a page fetches the ids, then
+      the posts in one batch, mostly from a post cache.
+
+      Memory is the estimate to make:
+
+      ```text
+      800 ids × 8 bytes × 10 million users = 64 GB of raw ids
+      ```
+
+      Redis adds overhead per element on top, so the real figure is higher. Two levers
+      bring it down: keep stored feeds only for users active in the last few weeks, and
+      rebuild a feed on demand, from the pull query, when an inactive user returns.
+
+      The stored feed is a cache, which is what makes this safe. Lose it, and each feed can
+      be rebuilt from the posts and follows tables. The rebuild is expensive in bulk, so a
+      full loss means feeds are slower for a while, not missing.
+  - title: Cursor pagination that stays stable
+    body: |-
+      Page numbers break on feeds. While a user reads page one, ten new posts arrive, and
+      page two starts with posts they've already seen. A cursor says "posts older than the
+      last one I saw" instead.
+
+      Here is the pull query with a cursor, run on PostgreSQL 17:
+
+      ```sql
+      CREATE INDEX posts_by_author ON posts (author_id, at DESC, id DESC);
+
+      -- first page
+      SELECT p.id, p.at FROM posts p
+      JOIN follows f ON f.followee_id = p.author_id
+      WHERE f.follower_id = 1
+      ORDER BY p.at DESC, p.id DESC
+      LIMIT 20;
+
+      -- next page: the cursor is the last row's (at, id)
+      SELECT p.id, p.at FROM posts p
+      JOIN follows f ON f.followee_id = p.author_id
+      WHERE f.follower_id = 1
+        AND (p.at, p.id) < ('2026-09-25 10:05', 102)
+      ORDER BY p.at DESC, p.id DESC
+      LIMIT 20;
+      ```
+
+      The id breaks ties: two posts with the same timestamp would otherwise be skipped or
+      repeated at a page boundary. In the test data, two posts at 10:00 both appeared on the
+      second page, in id order. The row comparison `(p.at, p.id) < (...)` compares the pair
+      in order, which is exactly the sort.
+
+      The client receives the cursor as an opaque string, such as the pair encoded in
+      base64, so the format can change later without breaking apps.
+  - title: Deletes, privacy and ranking
+    body: |-
+      Deleting a post has to reach every stored feed it was pushed into. Two approaches:
+
+      - **Filter at read time.** Feeds hold ids, and rendering fetches each post. A deleted
+        post returns nothing and is skipped. Cheap and immediate.
+      - **Clean up asynchronously.** A worker removes the id from followers' lists later,
+        which keeps feeds from filling with dead entries.
+
+      Use both: filtering gives correctness now, cleanup gives tidy storage. The same read
+      filter handles blocks and privacy changes. If a user blocks an author, or an account
+      goes private, check visibility when the page is built, because pushed copies were
+      decided under the old rules.
+
+      Ranking sits on top of fan-out. A chronological feed is a sort by time. A ranked feed
+      is two stages: candidate generation, a few hundred recent posts gathered by the
+      fan-out, then scoring by predicted interest, often with a model. Keeping the stages
+      separate lets each change alone. It also sets a latency budget: scoring hundreds of
+      candidates must fit within the feed's target, so features are precomputed and the
+      scorer is fast.
+
+      Finally, inactive followers. Pushing to someone who hasn't opened the app in months
+      wastes writes. Many systems skip them and rebuild their feed by pull when they return.
+pitfalls:
+  - "**Fanning out inside the posting request.** A large account's post turns into millions of awaited writes and a timeout. Enqueue the fan-out and return."
+  - "**Pure push with celebrities.** One post becomes millions of writes and a backlog behind it. Pull posts from accounts above a threshold."
+  - "**Page-number pagination.** New posts shift the pages, causing repeats and gaps. Use a cursor on time and id."
+  - "**Storing whole posts in every feed.** Edits and deletes must touch millions of copies. Store ids and fetch posts by id."
+  - "**More shards for a hot key.** The key still lives on one shard. Replicate it under several keys or cache it locally."
+  - "**Choosing push or pull before estimating.** The ratio of reads to posts decides it. Do the numbers first."
+interview:
+  - question: Fan-out on write or fan-out on read for a social feed?
+    answer: >-
+      Push for most accounts, pull for the few with huge followings, and the estimate
+      decides the threshold. With ten feed opens per two posts a day, pushing makes the
+      frequent operation, reading, a single lookup, and costs 200 writes per post at an
+      average of 200 followers. Pure push breaks on the tail: an account with 10 million
+      followers turns one post into 10 million writes. So above a threshold, say tens of
+      thousands of followers, posts aren't pushed; feeds pull those authors' recent posts at
+      read time and merge. The trade-off is complexity: two paths to build, test and keep
+      consistent, and a merge step on every read.
+  - question: A celebrity posts and one Redis shard hits 100% CPU. What do you do?
+    answer: >-
+      It's a hot key: every read of that post lands on the one shard that holds it, so more
+      shards won't help. Immediately, I'd add an in-process cache on each app server with a
+      TTL of a few seconds, so the shard sees one read per server per few seconds instead of
+      thousands. Structurally, I'd replicate hot keys under several names, such as
+      `post:123:0` to `post:123:7`, spread across shards, and have readers pick one at
+      random. Detecting hot keys automatically, from per-key request counts, lets you apply
+      this only where needed. The cost is staleness and more invalidation work: an edit must
+      clear every copy.
+  - question: How do you paginate a feed that keeps getting new posts?
+    answer: >-
+      With a cursor, not page numbers. The client sends the time and id of the last post it
+      saw, and the next query asks for posts strictly older than that pair, ordered by time
+      then id, with a limit. New posts at the top don't shift anything below, so there are no
+      duplicates or gaps. The id breaks ties between posts with the same timestamp. An index
+      on the author and the same sort order makes each page an index range scan. I'd hand the
+      cursor to clients as an opaque string so the format can change. The cost is that users
+      can't jump to page 50, which a feed never needs.
+  - question: How would you design the feed so that losing the feed cache isn't a disaster?
+    answer: >-
+      Treat the stored feeds as a cache derived from the source of truth, and make rebuilding
+      a normal code path. Posts and follows live in a durable database; the pushed lists hold
+      only post ids. If a user's list is missing, the read path falls back to the pull query
+      and repopulates the list. That same path serves inactive users returning after months,
+      so it's exercised daily, not only in disasters. A full loss would push every read onto
+      the pull path at once, so I'd rate-limit rebuilds and serve slightly degraded feeds,
+      such as fewer items, while the cache warms. The cost is capacity kept in reserve.

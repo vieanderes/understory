@@ -1,0 +1,294 @@
+id: backend.files
+title: Files and object storage
+objective: Accept an upload with a size and type check, store it in object storage, and hand out signed URLs.
+level: advanced
+minutes: 10
+concepts: [backend.object-storage, backend.signed-urls, backend.image-pipelines]
+prerequisites: [backend.http-in-depth, backend.authorisation]
+opening:
+  text: >-
+    You'll let people upload a profile photo, keep it somewhere that survives a redeploy,
+    and hand it back safely. And you'll stop the "photo" that's really a script.
+
+steps:
+  - type: prose
+    id: why-not-the-server
+    body: >-
+      Where does an uploaded photo go? Not on the server's own disk. A redeploy can wipe it,
+      and with two servers, half your users can't see it.
+
+
+      Not in the database either. It's built for rows of small values, and big files make
+      it slow and costly. Files go to a service made for them.
+
+  - type: prose
+    id: what-object-storage-is
+    body: >-
+      That service is **object storage**. Amazon S3 is the best known, and most others copy
+      its API. It holds files as **objects** in a **bucket**, a named container. Each object
+      sits under a **key**, its name, such as `avatars/a1.png`.
+
+
+      There are no real folders. Slashes are only part of the key. An object is written
+      whole and replaced whole, never edited in place.
+
+  - type: predict-output
+    id: predict-no-directories
+    concept: backend.object-storage
+    difficulty: 1
+    language: text
+    code: |
+      bucket: photos
+      keys:
+        u42/2026/09/9f1c.jpg
+        u42/2026/09/a7d0.jpg
+        u7/2026/09/9f1c.jpg
+    question: '`u42/2026/09/` looks like a folder. You delete both `u42` objects. What happens to it?'
+    choices:
+      - text: Nothing. There was never a folder
+        correct: true
+        feedback: >-
+          Right. A key is one flat string. The store never reads the slashes.
+      - text: It's removed once it's empty
+        feedback: >-
+          There's nothing to remove. Asking for keys that start with `u42/` now returns none.
+      - text: It stays, and must be deleted too
+        feedback: >-
+          Only objects exist. With both keys gone, nothing under `u42/` is left.
+
+  - type: prose
+    id: form-upload
+    body: |-
+      A page uploads a file with a form. `enctype="multipart/form-data"` tells the browser
+      to send the file's bytes:
+
+      ```html
+      <form method="post" action="/avatars" enctype="multipart/form-data">
+        <input type="file" name="photo">
+      </form>
+      ```
+
+      The handler reads it with `await request.formData()`. `form.get("photo")` is a file
+      with a `name`, a `type` and a `size` in bytes. Always cap the size, or one huge upload
+      fills memory. Too big gets **`413`**, Content Too Large.
+
+  - type: fill-blank
+    id: fill-size-limit
+    concept: backend.image-pipelines
+    difficulty: 2
+    language: js
+    prompt: >-
+      Read the uploaded photo and refuse anything over 2 MB. Fill the gaps.
+    template: |
+      const MAX_BYTES = 2000000; // 2 MB
+
+      const form = await request.{{1}}();
+      const photo = form.get("photo");
+      if (photo.{{2}} > MAX_BYTES) {
+        return Response.json({ error: "Photo too large" }, { status: {{3}} });
+      }
+    blanks:
+      - key: '1'
+        answer: formData
+      - key: '2'
+        answer: size
+      - key: '3'
+        answer: '413'
+    bank: [formData, json, size, length, '413', '400']
+
+  - type: prose
+    id: the-type-is-a-claim
+    body: |-
+      `photo.type` is only a claim. `curl -F` uploads a file the way the form does. It labels
+      this file of script text `image/png`, because the name ends in `.png`:
+
+      ```bash
+      $ curl -F "photo=@avatar.png" localhost:3000/avatars
+      {"name":"avatar.png","type":"image/png","size":25}
+      ```
+
+      Check the bytes instead. Every PNG starts `137 80 78 71`, every JPEG `255 216 255`.
+      Anything else gets **`415`**, Unsupported Media Type. Store it under a key you make,
+      never the sender's file name.
+
+  - type: prose
+    id: serving-safely
+    body: >-
+      Serving it back has one more trap. With no `Content-Type`, a browser **sniffs**: it
+      guesses the type from the bytes. Script text can then run as a page on your site.
+
+
+      So set the type you checked. Add `X-Content-Type-Options: nosniff` to forbid
+      guessing, and `Content-Disposition: attachment` to make the browser save, not show. `new Response(bytes, { headers })` sets them.
+
+  - type: ai-review
+    id: review-echoed-content-type
+    concept: backend.image-pipelines
+    difficulty: 4
+    language: js
+    request: Serve uploaded files back with the type the uploader gave us, and stop browsers guessing.
+    flawClass: security
+    code: |
+      async function serveUpload(key) {
+        const file = await storage.get(key);
+        return new Response(file.bytes, {
+          headers: {
+            "Content-Type": file.uploadedType,
+            "X-Content-Type-Options": "nosniff",
+          },
+        });
+      }
+    prompt: >-
+      An assistant wrote this. Photos display and `nosniff` is set, so the test passes. Then
+      someone uploads an HTML page declared as `text/html`, and it runs on your site. Tap the
+      line at fault.
+    lines: [5]
+    reasons:
+      - text: The type comes from the uploader
+        correct: true
+        feedback: >-
+          Yes. `nosniff` only stops guessing. Send the type you checked from the bytes.
+      - text: '`nosniff` should be `no-sniff`'
+        feedback: >-
+          The header is spelt right and works. It forbids guessing, and no guess was needed here.
+      - text: The bytes should be sent with `Response.json`
+        feedback: >-
+          A photo isn't JSON. Sending the bytes is right; the label on them is the problem.
+    fix: |
+      async function serveUpload(key) {
+        const file = await storage.get(key);
+        return new Response(file.bytes, {
+          headers: {
+            "Content-Type": file.checkedType,
+            "Content-Disposition": "attachment",
+            "X-Content-Type-Options": "nosniff",
+          },
+        });
+      }
+
+  - type: code-challenge
+    id: write-accept-upload
+    concept: backend.image-pipelines
+    difficulty: 3
+    language: ts
+    editable: '23-25'
+    prompt: >-
+      Write `acceptUpload(upload)`. Refuse a `size` over `MAX_BYTES` with `{ status: 413 }`.
+      Then match `firstBytes` against each signature in `KINDS`. No match is
+      `{ status: 415 }`.
+
+
+      A match is `{ status: 201, key, type }`, with the type from `KINDS` and the key
+      `avatars/<id>.<extension>`. Ignore `declaredType`. So JPEG bytes declared as PNG give
+      `avatars/b2.jpg` and `image/jpeg`.
+    hints:
+      - Check the size first. Then look for the kind whose signature the first bytes start with.
+      - '`KINDS.find(...)` picks the kind. `signature.every((byte, i) => ...)` compares byte by byte.'
+      - 'Start with `if (upload.size > MAX_BYTES) return { status: 413 };`'
+
+  - type: explain-back
+    id: explain-direct-upload
+    concept: backend.signed-urls
+    difficulty: 4
+    prompt: >-
+      Big videos would tie up your server, so a teammate suggests **signed URLs**: links the
+      server makes for one key, valid for a few minutes, with a signature so they can't be
+      edited. Why is that still safe?
+    rubric:
+      - The browser asks your server for the URL first, and the server checks the user before signing.
+      - The signature ties the URL to one key and a short expiry, so it can't be changed or reused later.
+      - The bytes then go straight to storage, sparing the server the bandwidth and memory.
+    modelAnswer: >-
+      The check moves, it doesn't vanish. The browser first asks your server for permission.
+      The server sees who's asking and what for. Then it signs a URL for that one key and the
+      next few minutes. Change the key or the time and the signature fails, and storage
+      answers `403`. The video then goes straight to storage, so the server never carries it.
+
+recap:
+  - Keep files in object storage, under keys you make, not on the server's disk.
+  - Cap the size with `413`, and check the real type from the first bytes.
+  - Serve uploads with a type you set, `nosniff` and `attachment`, and sign URLs for direct transfers.
+
+recall:
+  - id: card-flat-keys
+    concept: backend.object-storage
+    front: What is a "folder" in object storage?
+    back: >-
+      Nothing. Keys are flat strings that may contain slashes. Listing keys by a prefix is the
+      only folder there is.
+  - id: card-signed-url-parts
+    concept: backend.signed-urls
+    front: What does a signed URL carry, and what happens if someone edits it?
+    back: >-
+      A key, an expiry and a signature over both. Editing the key or the time breaks the
+      signature, so storage refuses it.
+  - id: card-nosniff-limit
+    concept: backend.image-pipelines
+    front: 'What does `X-Content-Type-Options: nosniff` stop, and what doesn''t it stop?'
+    back: >-
+      It stops the browser guessing a type from the bytes. It can't undo a `text/html` the
+      server itself declared.
+  - id: card-declared-type
+    concept: backend.image-pipelines
+    front: Why can't you trust the `type` of an uploaded file?
+    back: >-
+      The sender chooses it, often from the file name. Check the first bytes, and refuse a
+      mismatch with `415`.
+
+references:
+  - kind: docs
+    title: What is Amazon S3?
+    authors: Amazon Web Services
+    venue: Amazon Simple Storage Service User Guide
+    url: https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html
+    note: Buckets, objects and keys, and the flat namespace.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Download and upload objects with presigned URLs
+    authors: Amazon Web Services
+    venue: Amazon Simple Storage Service User Guide
+    url: https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-presigned-url.html
+    note: What a presigned URL grants, its expiry, and who can create one.
+    verified: true
+  - kind: docs
+    title: 'Request: formData() method'
+    authors: MDN contributors
+    venue: MDN Web Docs
+    url: https://developer.mozilla.org/en-US/docs/Web/API/Request/formData
+    note: Reading a multipart form, files included, in a handler.
+    verified: false
+  - kind: docs
+    title: X-Content-Type-Options header
+    authors: MDN contributors
+    venue: MDN Web Docs
+    url: https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/X-Content-Type-Options
+    note: What `nosniff` forbids, and that it applies to declared types only.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Content-Disposition header
+    authors: MDN contributors
+    venue: MDN Web Docs
+    url: https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Content-Disposition
+    note: '`attachment`, which makes the browser save instead of render.'
+    verified: true
+
+deepDive: >-
+  `request.formData()` reads the whole upload before you see its size. For big files, check
+  the `Content-Length` header first and refuse early, or let a signed URL send the bytes
+  straight to storage, which enforces its own size limit.
+
+
+  RFC 9110 renamed `413` from Payload Too Large to Content Too Large. Many servers, Node
+  among them, still print the old words. The number is what clients read.
+
+
+  An image pipeline goes further than the first bytes. It decodes the image and re-encodes
+  it, which strips hidden metadata such as the GPS location from a phone photo. Then it makes
+  the sizes pages ask for, once, and caches them.
+
+
+  Serving uploads from a separate domain, such as a CDN address, means a file that does
+  manage to run can't read your site's cookies. A content-addressed key such as
+  `sha256/9f1c...` names a file by its bytes, so a CDN can cache it for ever.

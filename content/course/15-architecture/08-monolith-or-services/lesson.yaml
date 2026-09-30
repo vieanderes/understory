@@ -1,0 +1,309 @@
+id: arch.monolith-and-services
+title: Monolith or services
+objective: Tell a monolith, a modular monolith and services apart, and count what a network boundary costs before you split.
+level: advanced
+minutes: 10
+concepts: [arch.monolith, arch.modular-monolith, arch.services, arch.network-boundary-costs]
+prerequisites: [arch.project-structure, db.transactions, perf.backend-performance]
+opening:
+  text: >-
+    You'll be able to say what splitting a system into services costs. Then you can tell when
+    the price is worth paying, and when a folder would do.
+
+steps:
+  - type: prose
+    id: deploy-and-monolith
+    body: >-
+      To **deploy** is to put a new version of your code on the machines that run it, and
+      start it. What goes out in one deploy is a **deployable unit**.
+
+
+      A **monolith** is one deployable unit. Every module ships together, and modules call
+      each other as plain functions inside one running program.
+
+  - type: prose
+    id: name-services
+    body: >-
+      A **service** is a program deployed on its own. It owns its data and talks to other
+      services over the network. Splitting an app into many small services is called
+      microservices.
+
+
+      Between the two sits the **modular monolith**: one deployable unit, whose modules meet
+      only through the enforced entry files from lesson 2.
+
+  - type: multiple-choice
+    id: pick-modular-monolith
+    concept: arch.modular-monolith
+    difficulty: 1
+    question: One deployable app, whose modules meet only through lint-enforced entry files. What is it?
+    choices:
+      - text: A set of services
+        feedback: >-
+          Services are deployed separately and talk over a network. This is one unit, and its
+          modules call each other in process.
+      - text: A modular monolith
+        correct: true
+        feedback: >-
+          Right. Enforced boundaries, plain function calls, one deploy.
+      - text: A plain monolith
+        feedback: >-
+          A plain monolith lets any file import any other. The enforced boundaries are what
+          make this one modular.
+
+  - type: prose
+    id: name-the-costs
+    body: >-
+      A network boundary sends a bill. **Latency**: a function call takes nanoseconds, a
+      network trip milliseconds. **Partial failure**: one side is up and the other isn't.
+      **Versioning**: the two sides deploy at different times, so each must accept old and
+      new shapes.
+
+
+      And no shared transaction. `BEGIN` and `COMMIT` cover one database, never two
+      services.
+
+  - type: predict-output
+    id: predict-partial-failure
+    concept: arch.network-boundary-costs
+    difficulty: 2
+    language: js
+    code: |
+      // orders service. The stock service is down right now.
+      async function placeOrder(sku) {
+        await ordersDb.insert({ sku, status: 'placed' });
+        await fetch(`${STOCK_URL}/reserve?sku=${sku}`, { method: 'POST' });
+        return 'ok';
+      }
+      try {
+        await placeOrder('tent');
+      } catch (error) {
+        console.log(error.cause.code);   // ECONNREFUSED: nothing was listening
+      }
+    question: The call to the stock service failed. What state is the system in?
+    choices:
+      - text: Nothing changed, the error undid the insert
+        feedback: >-
+          Inside one database, a transaction could do that. These are two systems, and no
+          transaction spans them.
+      - text: The order is saved, and no stock is reserved
+        correct: true
+        feedback: >-
+          Right. We ran it: one order saved, stock still at 4. Half an operation.
+      - text: Both changed, the error came afterwards
+        feedback: >-
+          `ECONNREFUSED` means the request never arrived. The stock service did nothing at
+          all.
+
+  - type: ai-review
+    id: review-transaction-around-fetch
+    concept: arch.network-boundary-costs
+    difficulty: 3
+    language: js
+    request: Stock is its own service now. Keep placing an order all or nothing, like before.
+    flawClass: logic
+    code: |
+      async function placeOrder(sku) {
+        await ordersDb.query('BEGIN');
+        try {
+          await ordersDb.query('INSERT INTO orders (sku) VALUES ($1)', [sku]);
+          await fetch(`${STOCK_URL}/reserve?sku=${sku}`, { method: 'POST' });
+          await chargeCard(sku);                 // throws when the card is declined
+          await ordersDb.query('COMMIT');
+        } catch (error) {
+          await ordersDb.query('ROLLBACK');
+          throw error;
+        }
+      }
+    prompt: >-
+      An assistant wrote this. When a card is declined, the order is rolled back. The tent
+      stays reserved in the stock service for ever. Tap the line the transaction can't undo.
+    lines: [5]
+    reasons:
+      - text: The transaction covers the orders database only
+        correct: true
+        feedback: >-
+          Yes. `ROLLBACK` can't recall a request to another service. Release the stock
+          yourself.
+      - text: '`COMMIT` should come before the charge'
+        feedback: >-
+          Then a declined card leaves a placed order too. The stock problem stays either way.
+      - text: The charge should come before the insert
+        feedback: >-
+          Reordering moves the gap, it doesn't close it. Some step will still fail after the
+          reservation.
+    fix: |
+      } catch (error) {
+        await ordersDb.query('ROLLBACK');
+        await fetch(`${STOCK_URL}/release?sku=${sku}`, { method: 'POST' });   // undo it by hand
+        throw error;
+      }
+
+  - type: bug-hunt
+    id: hunt-shared-table
+    concept: arch.services
+    difficulty: 3
+    language: js
+    code: |
+      // reports service
+      export async function weeklySales(db) {
+        const reply = await db.query(
+          `SELECT sku, count(*) AS sold
+           FROM orders_service.orders
+           WHERE status = 'paid' AND placed_at > now() - interval '7 days'
+           GROUP BY sku`);
+        return reply.rows;
+      }
+    prompt: >-
+      The orders team renamed `status` to `state` and deployed. Their tests passed. The
+      reports service broke that night. Tap the line that tied the two together.
+    lines: [5]
+    reasons:
+      - text: It reads another service's table directly
+        correct: true
+        feedback: >-
+          Yes. That table is orders' private storage. Call its API instead.
+      - text: '`count(*)` is slow on large tables'
+        feedback: >-
+          It may be, but slow isn't broken. The report failed because a column it relied on
+          was renamed.
+      - text: The query should run inside a transaction
+        feedback: >-
+          A single `SELECT` is already consistent. A transaction wouldn't bring the old column
+          back.
+    fix: |
+      const reply = await fetch(`${ORDERS_URL}/sales?days=7`);
+      return (await reply.json()).rows;
+
+  - type: code-challenge
+    id: write-batched-total
+    concept: arch.network-boundary-costs
+    difficulty: 3
+    language: ts
+    prompt: >-
+      Pricing became its own service, and `basketTotal` now makes one network trip per
+      line. A trade customer with 120 lines waits most of a second.
+
+
+      Make it one trip: call `getPrices` once with every sku, and never `getPrice`. An empty
+      basket costs 0 and makes no trip. A sku with no price throws an error that names it.
+
+
+      So a tent, two stoves and four mugs cost `25100` pence, in one trip.
+    hints:
+      - Collect the skus first, with `map`, then make the one call.
+      - '`getPrices` answers an object keyed by sku. A missing sku reads as `undefined`.'
+      - 'Start with `const prices = await pricing.getPrices(lines.map((line) => line.sku));`'
+
+  - type: explain-back
+    id: explain-no-shared-transaction
+    concept: arch.monolith
+    difficulty: 4
+    prompt: >-
+      In a monolith, placing an order and reserving stock either both happen or neither does.
+      After a split into two services, orders sometimes exist with no stock reserved. Why did
+      the split cause that?
+    rubric:
+      - In the monolith both writes ran in one database transaction, which commits or rolls back as a whole.
+      - Two services own separate data, and no transaction spans a network call between them.
+      - The second call can fail or time out after the first commit, so the code must retry or undo it deliberately.
+    modelAnswer: >-
+      In the monolith both writes sat in one transaction, so the database made them all or
+      nothing. After the split, each service has its own data, and the second write is a
+      network call. No transaction covers that. The order commits, then the call to stock
+      fails or times out, and nothing rolls the order back. The split turned one atomic step
+      into two. Now the code has to handle the gap itself: retry with an idempotency key, or
+      cancel the order.
+
+recap:
+  - Tell a monolith, a modular monolith and services apart by where the boundary is and what crossing it costs.
+  - Count a network boundary's bill, which is latency, partial failure, versioning and the lost transaction.
+  - Start with enforced modules in one deployable, and split out a service when a measured need pays for it.
+
+recall:
+  - id: card-three-shapes
+    concept: arch.modular-monolith
+    front: How does a modular monolith differ from a monolith and from services?
+    back: >-
+      Like a monolith, it's one deployable with in-process calls. Like services, its modules
+      have enforced boundaries and meet only through public APIs.
+  - id: card-monolith
+    concept: arch.monolith
+    front: What does a monolith give you that services can't?
+    back: >-
+      Calls that cost a function call, and one database transaction across modules. A change
+      across modules ships in one deploy.
+  - id: card-services-own-data
+    concept: arch.services
+    front: Why must a service never read another service's tables?
+    back: >-
+      The tables are private storage. Reading them couples you to a schema that its owner
+      will change without telling you.
+  - id: card-boundary-costs
+    concept: arch.network-boundary-costs
+    front: Name four costs of putting a network between two modules.
+    back: >-
+      Latency on every call, partial failure, versioning, and the loss of a shared
+      transaction.
+
+references:
+  - kind: essay
+    title: Monolith First
+    authors: Martin Fowler
+    year: 2015
+    venue: martinfowler.com
+    url: https://martinfowler.com/bliki/MonolithFirst.html
+    note: Why boundaries are easier to find inside one codebase before you pay for a network.
+    primary: true
+    verified: true
+  - kind: essay
+    title: Microservices
+    authors: James Lewis and Martin Fowler
+    year: 2014
+    venue: martinfowler.com
+    url: https://martinfowler.com/articles/microservices.html
+    note: The definition most people mean, including independent deployment and decentralised data.
+    primary: true
+    verified: true
+  - kind: essay
+    title: Microservices and the First Law of Distributed Objects
+    authors: Martin Fowler
+    year: 2014
+    venue: martinfowler.com
+    url: https://martinfowler.com/articles/distributed-objects-microservices.html
+    note: Why remote calls need coarser interfaces than in-process ones, which is the challenge's fix.
+    verified: true
+  - kind: paper
+    title: Sagas
+    authors: Hector Garcia-Molina and Kenneth Salem
+    year: 1987
+    venue: ACM SIGMOD International Conference on Management of Data
+    url: https://doi.org/10.1145/38713.38742
+    note: The original idea behind undoing a multi-step job one step at a time, from the deep dive.
+    verified: true
+
+deepDive: >-
+  The timings are from Node 24 on one laptop, 1,000 calls each. An in-process call took
+  about 0.0001 ms. A loopback HTTP call over a kept-alive connection took 0.19 ms. With 5
+  ms of simulated latency it took 6.3 ms. Forty of those in a row took 240 ms. Forty at
+  once took 24 ms, and one batched call took 6 ms. For the partial failure, we stopped the
+  stock service and placed an order. `fetch` failed, with `ECONNREFUSED` as its cause. The
+  order was saved, and stock stayed at 4.
+
+
+  Undoing a multi-service job step by step has a name: a **saga**. Each step that
+  succeeded gets a compensating action, run newest first when a later step fails. A refund
+  undoes a charge, a release undoes a reservation. It isn't a rollback: each undo is a
+  second visible change, and some things, like a sent email, can't be undone at all. So put
+  those last.
+
+
+  Two more items belong on the bill. Deployment: every service needs its own pipeline,
+  configuration and rollback. Observability: one request now crosses several processes, so
+  you need a shared request id to follow it. Availability multiplies as well. A page that
+  needs three services, each up 99.9% of the time, is up about 99.7% of the time.
+
+
+  None of this says "never split". Split when a part needs to scale, deploy or fail on its
+  own, and you've measured that need. A modular monolith with clean boundaries is also the
+  easiest thing to split later.

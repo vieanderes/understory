@@ -1,0 +1,242 @@
+summary: >-
+  Progressive delivery separates two moments that used to be one: putting code on servers,
+  and letting users use it. Feature flags let unfinished or risky features ship switched
+  off. Percentage rollouts and canaries let a small, steady share of real users try a
+  change first, while metrics decide whether it grows or rolls back.
+
+
+  That separation is what makes trunk-based development work. Everyone merges small
+  changes to main at least daily, and main stays releasable because anything unfinished
+  sits behind a flag. Merges stay small, conflicts stay rare, and a bad change is a switch
+  away from off.
+
+
+  The DORA metrics tell you whether all this is working: how often you deploy, how long a
+  commit takes to reach production, how often a deploy needs an urgent fix, and how fast
+  you recover. The research behind them finds that fast teams are also the stable ones.
+  These notes cover flag types and their lifecycle, hashing done properly, how to judge a
+  canary with statistics, how flags interact with database changes, and how to compute
+  the metrics.
+remember:
+  - A feature flag separates deploying code from releasing a feature, so a bad feature turns off in seconds without a deploy.
+  - Percentage rollouts hash the flag name and user id into a bucket, so each user always gets the same answer and raising the percentage only adds users.
+  - A canary compares the new version's error rate and latency with the old one's on live traffic, and waits for enough requests before deciding.
+  - Trunk-based development merges small changes to main at least daily, and flags keep unfinished work switched off.
+  - Every flag has an owner and a removal date, because each one is a branch in the code that someone must test.
+  - Flags don't cover schema changes, so database migrations stay backward compatible with the version still running.
+  - The DORA metrics are deployment frequency, change lead time, change fail rate and failed deployment recovery time, with deployment rework rate added recently.
+sections:
+  - title: Kinds of flag, and their lifecycle
+    body: |-
+      Flags differ in how long they live and who switches them. Mixing the kinds up is how
+      a codebase ends up with hundreds of flags nobody dares remove.
+
+      - **Release flags** hide unfinished or risky features. They live days or weeks, then
+        go to 100% and are deleted, code path and all.
+      - **Ops flags** or kill switches turn off an expensive or fragile feature under load,
+        such as recommendations or an AI summary. They can live for years, and on-call
+        engineers must know where they are.
+      - **Experiment flags** split users between variants to measure an outcome. They live
+        as long as the experiment, then the winner is kept and the flag removed.
+      - **Permission flags** enable features for a plan or a group of customers. They are
+        really product configuration and belong in the data model once they settle.
+
+      Two design rules make flags safe. First, **evaluate on the server** for anything that
+      matters. A flag checked only in the browser can be flipped by the user. Second, **every
+      flag read has a safe default**, used when the flag service is down or slow. For a
+      release flag, the default is off. For a kill switch, it's the normal behaviour.
+
+      ```ts
+      type Evaluate = (flag: string, userId: string) => Promise<boolean>;
+
+      async function isEnabled(evaluate: Evaluate, flag: string, userId: string, fallback: boolean) {
+        const timeout = new Promise<boolean>((resolve) => setTimeout(resolve, 50, fallback));
+        try {
+          return await Promise.race([evaluate(flag, userId), timeout]);
+        } catch {
+          return fallback; // a flag outage must never become a product outage
+        }
+      }
+      ```
+
+      `evaluate` is whatever your flag service provides. A slow answer loses the race to
+      the 50 ms timer, and an error falls through to the same default. Many flag SDKs keep
+      their rules in memory and evaluate locally, which avoids a network call per check.
+      The OpenFeature API lets code read flags the same way from any of them.
+  - title: Buckets that stay put
+    body: |-
+      The lesson's hash worked on small inputs. Production flag systems use a well-mixed
+      hash, so buckets are even and independent across flags. Node's `crypto` is enough.
+
+      ```ts
+      import { createHash } from 'node:crypto';
+
+      function bucket(flag: string, userId: string): number {
+        const digest = createHash('sha256').update(`${flag}:${userId}`).digest();
+        return digest.readUInt32BE(0) % 100;
+      }
+
+      function isOn(flag: string, userId: string, percent: number): boolean {
+        return bucket(flag, userId) < percent;
+      }
+      ```
+
+      Run over 100,000 user ids, `new-checkout` at 10% selected 9,943 users and at 20%
+      selected 19,885, and every user from the 10% group was still in the 20% group. That's
+      the property that matters: raising a rollout only adds users, so nobody flips back to
+      the old version.
+
+      Including the flag name keeps flags independent. `new-search` at 10% selected 10,051
+      users, of whom 944 were also in the `new-checkout` group: about 10%, what chance
+      predicts. Without the flag name in the input, the same unlucky 10% of users would get
+      every new feature first.
+
+      Bucket by the unit that must stay consistent. For a consumer app that's the user id.
+      For a business product, bucket by account id, so everyone in one company sees the same
+      screens and support isn't confused. Anonymous visitors need a stable id in a cookie.
+  - title: Judging a canary with statistics
+    body: |-
+      "The canary's error rate is higher" means little until you know how many requests
+      are behind it. A rough but useful check is the two-proportion z-score: how many
+      standard errors apart the two error rates are.
+
+      ```ts
+      type Stats = { requests: number; errors: number };
+
+      function errorRateZ(baseline: Stats, canary: Stats): number {
+        const p1 = baseline.errors / baseline.requests;
+        const p2 = canary.errors / canary.requests;
+        const pooled = (baseline.errors + canary.errors) / (baseline.requests + canary.requests);
+        const se = Math.sqrt(pooled * (1 - pooled) * (1 / baseline.requests + 1 / canary.requests));
+        return se === 0 ? 0 : (p2 - p1) / se;
+      }
+
+      const baseline = { requests: 20_000, errors: 200 }; // 1%
+      errorRateZ(baseline, { requests: 100, errors: 2 }); // 1.00: 2% on 100 requests
+      errorRateZ(baseline, { requests: 2_000, errors: 40 }); // 4.10: 2% on 2,000 requests
+      ```
+
+      Both canaries fail twice as often as the baseline. On 100 requests that could be luck;
+      on 2,000 it almost certainly isn't. A common rule is to roll back above about 3 and
+      keep waiting while the canary is too small to tell.
+
+      Real canary analysis adds care. Compare against a baseline started at the same time,
+      not the old fleet, whose caches are warm. Check latency percentiles and business
+      signals, such as checkouts completed, not only errors. And move through fixed steps,
+      say 1%, 5%, 25%, 50%, 100%, with a minimum time at each so slow problems such as memory
+      leaks have time to show. Tools such as Argo Rollouts and Flagger automate these steps
+      on Kubernetes.
+  - title: Flags, canaries and the database
+    body: |-
+      Flags and canaries mean two versions of the code run at once: old and new instances
+      during a canary, and both code paths behind a flag. The database has only one schema,
+      so it must suit both.
+
+      The **expand and contract** pattern handles this in separate releases:
+
+      ```text
+      release 1  expand     add the new column, nullable; old code ignores it
+      release 2  write both new code writes old and new columns; backfill old rows
+      release 3  read new   flip the flag to read the new column; watch
+      release 4  contract   stop writing the old column, then drop it
+      ```
+
+      At every step, rolling the code back one release still works, because the schema
+      suits both versions. The step people skip is the last one, which leaves dead columns
+      and dead flags behind; schedule it when you plan the change.
+
+      The same rule covers other shared contracts: message formats on a queue, cached values
+      and API responses read by mobile apps you can't update. Add before you remove, and
+      keep both working until nothing uses the old shape.
+
+      Know which tool fits which risk. A **flag** controls a feature for chosen users and
+      turns it off without a deploy. A **canary** tests a whole build, including dependency
+      upgrades and configuration, on a slice of traffic. **Blue-green** swaps all traffic at
+      once with a fast switch back. Teams use all three: canaries for every build, flags for
+      risky features.
+  - title: Computing the DORA metrics
+    body: |-
+      The metrics come from events you already have: deploys from the pipeline, commits
+      from Git, and incidents or rollbacks linked to deploys. A small calculation over a
+      period is enough to start.
+
+      ```ts
+      type Deploy = { commitAt: number; deployedAt: number; failed: boolean; restoredAt?: number };
+      const HOUR = 3_600_000;
+
+      function median(values: number[]): number {
+        const sorted = [...values].sort((a, b) => a - b);
+        const mid = Math.floor(sorted.length / 2);
+        return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+      }
+
+      function dora(deploys: Deploy[], days: number) {
+        const failed = deploys.filter((d) => d.failed);
+        return {
+          deploysPerDay: deploys.length / days,
+          leadTimeHours: median(deploys.map((d) => d.deployedAt - d.commitAt)) / HOUR,
+          changeFailRate: failed.length / deploys.length,
+          recoveryHours: median(failed.map((d) => (d.restoredAt ?? d.deployedAt) - d.deployedAt)) / HOUR,
+        };
+      }
+      ```
+
+      Four deploys over two days, one failing and restored after 30 minutes, give two
+      deploys a day, a median lead time of 1.5 hours, a fail rate of 25% and a recovery time
+      of half an hour. Medians resist the one outlier that averages hide.
+
+      Use the metrics to find the constraint, not to rank people. Measured on a team, they
+      show where work waits: slow review, a flaky test suite, a manual approval. Turned into
+      targets for individuals, they get gamed, for example by splitting one change into ten
+      trivial deploys.
+pitfalls:
+  - '**`Math.random` for rollouts.** Users flip between versions on every request. Hash the flag name and a stable id into a bucket.'
+  - '**Flags that are never removed.** Each one doubles a code path and its tests. Give every flag an owner and a removal date, and delete it once it''s at 100%.'
+  - '**Checking flags only in the browser.** The user can flip them. Evaluate anything that matters on the server.'
+  - '**No default for a flag outage.** A failing flag service then breaks the product. Wrap every read with a timeout and a safe fallback.'
+  - '**Promoting a canary on a handful of requests.** Small samples look clean by luck. Set a minimum request count and time per step, and compare against a fresh baseline.'
+  - '**Schema changes that assume one version.** A canary or flag runs old and new code together. Expand first, contract later, and keep every step reversible.'
+  - '**Turning DORA metrics into individual targets.** People optimise the number, not the outcome. Use them per team to find where work waits.'
+interview:
+  - question: What is the difference between deploying and releasing, and why does it matter?
+    answer: >-
+      Deploying puts new code on servers; releasing lets users use a feature. Feature flags
+      separate them. That matters for risk and for speed. Risk, because a feature that
+      misbehaves turns off in seconds by flipping a flag, with no rollback or redeploy, and
+      can be released to 1% of users first. Speed, because unfinished work can merge to main
+      and deploy daily while switched off, which is what makes trunk-based development and
+      small, frequent deploys possible. The cost is that flags are branches in the code: each
+      one adds a path to test, so they need owners, safe defaults when the flag service is
+      down, and removal once the feature is fully out.
+  - question: How would you roll out a risky change to a checkout flow?
+    answer: >-
+      Behind a server-side flag, bucketed by a hash of the flag name and user id, rolled out
+      in steps with metrics deciding each step. First internal users, then 1%, 5%, 25%, 50%
+      and 100%, with a minimum time and request count at each. At each step I'd compare the
+      flag group with the control on error rate, p95 latency and checkout completion,
+      because a flow can be error-free and still lose sales. A regression turns the flag off.
+      Any schema change ships first as an expand step that works for both paths. Once at
+      100% for a week, the old path and the flag are deleted. The trade-off is time: a
+      cautious rollout takes days, which is right for checkout and overkill for a copy change.
+  - question: How do you decide whether a canary is healthy?
+    answer: >-
+      By comparing it with a baseline on the same traffic, with enough requests for the
+      difference to be real. I'd watch error rate, latency percentiles and one or two
+      business metrics, and compare with a baseline started at the same time, because the
+      long-running fleet has warm caches. The sample size matters: 2% errors against 1% is
+      noise on 100 requests and a clear regression on 2,000, which a two-proportion test
+      shows. So the verdict is wait until a minimum count, roll back if clearly worse, promote
+      if not. I'd also hold each step for a minimum time so slow failures like memory leaks
+      appear. Automating it with a tool like Argo Rollouts removes the temptation to promote
+      early.
+  - question: What are the DORA metrics, and how would you use them?
+    answer: >-
+      They measure software delivery: deployment frequency and change lead time for
+      throughput, change fail rate and failed deployment recovery time for stability, and the
+      current guide adds deployment rework rate. I'd compute them per team from pipeline,
+      Git and incident data, using medians, and look at the trend rather than a benchmark.
+      Their value is diagnostic. Long lead time points to where work waits, such as review
+      queues or slow tests. A high fail rate points to weak testing or large changes. The
+      research shows speed and stability improve together, so a team shipping rarely to be
+      safe usually isn't safer. I'd never make them individual targets, because they'd be
+      gamed.

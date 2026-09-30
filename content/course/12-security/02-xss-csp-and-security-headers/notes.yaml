@@ -1,0 +1,304 @@
+summary: >-
+  Cross-site scripting happens when text from one person reaches another person's page and
+  the browser runs it as code. The code runs on your origin, as the victim, so it can read
+  the page, call your API with their session and change what they see. It's one of the most
+  common web flaws, and the damage is total for the victim.
+
+
+  The defence has two walls. The first is to keep untrusted text as text: set it with
+  `textContent`, let the framework escape it, and encode it for the exact place it lands,
+  which differs between HTML, an attribute, a URL and a script. The second is a Content
+  Security Policy, which tells the browser which scripts may run, so a missed escape
+  doesn't become a working attack. Security headers such as HSTS, `nosniff` and
+  `frame-ancestors` switch on further browser defences for almost no cost.
+
+
+  These notes add the kinds of XSS and where they hide, encoding for each context, the
+  strict CSP that current guidance recommends with `strict-dynamic`, hashes, Trusted Types,
+  and how to roll a policy out on an app that already exists. CSP is not a licence to stop
+  escaping: it's a safety net, and a net with one `unsafe-inline` in it has a hole.
+remember:
+  - XSS runs attacker script on your origin with the victim's session, so it can do anything the victim can do in that app.
+  - Keep untrusted text out of HTML parsing sinks such as `innerHTML`, and encode for the context it lands in, because HTML escaping doesn't make a URL or a script safe.
+  - Check a user-supplied URL by parsing it and allowing only `https:` or `http:`, because `javascript:` survives HTML escaping.
+  - A strict CSP uses a fresh random nonce per response with `'strict-dynamic'`, plus `object-src 'none'` and `base-uri 'none'`.
+  - With `'strict-dynamic'`, scripts a nonced script loads are trusted, and host allowlists, `'self'` and `'unsafe-inline'` are ignored by browsers that support it.
+  - Allowlist policies built from host names are routinely bypassable, which is why current guidance prefers nonces or hashes.
+  - '`HttpOnly` stops script reading a cookie, but XSS can still send requests as the user, so it limits damage and prevents nothing.'
+  - Roll a CSP out with `Content-Security-Policy-Report-Only` first, fix what it reports, then enforce it.
+sections:
+  - title: Three kinds of XSS, one model underneath
+    body: |-
+      Every XSS bug is a **source** flowing into a **sink** without the right encoding. A
+      source is anywhere attacker text comes from. A sink is an API that turns text into
+      markup or code.
+
+      **Stored XSS** keeps the payload in your database: a review, a chat message, a support
+      ticket, a user's display name. Every visitor who views it runs it, which makes it the
+      most damaging kind. **Reflected XSS** bounces it straight back from the request: a
+      search page that prints "No results for" and the query. The attacker sends the victim
+      a crafted link. **DOM-based XSS** never touches the server's HTML: client code reads
+      `location.hash` or a `postMessage` payload and writes it into the page.
+
+      The sinks worth searching a codebase for:
+
+      ```text
+      markup   innerHTML  outerHTML  insertAdjacentHTML  document.write
+               dangerouslySetInnerHTML (React)   v-html (Vue)
+      code     eval  new Function  setTimeout("string")  setInterval("string")
+      URLs     href / src / action set from user data  (javascript: URLs)
+      events   setAttribute("onclick", ...)  and any on* attribute built from data
+      ```
+
+      Frameworks close most of this. React escapes every value you put in JSX text and in
+      attributes, and React 19 replaces a `javascript:` URL in an attribute such as `href`
+      with one that throws. It can't know whether markup you pass to
+      `dangerouslySetInnerHTML` came from a sanitiser, and it doesn't vet URLs you hand to
+      `window.open` or `location`. Those are where XSS shows up in modern apps, together
+      with server-rendered templates that turn escaping off and markdown renderers that
+      allow raw HTML.
+
+      To test your own app, put a harmless marker such as `<b>x</b>` in every field and
+      watch where it renders bold. Bold means the text was parsed as HTML, and a script could
+      have been too.
+  - title: Encoding for the place the text lands
+    body: |-
+      HTML escaping protects HTML text and quoted attributes. Two other places need their
+      own treatment.
+
+      **URLs.** A link's `href` can hold `javascript:`, and case tricks or a stray tab don't
+      stop the browser running it. Don't match strings. Parse with `URL`, which normalises
+      the input the way the browser will, then check the scheme.
+
+      ```js
+      // Returns a URL safe to put in href, or null. The URL parser does the
+      // hard part: it strips tabs, newlines and leading spaces the way browsers do.
+      function safeHref(input, base = 'https://shop.example') {
+        let url;
+        try {
+          url = new URL(input, base);
+        } catch {
+          return null;
+        }
+        return url.protocol === 'https:' || url.protocol === 'http:' ? url.href : null;
+      }
+
+      for (const input of [
+        'https://example.org/profile',
+        '/orders/42',
+        'JaVaScRiPt:alert(1)',
+        '  javascript:alert(1)',
+        'java\tscript:alert(1)',
+        'data:text/html,<script>alert(1)</script>',
+      ]) {
+        console.log(JSON.stringify(input), '->', safeHref(input));
+      }
+      ```
+
+      The first two come back as full `https://` addresses; the relative path resolves
+      against the base. The other four return `null`: the parser read each as a
+      `javascript:` or `data:` URL. A `startsWith('https://')` check also blocks them, but it
+      rejects relative links too, and hand-written string checks drift from the browser's
+      own parsing.
+
+      **Data inside a script block.** Server-rendered apps often embed initial state as JSON
+      in a `script` tag. The HTML parser runs before the JavaScript parser, and it ends the
+      block at the first `</script>`, even inside a string. `JSON.stringify` doesn't escape
+      `<`, so escape it yourself.
+
+      ```js
+      function jsonForScript(value) {
+        return JSON.stringify(value)
+          .replace(/</g, '\\u003c')
+          .replace(/>/g, '\\u003e')
+          .replace(/&/g, '\\u0026');
+      }
+
+      const cart = { note: '</script><script>alert(1)</script>' };
+      const out = jsonForScript(cart);
+      console.log(out); // {"note":"</script><script>alert(1)..."}
+      console.log(JSON.parse(out).note === cart.note); // true
+      ```
+
+      The escapes are valid JSON, so the data arrives unchanged, and the HTML parser never
+      sees a tag.
+  - title: A strict CSP with nonces and strict-dynamic
+    body: |-
+      Older policies listed trusted hosts: `script-src 'self' cdn.example.com`. Research on
+      real deployments found most of them bypassable, because allowed hosts often serve
+      something an attacker can use, such as a JSONP endpoint or an old library that runs
+      code from HTML attributes. Current guidance from OWASP and browser vendors is a
+      **strict CSP** built on nonces or hashes instead.
+
+      ```js
+      import { createServer } from 'node:http';
+      import { randomBytes } from 'node:crypto';
+
+      function policy(nonce) {
+        return [
+          `script-src 'nonce-${nonce}' 'strict-dynamic' https: 'unsafe-inline'`,
+          "object-src 'none'",
+          "base-uri 'none'",
+          "frame-ancestors 'none'",
+        ].join('; ');
+      }
+
+      const server = createServer((req, res) => {
+        // A fresh, unguessable nonce for every response. Never cache this HTML.
+        const nonce = randomBytes(16).toString('base64');
+        res.setHeader('Content-Security-Policy', policy(nonce));
+        res.setHeader('Cache-Control', 'no-store');
+        res.setHeader('Content-Type', 'text/html; charset=utf-8');
+        res.end(`<!doctype html>
+      <title>Orders</title>
+      <script nonce="${nonce}" src="/app.js"></script>`);
+      });
+
+      server.listen(3000);
+      ```
+
+      Each part has a job. The nonce marks the scripts you wrote. `'strict-dynamic'` passes
+      that trust on: a script created with `document.createElement('script')` by a nonced
+      script may run, so bundlers and tag managers keep working without a host list. In
+      browsers that understand `'strict-dynamic'`, host sources, `'self'` and
+      `'unsafe-inline'` are ignored. The `https:` and `'unsafe-inline'` are there only for
+      very old browsers, which don't know nonces and would otherwise block everything.
+      `object-src 'none'` blocks plugin content. `base-uri 'none'` stops an injected `base`
+      tag redirecting your relative script URLs to another host.
+
+      Two limits to know. Trust from `'strict-dynamic'` doesn't extend to scripts added by
+      parser-based APIs such as `document.write`. And inline event handlers like
+      `onclick="..."` are blocked, so a strict CSP often means moving them to
+      `addEventListener`.
+
+      For a static page you can't give a fresh nonce, list a **hash** of each inline script
+      instead. The hash covers the exact text between the tags, whitespace included.
+
+      ```js
+      import { createHash } from 'node:crypto';
+
+      const inline = "document.documentElement.dataset.theme = localStorage.theme ?? 'light';";
+      const hash = createHash('sha256').update(inline, 'utf8').digest('base64');
+      console.log(`script-src 'sha256-${hash}'`);
+      ```
+  - title: Trusted Types, and the other headers worth sending
+    body: |-
+      CSP decides which scripts run. **Trusted Types** go after DOM XSS at the sink. With
+      this directive, the browser refuses plain strings in sinks such as `innerHTML` and
+      `eval`:
+
+      ```http
+      Content-Security-Policy: require-trusted-types-for 'script'; trusted-types sanitize
+      ```
+
+      Code must pass a typed value instead, made by a policy you create with
+      `trustedTypes.createPolicy('sanitize', { createHTML: ... })`, usually wrapping a
+      sanitiser such as DOMPurify. Every route to a sink then goes through a few reviewed
+      functions, so a code review looks at those instead of every `innerHTML` in the
+      codebase. Chromium-based browsers have supported it for years, and other engines have
+      been adding it, so check current support and keep your other defences.
+
+      The rest of a sensible header set:
+
+      ```http
+      Strict-Transport-Security: max-age=63072000; includeSubDomains
+      X-Content-Type-Options: nosniff
+      Referrer-Policy: strict-origin-when-cross-origin
+      Permissions-Policy: camera=(), microphone=(), geolocation=()
+      Cross-Origin-Opener-Policy: same-origin
+      ```
+
+      HSTS makes the browser use HTTPS for two years, subdomains included; add
+      `includeSubDomains` only once every subdomain serves HTTPS. `nosniff` stops a
+      user-uploaded file being guessed into a script or a stylesheet. The referrer policy
+      keeps paths and query strings, which can hold tokens, from leaking to other sites.
+      `Permissions-Policy` switches off browser features such as the camera the site doesn't use.
+      `Cross-Origin-Opener-Policy: same-origin` cuts the link between your window and a
+      cross-origin page that opened it or that it opens.
+
+      One header to leave alone: `X-XSS-Protection`. The filter it controlled has been
+      removed from modern browsers, and in old ones it could itself be abused. OWASP advises
+      setting it to `0` or not sending it. `X-Frame-Options` is the older form of
+      `frame-ancestors`; send both only if you support very old browsers.
+  - title: Rolling a policy out on an existing app
+    body: |-
+      Turning on a strict CSP in one step breaks things: inline handlers, third-party
+      widgets, an old analytics snippet. Roll it out in stages instead.
+
+      First, send the policy as `Content-Security-Policy-Report-Only`. The browser enforces
+      nothing, and reports every script the policy would have blocked to an endpoint you
+      name. Current browsers use the Reporting API for this:
+
+      ```http
+      Reporting-Endpoints: csp="https://shop.example/csp-reports"
+      Content-Security-Policy-Report-Only: script-src 'nonce-4f9Qx2' 'strict-dynamic'; object-src 'none'; base-uri 'none'; report-to csp
+      ```
+
+      Older browsers only know the deprecated `report-uri` directive, so many sites send
+      both. Expect noise: browser extensions inject scripts and trigger reports that aren't
+      yours.
+
+      Second, fix what the reports show. Add the nonce to your own inline scripts, move
+      `onclick` attributes to `addEventListener`, and replace any code that builds script
+      from strings. Each fix is small; the count is what takes time.
+
+      Third, enforce, and keep the report-only header running with a stricter next step,
+      such as Trusted Types. A policy you can see working is one nobody quietly weakens.
+
+      In a framework, generate the nonce once per request in server code and pass it to
+      whatever renders script tags. Caching is the trap: a CDN that caches the HTML also
+      caches the nonce, and a nonce every visitor shares is one an attacker can read and
+      copy. Pages with nonces are served uncached, or you use hashes for pages that must be
+      cached.
+pitfalls:
+  - '**Sanitising HTML with a regular expression.** Stripping `<script>` misses `<img onerror>`, SVG, odd casing and a hundred parser quirks. Escape when you need text; when users must submit formatting, use a maintained sanitiser such as DOMPurify.'
+  - '**HTML-escaping inside a script block or an event handler.** `&lt;` protects HTML text, not JavaScript. Serialise data as JSON with `<` escaped, and never build handler code from user data.'
+  - '**A nonce that isn''t fresh.** A fixed nonce in config, or HTML cached with its nonce, lets anyone read it and copy it into their payload. Generate it per response with a secure random source and don''t cache the page.'
+  - '**Adding a CDN host to fix a blocked script.** Host allowlists are the kind of policy research found bypassable. Give the loading script a nonce and let `strict-dynamic` trust what it loads.'
+  - '**Thinking `HttpOnly` stops XSS.** It stops script reading the cookie, but the injected script runs in the victim''s tab and sends requests with that cookie anyway. Fix the injection; treat `HttpOnly` as damage control.'
+  - '**Rendering markdown or model output with raw HTML allowed.** Many markdown renderers pass HTML through by default, and an AI reply can contain whatever its input contained. Turn raw HTML off or sanitise the result before `dangerouslySetInnerHTML`.'
+interview:
+  - question: How do you prevent XSS in a React application?
+    answer: >-
+      Mostly by staying inside React's escaping and treating its escape hatches as review
+      points. JSX escapes text and attribute values, so rendering user data as children is
+      safe. The gaps are `dangerouslySetInnerHTML`, which I allow only with output from a
+      sanitiser like DOMPurify, and URLs. React 19 neutralises `javascript:` in `href`, but
+      not URLs passed to `window.open` or `location`, and older versions only warn. I parse
+      user URLs with `URL` and allow only `http:` and `https:`. On the
+      server, I escape JSON embedded in the page so `</script>` can't close the tag. Then a
+      strict nonce-based CSP as the second wall, and Trusted Types where supported. The
+      trade-off is friction: a strict CSP means moving inline handlers and vetting third-party
+      scripts, which is worth it for anything with user content.
+  - question: Why do current guides recommend a nonce-based CSP with strict-dynamic over an allowlist of hosts?
+    answer: >-
+      Because allowlists are usually bypassable and hard to maintain, while nonces tie trust
+      to scripts you actually wrote. An allowed host like a big CDN often serves something an
+      attacker can reuse: a JSONP endpoint, or an old framework that runs code from HTML. So
+      `script-src cdn.example` quietly allows attacker-controlled script. A nonce is random per
+      response, so injected markup can't carry it. `'strict-dynamic'` then lets those trusted
+      scripts load others, which keeps bundlers and tag managers working without a host list,
+      and makes supporting browsers ignore host sources entirely. The cost is that nonces
+      need server rendering per request, which conflicts with caching whole pages; static
+      pages use hashes instead.
+  - question: What's the difference between stored, reflected and DOM-based XSS?
+    answer: >-
+      They differ in where the payload lives, not in the fix. Stored XSS is saved by the
+      server, say in a product review, and runs for everyone who views it, so it spreads
+      without the attacker doing anything more. Reflected XSS comes from the request itself,
+      such as a search term printed back on the page; the attacker has to get the victim to
+      open a crafted link. DOM-based XSS happens entirely in client code, for example reading
+      `location.hash` into `innerHTML`, so server-side scanning and logs never see it. The
+      defence is the same for all three: encode for the output context, avoid HTML sinks, and
+      back it with a CSP. DOM XSS is where Trusted Types help most.
+  - question: How would you add a CSP to a large app that has none?
+    answer: >-
+      In report-only mode first, then enforce once the reports go quiet. I'd pick the target
+      policy up front: a nonce with `strict-dynamic`, `object-src 'none'` and `base-uri 'none'`.
+      I'd send it as `Content-Security-Policy-Report-Only` with a reporting endpoint and watch
+      what it would block. Most findings are inline scripts needing the nonce, inline `onclick`
+      handlers to move to `addEventListener`, and third-party snippets. I'd filter noise from
+      browser extensions. Once real violations stop, I switch to enforcing and keep a stricter
+      report-only policy running as the next step. The risk is caching: if the CDN caches HTML
+      with a nonce in it, the nonce stops being secret, so those pages move to hashes or
+      aren't cached.

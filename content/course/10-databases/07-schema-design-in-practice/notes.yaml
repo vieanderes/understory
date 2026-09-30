@@ -1,0 +1,199 @@
+summary: >-
+  A table's design is the first and cheapest line of validation you have. Column types decide
+  what shape a value may take, and constraints (`NOT NULL`, `UNIQUE`, `CHECK`) decide which
+  rows may exist at all. Postgres checks both on every write, whichever service, script or
+  person sends it, so bad data is refused at the door instead of being cleaned up later.
+
+
+  Two choices go wrong more than any others. Money stored in a floating-point column drifts
+  by fractions of a penny, and those fractions break totals and equality checks. Time stored
+  as a plain `timestamp` loses the time zone, so nobody can tell whose 09:00 it means. The
+  fixes are small: integer minor units or `numeric`, and `timestamptz`.
+
+
+  Reach for these rules whenever you create a table. Application validation still matters,
+  because it gives users friendly messages, but it lives in one code path. The schema is the
+  one rule every code path shares. The cost is a little more thought up front and a
+  migration when a rule really changes.
+remember:
+  - Types and constraints are rules Postgres enforces on every write, from every client, so they are the last word on what data can exist.
+  - Store money as integer minor units (pence, cents) or `numeric(p,s)`, never `real` or `double precision`, which hold approximations.
+  - 'Use `timestamptz` for any moment in time: it stores UTC and shows it in the reader''s zone, while `timestamp` is a clock reading with no zone.'
+  - A `CHECK` passes when its condition is NULL, so pair it with `NOT NULL` when the value is required.
+  - A `UNIQUE` column allows many NULLs by default; `UNIQUE NULLS NOT DISTINCT` (Postgres 15 and later) treats them as equal.
+  - Name constraints you expect to hit, such as `bookings_ends_after_start`, because the name is in the error and code can map it to a message.
+  - Use `bigint GENERATED ALWAYS AS IDENTITY` for new numeric keys; `integer` runs out at 2,147,483,647.
+  - Prefer `text` over `varchar(n)` in Postgres; add a `CHECK` on the length only when the length is a real rule.
+sections:
+  - title: A worked table, with rules across columns
+    body: |-
+      A booking table shows most of the tools at once. A constraint written after the columns
+      can compare several of them, which a column rule can't.
+
+      ```sql
+      CREATE TABLE bookings (
+        id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        room_id integer NOT NULL,
+        starts_at timestamptz NOT NULL,
+        ends_at timestamptz NOT NULL,
+        status text NOT NULL DEFAULT 'pending'
+          CONSTRAINT bookings_status_known
+          CHECK (status IN ('pending', 'confirmed', 'cancelled')),
+        CONSTRAINT bookings_ends_after_start CHECK (ends_at > starts_at)
+      );
+
+      INSERT INTO bookings (room_id, starts_at, ends_at)
+      VALUES (1, '2026-10-01 10:00+00', '2026-10-01 09:00+00');
+      -- ERROR: new row for relation "bookings" violates check constraint
+      --        "bookings_ends_after_start"
+
+      INSERT INTO bookings (room_id, starts_at, ends_at, status)
+      VALUES (1, '2026-10-01 10:00+00', '2026-10-01 11:00+00', 'Confirmed');
+      -- ERROR: ... violates check constraint "bookings_status_known"
+      ```
+
+      Three details are worth knowing. `GENERATED ALWAYS AS IDENTITY` refuses an id you
+      supply by hand (`cannot insert a non-DEFAULT value into column "id"`), which stops a
+      script from colliding with the sequence later. `serial` is the older way to do the same
+      job; identity columns are the SQL standard and the one to use in new tables.
+
+      A `CHECK` must be true or NULL to pass. `CHECK (age >= 13)` on a nullable column accepts
+      a row with no age at all. If the value is required, `NOT NULL` is a separate rule.
+
+      A `CHECK` may only look at the row being written. "No two bookings for the same room
+      overlap" involves other rows, so it needs an exclusion constraint, a unique index or a
+      transaction with a lock, which the constraints lesson returns to.
+  - title: Money, precisely
+    body: |-
+      `numeric(p,s)` holds exact decimals: `p` digits in total, `s` after the point. It
+      rounds extra decimals half away from zero on the way in, so `0.005` becomes `0.01`, and
+      it refuses a value with too many digits before the point with `numeric field overflow`.
+      Rounding silently is a feature for display and a hazard for sums, so round once, at a
+      rule you chose, not at every step.
+
+      Integer minor units are the other safe choice and the one payment providers use: £19.99
+      is stored as `1999`. Sums are exact and fast. Two things follow from it:
+
+      - Store the currency beside the amount, as `currency char(3)` or `text` holding an ISO
+        4217 code. `1999` means nothing without it.
+      - Minor units differ per currency. Pounds and euros have two decimal places, the yen
+        has none, and a few currencies such as the Kuwaiti dinar have three. Formatting
+        belongs in code that knows the currency.
+
+      The driver matters too. `node-postgres` returns `numeric` and `bigint` values as
+      strings, because a JavaScript `number` can't hold every value of either exactly. Keep
+      them as strings, or convert to integer pence or `BigInt` deliberately. Parsing a
+      `numeric` with `parseFloat` puts the floating-point error straight back.
+
+      Avoid the built-in `money` type: its output depends on the `lc_monetary` setting, so the
+      same row prints differently on different servers.
+  - title: Time zones and wall-clock times
+    body: |-
+      A `timestamptz` doesn't store a zone. It converts the input to UTC and converts back to
+      the session's `TimeZone` on output. That's right for anything that happens at one
+      instant: a payment, a login, a parcel delivered.
+
+      Adding intervals shows that the zone still matters for arithmetic. In London the clocks
+      go forward on 29 March 2026:
+
+      ```sql
+      SET TimeZone = 'Europe/London';
+      SELECT (timestamptz '2026-03-28 09:00' + interval '1 day')::text AS plus_one_day,
+             (timestamptz '2026-03-28 09:00' + interval '24 hours')::text AS plus_24_hours;
+      -- plus_one_day            | plus_24_hours
+      -- 2026-03-29 09:00:00+01  | 2026-03-29 10:00:00+01
+      ```
+
+      "One day later" keeps the wall clock at 09:00, while "24 hours later" is exactly 24
+      hours. The session zone decides which calendar the day is counted in, so servers should
+      set it on purpose rather than inherit it.
+
+      Some times are wall-clock rules, not instants: a class every Monday at 09:00 Lisbon
+      time, or a shop's opening hours. Store those as a local `time` or `timestamp` plus the
+      zone name in its own column, and work out the instant when you need it:
+
+      ```sql
+      SELECT (timestamp '2026-10-09 09:00' AT TIME ZONE 'Europe/Lisbon')::text;
+      -- 2026-10-09 08:00:00+00
+      ```
+
+      Storing a future event as UTC alone breaks if the country changes its daylight saving
+      rules before the date. Use `date` for things with no time at all, such as a birthday.
+  - title: Status columns, keys and text
+    body: |-
+      A column with a small set of values has three designs.
+
+      - `text` with a `CHECK (status IN (...))`: readable, and changing the list is one
+        migration that drops and re-adds the constraint.
+      - An `ENUM` type: compact and self-documenting. `ALTER TYPE ... ADD VALUE` adds a value,
+        but Postgres has no command to remove one, so a retired status stays forever or the
+        type is rebuilt.
+      - A lookup table with a foreign key: best when each value carries data of its own, such
+        as a label, a colour or an "is active" flag, or when non-developers manage the list.
+
+      For primary keys, an identity `bigint` is small, fast and readable in logs. A UUID lets
+      clients create ids before they reach the server and hides how many rows exist. Random
+      version 4 UUIDs (`gen_random_uuid()`) scatter inserts across the index; Postgres 18 adds
+      `uuidv7()`, whose values start with a timestamp, so new keys land together at the end
+      of the index like a sequence does.
+
+      For strings, `text` and `varchar(n)` are stored the same way in Postgres. The limit in
+      `varchar(255)` is a habit from other databases. If a length is a business rule, such as
+      a three-letter currency code, say so with `CHECK (length(currency) = 3)`.
+pitfalls:
+  - "**Storing prices as `double precision` because it takes decimals.** It holds the nearest binary fraction, so `0.1 + 0.2` is `0.30000000000000004` and totals drift. Use integer minor units or `numeric`."
+  - "**Using `timestamp` for events people join from different countries.** It records a clock reading with no zone, so each reader guesses. Use `timestamptz` for instants, and a local time plus a zone name for recurring wall-clock rules."
+  - "**A `CHECK` on a nullable column, trusted as a requirement.** `CHECK (age >= 13)` passes when `age` is NULL. Add `NOT NULL` when the value must exist."
+  - "**Expecting `UNIQUE` to allow only one NULL.** By default any number of NULLs pass. Add `NOT NULL`, or write `UNIQUE NULLS NOT DISTINCT` on Postgres 15 and later."
+  - "**Parsing `numeric` results with `parseFloat` in Node.** The driver returns a string to keep the value exact. Converting to a float reintroduces rounding errors; keep strings or use integer pence."
+  - "**`integer` primary keys on tables that grow fast.** They stop at about 2.1 billion, and changing the type of a busy key column later rewrites the table. Start with `bigint`."
+  - "**Leaving every rule in application code.** A second service, a backfill script or a manual fix skips it. Put the rules that must always hold in the schema."
+interview:
+  - question: How would you store money in a relational database?
+    answer: >-
+      As exact values: integer minor units such as pence in a `bigint`, or `numeric(p,s)`,
+      always with a currency code beside the amount. Floating-point types hold binary
+      approximations, so 0.10 plus 0.20 isn't 0.30 and a "paid equals owed" check can fail.
+      Integer pence matches what payment providers send and makes sums exact and fast; I'd
+      pick `numeric` when I need fractions of a minor unit, such as tax rates or currency
+      conversion, and round once at a defined point. Minor units differ per currency (the yen
+      has none), so formatting lives in code that knows the currency. In Node, the driver
+      returns `numeric` and `bigint` as strings, and I keep it that way rather than parsing to
+      a float.
+  - question: What's the difference between `timestamp` and `timestamptz` in Postgres, and which do you use?
+    answer: >-
+      `timestamptz` for anything that happens at an instant. Despite the name, it doesn't
+      store a zone: it converts input to UTC and shows it in the session's time zone, so every
+      reader sees the same moment in their own clock. `timestamp` stores a bare clock reading,
+      so 09:00 from Lisbon and 09:00 from Warsaw look identical. The exception is a wall-clock
+      rule such as "every Monday at 09:00 in Lisbon": I'd store the local time and the zone
+      name, and compute the instant when needed, because daylight saving rules can change
+      before a future date arrives.
+  - question: The application already validates input. Why add constraints in the database as well?
+    answer: >-
+      Because the database is the only place every write passes through. Application checks
+      cover one code path; a second service, a migration script, a queue consumer or someone
+      fixing data by hand skips them. `NOT NULL`, `UNIQUE`, `CHECK` and foreign keys hold
+      whatever sends the write. `UNIQUE` also holds under concurrency, where two requests can
+      both pass an application-side "is this email taken" check and both insert. I keep
+      both: the app validates for friendly messages and the schema guarantees the invariant.
+      The trade-off is that changing a rule becomes a migration, which is a good thing for
+      rules that really matter.
+  - question: Auto-incrementing integers or UUIDs for primary keys?
+    answer: >-
+      An identity `bigint` by default, a UUID when there's a reason. Identity keys are 8
+      bytes, sequential so inserts append to the index, and readable in logs. UUIDs let
+      clients or several services create ids without a round trip, and don't reveal how many
+      rows exist or let someone guess the next id. Random version 4 UUIDs spread inserts over
+      the whole index, which hurts write performance and cache use on big tables; Postgres 18's
+      `uuidv7()` fixes most of that because the values start with a timestamp. A UUID is still
+      twice the size of a `bigint` in every index and foreign key that holds it.
+  - question: Would you use an enum type or a text column with a check for a status field?
+    answer: >-
+      Usually `text` with a named `CHECK (status IN (...))`, because it's the cheapest to
+      change. Adding or removing a value is dropping and re-adding one constraint. A Postgres
+      `ENUM` is compact and documents itself, but values can only be added, not removed, and
+      the order is fixed at creation unless you insert with `BEFORE` or `AFTER`. When each
+      status carries its own data, such as a display label or whether it counts as active, I'd
+      use a lookup table with a foreign key instead. All three stop typos like `'Confirmed'`
+      from landing, which is the part that matters.

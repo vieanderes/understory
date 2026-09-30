@@ -1,0 +1,315 @@
+summary: >-
+  A component test renders one React component into a fake page in memory, jsdom, and drives
+  it the way a person would: find a control by its role and name, click or type, then check
+  what the screen says. React Testing Library gives you the rendering and the queries, and
+  `user-event` gives you realistic clicks and keystrokes. A test like that runs in
+  milliseconds and needs no browser.
+
+
+  The rule behind every choice is that the more a test resembles real use, the more a pass
+  proves. So you query the way a user or a screen reader finds things, you assert on words,
+  roles and states rather than classes or component state, and you wait for the screen
+  rather than for your code. A test written this way survives a refactor, and it fails when
+  a button loses its accessible name, which is a real bug.
+
+
+  These notes cover what the steps leave out: the three query families and the priority
+  order, why `user-event` beats `fireEvent`, testing async components without flakes, what
+  the `act(...)` warning really means, and the things jsdom can't tell you, which is where
+  the end-to-end test takes over.
+remember:
+  - Query by what the user meets, in this order of preference, `getByRole`, `getByLabelText`, then `getByText`, and use `getByTestId` only when nothing visible identifies the element.
+  - '`getBy` throws when nothing matches, `queryBy` returns `null` for checking absence, and `findBy` returns a promise that retries for up to a second.'
+  - '`user-event` plays the whole sequence of events a person causes and respects disabled controls and `maxLength`, while `fireEvent` dispatches one event and nothing else.'
+  - Call `userEvent.setup()` before rendering and `await` every interaction, because each one is asynchronous.
+  - The `act(...)` warning means state changed after your test stopped watching, and the fix is almost always to await the resulting screen with `findBy`, not to wrap code in `act`.
+  - jsdom has no layout, no media queries and no observers, so sizes, visibility from CSS classes and responsive behaviour belong in a real browser test.
+  - Mock at the boundary your component calls, such as a function prop or the network, and never mock the component's own hooks or children to make a test pass.
+sections:
+  - title: The three query families and the priority order
+    body: |-
+      Every query comes in three families, and each has an `All` form that returns a list.
+
+      - `getBy...` returns the one match, and throws if there are none or more than one.
+      - `queryBy...` returns the match or `null`. It exists for one job: asserting that
+        something is **not** there.
+      - `findBy...` returns a promise. It retries a `getBy` until it passes or a timeout,
+        1,000 ms by default, runs out.
+
+      The priority order follows what a person perceives. `getByRole` comes first because it
+      reads the accessibility tree: the element's role (button, link, heading, checkbox) and
+      its **accessible name**, the text a screen reader announces. The name comes from the
+      button's text, a linked `<label>`, `aria-label` or `aria-labelledby`. Next are
+      `getByLabelText` for form fields and `getByPlaceholderText` as a weaker version of it,
+      then `getByText` for non-interactive content, then `getByDisplayValue`, `getByAltText`
+      and `getByTitle`. `getByTestId` is last, because users can't see a test id.
+
+      When the same control appears several times, scope the query with `within` instead of
+      reaching for an index:
+
+      ```tsx
+      function Basket() {
+        return (
+          <table>
+            <tbody>
+              <tr><td>Kettle</td><td><button>Remove</button></td></tr>
+              <tr><td>Toaster</td><td><button>Remove</button></td></tr>
+            </tbody>
+          </table>
+        );
+      }
+
+      test('each row has its own Remove button', () => {
+        render(<Basket />);
+        expect(screen.getAllByRole('button', { name: 'Remove' })).toHaveLength(2);
+        const row = screen.getByRole('row', { name: /toaster/i });
+        expect(within(row).getByRole('button', { name: 'Remove' })).toBeInTheDocument();
+      });
+      ```
+
+      A table row takes its name from its cells, so `/toaster/i` finds it. A list item does
+      not: `getByRole('listitem', { name: ... })` finds nothing, because ARIA doesn't name
+      list items from their content. When a query can't find something you can see, run
+      `screen.debug()` to print the page, or `screen.logTestingPlaygroundURL()` for a
+      suggested query.
+  - title: user-event, fireEvent and what a click really is
+    body: |-
+      A real click is a sequence: pointer down, mouse down, focus, pointer up, mouse up,
+      click. Typing one letter is a key down, a key press, an input event and a key up, and
+      the browser refuses the character if the field is full. `user-event` plays that whole
+      sequence and applies the browser's rules. `fireEvent` dispatches the single event you
+      name and skips every rule.
+
+      ```tsx
+      function SignUp({ onSubmit }: { onSubmit: (email: string) => void }) {
+        const [email, setEmail] = useState('');
+        return (
+          <form onSubmit={(e) => { e.preventDefault(); onSubmit(email); }}>
+            <label htmlFor="email">Email</label>
+            <input id="email" type="email" value={email} onChange={(e) => setEmail(e.target.value)} />
+            <label>
+              Code <input maxLength={4} />
+            </label>
+            <button type="submit" disabled={email === ''}>Create account</button>
+          </form>
+        );
+      }
+
+      test('types and submits like a person', async () => {
+        const user = userEvent.setup();
+        const onSubmit = vi.fn();
+        render(<SignUp onSubmit={onSubmit} />);
+        const button = screen.getByRole('button', { name: 'Create account' });
+        expect(button).toBeDisabled();
+        await user.type(screen.getByLabelText('Email'), 'sam@example.com');
+        await user.click(button);
+        expect(onSubmit).toHaveBeenCalledWith('sam@example.com');
+      });
+
+      test('user-event respects maxLength, fireEvent does not', async () => {
+        const user = userEvent.setup();
+        render(<SignUp onSubmit={() => {}} />);
+        const code = screen.getByRole('textbox', { name: 'Code' });
+        await user.type(code, '123456');
+        expect(code).toHaveValue('1234');
+        fireEvent.change(code, { target: { value: '123456' } });
+        expect(code).toHaveValue('123456'); // a value no user could type
+      });
+      ```
+
+      Both tests pass under Vitest with jsdom. The second shows the danger: `fireEvent` put
+      six characters in a four-character field, so a test built on it can pass on a state
+      users never reach. Keep `fireEvent` for events `user-event` doesn't model, such as a
+      `scroll` or a custom event. Asserting that a function prop was called, as with
+      `onSubmit`, is fine: the prop is the component's boundary with its parent.
+  - title: Async components without flakes
+    body: |-
+      Most real components load something. Pass the loader in, or stub the network, so the
+      test controls when and how it answers. Then wait for the screen, never for a number of
+      milliseconds.
+
+      ```tsx
+      type Book = { id: number; title: string };
+
+      function BookList({ loadBooks }: { loadBooks: () => Promise<Book[]> }) {
+        const [books, setBooks] = useState<Book[] | null>(null);
+        const [error, setError] = useState(false);
+        useEffect(() => {
+          loadBooks().then(setBooks, () => setError(true));
+        }, [loadBooks]);
+        if (error) return <p role="alert">Couldn't load the catalogue</p>;
+        if (books === null) return <p>Loading</p>;
+        return (
+          <ul aria-label="Books">
+            {books.map((b) => <li key={b.id}>{b.title}</li>)}
+          </ul>
+        );
+      }
+
+      test('shows the books once they load', async () => {
+        const loadBooks = () => Promise.resolve([{ id: 1, title: 'Dune' }, { id: 2, title: 'Emma' }]);
+        render(<BookList loadBooks={loadBooks} />);
+        expect(screen.getByText('Loading')).toBeInTheDocument();
+        const list = await screen.findByRole('list', { name: 'Books' });
+        expect(within(list).getAllByRole('listitem')).toHaveLength(2);
+        expect(screen.queryByText('Loading')).not.toBeInTheDocument();
+      });
+
+      test('says so when loading fails', async () => {
+        render(<BookList loadBooks={() => Promise.reject(new Error('503'))} />);
+        expect(await screen.findByRole('alert')).toHaveTextContent("Couldn't load the catalogue");
+      });
+      ```
+
+      `findBy` is `waitFor` plus `getBy`. Use `waitFor` directly when the thing you wait for
+      isn't an element, such as a mock having been called, and
+      `waitForElementToBeRemoved` to wait for a spinner to go. Keep one assertion inside a
+      `waitFor` callback and no side effects, because the callback runs again every 50 ms
+      until it stops throwing.
+
+      For a component that calls a real `fetch`, stub the network rather than `fetch`
+      itself. Mock Service Worker (MSW) intercepts requests in Node, so the component's own
+      request code runs and only the server is fake.
+  - title: What the act warning means
+    body: |-
+      React batches state updates and applies them later. `act()` tells React "flush
+      everything now, before I look". Testing Library already wraps `render`, `user-event`,
+      `fireEvent` and every `findBy` and `waitFor` in `act`, so in normal tests you never
+      write it.
+
+      The warning, `An update to SaveButton inside a test was not wrapped in act(...)`,
+      appears when state changes while nothing is inside `act`. That usually means the test
+      moved on while a promise was still pending. This test produced exactly that warning:
+
+      ```tsx
+      await user.click(screen.getByRole('button', { name: 'Save' }));
+      await new Promise((r) => setTimeout(r, 50)); // the save resolves in here, unwatched
+      ```
+
+      Wrapping the sleep in `act` would silence it and keep the guess. The fix is to wait for
+      what the user would see: `expect(await screen.findByText('Saved')).toBeInTheDocument()`.
+      The warning was telling you the test never checked the outcome.
+
+      One legitimate use remains: advancing fake timers by hand. Take a `Toast` whose Save
+      button shows a "Saved" status and whose effect hides it with a 5,000 ms `setTimeout`.
+      Under Vitest, its test needs two details:
+
+      ```tsx
+      test('the toast hides after five seconds', async () => {
+        vi.useFakeTimers({ shouldAdvanceTime: true });
+        const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+        render(<Toast />);
+        await user.click(screen.getByRole('button', { name: 'Save' }));
+        expect(screen.getByRole('status')).toHaveTextContent('Saved');
+        await act(() => vi.advanceTimersByTimeAsync(5000));
+        expect(screen.queryByRole('status')).not.toBeInTheDocument();
+        vi.useRealTimers();
+      });
+      ```
+
+      Without `act` around the advance, React warned and the toast was still on screen at
+      the assertion. Without `shouldAdvanceTime`, the click hung until the test timed out:
+      Testing Library's async wrapper waits on a `setTimeout` it only advances for Jest's
+      fake timers. Import `act` from `@testing-library/react` or from `react`. In React 19,
+      `react-dom/test-utils` keeps only a deprecated `act` that logs a warning, and its other
+      helpers are gone.
+  - title: What jsdom can't tell you
+    body: |-
+      jsdom implements the DOM and events in JavaScript. It doesn't lay anything out or
+      paint. In a Vitest run with jsdom 30, these all held:
+
+      ```text
+      element.getBoundingClientRect()   every field 0
+      element.offsetWidth               0
+      window.matchMedia                 undefined
+      IntersectionObserver              undefined
+      ResizeObserver                    undefined
+      element.scrollIntoView            undefined
+      ```
+
+      So a component test can't check that a menu fits on a phone, that text is truncated,
+      that a sticky header sticks, or that an element hidden by a Tailwind class is hidden.
+      `toBeVisible` sees `display: none` set inline or by a style sheet in the document, but
+      your CSS files and class-based styles usually aren't loaded, so a `<p className="hidden">`
+      counts as visible. Components that call `matchMedia` or an observer need a stub in the
+      test setup, and those stubs then decide the answer, so they prove nothing about layout.
+
+      This is the line between the layers. Behaviour, state changes, accessibility names and
+      error states go in fast component tests. Layout, real CSS, real navigation and the
+      whole journey across pages go in a few end-to-end tests in a real browser, the next
+      lesson. Vitest's browser mode is a middle option: component tests that run in a real
+      browser engine, slower than jsdom and faster than a full end-to-end run.
+pitfalls:
+  - '**Checking absence with `getBy`.** `getByText(...)` throws before `not.toBeInTheDocument()` can run, so the test fails for the wrong reason. Use `queryByText` for anything that should be gone.'
+  - '**Forgetting to `await` a `user-event` call or a `findBy`.** The test races ahead and asserts on the old screen, or passes before the promise rejects. Every `user.click`, `user.type` and `findBy` gets an `await`; the `testing-library/await-async-*` lint rules catch the misses.'
+  - '**Reaching into the DOM with `container.querySelector`.** It couples the test to markup and classes, and it passes on a button with no name. Query by role and name, and if that fails, fix the markup.'
+  - '**Silencing the `act` warning by wrapping code in `act`.** The warning means the test stopped watching before an update landed. Await the resulting screen with `findBy` instead.'
+  - '**Putting several assertions or side effects in `waitFor`.** The callback reruns until it passes, so a click inside it clicks many times, and a failure in the first assertion hides the second. One assertion per `waitFor`, actions outside.'
+  - '**Mocking the component''s own children or hooks.** The test then checks your mocks. Mock only what crosses the boundary: a function prop, a module that talks to the network, or the network itself.'
+  - '**Testing layout in jsdom.** Widths, visibility from CSS classes and media queries all read as zero, undefined or visible. Move those checks to a browser test.'
+interview:
+  - question: How do you decide what to assert in a React component test?
+    answer: >-
+      I assert on what a user can perceive and nothing else. That means text on the screen,
+      roles and accessible names, states exposed to assistive technology such as
+      `aria-pressed` or `disabled`, and calls across the component's boundary, like an
+      `onSubmit` prop. I don't assert on internal state, class names or which hook ran,
+      because users never see those and they change in every refactor. Queries follow the
+      same rule: `getByRole` with a name first, then labels, then text, with a test id as a
+      last resort. The payoff is double. Tests survive a redesign that keeps the behaviour,
+      and they fail when a button loses its accessible name, which is a real accessibility
+      bug. The trade-off is that you sometimes have to fix markup to make it queryable, which
+      is usually a fix you wanted anyway.
+  - question: What is the difference between getBy, queryBy and findBy?
+    answer: >-
+      They differ in what happens when nothing matches, and whether they wait. `getBy`
+      throws at once, so it's the default for things that should already be there, and the
+      error prints the page to help you debug. `queryBy` returns `null`, which makes it the
+      tool for asserting absence: `expect(screen.queryByText('Loading')).not.toBeInTheDocument()`.
+      `findBy` returns a promise that retries the `getBy` until it passes or a timeout, one
+      second by default, so it's for anything that appears after an async step, like data
+      loading or a message after a save. Each has an `All` variant for lists. The common
+      mistake is using `getBy` for absence, which throws before the assertion runs, or a
+      `findBy` without `await`, which never checks anything.
+  - question: You see "not wrapped in act(...)" warnings in the test output. What do you do?
+    answer: >-
+      I treat it as a test bug, not noise. The warning means a React state update happened
+      while nothing was inside `act`, which almost always means the test finished its
+      interaction and moved on while a promise was still pending, for example a save that
+      resolves after the last assertion. Testing Library already wraps render, `user-event`
+      and `findBy` in `act`, so the fix is to await the outcome the user would see, with
+      `findBy` or `waitForElementToBeRemoved`. That also adds the assertion the test was
+      missing. Wrapping code in `act` by hand only silences it. The one case where I call
+      `act` myself is advancing fake timers, because nothing else flushes those updates.
+  - question: Why prefer user-event over fireEvent?
+    answer: >-
+      Because `user-event` behaves like a person and `fireEvent` doesn't. A `user.click`
+      plays pointer down, mouse down, focus, pointer up, mouse up and click, and refuses to
+      click a disabled button. `user.type` fires the key events per character and respects
+      `maxLength`. `fireEvent.change` sets the value directly, so I've seen it put six
+      characters into a four-character field and pass. Tests built on `fireEvent` can
+      therefore pass on states users can't reach, and miss bugs in focus or keyboard
+      handlers. The costs are that every `user-event` call is async and a bit slower, and
+      that you call `userEvent.setup()` first. I keep `fireEvent` for events `user-event`
+      doesn't model, like scroll.
+  - question: What can't a Testing Library test in jsdom catch, and how do you cover it?
+    answer: >-
+      Anything that depends on layout or real CSS. jsdom doesn't lay out or paint, so every
+      size reads as zero, `matchMedia` and the observers don't exist, and class-based styles
+      usually aren't loaded, so a menu hidden by CSS counts as visible. That rules out
+      responsive behaviour, truncation, overlap and "is this actually on screen". I cover
+      those with a few Playwright tests in real browsers at the viewports that matter, plus
+      visual checks where the risk justifies them. Component tests stay the bulk because
+      they're fast and precise about behaviour and accessibility. Vitest browser mode is an
+      option in between when a component's logic depends on real layout.
+  - question: How do you test a streaming AI chat UI when the model's output changes every run?
+    answer: >-
+      I never call the real model in UI tests. The component or hook takes the stream as an
+      input, or I mock the endpoint, and the test feeds scripted events: a few tokens, then
+      done, or an error halfway. An async generator makes that a few lines. Then I test the
+      way a user acts: click Ask, expect the waiting state, expect the full text, press Stop
+      and expect the partial answer kept and marked. A fake stream that never ends until
+      aborted tests Stop and the abort signal. For end-to-end tests, Playwright's
+      `page.route` can answer with a canned event-stream body, which arrives in one go, so
+      the in-between states stay in component tests. Real model quality belongs in evals,
+      not in UI tests.

@@ -1,0 +1,235 @@
+summary: >-
+  Smooth motion means the browser finishes a new frame before every screen refresh. At
+  60 Hz that's about 16.7 ms per frame, at 120 Hz about 8.3 ms, and the browser needs part
+  of that budget for its own work. Miss the deadline and the screen shows the old frame
+  again, which people see as a stutter.
+
+
+  Three habits keep you inside the budget. Drive JavaScript animation with
+  `requestAnimationFrame` and compute positions from elapsed time, so speed doesn't depend
+  on the device. Animate `transform` and `opacity`, which the compositor can move without
+  layout or paint. And never let a loop alternate style writes with layout reads, which
+  forces the browser to lay the page out again and again.
+
+
+  These notes add the pipeline behind a frame, a complete time-based animation that stops
+  cleanly, the FLIP technique for animating layout changes cheaply, and how to prove where
+  a frame's time went. Reach for this whenever something moves on screen or a page feels
+  sluggish while you scroll or type.
+remember:
+  - A frame must be ready before the next refresh, about 16.7 ms at 60 Hz and 8.3 ms at 120 Hz, including the browser's own work.
+  - Changing a geometry property such as `left`, `width` or `top` reruns layout, paint and composite; `transform` and `opacity` usually need only composite.
+  - Compositor animations of `transform` and `opacity` can keep running while the main thread is busy, but a JavaScript loop cannot.
+  - Compute an animation's position from elapsed time, not from a fixed step per frame, so it runs at the same speed on any screen.
+  - Reading a layout value such as `offsetWidth` or `getBoundingClientRect()` after a style change forces a synchronous layout.
+  - Batch all layout reads before all style writes, so a loop costs one layout instead of one per item.
+  - Use `will-change` on the few elements about to animate and remove it afterwards, because every layer costs memory.
+  - Respect `prefers-reduced-motion`, and cancel every `requestAnimationFrame` loop you start.
+sections:
+  - title: What happens in one frame
+    body: |-
+      Each frame, the browser runs a fixed pipeline on the main thread and then hands the
+      result to the compositor.
+
+      ```text
+      input events -> requestAnimationFrame callbacks -> style -> layout -> paint -> composite
+      ```
+
+      **Style** works out which CSS rules apply to each element. **Layout** computes every
+      box's size and position. **Paint** records what to draw for each layer. **Composite**
+      puts the painted layers together, moved, scaled and faded as `transform` and `opacity`
+      say, and usually runs on its own thread with help from the GPU.
+
+      A change enters the pipeline at a stage and runs everything after it. That's why the
+      property you animate decides the cost:
+
+      - `width`, `height`, `left`, `top`, `margin`, `font-size`: layout, paint, composite.
+      - `color`, `background-color`, `box-shadow`: paint and composite.
+      - `transform`, `opacity`: composite only, once the element has its own layer.
+
+      Layout is rarely local. Growing one box can move its siblings and its parent's
+      siblings, so a layout-triggering animation on a long page costs more than it looks.
+
+      The budget is also smaller than 16.7 ms. The browser spends some of every frame on its
+      own housekeeping, so aim for well under 10 ms of your own work per frame. On a 120 Hz
+      screen the whole frame is 8.3 ms, so the same code that looked fine on a 60 Hz laptop
+      can stutter on a newer phone.
+
+      `requestAnimationFrame` callbacks run before style and layout, which makes them the
+      right place to write styles for the coming frame. Browsers pause them in background
+      tabs, so a loop there costs nothing while nobody is watching.
+  - title: A time-based animation that stops cleanly
+    body: |-
+      The lesson moved a ball by the time since the last frame. For an animation with a
+      fixed length, such as a drawer sliding in over 300 ms, it's simpler and more accurate
+      to compute the position from the time since the start. Rounding errors can't pile up,
+      and a dropped frame only skips a position.
+
+      ```js
+      // Position depends on elapsed time, not on how many frames ran.
+      function slideAt(elapsedMs, { from, to, durationMs }) {
+        const t = Math.min(1, elapsedMs / durationMs);
+        const eased = 1 - (1 - t) ** 3; // ease-out cubic
+        return from + (to - from) * eased;
+      }
+
+      function run(frameGapMs) {
+        let x;
+        for (let now = 0; ; now += frameGapMs) {
+          x = slideAt(now, { from: -240, to: 0, durationMs: 300 });
+          if (now >= 300) break;
+        }
+        return x;
+      }
+
+      console.log(run(1000 / 60), run(1000 / 120), run(50)); // 0 0 0
+      console.log(slideAt(150, { from: -240, to: 0, durationMs: 300 })); // -30
+      ```
+
+      At 60 Hz, 120 Hz or a struggling 20 frames a second, the drawer ends at 0 at 300 ms.
+      In the browser, the loop around it looks like this:
+
+      ```js
+      const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
+
+      function openDrawer(drawer) {
+        if (reduceMotion.matches) {
+          drawer.style.transform = "translateX(0)";
+          return () => {};
+        }
+        let start;
+        let id;
+        function frame(now) {
+          start ??= now; // the first frame's time, not performance.now()
+          const elapsed = now - start;
+          const x = slideAt(elapsed, { from: -240, to: 0, durationMs: 300 });
+          drawer.style.transform = `translateX(${x}px)`;
+          if (elapsed < 300) id = requestAnimationFrame(frame);
+        }
+        id = requestAnimationFrame(frame);
+        return () => cancelAnimationFrame(id); // call this if the drawer closes early
+      }
+      ```
+
+      Taking `start` from the first callback matters. The time passed to a callback marks
+      the start of the frame, so it can be slightly earlier than a `performance.now()` read
+      during that frame, and a negative elapsed time makes the first frame jump backwards. For a plain slide,
+      a CSS transition or `element.animate()` does all of this for you and can run on the
+      compositor. Write the loop yourself only when each frame needs logic, such as physics
+      or a canvas.
+  - title: 'FLIP: animating a layout change with transform'
+    body: |-
+      Sometimes the change you want to animate is a layout change: an item moving to the
+      top of a to-do list, a card growing into a detail view. Animating `top` or `height`
+      would lay the page out every frame. **FLIP** does the layout once and fakes the motion
+      with `transform`.
+
+      - **First**: measure where the element is now.
+      - **Last**: make the change, then measure where it ends up.
+      - **Invert**: apply a `transform` that puts it back where it started.
+      - **Play**: animate that `transform` back to none.
+
+      ```js
+      function moveToTop(list, item) {
+        const first = item.getBoundingClientRect();   // First: one read
+        list.prepend(item);                           // the real layout change
+        const last = item.getBoundingClientRect();    // Last: one forced layout
+        const dx = first.left - last.left;            // Invert
+        const dy = first.top - last.top;
+        item.animate(                                 // Play, on transform only
+          [{ transform: `translate(${dx}px, ${dy}px)` }, { transform: "none" }],
+          { duration: 250, easing: "ease-out" },
+        );
+      }
+      ```
+
+      The page pays for two layouts in total, however long the animation runs, and every
+      frame after that is composite only. `element.animate()` is the Web Animations API: it
+      takes keyframes and timing options and returns an `Animation` you can pause, reverse
+      or `cancel()`. Scale works the same way for size changes: invert with
+      `scale(first.width / last.width)`. Scaling distorts text and borders during the
+      motion, so it suits short animations best.
+
+      For many items at once, measure all the First rectangles, make all the changes, then
+      measure all the Last ones. Interleaving them per item is the layout thrashing from
+      the lesson.
+  - title: Finding a dropped frame
+    body: |-
+      Guessing at jank wastes time. The browser's tools show which pipeline stage took the
+      frame.
+
+      In Chrome DevTools, record in the **Performance** panel while the animation runs, with
+      CPU throttling on to act like a slower phone. The frames track marks dropped frames.
+      In the main thread track, purple **Layout** blocks during an animation mean you're
+      animating a geometry property. A layout block with a warning triangle and "Forced
+      reflow" points at a script that read layout after writing styles, and the summary
+      names the line.
+
+      The **Rendering** drawer has two toggles worth knowing. **Paint flashing** tints every
+      area the browser repaints, so a `transform` animation should flash nothing while it
+      moves. **Layer borders** outlines each compositor layer, which shows when
+      `will-change` or an animation promoted an element, and when far too many elements got
+      layers.
+
+      About `will-change`: promoting an element early saves the cost of creating its layer
+      on the first frame. Every layer holds its own painted texture in memory, which matters
+      on phones. So add `will-change: transform` shortly before an animation, for example on
+      hover or when a drag starts, and remove it when the motion ends. A rule such as
+      `* { will-change: transform; }` makes pages slower, not faster.
+
+      Animation also affects responsiveness. A long frame delays the next paint after a tap,
+      which is what the Interaction to Next Paint metric from the earlier lesson measures.
+      Keeping per-frame work small helps both.
+pitfalls:
+  - '**Animating `left`, `top`, `width` or `height`.** They look the same as `transform` in the code and on a fast laptop. Each frame reruns layout and paint. Keep the element in its final place and animate `transform: translate()` or `scale()` instead.'
+  - '**Moving a fixed number of pixels per frame.** It runs twice as fast on a 120 Hz screen and slows down on a busy phone. Compute position from elapsed time.'
+  - '**Reading layout inside a loop that writes styles.** Each read forces a synchronous layout. Read everything first, keep the numbers in variables, then write.'
+  - '**Using `setInterval` or `setTimeout` for animation.** Their timing drifts from the display refresh, so frames get skipped or doubled, and they keep running in hidden tabs. Use `requestAnimationFrame`, CSS transitions or `element.animate()`.'
+  - '**Putting `will-change` on everything.** Each promoted element becomes a layer with its own memory, and too many layers slow compositing down. Promote the few elements about to move, and remove it afterwards.'
+  - '**Forgetting to stop the loop.** A `requestAnimationFrame` loop that never checks an end condition keeps running after its element is gone. Keep the id and call `cancelAnimationFrame`, and in React do it in the effect clean-up.'
+  - '**Ignoring reduced motion.** Some people get dizzy or sick from large movement. Check `prefers-reduced-motion: reduce` and jump to the end state or use a fade.'
+interview:
+  - question: Why is animating `transform` cheaper than animating `left`?
+    answer: >-
+      Because `transform` skips layout and paint. Changing `left` changes geometry, so every
+      frame the browser recomputes layout, which can move other boxes, repaints the affected
+      area and then composites. A `transform` on an element with its own layer changes only
+      how the compositor places an already painted texture, which is cheap and usually runs
+      on a separate thread with GPU help. That's also why a transform animation keeps moving
+      while the main thread is busy with JavaScript, while a `left` animation freezes with
+      it. The trade-off is memory: each layer holds a texture, so promoting many elements,
+      for example with a blanket `will-change`, costs more than it saves.
+  - question: What is layout thrashing, and how do you fix it?
+    answer: >-
+      It's forcing the browser to lay the page out repeatedly within one frame, by
+      alternating style writes with layout reads. A read such as `offsetWidth` or
+      `getBoundingClientRect()` must return a correct number, so if a style changed since
+      the last layout, the browser lays out right then. In a loop of write, read, write,
+      read, that happens once per item, and a thousand items can take hundreds of
+      milliseconds. The fix is to batch: do all reads first and keep the values, then do all
+      writes, so layout runs once when the frame renders. In bigger codebases I'd schedule
+      reads and writes in separate phases per frame, or replace polling reads with
+      `ResizeObserver`. I confirm the fix in the Performance panel, where forced reflow
+      warnings disappear.
+  - question: A carousel stutters on mid-range Android phones but is smooth on your laptop. How do you debug it?
+    answer: >-
+      I'd reproduce it before guessing: a Performance recording on a real device through
+      remote debugging, or on the laptop with CPU throttling at four to six times slower.
+      Then I'd read the frames track for dropped frames and the main thread for what filled
+      them. Layout blocks every frame mean it animates a geometry property, so I'd switch to
+      `transform`. Forced reflow warnings mean a script reads layout after writing, so I'd
+      batch reads first. Long scripting blocks mean JavaScript per frame is too heavy, so
+      I'd move work out of the frame or use a CSS or Web Animations API animation that can
+      run on the compositor. I'd also check paint flashing and layer borders for huge
+      repaints or layer explosions. The laptop hid all of this because it's several times
+      faster.
+  - question: When would you use `requestAnimationFrame` instead of CSS transitions?
+    answer: >-
+      When each frame needs logic that CSS can't express. Physics, following a pointer during
+      a drag, drawing to a canvas, or syncing several values computed together all need
+      JavaScript per frame, and `requestAnimationFrame` runs it right before the browser
+      renders, paused in hidden tabs. For a fixed movement from A to B, a CSS transition or
+      `element.animate()` is better: less code, and when it animates `transform` or
+      `opacity` the browser can run it on the compositor, so a busy main thread doesn't stall
+      it. A `requestAnimationFrame` loop always runs on the main thread. If I do write one,
+      I compute positions from elapsed time and make sure it can be cancelled.

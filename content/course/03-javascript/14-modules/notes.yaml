@@ -1,0 +1,388 @@
+summary: >-
+  A **module** is a file with its own scope that shares only what it exports. Modules let you
+  split a program into pieces that can't trip over each other's variables, and they make the
+  dependencies between those pieces explicit: every `import` line is a declared edge in a
+  graph the browser, Node and your bundler can read.
+
+
+  JavaScript has two module systems. **ES modules** (ESM), with `import` and `export`, are
+  the standard, native in browsers and in Node. **CommonJS**, with `require` and
+  `module.exports`, is Node's original system and still common in older packages. They differ
+  in ways interviewers ask about: ESM is static and loads the whole graph before running any
+  of it, its imports are live bindings rather than copies, and it can load asynchronously.
+  CommonJS runs as it goes, synchronously, and hands out a plain object.
+
+
+  Those properties explain the practical behaviour. Imports are hoisted and checked before
+  your first line runs. Each module runs once and is cached, which makes it a natural
+  singleton. Bundlers can drop unused exports, called tree-shaking, because the imports are
+  known without running the code. `import()` loads code on demand. And circular imports fail
+  in specific, predictable ways.
+remember:
+  - Each module has its own scope, runs in strict mode, and runs once, however many files import it.
+  - Static `import` declarations are hoisted and resolved before any code in the file runs, so a missing export fails before the first line.
+  - An imported name is a live, read-only binding to the exporter's variable, while `require` returns a snapshot of whatever `module.exports` held.
+  - Modules are cached by resolved URL or path, so module-level state is shared by every importer, which makes a module a singleton.
+  - "`import()` loads a module at runtime and returns a promise for its namespace object, which is how code splitting and lazy loading work."
+  - Tree-shaking works because `import` and `export` are static, and top-level side effects and CommonJS defeat it.
+  - In a circular import, reading a `let`, `const` or `class` before its module has run throws a `ReferenceError`, while function declarations are already usable.
+  - 'Node treats `.mjs` files, and `.js` files under `"type": "module"`, as ESM, and Node 24 can `require()` an ES module that has no top-level `await`.'
+sections:
+  - title: How an ES module graph loads
+    body: |-
+      Loading an ES module happens in three phases, and the order explains most of its
+      behaviour.
+
+      1. **Construction.** Parse the entry file without running it, find its `import`
+         declarations, fetch those files, parse them, and repeat until the whole graph is
+         known. A syntax error or a missing file anywhere stops everything.
+      2. **Linking.** For every import, connect the name to the exporting module's variable. A
+         named import that no module exports fails here, with a `SyntaxError`.
+      3. **Evaluation.** Run each module's top-level code once, dependencies first, in
+         depth-first order.
+
+      ```js
+      // shared.mjs
+      console.log("shared runs");
+      export const shared = "s";
+
+      // a.mjs
+      import { shared } from "./shared.mjs";
+      console.log("a runs");
+      export const a = `a+${shared}`;
+
+      // b.mjs
+      import { shared } from "./shared.mjs";
+      console.log("b runs");
+      export const b = `b+${shared}`;
+
+      // main.mjs
+      console.log("main runs");
+      import { a } from "./a.mjs";
+      import { b } from "./b.mjs";
+      console.log(a, b);
+
+      // node main.mjs prints:
+      // shared runs
+      // a runs
+      // b runs
+      // main runs
+      // a+s b+s
+      ```
+
+      "main runs" comes last although it's the first line of `main.mjs`: static imports are
+      hoisted, and every dependency finishes evaluating before its importer starts. `shared`
+      runs once although two files import it.
+
+      Because the graph is known before anything runs, `import` must sit at the top level of
+      a module, never inside an `if` or a function, and its path must be a plain string.
+      That restriction is the price of the benefits: early errors, parallel fetching and
+      tree-shaking. When you need a condition or a computed path, use `import()`.
+
+      Module code also differs from a classic script in a few ways. It's always strict. Its
+      top-level `this` is `undefined`. Top-level `await` is allowed, and it pauses the
+      evaluation of every module that depends on this one. In a browser, a
+      `type="module"` script is deferred by default, and it's fetched with CORS rules, which
+      is why opening the page from `file://` fails.
+  - title: Live bindings, and why CommonJS differs
+    body: |-
+      An ES import isn't a copy of a value. It's a read-only view of the exporting module's
+      variable. When the exporter changes it, every importer sees the new value.
+
+      ```js
+      // counter.mjs
+      export let count = 0;
+      export function increment() {
+        count++;
+      }
+
+      // main.mjs
+      import { count, increment } from "./counter.mjs";
+      import * as counter from "./counter.mjs";
+
+      console.log(count); // 0
+      increment();
+      console.log(count); // 1, the binding is live
+      try {
+        count = 10;
+      } catch (error) {
+        console.log(error.constructor.name, error.message); // TypeError Assignment to constant variable.
+      }
+      try {
+        counter.count = 10;
+      } catch (error) {
+        console.log(error.constructor.name); // TypeError
+      }
+      ```
+
+      Importers can't assign to an import, and the namespace object from `import * as` is
+      read-only too. Only the module that owns the variable can change it, which keeps state
+      changes in one place. Note that read-only applies to the binding, not the value: an
+      imported object's properties can still be mutated by anyone.
+
+      CommonJS works differently. `require` runs the file, then returns its `module.exports`
+      object. Destructuring copies the values out at that moment.
+
+      ```js
+      // counter.cjs
+      let count = 0;
+      function increment() {
+        count++;
+      }
+      module.exports = { count, increment };
+
+      // main.cjs
+      const { count, increment } = require("./counter.cjs");
+      const again = require("./counter.cjs");
+      increment();
+      console.log(count); // 0, a copy taken at require time
+      console.log(again.count); // 0, the exports object holds the old value too
+      console.log(again === require("./counter.cjs")); // true, cached
+      ```
+
+      To share changing state from CommonJS, export a function such as `getCount()`, or
+      mutate a property on the exports object. With ESM the live binding does it for you.
+  - title: Caching, singletons and dynamic import
+    body: |-
+      A module is evaluated once per **module map** entry, keyed by its resolved URL in the
+      browser or its resolved file path in Node. Every later import gets the same instance.
+      That makes module-level variables shared state: a database client, a config object or
+      an in-memory cache created at the top of a module is effectively a singleton.
+
+      `import()` is the runtime counterpart of `import`. It takes any expression, works
+      anywhere, and returns a promise for the module's **namespace object**, where the
+      default export sits under `.default`.
+
+      ```js
+      // store.mjs
+      console.log("store.mjs evaluated");
+      const items = [];
+      export function add(item) {
+        items.push(item);
+        return items.length;
+      }
+      export default "cart store";
+
+      // main.mjs
+      const first = await import("./store.mjs"); // store.mjs evaluated
+      const second = await import("./store.mjs"); // nothing logged: cached
+      console.log(first === second); // true, the same namespace object
+      console.log(first.default); // cart store
+      first.add("tea");
+      console.log(second.add("jam")); // 2, one shared array
+
+      const fresh = await import("./store.mjs?copy"); // store.mjs evaluated
+      console.log(fresh.add("milk")); // 1, a different URL is a different module
+
+      try {
+        await import("./missing.mjs");
+      } catch (error) {
+        console.log(error.code); // ERR_MODULE_NOT_FOUND
+      }
+      ```
+
+      The query string shows the catch: "same module" means same resolved URL. Two copies of
+      a package in `node_modules`, or one package loaded both as CommonJS and as ESM, gives
+      two instances with two sets of state. The second case has a name, the **dual package
+      hazard**. Module singletons
+      also make tests leak state into each other, which is why test runners isolate or reset
+      modules between files.
+
+      In the browser, bundlers turn each `import()` into a separate chunk fetched on demand.
+      Load a charting library when someone opens the reports page, or a rich editor when they
+      click Edit, and the first page load stays small. Wrap the call in `try` and `catch`,
+      because a chunk can fail to download after a deploy.
+  - title: Tree-shaking and what defeats it
+    body: |-
+      **Tree-shaking** is a bundler removing exports nothing imports. It's possible because ES
+      imports are static: the bundler can see which names each file uses without running
+      anything.
+
+      ```js
+      // format.js
+      export function formatPrice(pence) {
+        return `£${(pence / 100).toFixed(2)}`;
+      }
+      export function formatDate(date) {
+        return date.toISOString().slice(0, 10);
+      }
+
+      // main.js
+      import { formatPrice } from "./format.js";
+      console.log(formatPrice(450));
+      ```
+
+      Bundled with esbuild, the output contains `formatPrice` and the `console.log` call, and
+      no trace of `formatDate`.
+
+      Four things defeat it. **Top-level side effects**: if a module does work when it
+      loads, such as patching a global or registering a plugin, the bundler must keep it
+      even if you use none of its exports. Packages mark themselves safe with
+      `"sideEffects": false` in `package.json`, or list the files that do have side effects.
+      **CommonJS**: `module.exports` is an object built at runtime, and `require` can take a
+      computed path, so bundlers mostly can't prove what's unused. **Dynamic property
+      access** on a namespace, such as `utils[name]`, forces the bundler to keep every export.
+      **Large barrel files** that re-export a whole library can slow builds and keep modules
+      whose top level has side effects.
+
+      That's why libraries ship ESM builds and why "import only what you use", such as
+      `import { debounce } from "lodash-es"`, keeps bundles small.
+  - title: ESM and CommonJS in Node
+    body: |-
+      Node decides the module system per file. `.mjs` is always ESM and `.cjs` always
+      CommonJS. A `.js` file follows the nearest `package.json`: `"type": "module"` means
+      ESM, otherwise CommonJS.
+
+      The differences you meet day to day:
+
+      - CommonJS has `require`, `module.exports`, `__dirname` and `__filename`. ESM has
+        `import`, `export`, and `import.meta.url`, `import.meta.dirname` and
+        `import.meta.filename` instead.
+      - ESM import paths need the file extension, `./menu.js` not `./menu`. CommonJS guesses
+        extensions and `index.js` files.
+      - ESM can import CommonJS: `module.exports` arrives as the default export, and Node
+        detects many named exports too.
+      - CommonJS can load ESM with `import()`, which is async. Node 24 also lets `require()`
+        load an ES module synchronously, as long as its graph has no top-level `await`.
+        Otherwise it throws `ERR_REQUIRE_ASYNC_MODULE`.
+      - JSON loads with `require("./config.json")` in CommonJS, and with
+        `import config from "./config.json" with { type: "json" }` in ESM.
+
+      New code should be ESM: it's the standard, it runs unchanged in browsers and Node, and
+      tools understand it. You still need to read CommonJS for older packages and
+      configuration files.
+  - title: Circular imports
+    body: |-
+      A cycle is when `a` imports `b` and `b` imports `a`, directly or through others. Both
+      systems allow it, and both can hand you a module that hasn't finished running.
+
+      In ESM, linking connects the bindings first, then evaluation runs the module deepest in
+      the cycle first. When `b` runs, `a` hasn't run yet. Function declarations in `a` are
+      already initialised, because they're hoisted. Its `const`, `let` and `class` bindings
+      are still in the temporal dead zone.
+
+      ```js
+      // main.mjs
+      import "./a.mjs";
+
+      // a.mjs
+      import { bName, bHello } from "./b.mjs";
+      export const aName = "a";
+      export function aHello() {
+        return "hello from a";
+      }
+      console.log(bName, bHello());
+
+      // b.mjs
+      import { aName, aHello } from "./a.mjs";
+      export const bName = "b";
+      export function bHello() {
+        return "hello from b";
+      }
+      console.log(aHello()); // hello from a: function declarations are ready early
+      try {
+        console.log(aName);
+      } catch (error) {
+        console.log(error.message); // Cannot access 'aName' before initialization
+      }
+
+      // then a.mjs finishes and logs: b hello from b
+      ```
+
+      In CommonJS, `require` of a module that's still loading returns its partly filled
+      `exports` object, so you get `undefined` for anything not yet assigned. Node prints a
+      warning when you read a missing property from it inside a cycle, but the code runs on
+      with the wrong value.
+
+      Cycles that only use each other inside functions, called later, are harmless: by then
+      both modules have finished. The trouble is top-level use. The fixes are to move the
+      shared piece into a third module both import, to pass the dependency in as an argument,
+      or to defer the access into a function. A cycle is often a sign two modules are really
+      one, or that one should depend on an interface rather than on the other.
+pitfalls:
+  - >-
+    **Importing a default export with braces.** `import { formatDate } from "./dates.js"` asks
+    for a named export. If the file has only `export default`, linking fails before any code
+    runs. Drop the braces, or change the export to a named one.
+  - >-
+    **Leaving off the extension or `./`.** In browsers and Node ESM, `"./menu"` doesn't find
+    `menu.js`, and `"menu.js"` is treated as a package name. Write `"./menu.js"`, or
+    configure an import map or a bundler that resolves bare names.
+  - >-
+    **Expecting a CommonJS destructure to stay current.** `const { count } = require(...)`
+    copies the value once. Export a getter function, or read the property from the module
+    object each time, or move to ESM, where imports are live.
+  - >-
+    **Using a value from a cycle at the top level.** In ESM it throws a `ReferenceError`, in
+    CommonJS it's silently `undefined`. Move the shared code into its own module, or read the
+    value inside a function that runs later.
+  - >-
+    **Top-level side effects in library code.** A module that patches globals or starts work
+    on import can't be tree-shaken and surprises anyone who imports it for one helper. Export
+    an `init()` function and let the caller decide when to run it.
+  - >-
+    **Assuming one module instance.** A second copy of a package, a different query string or
+    a CommonJS and an ESM build of the same library each create separate state. Deduplicate
+    dependencies and pick one format.
+interview:
+  - question: What are the differences between ES modules and CommonJS?
+    answer: >-
+      ESM is static and asynchronous, and CommonJS is dynamic and synchronous. ESM's `import`
+      and `export` are declarations that the engine reads before running anything: it builds
+      the whole graph, links names, then evaluates. That gives early errors, parallel loading
+      in browsers and tree-shaking. Its imports are live read-only bindings, and it supports
+      top-level `await`. CommonJS `require` is a function call that runs the file there and
+      then and returns `module.exports`, so you can require conditionally or with a computed
+      path, but destructured values are copies and bundlers can't easily prune it. Both cache
+      modules. In Node, `.mjs` or `"type": "module"` selects ESM, and Node 24 can now
+      `require()` synchronous ES modules, which eases migration.
+  - question: What does it mean that ES module imports are live bindings?
+    answer: >-
+      An import is a reference to the exporter's variable, not a copy of its value. If
+      `counter.js` does `export let count = 0` and later increments it, an importer reading
+      `count` sees the new number. The binding is read-only from the importer's side:
+      assigning to it throws a `TypeError`, so only the owning module changes it. CommonJS is
+      different. `require` returns the exports object, and `const { count } = require(...)`
+      copies the current value, which never updates. The practical upshot is that ESM lets a
+      module expose changing state safely. The catch is that read-only covers the binding
+      only: an imported object can still be mutated by any importer.
+  - question: How does tree-shaking work, and what stops it from working?
+    answer: >-
+      A bundler follows the static import graph, marks which exports are used, and leaves out
+      the rest. It works because ES `import` and `export` can be analysed without running
+      code. What stops it: modules with top-level side effects, which must be kept in case
+      the effect matters; CommonJS, where exports are assembled at runtime; dynamic access
+      like `namespace[key]`, which makes every export potentially used; and libraries that
+      only ship a single pre-bundled file. Library authors help with ESM builds and
+      `"sideEffects": false` in `package.json`. As a consumer I check bundle output with an
+      analyser rather than assuming a named import removed the rest.
+  - question: What happens with circular dependencies between modules?
+    answer: >-
+      They load, but one module sees the other before it has finished running. With ESM,
+      linking connects all bindings first, then evaluation runs the deepest module in the
+      cycle first. If it reads the other module's `const`, `let` or `class` at the top level,
+      it hits the temporal dead zone and throws a `ReferenceError`, while hoisted function
+      declarations already work. With CommonJS, `require` returns the partly filled exports
+      object, so values are silently `undefined`. Use inside functions called later is fine.
+      To fix a real problem I extract the shared code into a third module, inject the
+      dependency, or restructure, because a cycle usually means the boundary between the two
+      modules is in the wrong place.
+  - question: When would you use dynamic `import()`?
+    answer: >-
+      When code isn't needed at startup, or the path is only known at runtime. The classic
+      case is code splitting: a route, a modal or a heavy library such as a PDF generator
+      loads when the user reaches it, so the initial bundle stays small. It also suits
+      loading a locale file by language, optional plugins, and loading ESM from CommonJS.
+      `import()` returns a promise for the namespace object, with the default export on
+      `.default`, and repeated calls hit the module cache. The trade-offs: there's a network
+      round trip at the moment of use, so I prefetch likely chunks, and a failed chunk load
+      needs handling, commonly after a deploy removes old files.
+  - question: Should you prefer named or default exports?
+    answer: >-
+      I default to named exports. The name is fixed by the exporter, so every importer uses
+      the same one, search and rename refactors work, editors auto-import reliably, and a typo
+      fails at link time. A default export can be imported under any name, so the same thing
+      ends up called three things across a codebase. Defaults still make sense when a file
+      has one obvious main value and a tool expects it, such as a React component per file
+      or framework files like Next.js pages and config files that require a default export.
+      Mixing both in one module works but is confusing, so I keep to one style per file.

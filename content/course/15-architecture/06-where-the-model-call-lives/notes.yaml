@@ -1,0 +1,280 @@
+summary: >-
+  A language model is an outside service like a database or a payment provider, only more
+  volatile: it's slow, it costs money per call, it fails in new ways, and the provider ships
+  a new model every few months. So it gets the treatment from the ports lesson. The domain
+  declares a port in its own words, such as `classify(ticket)`, and one adapter per
+  provider holds everything provider-specific: the URL, the key, the prompt and the reply
+  parsing.
+
+
+  The port also draws the line between two kinds of test. Unit tests pass a fake model and
+  prove the rules; they're fast and never flaky. Evals run the real adapter over labelled
+  examples and measure how well the model does the job. A provider switch is decided by
+  the eval, never by the unit tests.
+
+
+  These notes add what production AI features need around that port: turning timeouts and
+  odd replies into values the domain understands, wrapping adapters with retries and
+  fallbacks without touching the rules, testing the parsing against saved real replies, and
+  a small eval harness that compares two providers on the same examples.
+remember:
+  - Treat the model as an outside service behind a port the domain owns, with one adapter per provider.
+  - The adapter holds the provider's URL, key, prompt, reply parsing and error handling, and the domain holds only business rules.
+  - A port returns domain values, so the adapter turns any unexpected answer into a safe default or a clear error.
+  - Unit tests with a fake model prove the rules; only an eval over labelled examples tells you whether a model does the job.
+  - Decide a provider or prompt change by running both adapters over the same labelled set and comparing the scores.
+  - Timeouts, retries with jittered backoff and fallbacks wrap the adapter once, instead of being repeated in every caller.
+  - Keep a saved real reply per provider as a test fixture, so a change in reply shape fails a fast test instead of production.
+sections:
+  - title: What the port returns when things go wrong
+    body: |-
+      The lesson's adapter turns any unknown answer into `'other'`. That keeps the domain
+      safe from free text, and it's the right default for a label. But it hides a
+      difference that sometimes matters: "the model read the ticket and chose other" isn't
+      the same as "the model timed out".
+
+      Decide per feature which the domain needs to know. For ticket routing, both can go
+      to the general inbox, so collapsing them is fine. For a feature where the difference
+      changes behaviour, the port says so in its type:
+
+      ```ts
+      type Label = 'refund' | 'bug' | 'other';
+      type Classification = { ok: true; label: Label } | { ok: false; reason: 'unavailable' };
+
+      interface Classifier {
+        classify(ticket: string): Promise<Classification>;
+      }
+      ```
+
+      Now a rule can route unavailable tickets to a retry queue and show "triage pending",
+      while `'other'` still goes to the inbox. The adapter is where each provider failure
+      becomes one of these values: a timeout, a `429` rate limit, a `5xx`, a reply that
+      isn't the expected JSON, or a refusal. The domain never sees an HTTP status or an SDK
+      exception class.
+
+      The same thinking applies to richer outputs. If the model returns structured data,
+      such as an extracted address, the adapter validates it against a schema before it
+      crosses the port. A reply that doesn't match becomes a failure value. Downstream code
+      can then trust every field, exactly as it trusts a validated request body. Model
+      output is untrusted input, and the adapter is its trust boundary.
+  - title: Wrapping adapters for timeouts, retries and fallbacks
+    body: |-
+      Because every adapter has the same port, resilience can be added by wrapping: a
+      function takes a `Classifier` and returns a `Classifier` that behaves better. This is
+      the decorator pattern, and the domain can't tell a wrapped adapter from a bare one.
+
+      ```ts
+      type Label = 'refund' | 'bug' | 'other';
+      interface Classifier {
+        classify(ticket: string): Promise<Label>;
+      }
+
+      function withTimeout(inner: Classifier, ms: number): Classifier {
+        return {
+          classify(ticket) {
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            const timeout = new Promise<never>((_, reject) => {
+              timer = setTimeout(() => reject(new Error(`timed out after ${ms} ms`)), ms);
+            });
+            return Promise.race([inner.classify(ticket), timeout]).finally(() => clearTimeout(timer));
+          },
+        };
+      }
+
+      function withRetry(inner: Classifier, attempts: number, baseMs: number): Classifier {
+        return {
+          async classify(ticket) {
+            for (let attempt = 1; ; attempt++) {
+              try {
+                return await inner.classify(ticket);
+              } catch (error) {
+                if (attempt >= attempts) throw error;
+                const wait = Math.random() * baseMs * 2 ** attempt; // full jitter
+                await new Promise((resolve) => setTimeout(resolve, wait));
+              }
+            }
+          },
+        };
+      }
+
+      function withFallback(primary: Classifier, backup: Classifier): Classifier {
+        return {
+          async classify(ticket) {
+            try {
+              return await primary.classify(ticket);
+            } catch {
+              return backup.classify(ticket);
+            }
+          },
+        };
+      }
+
+      // stand-ins for real adapters
+      let calls = 0;
+      const flaky: Classifier = {
+        async classify() {
+          calls++;
+          if (calls < 3) throw new Error('503 from provider');
+          return 'refund';
+        },
+      };
+      const hanging: Classifier = { classify: () => new Promise<Label>(() => {}) };
+      const safeDefault: Classifier = { classify: async () => 'other' };
+
+      console.log(await withRetry(flaky, 3, 10).classify('money back'), calls); // refund 3
+      console.log(await withFallback(withTimeout(hanging, 50), safeDefault).classify('crash')); // other
+      ```
+
+      The composition root stacks them: `withFallback(withRetry(withTimeout(providerA,
+      8000), 3, 200), providerB)`. Order matters. Timeout inside retry means each attempt
+      gets its own deadline; timeout outside means one deadline for all attempts together.
+      Real code also retries only failures worth retrying, such as timeouts, `429` and
+      `5xx`, and never a `400`, which will fail the same way every time. A timeout via
+      `Promise.race` stops waiting but doesn't cancel the request; a real adapter also
+      passes an `AbortSignal` to `fetch` so the connection is closed.
+  - title: Testing the adapter against saved replies
+    body: |-
+      The adapter is the one piece unit tests with a fake model never touch, and it's where
+      provider changes bite. The cheap safeguard is a **fixture**: a real reply from the
+      provider, saved once as JSON, replayed through a fake `send`. The test checks both
+      directions: what the adapter sends and what it makes of the reply.
+
+      ```ts
+      import assert from 'node:assert/strict';
+
+      type Label = 'refund' | 'bug' | 'other';
+      type Send = (body: unknown) => Promise<unknown>;
+
+      const PROMPT = 'Label as refund, bug or other: ';
+      function toLabel(text: unknown): Label {
+        const word = typeof text === 'string' ? text.trim().toLowerCase() : '';
+        return word === 'refund' || word === 'bug' ? word : 'other';
+      }
+      function providerA(send: Send) {
+        return {
+          async classify(ticket: string): Promise<Label> {
+            const reply = (await send({ prompt: PROMPT + ticket })) as { output?: { text?: unknown }[] };
+            return toLabel(reply.output?.[0]?.text);
+          },
+        };
+      }
+
+      // saved from a real call, trimmed to what matters
+      const fixture = { id: 'resp_1', output: [{ type: 'text', text: ' Refund\n' }] };
+
+      const sent: unknown[] = [];
+      const model = providerA(async (body) => {
+        sent.push(body);
+        return fixture;
+      });
+
+      assert.equal(await model.classify('charged twice'), 'refund');
+      assert.deepEqual(sent, [{ prompt: 'Label as refund, bug or other: charged twice' }]);
+      assert.equal(await providerA(async () => ({ error: 'overloaded' })).classify('x'), 'other');
+      console.log('adapter fixtures pass');
+      ```
+
+      Keep a few fixtures per provider: a normal answer, an odd answer, an error body. When
+      you upgrade the SDK or the model version, record fresh ones. If the shape changed,
+      this fast test fails on your machine instead of every ticket failing in production.
+  - title: A small eval harness at the port
+    body: |-
+      An eval needs three things: labelled examples, the real adapters, and a score. Because
+      every adapter fills the same port, one harness scores them all.
+
+      ```ts
+      type Label = 'refund' | 'bug' | 'other';
+      interface Classifier {
+        classify(ticket: string): Promise<Label>;
+      }
+      type Example = { text: string; label: Label };
+
+      async function evaluate(name: string, model: Classifier, examples: Example[]) {
+        let right = 0;
+        const misses: string[] = [];
+        for (const { text, label } of examples) {
+          const got = await model.classify(text);
+          if (got === label) right++;
+          else misses.push(`${label} -> ${got}: ${text}`);
+        }
+        console.log(`${name}: ${right}/${examples.length} correct`);
+        for (const miss of misses) console.log(`  ${miss}`);
+        return right / examples.length;
+      }
+
+      const examples: Example[] = [
+        { text: 'I was charged twice, refund one', label: 'refund' },
+        { text: 'Checkout button does nothing on Safari', label: 'bug' },
+        { text: 'Do you ship to Norway?', label: 'other' },
+        { text: 'Money back for the broken kettle', label: 'refund' },
+      ];
+
+      // stand-ins: in a real eval these are providerA(send) and providerB(send)
+      const providerA: Classifier = {
+        classify: async (t) => (/refund|money back/i.test(t) ? 'refund' : /button/i.test(t) ? 'bug' : 'other'),
+      };
+      const providerB: Classifier = {
+        classify: async (t) => (/refund/i.test(t) ? 'refund' : /broken|button/i.test(t) ? 'bug' : 'other'),
+      };
+
+      const a = await evaluate('provider A', providerA, examples); // 4/4
+      const b = await evaluate('provider B', providerB, examples); // 3/4, refund -> bug
+      console.log(b >= a ? 'consider switching' : 'keep A');
+      ```
+
+      The list of misses matters as much as the score. Here B confuses "broken" with a bug
+      report, a pattern you can fix with a prompt change and then re-run. A real eval set
+      has a few hundred examples drawn from real tickets, covers every label and the hard
+      cases, and records cost and latency next to accuracy, because a cheaper model that is
+      one point worse may still win. Model output varies between runs, so run each adapter
+      more than once before trusting a small difference.
+pitfalls:
+  - '**Provider reply shapes in domain code.** `reply.output[0].text` in a routing rule means every provider change edits the rules. Parse in the adapter and return a domain value.'
+  - '**Letting free text cross the port.** A model can answer "Refund." or a paragraph. Normalise and validate in the adapter, and map anything unexpected to a safe default or a failure value.'
+  - '**Judging a provider switch by unit tests.** They use a fake and pass with any model. Run an eval over the same labelled examples for both adapters.'
+  - '**An eval that scores a fake.** It measures your rules against a fixed answer, so every provider scores the same. Pass the real adapter into the harness.'
+  - '**Retry loops copied into every caller.** Some forget, some retry `400`s forever. Wrap the adapter once with timeout, retry and fallback.'
+  - '**Retrying without jitter or limits.** Clients retry in lockstep and multiply the load on a struggling provider. Cap attempts and randomise the wait.'
+  - '**Trusting an SDK to be your port.** Its types still speak in provider terms such as roles and token settings. Keep your own narrow port and put the SDK inside an adapter.'
+interview:
+  - question: How would you structure an application so you can switch LLM providers easily?
+    answer: >-
+      Put the model behind a port the domain owns and write one adapter per provider. The
+      port speaks the domain's language, such as `classify(ticket)` returning a label, not a
+      chat request. Each adapter holds the URL, key, prompt, reply parsing and error
+      mapping, so a switch means one new adapter wired in the composition root. Retries,
+      timeouts and fallbacks wrap adapters once. Then I'd decide the switch with an eval:
+      both adapters over the same labelled examples, comparing accuracy, cost and latency.
+      The trade-off is that a narrow port can hide provider features you might want, such
+      as streaming or tool use; when a feature needs those, the port grows deliberately
+      rather than leaking the SDK.
+  - question: What's the difference between a unit test and an eval for an AI feature?
+    answer: >-
+      A unit test checks your code against a fixed expectation with a fake model; an eval
+      measures how well a real model does the task across many labelled examples. Unit
+      tests are fast and deterministic and fail when your code changes, so they run on
+      every commit. Evals are slower, cost money and produce a score rather than
+      pass or fail, and that score moves when the model or prompt changes even if your
+      code didn't. So I run evals before shipping a prompt, model or provider change, and
+      track the score over time. Neither replaces the other: a perfect eval score doesn't
+      prove the routing rules are right, and green unit tests say nothing about quality.
+  - question: How do you handle a model provider being slow or down?
+    answer: >-
+      In the adapter layer, with wrappers around the port, so the domain only sees a
+      label or a clear "unavailable" value. Each call gets a timeout and an `AbortSignal`
+      so the connection closes. Retries happen only for retryable failures, timeouts,
+      `429` and `5xx`, with capped attempts and jittered exponential backoff, honouring
+      `Retry-After` when the provider sends it. After that, a fallback: a second provider,
+      a smaller model, or a safe default such as sending the ticket to the general inbox.
+      The trade-off is latency against success rate, since each retry adds wait time, so I
+      set the overall budget from what the user can tolerate.
+  - question: The provider changed its response format and your feature broke in production. How would you prevent that next time?
+    answer: >-
+      Parse replies in one adapter and test that adapter against saved real replies. A
+      fixture test replays a recorded response through a fake `send` and asserts both the
+      request body and the parsed label, so a format change fails a fast test. I'd refresh
+      fixtures whenever the SDK or model version changes, pin versions so upgrades are
+      deliberate, and make the adapter map anything unexpected to a safe value rather than
+      throwing deep in business code. A small scheduled smoke test against the live
+      provider catches changes that arrive without a version bump. The cost is a few
+      fixture files per provider, which is far cheaper than an incident.

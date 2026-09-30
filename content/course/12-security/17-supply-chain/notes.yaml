@@ -1,0 +1,228 @@
+summary: >-
+  Your app's supply chain is everything that ends up in a build without your team writing
+  it: packages and their transitive dependencies, the registry they come from, the build
+  tools, the CI runners and the actions they run. An attacker who compromises any link
+  gets their code into your product, or into the machine that holds your secrets, without
+  ever attacking you directly.
+
+
+  The lesson covers the sharpest edge: install scripts that run the moment a package
+  lands, and what to do when a package you use is hijacked. These notes add the rest of the
+  threat list (typosquatting, dependency confusion, account takeover, malicious code that
+  waits until runtime), the controls that reduce each, and how provenance, SBOMs and
+  cooldown windows fit together.
+
+
+  You reach for these controls on every project, because the cheap ones cost almost
+  nothing: a committed lockfile, `npm ci`, no install scripts by default, and CI secrets
+  scoped to the jobs that need them. The heavier ones, such as a private registry mirror,
+  signed provenance for your own packages and SLSA levels, earn their place as the team
+  and the blast radius grow.
+remember:
+  - An install script runs with the permissions of whoever installs the package, so in CI it can read every secret that job can.
+  - Removing a hijacked package stops the next install, but only rotating the secrets it could read makes the stolen copies useless.
+  - A committed lockfile plus `npm ci` installs exactly the reviewed versions and fails if `package.json` and the lockfile disagree.
+  - Blocking install scripts protects the build machine, not your users, because malicious code can also wait until your app imports it.
+  - Dependency confusion is stopped by mapping your internal scope to your private registry, so a public package with the same name is never picked.
+  - A cooldown such as npm's `min-release-age` or pnpm's `minimumReleaseAge` keeps brand-new versions out for the window in which hijacked releases are usually spotted and pulled.
+  - An SBOM per release answers "which builds contain version X?" in minutes, which is the first question on the bad day.
+  - Pin third-party CI actions to a full commit SHA, since a tag can be moved to point at different code.
+sections:
+  - title: The ways a dependency turns against you
+    body: |-
+      Supply-chain attacks come in a handful of shapes. Each needs a different control, so
+      it pays to name them.
+
+      - **Account takeover.** An attacker phishes or steals a maintainer's credentials and
+        publishes a new version of a trusted package. Your semver range such as `^3.2.0`
+        accepts it on the next fresh resolve. Defence: lockfiles, cooldowns, review of
+        lockfile diffs.
+      - **Typosquatting.** A package named one keystroke away from a popular one, waiting
+        for a mistyped `npm install`. Defence: review every new direct dependency by name,
+        and check its age, downloads and repository.
+      - **Dependency confusion.** Your code uses an internal package, say `@acme/billing`
+        or an unscoped `billing-utils`. An attacker publishes that name publicly with a
+        higher version, and a misconfigured installer prefers it. Defence: scope internal
+        packages and map the scope to your private registry.
+      - **Malicious maintainer or abandoned package.** A package changes hands and the
+        new owner adds a payload. Defence: prefer fewer, well-maintained dependencies.
+      - **Compromised build or CI.** A poisoned GitHub Action, a leaked publish token, a
+        tampered build step. Defence: pinned actions, least-privilege tokens, provenance.
+
+      Where the payload runs matters. An install script runs on the developer laptop and
+      in CI, where tokens live. Code in the package body runs when your app imports it: on
+      your servers, or in your users' browsers if it is bundled into the front end. In
+      September 2025 a phished maintainer account pushed malicious versions of widely used
+      packages including `chalk` and `debug`. The payload lived in the package code and
+      targeted browsers, so `--ignore-scripts` alone would not have stopped it. Only
+      pinned, reviewed versions and a cooldown would have.
+  - title: Reading a lockfile diff with a script
+    body: |-
+      A reviewer can't read a 3,000-line lockfile diff. A small check in CI can. It flags
+      the three changes that deserve a human: a package that newly runs install scripts, a
+      new package, and a package fetched from somewhere other than the registry.
+
+      ```js
+      // Usage: node new-install-scripts.mjs old-lock.json new-lock.json
+      import { readFileSync } from 'node:fs';
+
+      const [oldPath, newPath] = process.argv.slice(2);
+      const load = (p) => JSON.parse(readFileSync(p, 'utf8')).packages ?? {};
+      const before = load(oldPath);
+      const after = load(newPath);
+
+      const findings = [];
+      for (const [path, pkg] of Object.entries(after)) {
+        if (path === '') continue; // the root project itself
+        const old = before[path];
+        if (pkg.hasInstallScript && !old?.hasInstallScript) {
+          findings.push(`${path}@${pkg.version} now runs an install script`);
+        }
+        if (!old) {
+          findings.push(`${path}@${pkg.version} is new`);
+        }
+        if (pkg.resolved && !pkg.resolved.startsWith('https://registry.npmjs.org/')) {
+          findings.push(`${path} resolves outside the registry: ${pkg.resolved}`);
+        }
+      }
+
+      console.log(findings.join('\n') || 'No new install scripts or sources');
+      process.exitCode = findings.some((f) => !f.endsWith('is new')) ? 1 : 0;
+      ```
+
+      Given the lesson's update, where `tiny-calendar` moves to 2.1.0 with an install
+      script and a new package is fetched from a tarball URL, it prints:
+
+      ```text
+      node_modules/tiny-calendar@2.1.0 now runs an install script
+      node_modules/left-pad-utils@1.0.0 is new
+      node_modules/left-pad-utils resolves outside the registry: https://example.test/left-pad-utils-1.0.0.tgz
+      ```
+
+      and exits with code 1, which fails the check. New packages are reported but don't
+      fail it, because they are common and a person should judge them. In CI you would get
+      the old lockfile with `git show origin/main:package-lock.json`. If you use a private
+      registry, add its URL to the allowed prefixes.
+  - title: Install-script policies in npm and pnpm
+    body: |-
+      `npm ci --ignore-scripts` is the blunt tool. It also skips your own project's
+      lifecycle scripts, and it breaks the few packages that need a build step, such as
+      native image libraries. Both package managers now offer a finer tool: an allow-list.
+
+      pnpm 10 doesn't run dependencies' install scripts unless you allow them. The
+      allow-list lives in `package.json` or `pnpm-workspace.yaml`, and `pnpm approve-builds`
+      edits it after asking you.
+
+      ```json
+      {
+        "pnpm": {
+          "onlyBuiltDependencies": ["esbuild", "sharp"]
+        }
+      }
+      ```
+
+      Recent npm 11 releases add an `allowScripts` field in `package.json`, maintained with
+      `npm approve-scripts`. By default it pins each approval to the version you reviewed,
+      so a hijacked new version isn't approved automatically. In the current release the
+      policy only warns. Setting `strict-allow-scripts=true` in `.npmrc` makes an unreviewed
+      install script fail the install.
+
+      Both also support a cooldown. npm's `min-release-age` takes days and pnpm's
+      `minimumReleaseAge` takes minutes:
+
+      ```text
+      # .npmrc
+      min-release-age=3
+      strict-allow-scripts=true
+      ```
+
+      ```yaml
+      # pnpm-workspace.yaml
+      minimumReleaseAge: 4320
+      ```
+
+      The cooldown has a cost. An urgent security fix is also brand new, so it is blocked
+      too. Both tools have an exclude list, `min-release-age-exclude` and
+      `minimumReleaseAgeExclude`, for exactly that case.
+  - title: Provenance, SBOMs and SLSA
+    body: |-
+      Three ideas often get mixed up. They answer different questions.
+
+      **Provenance** answers "where was this package built, and from which source?" npm
+      can publish with a signed provenance statement that links the tarball to a public
+      source commit and a CI workflow run. `npm audit signatures` verifies the registry
+      signatures of what you installed and any provenance attestations. Provenance proves
+      origin, not intent: a hijacked CI workflow still produces valid provenance for bad
+      code. It does stop the case where a stolen token publishes from an attacker's laptop,
+      because that version won't have provenance while earlier ones did.
+
+      An **SBOM**, a software bill of materials, answers "what is inside this build?" Keep
+      one per release as a build artefact:
+
+      ```bash
+      npm sbom --sbom-format cyclonedx > sbom-1.8.0.cdx.json
+      npm ls tiny-calendar
+      ```
+
+      `npm ls` answers the question for one checkout. The stored SBOMs answer it for every
+      release you shipped, including ones no longer on `main`.
+
+      **SLSA**, Supply-chain Levels for Software Artifacts, is a framework that grades how
+      trustworthy a build's provenance is. Higher levels require builds on a hosted,
+      isolated platform that generates provenance itself, so a single compromised developer
+      machine can't forge it.
+
+      Around these sit the CI basics. Pin third-party actions to a full commit SHA rather
+      than a tag, with the tag in a comment for humans. Give the workflow token the least
+      permission it needs, with `permissions:` set per job. Publish with trusted publishing
+      over OIDC instead of a long-lived npm token stored as a secret.
+pitfalls:
+  - '**Committing `package.json` but not the lockfile.** Every fresh install then resolves ranges again and can pull in a version published an hour ago. Commit the lockfile and install with `npm ci` or `pnpm install --frozen-lockfile` in CI.'
+  - '**Treating `npm audit` as supply-chain protection.** It reports known vulnerabilities from an advisory database, and a freshly hijacked version has no advisory yet. Pair it with lockfile review, script policies and a cooldown.'
+  - '**Approving every install script to make the warning go away.** `approve-scripts --all` or a long `onlyBuiltDependencies` list turns a control into a formality. Approve only packages you know need a build step, pinned to the reviewed version.'
+  - '**Unscoped internal package names.** A name like `billing-utils` on your private registry can be claimed publicly by anyone. Put internal packages under a scope your organisation owns on the public registry and map that scope to the private one in `.npmrc`.'
+  - '**Rotating only the npm token after a compromise.** The script could read every environment variable in the job: cloud keys, database URLs, signing keys. Rotate everything the job could reach and check each provider''s access logs for use of the old values.'
+  - '**Pinning actions to a tag like `@v4`.** Tags are mutable, so a compromised action repository can repoint them. Pin to the commit SHA and let Dependabot or Renovate propose updates.'
+interview:
+  - question: How would you protect a Node.js project from a malicious dependency?
+    answer: >-
+      I layer cheap controls that each cut off one route. A committed lockfile and `npm ci`
+      mean we only install versions someone reviewed. Install scripts are off by default,
+      with an allow-list for the two or three packages that need a native build. A cooldown
+      of a few days keeps brand-new versions out, since hijacked releases are usually spotted
+      within days. CI secrets are scoped to the jobs that need them, so a poisoned test job
+      can't read the deploy key. A lockfile check flags new install scripts and non-registry
+      sources in pull requests. The trade-off is friction: the cooldown also delays urgent
+      fixes, so we keep an exclude list for patches we have decided to take immediately.
+  - question: A package in your lockfile was hijacked yesterday. Walk me through your response.
+    answer: >-
+      I treat it as an incident, with scope first. Using SBOMs and CI logs, I find every
+      build, laptop and deploy that installed the bad version, and where the code ran:
+      install time, servers or browsers. Then I contain: pin the last good version,
+      rebuild and redeploy from a clean lockfile. The step people skip is rotation. Every
+      secret those machines could read counts as stolen, even if we removed the package
+      within the hour, so I rotate CI tokens, cloud keys and database credentials and check
+      provider logs for use of the old ones. If the payload ran in users' browsers, that is
+      a possible personal-data breach with its own notification duties. Finally, a blameless
+      review asks which control would have stopped it.
+  - question: What is dependency confusion and how do you prevent it?
+    answer: >-
+      It's when an installer fetches a public package that shares a name with your private
+      one. If your build asks for `billing-utils` and both the private and public registries
+      are consulted, an attacker who publishes a higher public version can win the
+      resolution and run code in your CI. The fix is to make the name unambiguous: put
+      internal packages under a scope such as `@acme`, register that scope on the public
+      registry so nobody else can own it, and map it in `.npmrc` with
+      `@acme:registry=https://npm.internal.example/`. A lockfile with `resolved` URLs also
+      pins where each package came from. A registry proxy that serves only approved
+      packages goes further, at the cost of running it.
+  - question: What does npm provenance prove, and what doesn't it?
+    answer: >-
+      It proves where a package was built, not that the code is safe. A provenance
+      statement is signed and links the published tarball to a specific source commit and
+      CI run, and `npm audit signatures` checks it. That defeats one common attack: a
+      stolen token used to publish from an attacker's machine, because that version lacks
+      the provenance earlier releases had. It doesn't help if the attacker compromises the
+      repository or the workflow itself, since the build then produces valid provenance
+      for malicious code. So I see it as one layer that makes forgery harder, alongside
+      reviewed lockfiles and least-privilege CI, not a stamp of approval.

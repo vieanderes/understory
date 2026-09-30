@@ -1,0 +1,316 @@
+summary: >-
+  A chat that streams shows the first words in well under a second, even when the full
+  answer takes ten. The model's reply arrives as small events, text deltas and fragments of
+  tool-call arguments, and the client folds them into chat state as they come. Streaming is
+  where chat take-homes get probed hardest, because it is where the edge cases live:
+  cancelling, dropped connections, errors halfway through, and events that arrive after the
+  answer is finished.
+
+
+  The design has three layers. The server turns the model's output into a byte stream,
+  usually formatted as server-sent events, and stops the model when the client goes away.
+  The client reads the bytes with `fetch`, parses events across chunk boundaries, and
+  feeds them to a pure reducer. The reducer decides what the message looks like, including
+  a partial answer that is kept, marked and offered for retry.
+
+
+  Keeping the reducer pure is what makes the whole thing testable: a list of events in, a
+  state out, no network. Keeping the server's stream pull-based and cancellable is what
+  makes it cheap: a user who presses stop also stops the token bill.
+remember:
+  - A streamed reply is a sequence of deltas folded into state by a pure reducer, so it can be tested with a plain list of events.
+  - Tool-call arguments arrive as fragments of a JSON string; append them and parse once, when the call ends.
+  - On a cancel, an error event or a dropped connection, keep the text that arrived, mark the message incomplete and offer a retry.
+  - Once a message is finished, the reducer ignores any further events, so stragglers from a cancelled stream change nothing.
+  - "`EventSource` sends only GET with no body but reconnects on its own; `fetch` can POST the conversation but never reconnects, so a drop is your code's job."
+  - "Network chunks can split an event, a line or a multi-byte character, so decode with `{ stream: true }` and cut events on blank lines."
+  - Aborting the client's `fetch` should cancel the server's stream, and the server should stop the model, or abandoned answers keep costing tokens.
+  - A new send must abort the stream before it, or two answers fold into one message.
+sections:
+  - title: The streaming endpoint
+    body: |-
+      A chat endpoint takes the conversation as a POST body and returns a stream of
+      server-sent events. Each event is a `data:` line with JSON, ended by a blank line.
+      This version is written against the web `Request` and `Response` types, so the same
+      function works in a Next.js `route.ts` (`export const POST = chatHandler(model)`) or
+      behind any server that speaks them.
+
+      ```ts
+      type ChatMessage = { role: 'user' | 'assistant'; content: string };
+      // The model adapter yields deltas only. The endpoint adds `done` or `error` at the end.
+      type ModelStream = (messages: ChatMessage[], signal: AbortSignal) => AsyncIterable<StreamEvent>;
+
+      const encoder = new TextEncoder();
+      const frame = (id: number, event: StreamEvent) => encoder.encode(`id: ${id}\ndata: ${JSON.stringify(event)}\n\n`);
+
+      export function chatHandler(model: ModelStream) {
+        return async function POST(request: Request): Promise<Response> {
+          const body = await request.json().catch(() => null);
+          if (!body || !Array.isArray(body.messages)) {
+            return Response.json({ error: 'messages must be an array' }, { status: 400 });
+          }
+          const controller = new AbortController();
+          request.signal.addEventListener('abort', () => controller.abort());
+          const events = model(body.messages, controller.signal)[Symbol.asyncIterator]();
+          let id = 0;
+          let finished = false;
+
+          // pull() runs only when the client is ready for more, so a slow reader slows the
+          // model instead of filling server memory.
+          const stream = new ReadableStream<Uint8Array>({
+            async pull(out) {
+              if (finished) return;
+              try {
+                const next = await events.next();
+                if (next.done) {
+                  finished = true;
+                  out.enqueue(frame(++id, { type: 'done' }));
+                  out.close();
+                } else {
+                  out.enqueue(frame(++id, next.value));
+                }
+              } catch {
+                finished = true;
+                // Never forward the raw error: it can hold provider details or keys.
+                out.enqueue(frame(++id, { type: 'error', message: 'The model stopped unexpectedly' }));
+                out.close();
+              }
+            },
+            // The client went away: stop the model, which also stops the token bill.
+            async cancel() {
+              controller.abort();
+              await events.return?.();
+            },
+          });
+
+          return new Response(stream, {
+            headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' },
+          });
+        };
+      }
+      ```
+
+      Three choices to defend. `pull` instead of a loop in `start` gives backpressure for
+      free. `cancel` plus `request.signal` covers both ways a disconnect can surface, and
+      `events.return()` runs the model generator's `finally`, so its upstream request is
+      closed. The error event carries a safe message, while the real error goes to your
+      logs. The `id:` lines are what a resumable design would replay from.
+  - title: The client, a parser that survives bad chunk boundaries
+    body: |-
+      `fetch` gives you `response.body`, a stream of bytes in whatever chunks the network
+      delivers. One chunk can end in the middle of an event, a line, or a character like
+      "é". A `TextDecoder` called with `{ stream: true }` keeps multi-byte characters
+      whole, and a buffer cut on blank lines keeps events whole.
+
+      ```ts
+      export async function* readSse(body: ReadableStream<Uint8Array>): AsyncGenerator<StreamEvent> {
+        const reader = body.getReader();
+        // stream: true keeps a character split across two chunks until its last byte arrives.
+        const decoder = new TextDecoder();
+        let buffer = '';
+        try {
+          for (;;) {
+            const { value, done } = await reader.read();
+            if (done) return;
+            buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
+            let end: number;
+            while ((end = buffer.indexOf('\n\n')) !== -1) {
+              const block = buffer.slice(0, end);
+              buffer = buffer.slice(end + 2);
+              const data = block
+                .split('\n')
+                .filter((line) => line.startsWith('data:'))
+                .map((line) => line.slice(5).replace(/^ /, ''))
+                .join('\n');
+              if (data !== '') yield JSON.parse(data) as StreamEvent;
+            }
+          }
+        } finally {
+          // Runs on a normal end, a throw, or a consumer that stops early.
+          await reader.cancel().catch(() => {});
+        }
+      }
+
+      export async function sendChat(url: string, messages: unknown[], signal: AbortSignal, onState: (s: ChatState) => void) {
+        let state = initialState;
+        try {
+          const response = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ messages }),
+            signal,
+          });
+          if (!response.ok || !response.body) throw new Error(`HTTP ${response.status}`);
+          for await (const event of readSse(response.body)) {
+            state = reduceStream(state, event);
+            onState(state);
+            if (state.status !== 'streaming') return state;
+          }
+          state = { ...state, status: 'error', error: 'The stream ended early', canRetry: true };
+        } catch (error) {
+          state = signal.aborted
+            ? { ...state, status: 'cancelled', canRetry: true }
+            : { ...state, status: 'error', error: error instanceof Error ? error.message : String(error), canRetry: true };
+        }
+        onState(state);
+        return state;
+      }
+      ```
+
+      We ran it three ways in Node 24. Bytes cut into three-byte pieces, splitting both an
+      event and the "é", parsed into the right two events. A consumer that broke out after
+      the first event made the server's model generator stop. Over real HTTP, aborting the
+      client after the first words returned `cancelled` with "Room 4 " kept, and the server
+      stopped generating. The SSE rule strips one space after `data:`, not all leading
+      whitespace, which matters when a delta begins with a space.
+  - title: Rendering a stream without hurting the page
+    body: |-
+      A model can emit dozens of deltas per second. Rendering on every one is usually fine
+      for a short answer, and wasteful for a long one with markdown to re-parse. Three
+      techniques keep it smooth.
+
+      Batch updates to the frame rate. Fold every event into the state immediately, but
+      schedule the render with `requestAnimationFrame`, so twenty deltas in one frame cost
+      one render.
+
+      ```ts
+      let state = initialState;
+      let scheduled = false;
+
+      function onEvent(event: StreamEvent) {
+        state = reduceStream(state, event);
+        if (scheduled) return;
+        scheduled = true;
+        requestAnimationFrame(() => {
+          scheduled = false;
+          render(state);
+        });
+      }
+      ```
+
+      Be careful with announcements. A live region that updates on every token makes a
+      screen reader read fragments over and over. A common approach is to keep the growing
+      message out of the live region, and announce a short status such as "Answer
+      complete" or "Answer stopped" when the status changes.
+
+      Keep the user in control of scrolling. Auto-scroll to the bottom only while the user
+      is already at the bottom; if they scroll up to read, stop following. And show the
+      stop button only while the status is `streaming`, with the same abort as a new send.
+  - title: Retry, resume and the thirty-second agent run
+    body: |-
+      A classic design question: stream a thirty-second agent run to the browser, and fail
+      halfway. What does the user see, and what can they do?
+
+      The baseline answer is this lesson's: keep the partial output, mark it, offer a retry
+      that sends the same conversation again. The retry regenerates from the start. It is
+      simple, stateless on the server, and fine when answers are short.
+
+      For long runs, regenerating wastes time and money, and the second answer may differ
+      from the first half the user already read. A resumable design makes the run a server
+      side object. The server starts the run, stores each event with an increasing id, and
+      streams them. A reconnecting client sends the last id it saw, and the server replays
+      from there, then continues live. This is what `EventSource` does automatically with
+      the `Last-Event-ID` header, and what a `fetch` client can do by sending the id
+      itself.
+
+      Name the costs: event storage per run, a run lifetime and clean-up, and deciding what
+      happens if the client never returns (finish and keep the result, or stop). For tool
+      calls with side effects, a resumed run must not repeat them, which again points to
+      idempotency keys on write tools.
+pitfalls:
+  - >-
+    **Parsing tool arguments on every delta.** Fragments are not valid JSON until the last
+    one arrives, so parsing early throws or, worse, succeeds on a truncated object. Append,
+    then parse at `tool-call-end`.
+  - >-
+    **Clearing the message on failure.** The words that arrived are real and often useful.
+    Keep them, mark them incomplete, and offer a retry.
+  - >-
+    **Two streams into one message.** Pressing retry mid-stream without aborting the first
+    stream mixes two answers. Abort the previous controller before starting a new one.
+  - >-
+    **Treating an abort as an error.** Aborting a `fetch` rejects the pending read, so a
+    plain `catch` shows "failed" when the user pressed stop. Check `signal.aborted` first.
+  - >-
+    **Splitting on newlines per chunk.** A chunk can end mid-event or mid-character. Decode
+    with a streaming decoder and cut on blank lines from a buffer.
+  - >-
+    **Not stopping the model on disconnect.** The user closed the tab and the server keeps
+    generating and paying. Wire `cancel()` and `request.signal` to abort the model call.
+  - >-
+    **Forwarding raw provider errors.** They can contain internal details. Send a safe
+    message in the stream and log the real error on the server.
+interview:
+  - question: Why stream with fetch rather than EventSource?
+    answer: >-
+      Because a chat needs to POST the conversation, and `EventSource` only sends a GET with
+      no body and no custom headers. With `fetch` I send JSON, pass an `AbortSignal` for
+      the stop button, and read `response.body` as a stream. The server can still format
+      the stream as server-sent events, so I parse `data:` lines myself. The trade-off is
+      reconnection: `EventSource` reconnects on its own and sends `Last-Event-ID`, while
+      `fetch` never reconnects, so a dropped connection surfaces as a thrown read and my
+      code decides what to do. For a chat that regenerates on retry, that is fine. For a
+      long run I would add ids and resume explicitly.
+  - question: The connection drops halfway through a long answer. What happens in your design?
+    answer: >-
+      The read throws, the client keeps the text that arrived, and the message is marked
+      incomplete with a retry button. The reducer ignores anything that trickles in after
+      that, because a finished message never changes. On the server, the dropped connection
+      cancels the response stream, which aborts the model call so we stop paying for tokens
+      nobody will read. Retry sends the same conversation and regenerates. If answers were
+      long or expensive, I would make runs resumable: the server keeps events with ids, and
+      the client reconnects with the last id it saw. The cost is server-side state per run
+      and a clean-up policy.
+  - question: How do you test streaming code without a network?
+    answer: >-
+      By separating the pure part from the plumbing. The reducer takes a state and an event
+      and returns a new state, so most tests are lists of events: text joins, tool arguments
+      parse only at the end, an error keeps the text, stragglers after `done` are ignored,
+      the old state is never mutated. For the plumbing, I feed scripted async iterables
+      into `collect`, including one that throws mid-stream and one with no `done`. For the
+      parser, I build a `ReadableStream` that splits bytes mid-event and mid-character. One
+      integration test runs the real handler over HTTP and aborts from the client, to check
+      the server stops generating.
+  - question: A user presses stop. Walk me through what happens end to end.
+    answer: >-
+      The client calls `abort()` on the controller whose signal it passed to `fetch`. The
+      pending read rejects, and because `signal.aborted` is true the client marks the
+      message `cancelled`, keeps the partial text and offers a retry. The aborted fetch
+      closes the connection. On the server, the response stream's `cancel()` runs and
+      `request.signal` fires; both abort the controller passed to the model adapter, and
+      `return()` on the model's iterator runs its clean-up, closing the upstream request.
+      The effect is that the user sees a stable partial answer and the provider stops
+      billing within a moment. I verify this with an integration test that aborts and then
+      checks the generator's `finally` ran.
+  - question: Which states does a streaming answer need, and how do you model them?
+    answer: >-
+      Six: idle, waiting before the first token, streaming, done, stopped by the user, and
+      error. Waiting deserves its own state because the first token can take seconds, so
+      the UI shows "Thinking" rather than an empty bubble. Stopped keeps the partial answer
+      and says it may be incomplete, and error keeps the text too and offers a retry. I
+      model them as one union type, not a set of booleans, so the UI can never be streaming
+      and errored at once. In React that lives in a hook, `useStreamingChat`, that owns an
+      `AbortController` in a ref for Stop and appends tokens with a functional update, so
+      each piece builds on the latest text.
+terms:
+  - term: Streaming
+    say: It makes the model answer faster.
+    means: The whole answer takes about as long. The first words appear in well under a second because
+      the reply is sent as small events while it is generated.
+  - term: Delta
+    say: A chunk of the answer.
+    means: One event carrying a small addition, some text or a fragment of tool-call arguments, which a
+      pure reducer folds into the message state.
+  - term: Server-sent events (SSE)
+    say: The same thing as `EventSource`.
+    means: A text format of `data:` lines ending in a blank line, sent over one HTTP response.
+      `EventSource` is one client for it and only sends GET; `fetch` can read the same format after
+      a POST.
+  - term: Network chunk
+    say: Each chunk is one event.
+    means: "A chunk is whatever bytes arrived, and it can split an event, a line or a multi-byte
+      character. Decode with `{ stream: true }` and cut events on blank lines."
+  - term: Cancelling a stream
+    say: Stop showing the rest of the answer.
+    means: Aborting the `fetch` closes the connection, and the server should notice and stop the model.
+      Otherwise the abandoned answer keeps generating and costing tokens.

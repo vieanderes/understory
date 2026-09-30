@@ -1,0 +1,291 @@
+summary: >-
+  The React component round asks for the same widgets as the plain DOM round, but the
+  marks move. The interviewer still checks keyboard and screen reader behaviour, and now
+  also reads your component as code a team would maintain: where state lives, what the
+  props say, whether effects clean up, and where focus goes.
+
+
+  Four habits cover most of it. Keep one piece of state and derive the rest during render.
+  Give widgets a clear contract, `value` in and `onChange` out, so the parent can own the
+  value. Pair every effect that subscribes to something outside React with a cleanup that
+  unsubscribes. And manage focus on purpose: into a popup when it opens, back to the opener
+  when it closes.
+
+
+  React adds its own traps on top of the accessibility ones: a prop copied into state that
+  stops updating, listeners that pile up because an effect never returns a cleanup, and
+  focus code that works once but breaks under Strict Mode. Knowing why each happens is
+  what separates a senior answer from code that merely passes the demo.
+remember:
+  - If a value can be computed from props or state, compute it during render; storing a copy creates a second source of truth that drifts.
+  - A controlled widget takes `value` and `onChange` and keeps no copy; `useState(props.value)` reads the prop once and ignores later changes.
+  - Every effect that adds a listener, timer or subscription returns a cleanup that removes exactly what it added, with the same function reference.
+  - React runs an effect's cleanup before the effect runs again and on unmount, and Strict Mode runs setup, cleanup, setup in development to expose missing cleanups.
+  - When a popup opens, move focus into it; when it closes by any route, return focus to the element that opened it.
+  - Menu items that receive focus programmatically need `tabIndex={-1}`, and a menu button carries `aria-haspopup="menu"` and `aria-expanded`.
+  - A native `<dialog>` driven by an effect from an `open` prop gives Escape, an inert page and focus return, and its `close` event reports back through `onClose`.
+  - Test components by role and accessible name, so the tests fail when the accessibility contract breaks.
+sections:
+  - title: A modal built on the native dialog, controlled by a prop
+    body: |-
+      Many teams hand-build modals, which is why the round asks you to manage focus. The
+      stronger answer, when styling allows, wraps a real `<dialog>`. The parent owns
+      `open`. An effect makes the DOM match it. The dialog's own `close` event, fired by
+      Escape or by a form with `method="dialog"`, reports back through `onClose`.
+
+      ```tsx
+      import { useEffect, useId, useRef, useState, type ReactNode } from 'react';
+
+      type ModalProps = {
+        open: boolean;
+        onClose: (returnValue: string) => void;
+        title: string;
+        children: ReactNode;
+      };
+
+      export function Modal({ open, onClose, title, children }: ModalProps) {
+        const ref = useRef<HTMLDialogElement>(null);
+        const titleId = useId();
+
+        useEffect(() => {
+          const dialog = ref.current;
+          if (!dialog) return;
+          if (open && !dialog.open) {
+            dialog.returnValue = '';
+            dialog.showModal();
+          } else if (!open && dialog.open) {
+            dialog.close();
+          }
+        }, [open]);
+
+        return (
+          <dialog ref={ref} aria-labelledby={titleId} onClose={(event) => onClose(event.currentTarget.returnValue)}>
+            <h2 id={titleId}>{title}</h2>
+            {children}
+          </dialog>
+        );
+      }
+
+      // Usage: Cancel comes first, so it takes focus when the dialog opens.
+      function DeleteButton({ onDelete }: { onDelete: () => void }) {
+        const [open, setOpen] = useState(false);
+        return (
+          <>
+            <button type="button" onClick={() => setOpen(true)}>Delete file</button>
+            <Modal
+              open={open}
+              title="Delete this file?"
+              onClose={(value) => {
+                setOpen(false);
+                if (value === 'delete') onDelete();
+              }}
+            >
+              <form method="dialog">
+                <button value="cancel">Cancel</button>
+                <button value="delete">Delete</button>
+              </form>
+            </Modal>
+          </>
+        );
+      }
+      ```
+
+      We ran this inside `<StrictMode>` in Chromium. Opening focused Cancel. Escape closed
+      the dialog, called `onClose` with an empty `returnValue` and put focus back on the
+      opener. Delete called `onClose` with `"delete"`. The effect is safe to run twice
+      because it checks `dialog.open` before acting, so it is idempotent. Notice there is
+      no cleanup that closes the dialog: closing fires the `close` event, which would tell
+      the parent to set `open` to false during Strict Mode's extra cleanup, and the modal
+      would shut itself in development.
+  - title: Controlled, uncontrolled, or both
+    body: |-
+      A **controlled** widget shows whatever the parent passes and reports changes. An
+      **uncontrolled** one keeps its own state, starting from a default. Native inputs
+      support both (`value` or `defaultValue`), and a reusable component can too. The rule
+      that keeps it sane: decide once per render whether the parent passed `value`, and
+      never copy that prop into state.
+
+      ```tsx
+      import { useId, useState } from 'react';
+
+      type RatingProps = {
+        value?: number;
+        defaultValue?: number;
+        onChange?: (value: number) => void;
+        label: string;
+        max?: number;
+      };
+
+      export function Rating({ value, defaultValue = 0, onChange, label, max = 5 }: RatingProps) {
+        const name = useId();
+        const [inner, setInner] = useState(defaultValue);
+        const controlled = value !== undefined;
+        const current = controlled ? value : inner;
+
+        function pick(next: number) {
+          if (!controlled) setInner(next);
+          onChange?.(next);
+        }
+
+        return (
+          <fieldset>
+            <legend>{label}</legend>
+            {Array.from({ length: max }, (_, i) => i + 1).map((n) => (
+              <label key={n}>
+                <input type="radio" name={name} checked={current === n} onChange={() => pick(n)} />
+                {n} {n === 1 ? 'star' : 'stars'}
+              </label>
+            ))}
+          </fieldset>
+        );
+      }
+      ```
+
+      In controlled mode the parent can refuse a change: if its `onChange` ignores 5, the
+      radios stay on the old value, because `checked` follows `value`. That is the power a
+      controlled contract gives a form: validation, undo and syncing to a URL all live in
+      the parent. `useId` gives each instance its own radio `name`, so two ratings on one
+      page do not share a group. Switching a single instance between controlled and
+      uncontrolled during its life is a bug, and React warns about it for native inputs.
+  - title: Effects that subscribe, and the cleanup rule
+    body: |-
+      An effect is for synchronising with something outside React: a document listener, a
+      timer, a socket. The cleanup is the other half of the same thought. React calls it
+      before the effect runs again with new dependencies, and on unmount. A click-outside
+      hook shows every part of the rule.
+
+      ```tsx
+      import { useEffect, type RefObject } from 'react';
+
+      export function useClickOutside(ref: RefObject<HTMLElement | null>, onOutside: () => void, active: boolean) {
+        useEffect(() => {
+          if (!active) return;
+          function onPointerDown(event: PointerEvent) {
+            if (ref.current && !ref.current.contains(event.target as Node)) onOutside();
+          }
+          document.addEventListener('pointerdown', onPointerDown);
+          return () => document.removeEventListener('pointerdown', onPointerDown);
+        }, [ref, onOutside, active]);
+      }
+      ```
+
+      The handler is defined inside the effect, so the remove call gets the same function
+      reference the add call got. A handler created outside and recreated each render
+      would silently fail to remove. `active` means a closed menu has no listener at all.
+      `pointerdown` catches the press before focus moves, which suits popups.
+
+      One cost to name: if the parent passes an inline `onOutside`, its identity changes on
+      every render, so the effect unsubscribes and resubscribes each time. That is correct
+      but wasteful. Wrap the callback in `useCallback`, or read the latest callback from a
+      ref, when it matters. Leaving it out of the dependency list is the wrong fix, because
+      the listener would then call a stale callback that closes over old state.
+  - title: Taking the menu button further
+    body: |-
+      The challenge covers the core of the APG menu button. The pattern also defines Home
+      and End, and typeahead: pressing a letter moves to the next item that starts with it.
+      Keep the key logic in a pure function, so it can be tested without rendering.
+
+      ```ts
+      export function nextIndex(key: string, active: number, items: string[]): number | null {
+        const count = items.length;
+        if (key === 'ArrowDown') return (active + 1) % count;
+        if (key === 'ArrowUp') return (active - 1 + count) % count;
+        if (key === 'Home') return 0;
+        if (key === 'End') return count - 1;
+        // Typeahead: a printable character jumps to the next item starting with it, wrapping.
+        if (key.length === 1 && key.trim() !== '') {
+          const letter = key.toLowerCase();
+          for (let step = 1; step <= count; step++) {
+            const i = (active + step) % count;
+            if (items[i]!.toLowerCase().startsWith(letter)) return i;
+          }
+        }
+        return null;
+      }
+      ```
+
+      With items Rename, Duplicate, Delete and Download, pressing "d" from Rename goes to
+      Duplicate, again to Delete, again to Download, then wraps. The component's
+      `onKeyDown` becomes three lines: compute the next index, and if it is not `null`,
+      prevent the default and set it. Closing on Tab is the other detail people miss: Tab
+      should close the menu and let focus move on naturally, without pulling it back to
+      the button.
+  - title: Where state lives, said in one breath
+    body: |-
+      Interviewers often ask you to justify each `useState`. A quick test for each value:
+
+      - Can it be computed from props or other state? Then it is not state. The tab panel
+        text, a filtered list and `isOpen = status === 'success'` are all derived.
+      - Does the parent need to read or change it? Then lift it to the parent and pass
+        `value` and `onChange`.
+      - Does it change without causing a render, like a timer id, the latest request id or
+        a DOM node? Then it belongs in a ref.
+      - Does it need to survive a refresh or be shareable? Then it belongs in the URL.
+
+      The same test explains the classic starter bug in this lesson: the panel text was
+      stored next to the active index, and a click updated only one of them. Deriving it
+      makes that bug impossible, not merely fixed.
+pitfalls:
+  - >-
+    **Copying a prop into state.** `useState(value)` reads the prop on the first render only,
+    so a controlled widget stops following its parent. Read `value` directly, or support
+    `defaultValue` for the uncontrolled case.
+  - >-
+    **Effects without cleanup.** Each run adds another listener, so one Escape fires
+    `onClose` several times. Return a function that removes exactly what the effect added.
+  - >-
+    **Dropping a dependency to stop re-runs.** The effect then keeps an old callback that
+    reads stale state. Stabilise the callback with `useCallback` or a ref instead.
+  - >-
+    **Forgetting to return focus.** Closing a menu or modal leaves focus on a removed node,
+    and the next Tab starts from the top of the page. Focus the opener on every close path.
+  - >-
+    **Items that cannot take focus.** Calling `focus()` on an `li` does nothing without
+    `tabIndex={-1}`. Add it to every item you focus from code.
+  - >-
+    **A modal cleanup that closes the dialog.** Under Strict Mode the extra cleanup fires
+    the `close` event and the parent shuts the modal. Make the effect idempotent instead.
+  - >-
+    **Index keys on a list that reorders.** React reuses the wrong DOM nodes, and focus or
+    checked state jumps to another item. Key by a stable id.
+interview:
+  - question: Your tabs store only the active index. Why not the panel content too?
+    answer: >-
+      Because the panel is a function of the index, and storing it creates a second source
+      of truth. Every place that changes the index would also have to change the panel,
+      and the first place that forgets leaves the tab and the panel disagreeing, which is
+      exactly the starter's bug. Computing `TABS[active]` during render costs nothing and
+      makes that bug impossible. I store something only when it cannot be derived, and I
+      lift it to the parent when the parent needs it. The exception is an expensive
+      derivation over a large list; then I still derive it, but wrap it in `useMemo`,
+      rather than keeping a copy in state.
+  - question: What is the difference between a controlled and an uncontrolled component, and which would you ship?
+    answer: >-
+      A controlled component renders the `value` its parent passes and reports changes
+      through `onChange`; an uncontrolled one keeps its own state from a `defaultValue`.
+      Controlled gives the parent full power: validation, rejecting a change, syncing to the
+      URL, resetting a form. Uncontrolled is less wiring for simple cases. For a reusable
+      widget I support both, as native inputs do: if `value` is defined, use it; otherwise
+      use internal state; and call `onChange` either way. The rule I never break is copying
+      the prop into state, because that silently turns a controlled component into one that
+      ignores its parent after the first render.
+  - question: Why does React run effects twice in development, and what does it tell you?
+    answer: >-
+      Strict Mode runs setup, then cleanup, then setup again on mount, to prove the
+      cleanup undoes the setup. In production an effect can also run many times, whenever
+      its dependencies change, so an effect that breaks when run twice is already a bug.
+      Missing cleanups show up at once: two document listeners mean one Escape fires twice.
+      The fix is never to disable Strict Mode, but to make each effect symmetric or
+      idempotent. For example, my modal effect checks `dialog.open` before calling
+      `showModal()`, and my focus effect reads `document.activeElement` before moving focus,
+      so the second setup sees the same world as the first.
+  - question: Walk me through focus management in your menu button.
+    answer: >-
+      Opening moves focus to the first item, closing always returns it to the button. The
+      button has `aria-haspopup="menu"` and `aria-expanded`. When it opens, I set the active
+      index to 0 and an effect focuses that item through a ref array; items have
+      `tabIndex={-1}` so they can take focus. ArrowDown and ArrowUp change the index with
+      wrapping, and the effect follows. Enter or a click calls `onSelect`, then one
+      `close()` hides the menu and focuses the button, and Escape uses the same `close()`.
+      One function for closing means no path forgets the focus return. Next I would add
+      Home, End and typeahead, and close on Tab without stealing focus back.

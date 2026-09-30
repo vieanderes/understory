@@ -1,0 +1,274 @@
+id: perf.caching-layers
+title: Caching in the browser and CDN
+objective: "Let the browser reuse a response with `Cache-Control`, check a stale one with an `ETag`, and keep private pages out of a shared CDN."
+level: essential
+minutes: 10
+concepts: [perf.http-caching, perf.cdn-caching]
+prerequisites: [perf.critical-rendering-path, backend.http-in-depth]
+opening:
+  text: >-
+    You'll make repeat visits load from a copy instead of the network. And you'll stop the
+    one caching mistake that shows one person's page to everybody.
+
+steps:
+  - type: prose
+    id: what-a-cache-is
+    body: >-
+      A **cache** keeps a copy of something slow to get, so the next request is quick.
+      Answering from the copy is a **hit**. Having to fetch it is a **miss**.
+
+
+      There are caches at every layer: the browser, servers near the user, your own server,
+      the database. This lesson covers the two that HTTP headers control. The next covers
+      caching in your own code.
+
+  - type: prose
+    id: fresh-and-stale
+    body: |-
+      A response says how long it may be reused with the `Cache-Control` header:
+
+      ```http
+      HTTP/1.1 200 OK
+      Cache-Control: max-age=60
+      ETag: "v7"
+
+      {"price":12}
+      ```
+
+      For 60 seconds the copy is **fresh**: the browser reuses it without asking. After that it's **stale**. It isn't thrown away; it gets checked first.
+
+  - type: predict-output
+    id: predict-max-age-hits
+    concept: perf.http-caching
+    difficulty: 1
+    language: js
+    code: |
+      // /prices answers with Cache-Control: max-age=60
+      await fetch("/prices");
+      await new Promise((resolve) => setTimeout(resolve, 10000));
+      await fetch("/prices");
+    question: How many requests reach the server?
+    choices:
+      - text: One
+        correct: true
+        feedback: >-
+          Right. Ten seconds in, the copy is fresh, so the browser answers itself.
+      - text: Two, one per fetch
+        feedback: >-
+          Without that header, yes. With it, the second fetch never leaves the machine.
+      - text: None, the browser guesses
+        feedback: >-
+          The first fetch must go out. There's nothing to reuse until a reply comes back.
+
+  - type: prose
+    id: etag-and-304
+    body: >-
+      The `ETag` is a version label for the response. When the copy goes stale, the browser
+      asks again and sends the label back, in an `If-None-Match` header.
+
+
+      If the data hasn't changed, the server answers **`304 Not Modified`** with no body:
+      "yours still holds". The browser keeps its copy, fresh for another 60 seconds. Only a
+      changed response costs a full download.
+
+  - type: predict-output
+    id: predict-304-body
+    concept: perf.http-caching
+    difficulty: 2
+    language: bash
+    code: |
+      $ curl -si -H 'If-None-Match: "v7"' localhost:3000/prices
+      HTTP/1.1 304 Not Modified
+      ETag: "v7"
+      Cache-Control: max-age=60
+    question: What's in the body of this reply?
+    choices:
+      - text: Nothing at all
+        correct: true
+        feedback: >-
+          Right. The labels matched, so no body is sent. That's the saving.
+      - text: The full prices again
+        feedback: >-
+          That would be a 200. A 304 means the copy you hold is still right.
+      - text: Only the prices that changed
+        feedback: >-
+          HTTP doesn't send differences: a 200 with everything, or a 304 with nothing.
+
+  - type: prose
+    id: cdn-and-shared-caches
+    body: >-
+      A **CDN** is a network of servers in many cities that keep copies near your users. It's
+      a **shared cache**: one copy serves everybody. `public` lets shared caches store a
+      response; `private` allows only the user's own browser.
+
+
+      A file whose name holds a hash of its content, like `app.3f9a1c.js`, never changes, so
+      cache it for a year. HTML keeps its name, so `no-cache`: check before every reuse.
+
+  - type: fill-blank
+    id: fill-asset-and-html-headers
+    concept: perf.http-caching
+    difficulty: 2
+    language: js
+    prompt: >-
+      `immutable` means "this never changes, don't even check". Set the headers for a hashed
+      script and for the page. Fill the gaps.
+    template: |
+      const headers = {
+        "/assets/app.3f9a1c.js": "public, max-age=31536000, {{1}}",
+        "/index.html": "{{2}}",
+      };
+    blanks:
+      - key: '1'
+        answer: immutable
+      - key: '2'
+        answer: no-cache
+    bank: [immutable, no-cache, private, max-age=31536000]
+
+  - type: ai-review
+    id: review-public-account-page
+    concept: perf.cdn-caching
+    difficulty: 3
+    language: js
+    request: Our account page is slow. Cache it at the CDN for five minutes.
+    flawClass: security
+    code: |
+      async function handle(request) {
+        const url = new URL(request.url);
+        if (url.pathname === "/account") {
+          const user = await userFromSession(request);
+          return new Response(renderAccount(user), {
+            headers: {
+              "Content-Type": "text/html",
+              "Cache-Control": "public, max-age=300",
+            },
+          });
+        }
+      }
+    prompt: >-
+      An assistant wrote this. The tester signed in, saw their page load fast, and approved
+      it. One tester has one account, so nothing looked wrong. Tap the line at fault.
+    lines: [8]
+    reasons:
+      - text: '`public` lets the CDN serve one user''s page to others'
+        correct: true
+        feedback: >-
+          Yes. A shared cache keys on the URL, and everyone asks for `/account`.
+      - text: Five minutes is too long for a CDN
+        feedback: >-
+          The length isn't the danger. Even one second of sharing this page is too much.
+      - text: '`Content-Type` stops the CDN caching HTML'
+        feedback: >-
+          `Content-Type` has no say in caching. `Cache-Control` decides, and it says "share".
+    fix: |
+      return new Response(renderAccount(user), {
+        headers: {
+          "Content-Type": "text/html",
+          "Cache-Control": "private, no-cache",
+        },
+      });
+
+  - type: code-challenge
+    id: write-cache-control-for
+    concept: perf.cdn-caching
+    difficulty: 3
+    language: ts
+    editable: '3'
+    prompt: >-
+      Write `cacheControlFor(path)`, the header policy for a server.
+
+
+      Paths under `/account` answer `'private, no-cache'`. Paths under `/assets/` hold hashed
+      files, so they answer `'public, max-age=31536000, immutable'`. Every other page
+      answers `'no-cache'`.
+    hints:
+      - Three kinds of path, three answers. Check the most private one first.
+      - '`path.startsWith("/assets/")` matches the folder, and not a page that only mentions it.'
+      - 'Start with `if (path.startsWith("/account")) return "private, no-cache";`'
+
+  - type: explain-back
+    id: explain-headers-per-file
+    concept: perf.http-caching
+    difficulty: 3
+    prompt: >-
+      A hashed script can be cached for a year. Why must the HTML page that loads it be
+      checked every time?
+    rubric:
+      - A hashed file's name changes whenever its content changes, so an old copy is never wrong.
+      - The HTML keeps its name, so a kept copy could point at old scripts.
+      - '`no-cache` makes the browser check the HTML with its ETag, which is cheap when nothing changed.'
+    modelAnswer: >-
+      The script's name carries a hash of its content. New code means a new name. So a copy
+      under the old name is never out of date, and it can be kept for a year. The HTML is
+      always `/index.html`, and it's what points at the new names. So it's `no-cache`: the
+      browser checks it each time, and a `304` makes that check cheap.
+
+recap:
+  - "Set `Cache-Control: max-age` so a copy is reused while fresh, and an `ETag` so a stale one costs a `304`."
+  - Cache hashed files for a year, and check HTML with `no-cache`.
+  - "Mark anything personal `private`, so a shared CDN never serves it to others."
+
+recall:
+  - id: card-fresh-stale
+    concept: perf.http-caching
+    front: 'What does `Cache-Control: max-age=60` let the browser do?'
+    back: >-
+      Reuse the response for 60 seconds without asking. After that the copy is stale and is
+      checked first.
+  - id: card-304
+    concept: perf.http-caching
+    front: What does a `304 Not Modified` reply mean, and what does it carry?
+    back: >-
+      The copy the browser holds is still right. It has no body.
+  - id: card-shared-cache
+    concept: perf.cdn-caching
+    front: Why must a signed-in page never be `public`?
+    back: >-
+      A CDN is a shared cache keyed on the URL, so it would serve one person's page to
+      everyone.
+  - id: card-hashed-names
+    concept: perf.cdn-caching
+    front: Why can `app.3f9a1c.js` be cached for a year?
+    back: >-
+      Its name changes whenever its content does, so a copy under that name is never wrong.
+
+references:
+  - kind: rfc
+    title: 'RFC 9111: HTTP Caching'
+    authors: R. Fielding, M. Nottingham and J. Reschke (eds)
+    year: 2022
+    venue: IETF
+    url: https://www.rfc-editor.org/rfc/rfc9111
+    note: Freshness, validation with ETags, and `public` and `private`.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Prevent unnecessary network requests with the HTTP Cache
+    authors: Jeff Posnick and Ilya Grigorik
+    venue: web.dev
+    url: https://web.dev/articles/http-cache
+    note: Long-lived hashed files, and `no-cache` for HTML.
+    verified: true
+  - kind: docs
+    title: Cache-Control header
+    authors: MDN contributors
+    venue: MDN Web Docs
+    url: https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Cache-Control
+    note: Every directive, including `immutable` and `no-store`.
+    verified: true
+
+deepDive: >-
+  People often mix up `no-cache` and `no-store`. `no-cache` keeps a copy but checks it before
+  each use. `no-store` keeps nothing at all, for data such as a bank statement.
+
+
+  `s-maxage` sets a separate lifetime for shared caches only. A CDN can then hold a public
+  page for an hour while browsers check it every minute. Most CDNs can also purge a URL on
+  demand, when you publish a change.
+
+
+  `stale-while-revalidate=30` lets a cache serve a stale copy for 30 more seconds while it
+  fetches a fresh one in the background. The visitor never waits for the check.
+
+
+  Next.js has its own caches on top of these, covered in Next.js on the server.

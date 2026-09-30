@@ -1,0 +1,313 @@
+summary: >-
+  A generic is code with a **type parameter**: a name for a type that each caller fills in.
+  Its job is to relate positions. `firstOf<T>(items: T[]): T | undefined` says "the result
+  has the item type of the list you passed", something neither `any` nor `unknown` can say.
+  `any` switches checking off, and `unknown` forgets what you had. A type parameter keeps it.
+
+
+  Most of the time you never write the type argument. The checker **infers** it from the
+  arguments at each call, so generic code reads like plain JavaScript. A **constraint**,
+  `T extends X`, says what every `T` must have, which lets the body use those properties.
+  Add `keyof` and indexed access, `T[K]`, and a function can accept only real property names
+  and return the matching value type. That trio powers `pluck`, `groupBy`, typed event
+  emitters, form libraries and most of the standard library's types.
+
+
+  Reach for a generic when a type must flow from an input to an output, or between two
+  inputs. Don't reach for one when a plain parameter type would do, and be wary of a type
+  parameter that appears only in the result: nothing checks it, so it's a cast wearing
+  nicer syntax.
+remember:
+  - A type parameter earns its place by linking two positions, usually an input and the result; one used only once links nothing.
+  - "A type parameter that appears only in the return type, like `load<T>(key: string): T`, is an unchecked cast: the caller names a type and nobody verifies it."
+  - The checker infers type arguments from the values passed at each call, so write them yourself only when there's nothing to infer from, as in `new Map<string, number>()`.
+  - "`T extends X` is a constraint: every `T` must be assignable to `X`, and inside the body you may use only what `X` guarantees."
+  - "`K extends keyof T` plus a result of `T[K]` ties a property name to its value type, so a wrong key fails to compile."
+  - "Type parameters can have defaults, `<T, E = string>`, and there's no partial inference: pass one type argument by hand and you must pass every one without a default."
+  - Generics are erased like every type, so there's no `T` at run time; to act on a type, pass a value that knows it, such as a parse function.
+  - If a constraint alone would do, drop the type parameter and use the constraint as the parameter type.
+sections:
+  - title: How the checker picks T
+    body: |-
+      At each call, the checker collects **candidates** for `T` from every argument whose
+      parameter mentions `T`, then settles on one type. For a list it takes the whole list, not
+      the first item, which is why a mixed list gives a union. Literals often widen, so
+      `"draft"` can become `string`. A type parameter marked `const` (TypeScript 5.0) asks
+      for the narrowest type instead, as `as const` would.
+
+      ```ts
+      function firstOf<T>(items: readonly T[]): T | undefined {
+        return items[0];
+      }
+      const seat = firstOf(["A1", "A2"]); // string | undefined
+      const mixed = firstOf([4500, "GBP"]); // string | number | undefined
+      const none = firstOf<string | null>([]); // string | null | undefined
+
+      function tag<T>(value: T) {
+        return { value };
+      }
+      function tagExact<const T>(value: T) {
+        return { value };
+      }
+      const loose = tag("draft"); // { value: string }
+      const exact = tagExact("draft"); // { value: "draft" }
+      const sizes = tagExact(["small", "large"]); // { value: readonly ["small", "large"] }
+      ```
+
+      When `T` appears in two parameters, both are candidates, and a clash is an error rather
+      than a union. `same<T>(a: T, b: T)` called with `4500` and `"4500"` fails, because the
+      first argument fixes `T` as `number`. Sometimes one position should not vote at all.
+      `NoInfer<T>` (TypeScript 5.4) says "check this against `T`, but don't use it to work
+      `T` out":
+
+      ```ts
+      function pickStatus<S extends string>(allowed: S[], initial: NoInfer<S>): S {
+        return allowed.includes(initial) ? initial : allowed[0]!;
+      }
+      pickStatus(["open", "closed"], "open"); // fine
+      pickStatus(["open", "closed"], "archived");
+      // Argument of type '"archived"' is not assignable to parameter of type '"closed" | "open"'.
+      ```
+
+      Without `NoInfer`, `"archived"` would join the candidates and `S` would quietly become
+      `"open" | "closed" | "archived"`. The `!` is safe here only because a status list is
+      never empty in this code; in general, check instead.
+  - title: What a constraint lets the body do, and the error it causes
+    body: |-
+      Inside a generic function, `T` is unknown: it could be any type the caller picks. A
+      constraint promises a minimum, so the body may read those properties. It does not
+      promise that `T` is *exactly* the constraint. That's the source of the most confusing
+      generic error:
+
+      ```ts
+      type Priced = { pricePence: number };
+
+      function makeFree<T extends Priced>(item: T): T {
+        return { pricePence: 0 };
+      }
+      // Type '{ pricePence: number; }' is not assignable to type 'T'.
+      //   '{ pricePence: number; }' is assignable to the constraint of type 'T', but 'T'
+      //   could be instantiated with a different subtype of constraint 'Priced'.
+      ```
+
+      The caller might pass a book with a title. Returning a bare `{ pricePence: 0 }` would
+      hand back something typed as a book with no title. The fix is to build the result from
+      the input, so every extra property survives:
+
+      ```ts
+      function makeFree<T extends Priced>(item: T): T {
+        return { ...item, pricePence: 0 };
+      }
+      const free = makeFree({ title: "Dune", pricePence: 899 });
+      console.log(free.title, free.pricePence); // Dune 0
+      ```
+
+      The same thinking explains why `a + b` fails for `<T>(a: T, b: T)`: nothing says `T`
+      supports `+`. And it's why a constraint alone is often enough. If the result doesn't
+      reuse `T`, drop the parameter:
+
+      ```ts
+      function lengthOf(value: { length: number }): number {
+        return value.length;
+      }
+      console.log(lengthOf("hello"), lengthOf([1, 2])); // 5 2
+      ```
+
+      `<T extends { length: number }>(value: T): number` does the same job with more to read.
+  - title: Generic types, defaults and generic components
+    body: |-
+      Types, interfaces and classes take type parameters too. A default applies when the
+      argument is neither passed nor inferred:
+
+      ```ts
+      type Result<T, E = string> =
+        | { ok: true; value: T }
+        | { ok: false; error: E };
+
+      const saved: Result<number> = { ok: false, error: "timeout" };
+      const parsed: Result<number, SyntaxError> = { ok: false, error: new SyntaxError("bad") };
+      ```
+
+      A class with a type parameter and generic methods gives you a typed event emitter, a
+      classic interview exercise. The event map is the single source of truth:
+
+      ```ts
+      type CartEvents = {
+        added: { sku: string; quantity: number };
+        removed: { sku: string };
+        cleared: null;
+      };
+
+      class Emitter<M> {
+        private handlers: { [K in keyof M]?: Array<(payload: M[K]) => void> } = {};
+
+        on<K extends keyof M>(name: K, handler: (payload: M[K]) => void): void {
+          (this.handlers[name] ??= []).push(handler);
+        }
+
+        emit<K extends keyof M>(name: K, payload: M[K]): void {
+          for (const handler of this.handlers[name] ?? []) handler(payload);
+        }
+      }
+
+      const cart = new Emitter<CartEvents>();
+      cart.on("added", (event) => console.log(`+${event.quantity} ${event.sku}`));
+      cart.emit("added", { sku: "MUG-1", quantity: 2 }); // +2 MUG-1
+      cart.emit("clear", null);
+      // Argument of type '"clear"' is not assignable to parameter of type 'keyof CartEvents'.
+      ```
+
+      React components are functions, so they can be generic as well. The props relate the
+      items to the callbacks:
+
+      ```tsx
+      import type { ReactNode } from "react";
+
+      type ListProps<T> = {
+        items: readonly T[];
+        getKey: (item: T) => string;
+        renderItem: (item: T) => ReactNode;
+      };
+
+      export function List<T>({ items, getKey, renderItem }: ListProps<T>) {
+        return (
+          <ul>
+            {items.map((item) => (
+              <li key={getKey(item)}>{renderItem(item)}</li>
+            ))}
+          </ul>
+        );
+      }
+      ```
+
+      Write `<List items={books} renderItem={(book) => book.title} ... />` and `book` is typed
+      from `items`, with no annotation. In a `.tsx` file, an arrow function needs
+      `<T,>(props: ...) =>`, because a bare `<T>` is read as a JSX tag.
+  - title: 'Carrying a type at run time: pass a value, not a type'
+    body: |-
+      Types vanish when the code runs, so `getJson<T>(url)` can't check anything about `T`.
+      The lesson called this an `as` in disguise. The honest version asks the caller for a
+      function that turns `unknown` into `T`. Now `T` appears in an argument, it's inferred
+      from that function, and the check really happens:
+
+      ```ts
+      type Parser<T> = (value: unknown) => T;
+
+      function parseJson<T>(text: string, parse: Parser<T>): T {
+        return parse(JSON.parse(text));
+      }
+
+      type Weather = { city: string; celsius: number };
+
+      const parseWeather: Parser<Weather> = (value) => {
+        if (
+          typeof value === "object" &&
+          value !== null &&
+          "city" in value &&
+          typeof value.city === "string" &&
+          "celsius" in value &&
+          typeof value.celsius === "number"
+        ) {
+          return { city: value.city, celsius: value.celsius };
+        }
+        throw new Error("Not a weather reply");
+      };
+
+      const weather = parseJson('{"city":"Leeds","celsius":11.5}', parseWeather);
+      console.log(weather.celsius.toFixed(0)); // 12
+
+      try {
+        parseJson('{"city":"Leeds","temp":11.5}', parseWeather);
+      } catch (error) {
+        if (error instanceof Error) console.log(error.message); // Not a weather reply
+      }
+      ```
+
+      Schema libraries such as Zod work the same way: the schema is a value, and the type is
+      derived from it, so the check and the type can't drift apart. The same idea answers
+      "how do I create a `T` inside a generic?". You can't write `new T()`, so accept a
+      factory or a class: `create<T>(make: () => T): T`.
+pitfalls:
+  - "**A type parameter only in the return type.** `load<T>(key: string): T` lets the caller claim any type and checks nothing. Return `unknown` and parse, or take a parser argument so `T` is inferred from a real value."
+  - "**Making everything generic.** `<T extends Item>(item: T): number` adds a name that relates nothing. If `T` appears once, use the constraint as the parameter type. Fewer type parameters make better error messages."
+  - "**Building a fresh object and returning it as `T`.** The checker rejects it because `T` may carry extra properties. Build the result from the input, `{ ...item, pricePence: 0 }`, or return the constraint type instead of `T`."
+  - "**Expecting `T` to exist at run time.** `typeof T`, `new T()` and `value instanceof T` are errors, because generics are erased. Pass a value that carries the information: a parser, a factory or a class."
+  - "**Writing `<T>` before an arrow function in a `.tsx` file.** The parser reads it as a JSX tag and reports a missing closing tag. Write `<T,>` or use a `function` declaration."
+  - "**Passing one type argument when there are two.** `pluck<Ticket>(tickets, \"tier\")` fails with 'Expected 2 type arguments, but got 1', because inference is all or nothing. Let both be inferred, or give the second a default."
+interview:
+  - question: What are generics, and why not use any instead?
+    answer: >-
+      A generic is a function or type with a type parameter, a placeholder each caller fills
+      in, so one implementation stays type-safe for many types. The key is that it relates
+      positions: `firstOf<T>(items: T[]): T | undefined` promises the result has the item
+      type of the list. With `any`, the result is `any`, so a misspelt property compiles and
+      fails at run time, and the `any` spreads to everything it touches. `unknown` is safe
+      but forgets the type, forcing the caller to narrow again. Generics keep the precise
+      type with no cost at run time, since they're erased. The trade-off is readability:
+      each type parameter should earn its place by linking an input to an output.
+  - question: Explain `K extends keyof T`. How would you type a function that reads a property by name?
+    answer: >-
+      `keyof T` is the union of `T`'s property names, and `K extends keyof T` says the key
+      must be one of them. Returning `T[K]`, an indexed access type, gives the type of that
+      specific property. So `function get<T, K extends keyof T>(obj: T, key: K): T[K]`
+      rejects a wrong key at compile time, and `get(ticket, "priceMinor")` returns `number`
+      while `get(ticket, "id")` returns `string`. Without the second parameter, typing the
+      key as `keyof T` would make the result a union of every property type. This pattern
+      underlies `pluck`, `groupBy`, typed event emitters and form libraries. One caveat: in
+      generic code, `keyof T` may include number and symbol keys, so code that needs a
+      string key uses `Extract<keyof T, string>`.
+  - question: Why does TypeScript say "T could be instantiated with a different subtype of constraint"?
+    answer: >-
+      Because a constraint is a minimum, not an exact type. In
+      `makeFree<T extends { pricePence: number }>(item: T): T`, returning `{ pricePence: 0 }`
+      fails: the caller may pass a book with a title, and the function promises to return that
+      same book type. A bare object would lie about having a title. The fix is to build the
+      result from the input, `{ ...item, pricePence: 0 }`, which keeps every extra property,
+      or to change the return type to the constraint if the extra properties don't matter.
+      Reaching for `as T` silences the error but reintroduces exactly the bug it warned about.
+  - question: When would you not use a generic?
+    answer: >-
+      When the type parameter doesn't relate two positions. If `T` appears once, a plain
+      parameter type does the same job: `lengthOf(value: { length: number })` beats
+      `<T extends { length: number }>(value: T): number`. A return-only parameter, like
+      `load<T>(key): T`, is worse: it's an unchecked cast, so I'd return `unknown` and parse,
+      or take a parser so `T` is inferred from a real value. I'd also avoid generics where a
+      small union or overloads say it more plainly, and avoid stacks of four or five type
+      parameters, which produce unreadable errors. Generics are for libraries and shared
+      helpers where the same logic genuinely serves many types.
+  - question: How would you type a reusable list or select component in React?
+    answer: >-
+      Make the component generic, so the items and the callbacks share a type. `List<T>`
+      takes `items: readonly T[]`, `getKey: (item: T) => string` and
+      `renderItem: (item: T) => ReactNode`. At the call site, `T` is inferred from `items`,
+      so `renderItem` gets a typed `book` with autocomplete and no annotation, and a typo in
+      the render function fails to compile. For a select, `value: T` and
+      `onChange: (next: T) => void` keep the chosen value typed as the domain object, not a
+      string. In a `.tsx` arrow function I write `<T,>` so the parser doesn't read a JSX tag.
+      The cost is slightly harder error messages, so I keep it to one type parameter where I
+      can.
+terms:
+  - term: Generic
+    say: A function that works with any type.
+    means: "Code with a type parameter that links positions, usually an input and the result.
+      `firstOf<T>(items: T[]): T | undefined` returns the item type of the list you passed."
+  - term: "`T extends X`"
+    say: T inherits from X.
+    means: "A constraint: every `T` must be assignable to `X`, and the body may use only what `X`
+      guarantees. No class inheritance is involved."
+  - term: "`K extends keyof T`"
+    say: K is any string.
+    means: K must be one of `T`'s property names, and `T[K]` is that property's value type, so a wrong
+      key fails to compile.
+  - term: Type argument inference
+    say: You have to write `<string>` at every call.
+    means: The checker infers type arguments from the values passed at each call. Write them only when
+      there's nothing to infer from, as in `new Map<string, number>()`.
+  - term: Return-only type parameter
+    say: Making it generic makes it type-safe.
+    means: "`load<T>(key: string): T` is an unchecked cast: the caller names a type and nothing verifies
+      it."
+  - term: Generics at run time
+    say: You can check what `T` is inside the function.
+    means: Generics are erased, so there's no `T` when the code runs. To act on a type, pass a value
+      that knows it, such as a parse function.

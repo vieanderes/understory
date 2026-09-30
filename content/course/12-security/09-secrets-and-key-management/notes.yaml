@@ -1,0 +1,263 @@
+summary: >-
+  A secret is any value that grants access: a database password, an API key, a signing key,
+  an encryption key. Secrets management is the discipline of keeping those values out of the
+  places that copy things (the repository, the browser bundle, logs, screenshots, chat), giving
+  each one the narrowest scope that does its job, and replacing them on a schedule and after a
+  leak. The lesson covers where secrets live, rotation after a leak and least privilege.
+
+
+  These notes go one level down. Envelope encryption explains how a key management service
+  (KMS) protects data without ever handing out its master key. A keyring with key ids shows
+  how to rotate a signing key without logging everybody out. Then come the tools that catch
+  leaks early, what to do in the hour after one, and how secrets escape at runtime even when
+  the repository is clean.
+
+
+  Reach for a secrets manager and a KMS once you have more than one environment, more than a
+  couple of people, or data that must be encrypted at rest under your own keys. For a small
+  side project, platform environment variables plus a scanner on the repository are enough.
+  What never changes at any size: code names a secret, it never contains one.
+remember:
+  - A leaked secret is fixed by rotating it (new key live, old key revoked), never by deleting the line that exposed it.
+  - Scope every key to one job and one environment, because the scope is the size of the damage when it leaks.
+  - Envelope encryption encrypts data with a per-record data key and encrypts that data key with a master key that never leaves the KMS.
+  - 'Rotating a signing key needs an overlap: sign with the new key, keep verifying with the old one until everything it signed has expired.'
+  - Store a key id next to every ciphertext and signature, so rotation is a lookup, not a migration.
+  - Secret scanning on push and in CI catches known key formats within seconds, and push protection blocks them before they land.
+  - Environment variables leak through child processes, crash reports and debug output, so redact logs and prefer short-lived credentials.
+  - In Next.js, anything prefixed `NEXT_PUBLIC_` is inlined into the browser bundle at build time, so it is public by definition.
+sections:
+  - title: Envelope encryption and what a KMS does
+    body: |-
+      A **KMS** (key management service, such as AWS KMS, Google Cloud KMS or HashiCorp Vault's
+      transit engine) holds master keys inside hardware or a hardened service. You never get
+      the master key out. You send it small things to encrypt or decrypt, and every call is
+      authorised and logged.
+
+      Sending every record to the KMS would be slow and expensive, so real systems use
+      **envelope encryption**. Each record gets a fresh random data key. The data key
+      encrypts the record locally with AES-256-GCM. The KMS then encrypts ("wraps") the data
+      key under the master key, and you store the wrapped key next to the ciphertext.
+
+      ```js
+      import { randomBytes, createCipheriv, createDecipheriv } from 'node:crypto';
+
+      // Stands in for a KMS. In production the master keys never leave it:
+      // you send it a data key and get back the key encrypted, or the reverse.
+      const masterKeys = { 'mk-2026': randomBytes(32) };
+      const kms = {
+        wrap(keyId, dataKey) {
+          return { keyId, ...seal(masterKeys[keyId], dataKey) };
+        },
+        unwrap(wrapped) {
+          return open(masterKeys[wrapped.keyId], wrapped);
+        },
+      };
+
+      function seal(key, plaintext) {
+        const iv = randomBytes(12);
+        const cipher = createCipheriv('aes-256-gcm', key, iv);
+        const data = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+        return { iv, data, tag: cipher.getAuthTag() };
+      }
+
+      function open(key, { iv, data, tag }) {
+        const decipher = createDecipheriv('aes-256-gcm', key, iv);
+        decipher.setAuthTag(tag);
+        return Buffer.concat([decipher.update(data), decipher.final()]);
+      }
+
+      // Encrypt one support ticket with its own data key.
+      function encryptRecord(plaintext) {
+        const dataKey = randomBytes(32);
+        const body = seal(dataKey, Buffer.from(plaintext));
+        const wrappedKey = kms.wrap('mk-2026', dataKey);
+        dataKey.fill(0); // drop the plaintext key from memory as soon as you can
+        return { body, wrappedKey }; // both are safe to store side by side
+      }
+
+      function decryptRecord({ body, wrappedKey }) {
+        const dataKey = kms.unwrap(wrappedKey);
+        return open(dataKey, body).toString();
+      }
+
+      const stored = encryptRecord('Refund request for order 1043');
+      console.log(stored.wrappedKey.keyId); // mk-2026
+      console.log(decryptRecord(stored)); // Refund request for order 1043
+      ```
+
+      This buys three things. A stolen database dump is useless without KMS access. Rotating
+      the master key only means rewrapping small data keys, not re-encrypting terabytes. And
+      revoking a service's permission to call `unwrap` cuts off its access to the data at once.
+      AWS KMS offers this pattern directly through its `GenerateDataKey` call, which returns
+      the data key both in plaintext and wrapped.
+  - title: Rotating a key without logging everyone out
+    body: |-
+      A key that signs things (session cookies, password reset links, webhooks) is still
+      checking yesterday's signatures today. If you swap it in one step, every live session
+      and every unclicked reset link fails at once. The fix is a **keyring**: several keys,
+      each with an id, one of them current.
+
+      ```js
+      import { createHmac, timingSafeEqual } from 'node:crypto';
+
+      // Loaded from a secrets manager. The id travels with every signature.
+      const keyring = {
+        current: 'k2',
+        keys: { k1: 'old-secret-from-the-manager', k2: 'new-secret-from-the-manager' },
+      };
+
+      const mac = (secret, value) => createHmac('sha256', secret).update(value).digest('base64url');
+
+      function sign(value) {
+        const kid = keyring.current;
+        return `${value}.${kid}.${mac(keyring.keys[kid], value)}`;
+      }
+
+      function verify(token) {
+        const [value, kid, sig] = token.split('.');
+        const secret = keyring.keys[kid]; // look up in a fixed map, never build a path or query from kid
+        if (!secret || !sig) return null;
+        const expected = Buffer.from(mac(secret, value));
+        const given = Buffer.from(sig);
+        if (expected.length !== given.length || !timingSafeEqual(expected, given)) return null;
+        return value;
+      }
+
+      const before = `cart-81.k1.${mac(keyring.keys.k1, 'cart-81')}`; // signed before the rotation
+      console.log(verify(before)); // cart-81: old signatures still pass
+      console.log(sign('cart-82')); // cart-82.k2.<signature>: new ones use k2
+
+      delete keyring.keys.k1; // once every k1 token has expired
+      console.log(verify(before)); // null
+      ```
+
+      The rotation runs in three phases. Add the new key as verify-only and deploy everywhere.
+      Make it current, so new signatures use it. Remove the old key after the longest token
+      lifetime has passed. The first phase matters when many servers deploy at different
+      speeds: a server that signs with k2 before another knows k2 would break requests.
+
+      The same idea works for API keys you hold at a provider, which is why most providers
+      allow two live keys. For public-key signing, the issuer publishes both public keys in its
+      JWKS during the overlap. A leak changes the timetable, not the method: revoke first and
+      accept that some sessions end.
+  - title: Catching leaks early, and the hour after one
+    body: |-
+      Many providers give keys a recognisable shape, such as a `sk_live_` prefix or GitHub's
+      `ghp_` tokens. That lets scanners find them with few false alarms. **GitHub secret
+      scanning** checks pushes to public repositories and notifies many providers, some of
+      which revoke the key automatically. **Push protection** goes further and refuses a push
+      that contains a supported secret. Tools such as gitleaks and trufflehog run the same
+      kind of check in a pre-commit hook and in CI, so a leak is caught on your laptop rather
+      than on the internet.
+
+      Bots scrape public pushes within minutes, so treat a public leak as already used. The
+      response, in order:
+
+      1. **Revoke or rotate** the key at the provider. If it's public, revoke first and take
+         the outage.
+      2. **Deploy the replacement** and confirm the system works.
+      3. **Read the provider's audit log** for what the old key did since it leaked: calls,
+         new users, changed settings, spend.
+      4. **Find the path** it took. A `.env` committed by accident needs a scanner in CI. A key
+         in a log needs redaction. A key in a bundle needs a build check.
+      5. **Tidy history** with `git filter-repo` if you want, knowing forks and clones keep the
+         old commits. This step is optional; the first one is not.
+
+      Write this as a runbook before you need it, with the dashboard link for every provider
+      you use. Half the delay in a real leak is working out who can rotate what.
+  - title: How secrets escape at runtime
+    body: |-
+      A clean repository doesn't mean a safe secret. Environment variables are inherited by
+      every child process you spawn, appear in crash reports and error trackers that capture
+      the environment, and turn up in debug pages that print configuration. The most common
+      runtime leak is the most boring: a log line that prints a whole request, headers and
+      all, or an error message from a provider that quotes the key back.
+
+      Redact before anything is written. Match by field name for structure you know, and by
+      value shape for text you don't.
+
+      ```js
+      // Redact by field name and by value shape before anything reaches a log line.
+      const SECRET_FIELDS = /pass(word)?|secret|token|api[-_]?key|authorization|cookie/i;
+      const SECRET_VALUES = /\b(sk_live_[A-Za-z0-9]+|ghp_[A-Za-z0-9]{36}|AKIA[0-9A-Z]{16})\b/g;
+
+      function redact(value) {
+        if (typeof value === 'string') return value.replace(SECRET_VALUES, '[redacted]');
+        if (Array.isArray(value)) return value.map(redact);
+        if (value && typeof value === 'object') {
+          return Object.fromEntries(
+            Object.entries(value).map(([k, v]) => [k, SECRET_FIELDS.test(k) ? '[redacted]' : redact(v)]),
+          );
+        }
+        return value;
+      }
+
+      const log = (message, fields) => console.log(JSON.stringify({ message, ...redact(fields) }));
+
+      log('payment failed', {
+        orderId: 1043,
+        headers: { authorization: 'Bearer eyJhbGciOi...', 'user-agent': 'curl/8.7' },
+        error: 'Invalid API key sk_live_51Hx9abc provided',
+      });
+      // {"message":"payment failed","orderId":1043,"headers":{"authorization":"[redacted]",
+      //  "user-agent":"curl/8.7"},"error":"Invalid API key [redacted] provided"}
+      ```
+
+      Better than protecting a long-lived key is not having one. **Workload identity** lets a
+      CI job or a container prove who it is to the cloud provider (for example with an OIDC
+      token from GitHub Actions) and receive credentials that expire within the hour. Nothing
+      long-lived sits in CI settings to steal.
+
+      In Next.js, add `import 'server-only'` to modules that read secrets. The build then fails
+      if a Client Component imports them, which catches the mistake before it ships.
+pitfalls:
+  - '**Deleting the commit and calling it fixed.** Rewriting history feels like undoing the leak, but clones, forks and scrapers already have it. Rotate the key first; history clean-up is optional.'
+  - '**One key shared by every service and environment.** It saves setup time, and then one leak exposes everything and rotating it breaks everything. Give each service and environment its own scoped key.'
+  - '**Rotating a signing key in one step.** Every session and reset link signed with the old key fails at once. Use a keyring with key ids and keep the old key for verification until its tokens expire.'
+  - '**A deny-list filter for what reaches the browser.** Filtering out names containing `SECRET` misses `DATABASE_URL` and the next oddly named key. Build client config from an allow-list of public names.'
+  - '**Logging whole requests or provider errors.** Headers carry bearer tokens and provider errors often quote the key. Redact by field name and by known key shapes before writing any log line.'
+  - '**Encrypting data with a key stored beside it.** An encryption key in the same database or config file as the ciphertext protects nothing in a breach. Keep master keys in a KMS and store only wrapped data keys.'
+interview:
+  - question: How do you manage secrets in a production application?
+    answer: >-
+      Secrets live in a secrets manager and reach the process at start-up, never in the
+      repository or the image. Each service and environment gets its own key, scoped to what
+      that service does, so a leak is contained. Where the platform allows, I replace long-lived
+      keys with workload identity, so CI jobs and containers get credentials that expire within
+      the hour. Data encryption keys sit behind a KMS with envelope encryption, so the master
+      key never leaves it and access is logged. On the code side: secret scanning with push
+      protection, a scanner in CI, log redaction, and a build check that nothing secret reaches
+      the client bundle. The trade-off is operational weight; for a tiny project, platform
+      environment variables plus a scanner are a sensible start.
+  - question: Someone pushed an API key to a public GitHub repository. Walk me through your response.
+    answer: >-
+      Rotate first, investigate second. Bots scrape public pushes within minutes, so I assume
+      it's been used. I revoke the key at the provider, or rotate with a brief overlap if the
+      exposure was private, deploy the replacement and confirm the system works. Then I read
+      the provider's audit log from the moment of the push: calls made, resources created,
+      money spent. I find how it got there, usually a committed `.env` or a hard-coded test
+      value, and add the control that would have caught it: push protection, a pre-commit
+      scanner, a CI check. Rewriting history with `git filter-repo` is optional tidying,
+      because forks and clones keep the old commits. Finally, I write it up blamelessly and
+      check the runbook named who could rotate that key.
+  - question: What is envelope encryption, and why use it instead of encrypting everything with one key?
+    answer: >-
+      Envelope encryption encrypts each piece of data with its own data key, then encrypts
+      that data key with a master key held in a KMS. You store the wrapped data key next to
+      the ciphertext. The master key never leaves the KMS, so a stolen database is useless
+      without KMS access, and every unwrap is authorised and logged. Encryption itself happens
+      locally with AES-GCM, so it's fast and doesn't send bulk data to the KMS. Rotating the
+      master key means rewrapping small data keys, not re-encrypting the data. The trade-off is
+      a KMS call per decrypt, which adds latency and cost, so systems cache unwrapped data keys
+      briefly in memory, accepting a short window in which a compromised process holds them.
+  - question: How do you rotate a key that signs session tokens without logging everyone out?
+    answer: >-
+      With overlapping keys identified by a key id. Every token carries the id of the key that
+      signed it. I add the new key to the keyring as verify-only and deploy it everywhere, then
+      make it the signing key, then remove the old key once the longest token lifetime has
+      passed. During the overlap, old tokens verify under the old key and new ones under the
+      new key, so nobody notices. The verify-only phase matters with many servers, so no server
+      receives a token signed with a key it doesn't know yet. For asymmetric keys the issuer
+      publishes both public keys in its JWKS. If the old key has leaked, I skip the overlap and
+      accept that sessions end.

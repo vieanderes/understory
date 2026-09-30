@@ -1,0 +1,223 @@
+summary: >-
+  Domain modelling is designing your types and objects so that the business rules live in
+  the data itself, not in scattered `if` statements. The goal is that an invalid state, such
+  as an order that is shipped but never paid, can't be built at all. When that holds, every
+  function that receives an order can trust it, and nothing needs to check again.
+
+
+  Three tools do most of the work. A **state machine** replaces a pile of flags with one
+  named state and a table of allowed moves. An **invariant** is a rule enforced inside the
+  object that owns the data, on every path that changes it. A **value object** wraps a
+  primitive, such as an amount of money, so it's valid from construction, immutable and
+  compared by contents.
+
+
+  Reach for these where the rules are real and costly to get wrong: orders, payments,
+  bookings, stock, anything with a lifecycle. A settings form with three optional fields
+  doesn't need a state machine. The test is whether a wrong combination would ever reach a
+  customer, a bill or a report.
+remember:
+  - Make invalid states unrepresentable, so code that receives the data never has to check it again.
+  - A lifecycle is one named state plus a table of allowed moves, not a set of true-or-false flags.
+  - Enforce each invariant inside the object that owns the data, on every function that changes it, so no caller can skip it.
+  - A value object is immutable, compared by its contents and valid from the moment it's made.
+  - Keep money as whole minor units in integers, and round once at the edge where a decimal comes in.
+  - In TypeScript, a discriminated union gives each state its own fields, and a `never` check finds every switch a new state breaks.
+  - The database enforces the same rules with `CHECK` constraints and a conditional `UPDATE` that names the state it expects.
+sections:
+  - title: States that carry their own data
+    body: |-
+      A `state` string fixes the flag problem, but it leaves a quieter one. If `paidAt`
+      is an optional field on every order, code can still read it from an unpaid order and
+      get `undefined`. A **discriminated union** gives each state exactly the fields that
+      exist in that state, keyed by a shared literal field.
+
+      ```ts
+      type Order =
+        | { state: 'placed'; id: number }
+        | { state: 'paid'; id: number; paidAt: Date }
+        | { state: 'shipped'; id: number; paidAt: Date; trackingCode: string }
+        | { state: 'cancelled'; id: number; reason: string };
+
+      function ship(order: Order, trackingCode: string): Order {
+        if (order.state !== 'paid') throw new Error(`cannot ship a ${order.state} order`);
+        return { ...order, state: 'shipped', trackingCode };
+      }
+
+      function label(order: Order): string {
+        switch (order.state) {
+          case 'placed':
+            return 'Waiting for payment';
+          case 'paid':
+            return `Paid on ${order.paidAt.toISOString().slice(0, 10)}`;
+          case 'shipped':
+            return `On its way: ${order.trackingCode}`;
+          case 'cancelled':
+            return `Cancelled: ${order.reason}`;
+          default: {
+            const unreachable: never = order;
+            return unreachable;
+          }
+        }
+      }
+      ```
+
+      After the `if` in `ship`, TypeScript knows `order` is the paid shape, so spreading it
+      carries `paidAt` across and the result type-checks as a shipped order. In `label`,
+      reading `order.trackingCode` in the `paid` branch is a compile error.
+
+      The `default` branch is the payoff. Add a `'refunded'` state to the union and every
+      switch that forgot it fails to compile, because `order` is no longer `never` there.
+      The compiler becomes your list of places to update.
+
+      This doesn't replace the transition table. The union says what each state looks
+      like. The table, or functions like `ship`, say which moves are legal. You want both.
+  - title: A money value object that behaves like money
+    body: |-
+      Wrapping pence in a frozen object is the start. A useful value object also owns the
+      operations, so the rules about currency and rounding live in one file.
+
+      ```ts
+      type Currency = 'GBP' | 'EUR';
+      type Money = Readonly<{ pence: number; currency: Currency }>;
+
+      function money(pence: number, currency: Currency): Money {
+        if (!Number.isSafeInteger(pence)) throw new Error(`not whole pence: ${pence}`);
+        return Object.freeze({ pence, currency });
+      }
+
+      function add(a: Money, b: Money): Money {
+        if (a.currency !== b.currency) throw new Error(`cannot add ${a.currency} to ${b.currency}`);
+        return money(a.pence + b.pence, a.currency);
+      }
+
+      function equals(a: Money, b: Money): boolean {
+        return a.pence === b.pence && a.currency === b.currency;
+      }
+
+      // Split without losing a penny: the remainder goes to the first shares.
+      function allocate(total: Money, parts: number): Money[] {
+        const base = Math.floor(total.pence / parts);
+        const remainder = total.pence % parts;
+        return Array.from({ length: parts }, (_, i) =>
+          money(base + (i < remainder ? 1 : 0), total.currency),
+        );
+      }
+
+      equals(money(500, 'GBP'), money(500, 'GBP')); // true
+      money(500, 'GBP') === money(500, 'GBP');      // false: two objects
+      allocate(money(1000, 'GBP'), 3);              // 334, 333, 333 pence
+      ```
+
+      Three details are worth saying out loud in a review. `===` compares references, so a
+      value object needs its own `equals`. `add` refuses mixed currencies instead of
+      guessing an exchange rate. And `allocate` exists because `1000 / 3` in pence has no
+      exact answer: splitting a bill three ways must still add up to the bill, so someone
+      gets the extra penny, deliberately.
+
+      `Number.isSafeInteger` also rejects `NaN`, `Infinity` and anything above 2^53 - 1,
+      where integers stop being exact in a JavaScript number. Very large ledgers use
+      `bigint` or a decimal type in the database for that reason.
+  - title: Where an invariant lives when it spans several objects
+    body: |-
+      "Quantity is at least 1" belongs to one order line. "An order's total never exceeds
+      the customer's credit limit" touches the order and every line in it. So which object
+      enforces it?
+
+      The usual answer is an **aggregate**: a cluster of objects treated as one unit for
+      changes, with one root that every change goes through. The order is the root. Lines
+      are reached only through it: `order.addLine()`, `order.setQuantity()`. Because every
+      change passes the root, the root can check any rule that involves the whole cluster.
+      Code outside never holds a line it can change on its own, which is why the lesson's
+      `getLines` returns copies.
+
+      The aggregate is also the unit of consistency. One aggregate is saved in one
+      transaction, so its rules hold whenever it's read. A rule that spans two aggregates,
+      such as "a room is booked by at most one guest a night", can't be enforced by either
+      object alone, because two requests load two separate copies. Those rules move to the
+      database, as a unique constraint or an exclusion constraint, or to a conditional
+      update that fails if someone else got there first.
+
+      A practical guide: keep aggregates small. A customer aggregate that contains every
+      order the customer ever placed makes every change load and lock all of them.
+  - title: The same rules, enforced by the database
+    body: |-
+      Objects protect code that goes through them. An import script, a migration or a
+      second service can write rows directly, so the rules that matter most are repeated
+      in the schema. The database is the last object every write passes through.
+
+      ```sql
+      CREATE TABLE orders (
+        id       integer PRIMARY KEY,
+        state    text NOT NULL DEFAULT 'placed'
+                 CHECK (state IN ('placed', 'paid', 'shipped', 'cancelled')),
+        paid_at  timestamptz,
+        CHECK ((state IN ('paid', 'shipped')) = (paid_at IS NOT NULL))
+      );
+
+      UPDATE orders SET state = 'paid', paid_at = now()
+      WHERE id = 7 AND state = 'placed'
+      RETURNING id, state;
+      ```
+
+      The second `CHECK` says a payment date exists exactly when the order is paid or
+      shipped, which is the discriminated union written in SQL. Trying to set `shipped`
+      with a null `paid_at` fails with "violates check constraint".
+
+      The conditional `UPDATE` is the transition table enforced where the data lives. Run
+      it twice on PostgreSQL and the first returns the row, the second returns none,
+      because the order is no longer `placed`. Two concurrent requests to pay the same
+      order can't both win: one updates one row, the other updates zero and reports a
+      conflict. Checking the state in application code first and then writing it has a
+      gap between the read and the write. The `WHERE` clause closes it.
+pitfalls:
+  - '**Adding one more boolean.** `isRefunded` joins `isPaid` and `isCancelled`, and the combinations double again. When a new status appears, add a state and its moves to the table, never a flag.'
+  - '**Guarding the constructor but not the setters.** The factory checks the quantity, then a `setQuantity` or a direct property write skips it. Every path that changes the data runs the same check, and the data itself stays private.'
+  - '**Trusting `Object.freeze` to go deep.** It freezes one level. Nested arrays and objects stay writable, so freeze each level or copy on the way in and out.'
+  - '**Comparing value objects with `===`.** Two identical amounts are two different objects, so `===` says false. Give the type an `equals` function and use it.'
+  - '**Rounding money in the middle of a calculation.** Floats drift, and rounding each step compounds it. Convert to integer minor units once at the edge, keep integers inside, and use an explicit allocation when a total must split.'
+  - '**Checking the state, then writing it.** A read followed by an update lets two requests both see `placed`. Put the expected state in the `UPDATE ... WHERE` and treat zero affected rows as a conflict.'
+interview:
+  - question: What does "make invalid states unrepresentable" mean, and how do you do it in TypeScript?
+    answer: >-
+      It means designing types so a nonsensical value can't be constructed, so no code has
+      to check for it later. The classic case is a set of boolean flags that allows
+      combinations like shipped and cancelled. I'd replace them with a discriminated union:
+      one `state` literal per variant, each carrying only the fields that exist in that
+      state, so a `placed` order has no `paidAt` to read. Transitions go through
+      functions that accept the right variant, and a `never` check in every switch turns a
+      forgotten new state into a compile error. The trade-off is ceremony: more types and
+      constructors. For data with a real lifecycle, such as orders or bookings, that pays
+      for itself the first time a bad combination would have reached a customer.
+  - question: What's a value object, and why would you wrap something as small as a price?
+    answer: >-
+      A value object is a small immutable type defined by its contents rather than an
+      identity, and valid from construction. Money is the standard example. A bare
+      `number` can't tell you whether it's pounds or pence, or which currency, and it
+      happily adds euros to pounds. A `Money` type stores whole minor units, rejects
+      fractions at the factory, refuses to add different currencies, and has an `equals`
+      and an `allocate` that splits a total without losing a penny. The rules then live in
+      one file instead of every call site. The cost is conversion at the edges, such as
+      JSON and the database, and a little verbosity. I wouldn't wrap every string, only the
+      ones with rules attached: money, email addresses, date ranges, quantities.
+  - question: Where should a business invariant be enforced, and is validating in the API layer enough?
+    answer: >-
+      Inside the object that owns the data, on every operation that changes it, and again in
+      the database for the rules that matter most. API validation guards one entry point.
+      A background job, an admin script or a future endpoint writes through a different
+      door and skips it. If the order itself refuses a quantity of zero, every caller is
+      covered at once. Rules that span several records, like one booking per room per
+      night, can't live in one object because two requests load two copies, so they belong
+      in a unique or exclusion constraint or a conditional update. I'd still validate at
+      the API, but that's for friendly error messages, not for safety.
+  - question: Two requests try to move the same order from paid to shipped at once. How do you keep the state machine correct?
+    answer: >-
+      Make the transition a single conditional write that names the state it expects:
+      `UPDATE orders SET state = 'shipped' WHERE id = $1 AND state = 'paid'`. PostgreSQL
+      applies it atomically per row, so one request updates one row and the other updates
+      zero, which I report as a conflict. Reading the state in application code and then
+      writing it leaves a gap where both requests see `paid`. An alternative is a version
+      column with optimistic locking, which catches any concurrent change, not only state
+      changes. Pessimistic `SELECT ... FOR UPDATE` works too, but it holds a lock for the
+      whole request, which hurts under load, so I'd reserve it for multi-step changes that
+      can't be expressed as one statement.

@@ -1,0 +1,189 @@
+summary: >-
+  Almost every screen in an app is a filtered, sorted, shortened list: the open tasks, the
+  newest messages, the next three bookings. `WHERE`, `ORDER BY` and `LIMIT` are how you
+  ask the database for exactly that list, so it sends only the rows the screen needs.
+
+
+  Doing this in the database rather than in your code matters for two reasons. It moves
+  fewer rows over the network, and the database can use an index to find them without
+  reading the whole table. Fetching everything and filtering in JavaScript works on ten
+  rows and falls over on ten million.
+
+
+  The part that trips people is NULL. SQL uses three-valued logic: a condition can be true,
+  false or unknown, and `WHERE` keeps only true. Once you see NULL as "unknown", the odd
+  results stop being odd: `= NULL` matches nothing, `<> 'sam'` skips the unassigned rows,
+  and `NOT IN` with a NULL in the list returns nothing at all.
+remember:
+  - "`WHERE` keeps a row only when its condition is true, so rows where it's false or unknown are both dropped."
+  - Any comparison with NULL gives unknown, so test for missing values with `IS NULL` and `IS NOT NULL`.
+  - "`AND` binds tighter than `OR`, so bracket every mix of the two."
+  - Without `ORDER BY` the row order is undefined, and `LIMIT` without `ORDER BY` returns an arbitrary set of rows.
+  - Add a unique column such as `id` as the last sort key, so rows with equal values come back in a stable order.
+  - "`x NOT IN (list)` returns no rows at all if the list contains a NULL, so prefer `NOT EXISTS`."
+  - Filter time ranges as half-open intervals, `>= start AND < end`, rather than with `BETWEEN`.
+  - Postgres sorts NULLs last in ascending order and first in descending order, unless you write `NULLS FIRST` or `NULLS LAST`.
+sections:
+  - title: Three-valued logic, and the NOT IN trap
+    body: |-
+      With NULL in play, conditions have three outcomes. The rules follow from reading NULL
+      as "some value, we don't know which":
+
+      ```text
+      true  AND unknown  ->  unknown     false AND unknown  ->  false
+      true  OR  unknown  ->  true        false OR  unknown  ->  unknown
+      NOT unknown        ->  unknown
+      ```
+
+      `false AND unknown` is false because whatever the unknown value is, the whole can't be
+      true. `true OR unknown` is true for the same reason.
+
+      The worst consequence is `NOT IN`. `x NOT IN (a, b)` means `x <> a AND x <> b`. If one
+      of the values is NULL, that part is unknown, so the whole condition can never be true:
+
+      ```sql
+      CREATE TABLE members (id integer PRIMARY KEY, name text NOT NULL);
+      CREATE TABLE loans (book_id integer, member_id integer);
+      INSERT INTO members VALUES (1, 'Ana'), (2, 'Ben'), (3, 'Cara');
+      INSERT INTO loans VALUES (10, 1), (11, NULL);
+      SELECT name FROM members WHERE id NOT IN (SELECT member_id FROM loans);
+      SELECT name FROM members m
+      WHERE NOT EXISTS (SELECT 1 FROM loans l WHERE l.member_id = m.id);
+      ```
+
+      The first query returns no rows, though Ben and Cara have no loans. One stray NULL in
+      `loans.member_id` wiped the result. The `NOT EXISTS` version returns Ben and Cara,
+      because it asks "is there a matching row?", which is plain true or false.
+
+      `IS DISTINCT FROM` is the NULL-safe comparison. It treats two NULLs as equal and NULL
+      as different from any value, so it always answers true or false.
+  - title: Sorting you can rely on
+    body: |-
+      `ORDER BY` is the only thing that fixes row order. Without it, Postgres returns rows in
+      whatever order its plan produces them, which can change after an update, a `VACUUM`
+      or a new index.
+
+      Two details make sorts dependable. First, ties. `ORDER BY due` leaves tasks with the
+      same due date in any order, so a paged list can show one task on two pages and skip
+      another. Add a unique column last: `ORDER BY due, id`.
+
+      Second, NULLs. Postgres treats NULL as larger than every value, so NULLs come last in
+      ascending order and first in descending order. You can say which you want:
+
+      ```sql
+      CREATE TABLE tasks (id integer PRIMARY KEY, title text NOT NULL, due date);
+      INSERT INTO tasks VALUES (1, 'Renew domain', '2026-10-01'), (2, 'Update logo', NULL),
+        (3, 'Write notes', '2026-10-02'), (4, 'Back up', '2026-10-01');
+      SELECT id, title, due FROM tasks ORDER BY due DESC NULLS LAST, id;
+      ```
+
+      This lists the latest due dates first, puts the undated task at the end, and orders
+      tasks 1 and 4, which share a date, by id. Without `NULLS LAST`, the undated task would
+      come first in a descending sort.
+
+      Text sorts by the database's collation, the rules for a language's alphabet. Upper
+      and lower case, accents and spaces can sort differently from what a plain byte
+      comparison in JavaScript gives.
+  - title: The other filters you'll reach for
+    body: |-
+      A few operators cover most real filters.
+
+      - `IN (...)`: `WHERE status IN ('open', 'waiting')` is shorter than two `OR`s and
+        means the same.
+      - `LIKE` and `ILIKE`: pattern matching, where `%` matches any run of characters and
+        `_` matches one. `ILIKE` ignores case and is a Postgres extension.
+      - `BETWEEN a AND b`: includes both ends.
+
+      That last point makes `BETWEEN` wrong for times. `due BETWEEN '2026-10-01' AND
+      '2026-10-31'` on a `timestamptz` column stops at midnight at the start of the 31st,
+      and misses the rest of that day. Use a half-open range, which never double-counts
+      and never leaves a gap between one month and the next:
+
+      ```sql
+      CREATE TABLE bookings (id integer PRIMARY KEY, starts_at timestamptz NOT NULL);
+      INSERT INTO bookings VALUES (1, '2026-10-31 14:00+00'), (2, '2026-11-01 00:00+00');
+      SELECT id FROM bookings
+      WHERE starts_at BETWEEN '2026-10-01 00:00+00' AND '2026-10-31 00:00+00';
+      SELECT id FROM bookings
+      WHERE starts_at >= '2026-10-01 00:00+00' AND starts_at < '2026-11-01 00:00+00';
+      ```
+
+      The `BETWEEN` query misses booking 1. The half-open query finds it, and booking 2
+      rightly belongs to November.
+
+      A search box that becomes `WHERE title ILIKE '%' || $1 || '%'` needs two cares. The
+      user's own `%` and `_` act as wildcards unless you escape them. And a pattern that
+      starts with `%` can't use an ordinary B-tree index, so it reads every row. Real
+      search usually moves to full-text search or a trigram index.
+  - title: Pages that stay fast
+    body: |-
+      `LIMIT 20 OFFSET 4000` reads 4,020 rows and throws 4,000 away, so deep pages get
+      slower. It also shifts: if a row is inserted above the page while someone reads, the
+      next page repeats a row.
+
+      **Keyset pagination** remembers where the last page ended and asks for rows after it.
+      With a tie-breaker, the cleanest form in Postgres compares rows as pairs:
+
+      ```sql
+      CREATE TABLE messages (id integer PRIMARY KEY, sent_at timestamptz NOT NULL);
+      INSERT INTO messages
+      SELECT g, '2026-09-01 00:00+00'::timestamptz + (g / 3) * interval '1 minute'
+      FROM generate_series(1, 12) AS g;
+      SELECT id, sent_at FROM messages ORDER BY sent_at, id LIMIT 4;
+      SELECT id, sent_at FROM messages
+      WHERE (sent_at, id) > ('2026-09-01 00:01+00', 4)
+      ORDER BY sent_at, id LIMIT 4;
+      ```
+
+      The first page ends at message 4. The second query starts from that pair and returns
+      messages 5 to 8, with no repeats even though several messages share a timestamp.
+      `(a, b) > (x, y)` means `a > x OR (a = x AND b > y)`, and an index on
+      `(sent_at, id)` serves it directly.
+
+      The trade-off: keyset pages can't jump to page 50, only forwards and backwards.
+      That suits feeds and infinite scroll. Admin tables with page numbers often keep
+      `OFFSET` and cap how deep it goes.
+pitfalls:
+  - '**Writing `= NULL` or `<> NULL`.** Both are always unknown, so the query quietly returns nothing. Use `IS NULL` and `IS NOT NULL`.'
+  - '**Forgetting the NULL rows in a "not equal" filter.** `assignee <> ''sam''` also drops unassigned rows. Add `OR assignee IS NULL`, or use `assignee IS DISTINCT FROM ''sam''`.'
+  - '**`NOT IN` over a column that can be NULL.** One NULL empties the result. Use `NOT EXISTS`.'
+  - '**Mixing `AND` and `OR` without brackets.** `AND` wins, so extra rows sneak in. Bracket the `OR`.'
+  - '**Relying on the order rows happen to come back in.** It holds in development and breaks in production. Always `ORDER BY`, with a unique tie-breaker.'
+  - '**`BETWEEN` on timestamps.** The end is included at midnight and the rest of the last day is lost. Use `>= start AND < next_start`.'
+  - '**Filtering in application code.** Fetching all rows and calling `.filter()` moves the whole table over the network. Put the condition in `WHERE`.'
+interview:
+  - question: Why does `WHERE deleted_at = NULL` return nothing, and what else behaves oddly because of NULL?
+    answer: >-
+      Because SQL uses three-valued logic and any comparison with NULL is unknown, not true,
+      while `WHERE` keeps only true rows. The fix is `IS NULL`. The same rule drops NULL rows
+      from `col <> 'x'`, makes `NOT IN` return nothing when its list holds a NULL, and makes
+      `count(col)` skip NULLs. `IS DISTINCT FROM` gives a NULL-safe comparison, and
+      `NOT EXISTS` avoids the `NOT IN` trap. The design lesson is to make columns
+      `NOT NULL` unless missing really is a state you need, so the question rarely arises.
+  - question: How would you paginate an endpoint that lists millions of rows?
+    answer: >-
+      With keyset pagination: order by a sort column plus a unique tie-breaker, and fetch
+      rows after the last pair the client saw, `WHERE (created_at, id) < ($1, $2) ORDER BY
+      created_at DESC, id DESC LIMIT 50`, backed by an index on those two columns. Each
+      page then costs the same however deep it is, and inserts don't cause repeats or gaps.
+      `OFFSET` reads and discards every skipped row, so page 10,000 is slow, and it shifts
+      when rows are added. The trade-off is that keyset can't jump to an arbitrary page
+      number, so I'd use it for feeds and APIs and accept `OFFSET` for small admin tables.
+  - question: A query with `ORDER BY created_at LIMIT 20` sometimes shows the same item on two pages. Why?
+    answer: >-
+      Because several rows share a `created_at`, and the order among ties isn't defined, so
+      each page request can break the ties differently. The fix is a unique tie-breaker,
+      `ORDER BY created_at, id`, which makes the order total and repeatable. If the pages
+      use `OFFSET`, rows inserted between requests shift everything too, which keyset
+      pagination avoids. The general rule is that any sort feeding pagination must end in a
+      unique column.
+  - question: How do you select all bookings in October?
+    answer: >-
+      With a half-open range: `starts_at >= '2026-10-01' AND starts_at < '2026-11-01'`, with
+      the time zone stated for a `timestamptz` column. `BETWEEN` includes both ends, so
+      ending at `'2026-10-31'` means midnight at the start of the 31st and loses that
+      day, while ending at `'2026-11-01'` double-counts a booking at exactly midnight in
+      two months. Half-open ranges tile with no gaps and no overlaps, and an index on
+      `starts_at` serves them. Avoid wrapping the column in a function, such as
+      `date_trunc('month', starts_at) = ...`, because a plain index on the column can't be
+      used then.

@@ -1,0 +1,338 @@
+id: cloud.reverse-proxies
+title: Reverse proxies and load balancing
+objective: Put a reverse proxy in front of an app, end TLS there, spread requests over instances, and see what sticky sessions hide.
+level: essential
+minutes: 10
+concepts: [cloud.reverse-proxy, cloud.tls-termination, cloud.load-balancing, cloud.sticky-sessions]
+prerequisites: [cloud.compose, cloud.dns-and-tls, backend.sessions-and-tokens]
+opening:
+  text: >-
+    You'll put one front door before two copies of your app, with HTTPS on it. Then you'll
+    see what breaks when a copy dies, and how to stop visitors noticing.
+
+steps:
+  - type: prose
+    id: name-proxy-and-balancer
+    body: |-
+      So far the browser talks to your app directly. In production, something usually sits
+      in between:
+
+      ```text
+      browser ──> proxy ──> app1
+                       └──> app2
+      ```
+
+      A **reverse proxy** is a server that passes each request to an app behind it, an
+      **upstream**. The browser only sees the proxy. With two copies behind it, the proxy is
+      also a **load balancer**: it picks a copy for each request. We'll use Caddy, a web
+      server that can proxy.
+
+  - type: predict-output
+    id: predict-round-robin
+    concept: cloud.load-balancing
+    difficulty: 1
+    language: bash
+    code: |
+      # Caddyfile: Caddy's config file
+      localhost {
+        reverse_proxy app1:8080 app2:8080 {
+          lb_policy round_robin     # take turns
+        }
+      }
+
+      # each app replies with its own name
+      $ curl -sk https://localhost/
+      app1
+      $ curl -sk https://localhost/
+      app2
+      $ curl -sk https://localhost/
+    question: What does the third request print?
+    choices:
+      - text: '`app1`'
+        correct: true
+        feedback: >-
+          Right. Ours went app1, app2, app1, app2. Each copy gets half the work.
+      - text: '`app2` again'
+        feedback: >-
+          That would be a proxy with a favourite. Round robin gives each copy a turn, in order.
+      - text: It's random
+        feedback: >-
+          A random policy exists too. `round_robin` is strict: one each, in turn.
+
+  - type: prose
+    id: name-tls-termination
+    body: >-
+      The proxy is also where HTTPS lives. It holds the certificate and decrypts each
+      request. Then it forwards plain HTTP over the private network to the app. That's
+      **TLS termination**. The apps need no certificates at all.
+
+
+      The proxy tells the app what it saw, in headers. `X-Forwarded-Proto` holds the scheme
+      the browser used. `X-Forwarded-For` holds the browser's address.
+
+  - type: predict-output
+    id: predict-tls-ends-at-proxy
+    concept: cloud.tls-termination
+    difficulty: 2
+    language: js
+    code: |
+      // the app behind Caddy. The browser asked for https://localhost/
+      http.createServer((req, res) => {
+        const proto = req.headers['x-forwarded-proto'];   // set by the proxy
+        const tls = Boolean(req.socket.encrypted);        // is this socket encrypted?
+        res.end(`proto=${proto} tls=${tls}\n`);
+      }).listen(8080, '0.0.0.0');
+    question: The padlock shows in the browser. What does the app reply?
+    choices:
+      - text: '`proto=https tls=true`'
+        feedback: >-
+          The browser's encrypted connection ends at the proxy. The hop to the app is a new,
+          plain one.
+      - text: '`proto=https tls=false`'
+        correct: true
+        feedback: >-
+          Right. That's what ours printed. The proxy decrypted, then forwarded plain HTTP.
+      - text: '`proto=http tls=false`'
+        feedback: >-
+          The app's own connection is plain, true. But the header reports what the browser
+          used.
+
+  - type: prose
+    id: name-health-checks
+    body: >-
+      What if one copy crashes? The proxy tries to reach it, fails, and answers `502 Bad
+      Gateway`, as in the backend chapter. Round robin keeps giving the dead copy its turn.
+
+
+      A **health check** fixes that. The proxy asks each upstream for a path such as
+      `/health` every few seconds. A copy that doesn't answer is skipped until it does.
+
+  - type: bug-hunt
+    id: hunt-no-health-check
+    concept: cloud.load-balancing
+    difficulty: 2
+    language: bash
+    code: |
+      localhost {
+        reverse_proxy app1:8080 app2:8080 {
+          lb_policy round_robin
+        }
+      }
+
+      $ docker compose stop app2
+      # print only the status code of four requests
+      $ for i in 1 2 3 4; do curl -sk -o /dev/null -w '%{http_code} ' https://localhost/; done
+      200 502 200 502
+    prompt: >-
+      app2 crashed, and every other visitor gets an error page. Tap the line that needs more
+      config.
+    lines: [2]
+    reasons:
+      - text: The proxy never checks if an upstream is alive
+        correct: true
+        feedback: >-
+          Yes. Add `health_uri /health`, and all four requests came back 200.
+      - text: '`round_robin` should pick at random'
+        feedback: >-
+          A random policy still lands on app2 about half the time. The proxy needs to know
+          it's dead.
+      - text: '`curl -k` turns the 200s into 502s'
+        feedback: >-
+          `-k` only skips the certificate check. The 502s come from the proxy failing to
+          reach app2.
+    fix: |
+      reverse_proxy app1:8080 app2:8080 {
+        lb_policy round_robin
+        health_uri /health       # ask each app for this path...
+        health_interval 2s       # ...every two seconds
+      }
+
+  - type: prose
+    id: name-sticky-sessions
+    body: |-
+      Our app counts each visitor's requests in memory. Round robin splits the count between
+      two copies. So we told Caddy to send each browser to the same copy, with a cookie.
+      That's a **sticky session**. Then we stopped that copy:
+
+      ```bash
+      app2 count 5
+      app2 count 6
+      $ docker compose stop app2
+      app1 count 1
+      ```
+
+      The visit carried on. The count didn't.
+
+  - type: ai-review
+    id: review-trusts-forwarded-for
+    concept: cloud.reverse-proxy
+    difficulty: 3
+    language: js
+    request: We're behind nginx now. Block abusive visitors by their IP address.
+    flawClass: security
+    code: |
+      // nginx, another proxy, keeps any X-Forwarded-For the client
+      // sent, and adds the address it saw at the end.
+      function clientIp(req) {
+        const forwarded = req.headers['x-forwarded-for'];
+        return forwarded.split(',')[0].trim();
+      }
+
+      function isBlocked(req) {
+        return blockedIps.includes(clientIp(req));
+      }
+    prompt: >-
+      The tests sent no `X-Forwarded-For` of their own, so they passed. A blocked visitor
+      now gets straight back in. Tap the line at fault.
+    lines: [5]
+    reasons:
+      - text: The first entry is whatever the client typed
+        correct: true
+        feedback: >-
+          Yes. We sent `10.0.0.1`, and the app saw `10.0.0.1, 172.66.172.252`. Trust the last.
+      - text: '`includes` is too slow for a block list'
+        feedback: >-
+          Speed isn't how they got in. They chose which address the check would see.
+      - text: The header name should be in capitals
+        feedback: >-
+          Node lower-cases header names, so this lookup works. Look at which part of the value
+          is used.
+    fix: |
+      // the last entry is the one your own proxy added
+      const parts = forwarded.split(',');
+      return parts[parts.length - 1].trim();
+
+  - type: code-challenge
+    id: write-client-ip
+    concept: cloud.tls-termination
+    difficulty: 4
+    language: ts
+    editable: '6-8'
+    prompt: >-
+      Write `clientIp(forwardedFor, proxies)`. Your app sits behind `proxies` proxies that
+      you run, such as a CDN and Caddy. Each one adds the address it saw to the end of
+      `X-Forwarded-For`.
+
+
+      So the visitor's address is the entry `proxies` places from the end. Anything before it
+      came from the client and can't be trusted. Trim the spaces. Return `null` when the
+      header is missing or has too few entries.
+
+
+      `clientIp('10.0.0.1, 203.0.113.7, 198.51.100.2', 2)` returns `'203.0.113.7'`.
+    hints:
+      - Split the header on commas first. Everything else works on that list.
+      - With one proxy, you want the last entry. With two, the one before it.
+      - '`parts.length - proxies` is the index to read. Check it isn''t below 0.'
+
+  - type: explain-back
+    id: explain-sticky-hides-state
+    concept: cloud.sticky-sessions
+    difficulty: 3
+    prompt: >-
+      A team keeps login sessions in each app's memory, and turns on sticky sessions so users
+      stay logged in. Why does that still fail them during a deploy?
+    rubric:
+      - Sticky sessions send each user to one instance, so state kept in its memory appears to work.
+      - A deploy or crash replaces that instance, and the memory holding those sessions is gone.
+      - Keeping sessions in a shared store, such as the database or Redis, lets any instance serve any user.
+    modelAnswer: >-
+      Stickiness hides the problem. It doesn't remove it. Each user's session lives in one
+      instance's memory, and the proxy keeps sending them there. A deploy replaces instances.
+      When a user's instance goes, the proxy picks another, and that one has never heard of
+      them. They're logged out mid-task, the way our counter fell from 6 to 1. The fix is to
+      keep sessions somewhere every instance can read, like the database or Redis. Then any
+      instance will do, and stickiness isn't needed.
+
+recap:
+  - Put a reverse proxy in front of several app instances, with a policy and health checks.
+  - End TLS at the proxy, and read the client's address from the right end of `X-Forwarded-For`.
+  - Treat sticky sessions as a patch, and keep state where every instance can reach it.
+
+recall:
+  - id: card-reverse-proxy
+    concept: cloud.reverse-proxy
+    front: What does a reverse proxy do, and what do clients see?
+    back: >-
+      It accepts client connections and forwards each request to an app server behind it.
+      Clients only see the proxy.
+  - id: card-tls-termination
+    concept: cloud.tls-termination
+    front: Where does TLS end in a typical proxy setup, and how does the app learn the scheme?
+    back: >-
+      At the proxy, which holds the certificate. The app gets plain HTTP, with the original
+      scheme in `X-Forwarded-Proto`.
+  - id: card-health-checks-lb
+    concept: cloud.load-balancing
+    front: Why does a load balancer need health checks?
+    back: >-
+      Without them it keeps sending a dead instance its turn, so a share of requests fail
+      with 502. With them, the dead instance is skipped.
+  - id: card-sticky
+    concept: cloud.sticky-sessions
+    front: What do sticky sessions hide, and when does it show?
+    back: >-
+      State kept in one instance's memory. It shows when that instance is replaced, and the
+      user's state goes with it.
+
+references:
+  - kind: docs
+    title: reverse_proxy (Caddyfile directive)
+    authors: Caddy
+    venue: Caddy Documentation
+    url: https://caddyserver.com/docs/caddyfile/directives/reverse_proxy
+    note: '`lb_policy` and its values, `health_uri`, `health_interval`, and the headers Caddy sets.'
+    primary: true
+    verified: true
+  - kind: docs
+    title: Automatic HTTPS
+    authors: Caddy
+    venue: Caddy Documentation
+    url: https://caddyserver.com/docs/automatic-https
+    note: How Caddy gets and renews certificates, and its local authority for `localhost`.
+    verified: true
+  - kind: docs
+    title: Module ngx_http_upstream_module
+    authors: nginx
+    venue: nginx documentation
+    url: https://nginx.org/en/docs/http/ngx_http_upstream_module.html
+    note: '`upstream`, `server`, `least_conn` and `ip_hash`, and which directives need the commercial version.'
+    primary: true
+    verified: true
+  - kind: docs
+    title: Using nginx as HTTP load balancer
+    authors: nginx
+    venue: nginx documentation
+    url: https://nginx.org/en/docs/http/load_balancing.html
+    note: Round robin, least connections and session persistence, with example configs.
+    verified: true
+
+deepDive: >-
+  Everything ran in Docker Compose: Caddy 2.11.4 in front of two Node 24 apps. Round robin
+  answered app1, app2, app1, app2. With app2 stopped and no health check, the four requests
+  returned `200 502 200 502`. Caddy logged `dial tcp: lookup app2 on 127.0.0.11:53: no
+  such host`. With `health_uri /health` and `health_interval 2s`, all four returned 200 five
+  seconds after the stop. The log showed each failed check. In the seconds before a check
+  fails, a request can still land on the dead app. Caddy can retry it on another upstream
+  with `lb_try_duration`, and remember a failure for a while with `fail_duration`.
+
+
+  `lb_policy least_conn` sends each request to the upstream with the fewest in flight. It
+  suits an endpoint that calls a language model. One request takes 50 ms and the next takes
+  20 seconds, so turns alone can pile work onto one copy. The sticky run used `lb_policy
+  cookie`: Caddy set a cookie named `lb`, and a new one when app2 was gone.
+
+
+  The `X-Forwarded-For` test ran against nginx 1.31 with `proxy_set_header X-Forwarded-For
+  $proxy_add_x_forwarded_for`. We sent `10.0.0.1` and the app saw `10.0.0.1,
+  172.66.172.252`, the second being the address Docker's network showed nginx. Caddy
+  replaced the header we sent, because it doesn't trust clients by default. Know which one
+  your proxy does before your app reads that header. Express's `trust proxy` setting and the
+  `proxy-addr` package count proxies from the right, as the challenge does.
+
+
+  Open-source nginx balances round robin by default, and offers `least_conn` and `ip_hash`.
+  Its documentation lists `sticky cookie` and active `health_check` as part of the
+  commercial subscription. Caddy served `localhost` with a certificate from "Caddy Local
+  Authority", which is why `curl` needed `-k`. On a public domain, the same Caddyfile with
+  a real name gets a public certificate by ACME, as lesson 3 described.

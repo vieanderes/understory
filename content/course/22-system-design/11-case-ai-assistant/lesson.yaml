@@ -1,0 +1,273 @@
+id: sysdesign.case-ai-assistant
+title: "Case study: an AI assistant over company documents"
+objective: "Design an AI assistant over company documents as an interview wants: requirements, given numbers, both pipelines, permissions, freshness and failure modes."
+level: advanced
+minutes: 10
+concepts: [sysdesign.llm-system-design, sysdesign.graceful-degradation]
+prerequisites: [sysdesign.case-news-feed, ai.rag, aisys.retrieval-in-depth, aisys.cost-and-latency]
+opening:
+  text: >-
+    You'll design an assistant that answers staff questions from company documents, the way
+    a senior AI interview wants it. It's the AI design question you're most likely to get.
+
+steps:
+  - type: prose
+    id: assistant-requirements
+    body: |-
+      The brief: "Design an assistant that answers employees' questions from our internal
+      documents." Spend the first five minutes on requirements.
+
+      - Answer from the wiki, tickets and policies, citing the source.
+      - Use only documents the person asking may read.
+      - Say "I don't know" when nothing fits.
+      - First words within two seconds; an edited page counts within an hour.
+
+  - type: prose
+    id: given-numbers
+    body: |-
+      Then the interviewer hands you numbers. Don't do sums. Say what they mean.
+
+      - 100,000 questions a day, about 10 a second at peak
+      - 2 million documents, about 50 million **chunks**, short passages
+      - about 4,000 tokens of instructions and chunks per question
+
+      Ten a second is small. Four thousand tokens each is heavy, and cost and latency
+      follow the tokens.
+
+  - type: multiple-choice
+    id: pick-design-driver
+    concept: sysdesign.llm-system-design
+    difficulty: 1
+    question: Which of those numbers drives the design most?
+    choices:
+      - text: About 4,000 tokens per question
+        correct: true
+        feedback: >-
+          Yes. Tokens set the cost and the wait. Cut them and both fall.
+      - text: About 10 questions a second
+        feedback: >-
+          One small server pool handles that. The weight is inside each request.
+      - text: 20,000 employees
+        feedback: >-
+          Headcount only matters through the questions and tokens it produces.
+
+  - type: prose
+    id: assistant-sketch
+    body: |-
+      Now the sketch. It has two paths.
+
+      **Ingestion** runs in the background. It splits changed documents into chunks. Each is
+      stored as an **embedding**, numbers that put similar meanings close together, with its
+      access list.
+
+      The **query path** runs per question. Check who's asking, and search only chunks they
+      may read. **Rerank** the hits with a slower, sharper model, then prompt with the best
+      few and stream the answer.
+    figure:
+      id: rag-pipeline
+      caption: The model only sees the chunks search kept, so search quality caps answer quality.
+
+  - type: parsons
+    id: order-query-path
+    concept: sysdesign.llm-system-design
+    difficulty: 2
+    prompt: Put the query path in order, from the question to the answer.
+    language: yaml
+    blocks:
+      - id: who
+        code: 'who: look up the groups the asker belongs to'
+        subgoal: Find sources
+      - id: search
+        code: 'search: nearest 50 chunks, only from those groups'
+      - id: rerank
+        code: 'rerank: keep the best 5 of the 50'
+      - id: prompt
+        code: 'prompt: the question plus the 5 chunks, with their sources'
+        subgoal: Answer
+      - id: stream
+        code: 'stream: the answer with citations as it''s written'
+      - id: trace
+        code: 'trace: log the prompt version and chunk ids, no personal data'
+        subgoal: Learn from it
+    distractors:
+      - id: ask-model
+        code: 'check: ask the model which documents the user may see'
+        feedback: >-
+          Access is a rule your code enforces. A model can be talked into anything.
+
+  - type: prose
+    id: data-and-freshness
+    body: |-
+      The data: a chunks table with the document id, the text, its embedding, the access
+      groups and when it changed. Postgres with pgvector can hold it. A dedicated vector
+      store is the trade-off to name, for scale against running one more system.
+
+      Freshness: sources send change events to a queue, and workers re-embed only what
+      changed. A deleted page or revoked access must remove chunks at once.
+
+  - type: ai-review
+    id: review-permission-filter
+    concept: sysdesign.llm-system-design
+    difficulty: 3
+    language: ts
+    request: Retrieve the passages for a question, respecting document permissions.
+    flawClass: logic
+    code: |
+      async function retrieve(question: string, user: User) {
+        const vector = await embed(question);
+        const hits = await index.search(vector, { topK: 5 });
+        return hits.filter((hit) => hit.groups.some((g) => user.groups.includes(g)));
+      }
+    prompt: >-
+      An assistant wrote this. No one sees a forbidden document. But people in small teams
+      often get "I don't know" for questions their own docs answer. Tap the line at fault.
+    lines: [3]
+    reasons:
+      - text: It ranks everyone's chunks, then filters
+        correct: true
+        feedback: >-
+          Yes. Pass the groups into the search, so the top 5 are all readable.
+      - text: Five passages is too few
+        feedback: >-
+          More helps a little. Filtering inside the search fixes it properly.
+      - text: The filter leaks forbidden documents
+        feedback: >-
+          It removes them, so nothing leaks. It leaves too little behind.
+    fix: |
+      const hits = await index.search(vector, { topK: 5, filter: { groups: user.groups } });
+      return hits;
+
+  - type: prose
+    id: name-degradation
+    body: |-
+      Now the failures, unprompted, as **graceful degradation** in a planned order. The main
+      model is overloaded? Retry with backoff, then a smaller model. No model at all? Show
+      the search results as links.
+
+      Search down? Don't let the model guess; point people to the help desk. The permission
+      check down? Refuse. Access control never degrades.
+
+  - type: code-challenge
+    id: write-pick-route
+    concept: sysdesign.graceful-degradation
+    difficulty: 4
+    language: ts
+    prompt: >-
+      Write `pickRoute(s)`. `s.cached` says whether a vetted answer exists for this question.
+      `s.permissions`, `s.retrieval`, `s.primary` and `s.fallback` are each `'ok'` or
+      `'down'`.
+
+
+      Apply in order. Permissions down gives `'refuse'`. A cached answer gives
+      `'cached-answer'`. Retrieval down gives `'help-desk'`. Primary ok gives `'primary'`.
+      Fallback ok gives `'fallback-model'`. Otherwise return `'search-results'`.
+    hints:
+      - The order is the whole design. Return as soon as a rule matches.
+      - A healthy model can't help without sources or without knowing who's asking.
+      - 'Start with `if (s.permissions === ''down'') return ''refuse'';`'
+
+  - type: explain-back
+    id: explain-fail-closed
+    concept: sysdesign.graceful-degradation
+    difficulty: 4
+    prompt: >-
+      When the model is down, the assistant shows search results. When the permission check
+      is down, it refuses. Why treat them differently?
+    rubric:
+      - A weaker answer is recoverable, since people can read the results or ask again.
+      - Searching without the permission check could show someone a document they mustn't see.
+      - So paths that only lose quality degrade, and paths that guard access fail closed.
+    modelAnswer: >-
+      It's about what a mistake costs. Search results instead of an answer are less
+      helpful, but nobody is harmed. Without the permission check, a search could show a
+      salary review to the wrong person. That can't be undone. So the answer path degrades, and access control
+      fails closed.
+
+recap:
+  - Start from requirements, and read given numbers for what drives the design.
+  - Sketch ingestion and the query path, with permissions inside the search.
+  - Degrade answers in a planned order, and let access control fail closed.
+
+recall:
+  - id: card-driver
+    concept: sysdesign.llm-system-design
+    front: What usually drives the design of an LLM assistant, requests or tokens?
+    back: >-
+      Tokens. Requests per second are often low, but each call carries thousands of tokens,
+      so cost and latency follow the context size.
+  - id: card-pipeline
+    concept: sysdesign.llm-system-design
+    front: What are the two paths of a document assistant?
+    back: >-
+      Ingestion, which chunks, embeds and stores changed documents with their access lists,
+      and the query path, which searches, reranks, prompts and streams.
+  - id: card-filter-first
+    concept: sysdesign.llm-system-design
+    front: Where does the permission filter belong in retrieval?
+    back: >-
+      Inside the search, before the top k is chosen. Filtering afterwards leaves too little.
+  - id: card-fallback-order
+    concept: sysdesign.graceful-degradation
+    front: Give a sensible fallback order when the main model is overloaded.
+    back: >-
+      Retry with backoff, then a smaller model, then show search results as links.
+  - id: card-fail-closed
+    concept: sysdesign.graceful-degradation
+    front: Which parts of an assistant should fail closed rather than degrade?
+    back: >-
+      Anything that guards access or takes an irreversible action, such as the permission
+      check.
+
+references:
+  - kind: paper
+    title: Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks
+    authors: Patrick Lewis et al.
+    year: 2020
+    venue: NeurIPS 2020
+    url: https://arxiv.org/abs/2005.11401
+    note: The paper that named retrieval-augmented generation.
+    primary: true
+    verified: true
+  - kind: essay
+    title: Introducing Contextual Retrieval
+    authors: Anthropic
+    year: 2024
+    venue: Anthropic
+    url: https://www.anthropic.com/news/contextual-retrieval
+    note: Chunking, hybrid search and reranking, measured on retrieval failures.
+    verified: true
+  - kind: source
+    title: pgvector
+    authors: Andrew Kane
+    venue: GitHub
+    url: https://github.com/pgvector/pgvector
+    note: Vector search in Postgres, including how filters interact with approximate indexes.
+    primary: true
+    verified: true
+
+deepDive: >-
+  How the 45 minutes usually go: requirements for five, numbers for five, the sketch for
+  ten, then the interviewer picks a deep dive for fifteen. Leave the last ten for failures
+  and how you'd measure it. Say trade-offs as you go: "pgvector, because it's one less
+  system; a dedicated store past a few hundred million chunks".
+
+
+  What interviewers probe. How would you know a prompt change made answers worse? Keep a
+  set of real questions with known source documents, and run it before every change.
+  Score retrieval (did the right document come back?) apart from the answer (does it stick
+  to the sources?). How do you stop a document telling the model to do something?
+  Treat retrieved text as data, never instructions, and give the model no tools that write.
+  What would you cache? Vetted answers to the most common questions, keyed by the asker's
+  access groups. How would you cut cost? Fewer, better chunks; a cached prompt prefix; a
+  small model for simple questions.
+
+
+  The filter-after-search trap is real in pgvector too. With an approximate index, a
+  `WHERE` on the access groups is applied after the index scan, so a narrow filter can
+  return fewer rows than asked. Its README describes iterative index scans that keep
+  searching until enough rows pass.
+
+
+  Freshness has a hard edge. An edited page can take an hour to show. A revoked permission
+  can't: it must remove access at once, so it travels on its own fast path, not the
+  re-embedding queue.

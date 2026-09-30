@@ -1,0 +1,269 @@
+id: sysdesign.rate-limiting
+title: Rate limiting
+objective: Implement token bucket and sliding window limits, share them across servers with Redis, and answer with 429 and Retry-After.
+level: advanced
+minutes: 10
+concepts: [sysdesign.token-bucket, sysdesign.window-limits, sysdesign.distributed-rate-limits]
+prerequisites: [sysdesign.replication, security.abuse-and-privacy, scale.failure-handling]
+opening:
+  text: >-
+    You'll build a rate limit that holds at the edge of a minute and across ten servers. Most
+    homemade limiters leak at exactly those two places.
+
+steps:
+  - type: prose
+    id: limits-recap
+    body: |-
+      You built a **token bucket** in the Security chapter. A bucket holds up to N tokens and
+      refills at a steady rate. Each request spends one, and an empty bucket answers `429`.
+
+      That works on one server. This lesson adds the two places homemade limiters leak: the
+      edge of a time window, and many servers sharing one limit.
+
+  - type: multiple-choice
+    id: pick-bucket-burst
+    concept: sysdesign.token-bucket
+    difficulty: 1
+    question: A token bucket holds 10 and refills one a second. An idle client sends 15 requests at once. What happens?
+    choices:
+      - text: 10 pass now, then about one a second
+        correct: true
+        feedback: >-
+          Right. A full bucket allows a burst, and the refill sets the pace.
+      - text: All 15 pass
+        feedback: >-
+          The bucket caps at 10 tokens, however long the client was idle.
+      - text: One passes, then one a second
+        feedback: >-
+          That's a strict pacer. A bucket saves up tokens, so bursts are allowed.
+
+  - type: predict-output
+    id: predict-edge-burst
+    concept: sysdesign.window-limits
+    difficulty: 2
+    language: js
+    code: |
+      const limit = 100;
+      const counts = new Map();
+      function allow(ms) {
+        const minute = Math.floor(ms / 60000);
+        const used = counts.get(minute) ?? 0;
+        if (used >= limit) return false;
+        counts.set(minute, used + 1);
+        return true;
+      }
+      let accepted = 0;
+      for (let i = 0; i < 100; i++) if (allow(59900)) accepted++;
+      for (let i = 0; i < 100; i++) if (allow(60100)) accepted++;
+      console.log(accepted);
+    question: The limit is 100 a minute. 200 requests arrive within 0.2 seconds. What does it log?
+    choices:
+      - text: '`200`'
+        correct: true
+        feedback: >-
+          Right. The bursts fall either side of the minute, so each gets a fresh count.
+      - text: '`100`'
+        feedback: >-
+          That's the limit you meant. But the counter resets at 60,000 ms, between the bursts.
+      - text: '`0`'
+        feedback: >-
+          The first 100 fit easily. The question is whether the next 100 do too.
+
+  - type: prose
+    id: name-window-limits
+    body: |-
+      That counter is a **fixed window**. It's cheap, and it lets through twice the limit
+      around each boundary.
+
+      A **sliding window counter** smooths it out. Keep this window's count and the last one's,
+      and weight the last by how much of it still overlaps:
+
+      ```text
+      estimate = previous × (1 − elapsed fraction) + current
+      ```
+
+      Allow the request only while the estimate is under the limit.
+
+  - type: code-challenge
+    id: write-sliding-window
+    concept: sysdesign.window-limits
+    difficulty: 4
+    language: ts
+    prompt: >-
+      Write `slidingWindow(limit, windowMs)`. It returns `allow(now)`, which answers `true` or
+      `false` for each request. Times only go forward.
+
+
+      Windows start at multiples of `windowMs`. Estimate as `previous × (1 − elapsed ÷
+      windowMs) + current`. Here `previous` counts only the window right before this one.
+      Allow while the estimate is below `limit`, and count only allowed requests.
+
+
+      With a limit of 3, requests at 997, 998 and 999 ms fill the window. One at 1000 ms is
+      refused.
+    hints:
+      - Keep three numbers between calls, the current window's start and two counts.
+      - When a request lands in a new window, the old current count becomes previous, but only if the windows touch.
+      - "Start with `const start = Math.floor(now / windowMs) * windowMs;`"
+
+  - type: prose
+    id: name-distributed-limits
+    body: |-
+      With several servers, each one's own counter multiplies the limit. So the count lives
+      in one shared place, usually Redis. That's a **distributed rate limit**.
+
+      Updates must be **atomic**: one step no other client can slip between, like Redis's
+      `INCR`. A limited client gets `429 Too Many Requests` with a `Retry-After` header,
+      saying how many seconds to wait.
+
+  - type: ai-review
+    id: review-racy-counter
+    concept: sysdesign.distributed-rate-limits
+    difficulty: 3
+    language: ts
+    request: Limit each client to 100 requests a minute, shared across all our servers.
+    flawClass: race
+    code: |
+      async function allow(clientId: string) {
+        const key = `rl:${clientId}`;
+        const used = Number((await redis.get(key)) ?? 0);
+        if (used >= 100) return false;
+        await redis.set(key, used + 1, { EX: 60 });
+        return true;
+      }
+    prompt: >-
+      An assistant wrote this. One request at a time, the test passed. Under a burst, a
+      client got 600 requests through in a minute. Tap the line at fault.
+    lines: [5]
+    reasons:
+      - text: It writes back a count others have already changed
+        correct: true
+        feedback: >-
+          Yes. Many requests read the same count, and each writes count + 1.
+      - text: The key needs the server's name in it
+        feedback: >-
+          That would give each server its own limit, which is the leak you're avoiding.
+      - text: Sixty seconds is the wrong expiry
+        feedback: >-
+          The expiry sets the window. Lost increments are the problem here.
+    fix: |
+      async function allow(clientId: string) {
+        const key = `rl:${clientId}`;
+        const used = await redis.incr(key); // atomic: read and add in one step
+        if (used === 1) await redis.expire(key, 60);
+        return used <= 100;
+      }
+
+  - type: ai-review
+    id: review-spoofable-key
+    concept: sysdesign.distributed-rate-limits
+    difficulty: 4
+    language: ts
+    request: Rate-limit our public API per client IP. We run behind one proxy that appends the client IP to X-Forwarded-For.
+    flawClass: security
+    code: |
+      function limitKey(request: Request) {
+        const forwarded = request.headers.get('x-forwarded-for') ?? '';
+        const ip = forwarded.split(',')[0].trim();
+        return `rl:${ip}`;
+      }
+    prompt: >-
+      A proxy adds each caller's IP to the end of `X-Forwarded-For`. An assistant wrote this. A test sent requests through the proxy and got limited. A
+      scraper then made 50,000 requests an hour without a single `429`. Tap the line at fault.
+    lines: [3]
+    reasons:
+      - text: The first entry is whatever the client sent
+        correct: true
+        feedback: >-
+          Yes. Our proxy appends the real IP last. The first entry is client-controlled.
+      - text: IPs should be hashed before use as keys
+        feedback: >-
+          Hashing changes how the key looks, not who controls it. The scraper still picks it.
+      - text: The header name should be capitalised
+        feedback: >-
+          HTTP header names are case-insensitive, and `get` handles either.
+    fix: |
+      const ip = forwarded.split(',').at(-1)?.trim() ?? '';
+
+  - type: explain-back
+    id: explain-edge-burst
+    concept: sysdesign.window-limits
+    difficulty: 4
+    prompt: >-
+      A fixed window of 100 a minute let 200 requests through in under a second. Why doesn't a
+      sliding window leak the same way?
+    rubric:
+      - The fixed counter resets at each boundary, so bursts either side each get a full limit.
+      - The sliding window still counts the previous window, weighted by how much overlaps.
+      - Right after the boundary the previous count weighs almost fully, so the second burst is refused.
+    modelAnswer: >-
+      A fixed window forgets everything when the minute ticks over. 100 requests right before
+      and 100 right after each see an empty counter, so all 200 pass. A sliding window keeps
+      last minute's count and weights it by the overlap. A moment after the boundary that
+      weight is nearly one, so the estimate is already near 100. The second burst is refused.
+
+recap:
+  - Use a token bucket for bursts with a steady average, or a sliding window to smooth edges.
+  - Keep shared counters in Redis, and update them atomically.
+  - Answer a limited client with `429` and a `Retry-After` header.
+recall:
+  - id: card-fixed-window-leak
+    concept: sysdesign.window-limits
+    front: How much can a fixed window of N per minute let through in a short burst?
+    back: >-
+      Up to 2N, with N right before the boundary and N right after it.
+  - id: card-token-bucket
+    concept: sysdesign.token-bucket
+    front: What two numbers define a token bucket, and what does each control?
+    back: >-
+      The capacity caps the burst. The refill rate caps the average.
+  - id: card-atomic-count
+    concept: sysdesign.distributed-rate-limits
+    front: Why is `GET` then `SET` wrong for a shared counter in Redis?
+    back: >-
+      Other clients read the same count between the two calls, so increments are lost. Use
+      `INCR` or a Lua script.
+  - id: card-429
+    concept: sysdesign.distributed-rate-limits
+    front: What does a rate-limited client receive?
+    back: >-
+      Status `429 Too Many Requests`, ideally with `Retry-After` saying how many seconds to wait.
+
+references:
+  - kind: rfc
+    title: Additional HTTP Status Codes
+    authors: Mark Nottingham and Roy T. Fielding
+    year: 2012
+    venue: RFC 6585, IETF
+    url: https://www.rfc-editor.org/rfc/rfc6585
+    note: Defines 429 Too Many Requests and suggests Retry-After with it.
+    primary: true
+    verified: true
+  - kind: essay
+    title: How we built rate limiting capable of scaling to millions of domains
+    authors: Julien Desgats
+    venue: The Cloudflare Blog
+    url: https://blog.cloudflare.com/counting-things-a-lot-of-different-things/
+    note: The sliding window counter, and how close its estimate comes in practice.
+    primary: true
+    verified: true
+  - kind: docs
+    title: INCR
+    authors: Redis
+    venue: Redis Documentation
+    url: https://redis.io/docs/latest/commands/incr/
+    note: The atomic counter, with rate limiter patterns built on it.
+    verified: true
+
+deepDive: >-
+  The Redis runs used Redis 8 in Docker. The racy `GET` then `SET` loop ended at 6, 3 and 5
+  in three runs, and the same 100 clients using `INCR` ended at exactly 100.
+
+
+  `INCR` alone leaves one gap. If a process dies between `INCR` and `EXPIRE`, the key never
+  expires and that client is blocked for good. A Lua script runs both as one step:
+  `local n = redis.call("INCR", KEYS[1]) if n == 1 then redis.call("EXPIRE", KEYS[1],
+  ARGV[1]) end return n`. A token bucket in Redis is the same idea, storing tokens and the
+  last refill time in one hash. Decide what happens when Redis is unreachable: failing open
+  keeps the API up and drops the limit for a while, and failing closed does the opposite.
+  An IETF draft standardises `RateLimit` headers that tell clients their remaining quota.

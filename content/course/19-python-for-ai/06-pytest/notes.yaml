@@ -1,0 +1,294 @@
+summary: >-
+  pytest is the standard test runner for Python. It finds functions named `test_*` in files
+  named `test_*.py` or `*_test.py`, runs them, and reports each plain `assert` that fails
+  with the values on both sides. There's no assertion library to learn and no test class to
+  inherit from.
+
+
+  Three features carry most real test suites. **Fixtures** build what a test needs, and the
+  test asks for them by parameter name, which is dependency injection for tests.
+  **Parametrize** runs one test body over a table of cases. **Built-in fixtures** such as
+  `tmp_path`, `monkeypatch` and `capsys` give each test a clean folder, a reversible change
+  to the environment, and captured output.
+
+
+  For AI code the rule is that unit tests never call a real model. You pass in a fake
+  client with recorded replies, so tests run in milliseconds, cost nothing and give the
+  same result every time. Whether the model is any good is a different question, answered
+  by evals, not unit tests.
+remember:
+  - pytest runs functions named `test_*` in files named `test_*.py` or `*_test.py`, and a plain `assert` is the whole assertion API.
+  - A test asks for a fixture by naming it as a parameter, and code after `yield` in the fixture runs as teardown, pass or fail.
+  - Fixture scope is function by default; a wider scope such as `session` builds it once and shares it, so it must not be mutated.
+  - Put boundary values in a `parametrize` table, the threshold itself and the value just below it.
+  - '`monkeypatch` changes environment variables and attributes for one test and undoes them afterwards; `tmp_path` gives each test a fresh folder.'
+  - Prefer injecting a fake over patching with a mock, and when you do mock, use `create_autospec` so a misspelt method fails.
+  - Compare floats with `pytest.approx` and check errors with `pytest.raises(..., match=...)`.
+  - pytest can't run `async def` tests on its own; use a plugin such as `anyio` or `pytest-asyncio`, or call `asyncio.run` inside a normal test.
+sections:
+  - title: How a plain assert gives a useful failure
+    body: |-
+      Python's `assert` only raises `AssertionError`, with no detail. pytest adds the detail
+      by **rewriting** your test files as it imports them. An import hook turns each
+      `assert` into code that keeps every sub-expression, so a failure shows the values that
+      went in.
+
+      ```python
+      def cart_summary(prices):
+          return {"items": len(prices), "total": sum(prices)}
+
+
+      def test_summary():
+          assert cart_summary([2.5, 4.0, 1.0]) == {"items": 3, "total": 7.0}
+      ```
+
+      ```text
+      >       assert cart_summary([2.5, 4.0, 1.0]) == {"items": 3, "total": 7.0}
+      E       AssertionError: assert {'items': 3, 'total': 7.5} == {'items': 3, 'total': 7.0}
+      E
+      E         Omitting 1 identical items, use -vv to show
+      E         Differing items:
+      E         {'total': 7.5} != {'total': 7.0}
+      ```
+
+      It diffs dicts, lists, sets and long strings. Rewriting applies to test modules and
+      `conftest.py` files. An `assert` in a helper module you import gives a bare error,
+      unless you register it with `pytest.register_assert_rewrite`.
+
+      Two helpers cover what `==` can't. Floats carry rounding error, so
+      `0.1 + 0.2 == 0.3` is false, and `0.1 + 0.2 == pytest.approx(0.3)` is true. For errors,
+      `pytest.raises` fails the test if nothing is raised, and `match` checks the message
+      with a regular expression search.
+
+      ```python
+      import pytest
+
+
+      def set_quantity(n):
+          if n < 0:
+              raise ValueError(f"quantity must be 0 or more, got {n}")
+          return n
+
+
+      def test_rejects_negative_quantity():
+          with pytest.raises(ValueError, match="got -1"):
+              set_quantity(-1)
+
+
+      def test_float_total():
+          assert 0.1 + 0.2 == pytest.approx(0.3)
+      ```
+
+      Keep one statement in the `raises` block. Any line after the one that raises never
+      runs, so an assert there checks nothing.
+
+      A note on production code: `assert` is for tests and internal sanity checks, never for
+      validating input. Running Python with `-O` removes every `assert` statement.
+  - title: Fixtures, scope and conftest.py
+    body: |-
+      A fixture is a function marked `@pytest.fixture`. pytest reads each test's parameter
+      names, finds fixtures with those names, builds them, and passes the values in.
+      Fixtures can ask for other fixtures the same way, so setup composes like dependency
+      injection in FastAPI, which comes next.
+
+      **Scope** decides how long a fixture's value lives. The default, `function`, builds it
+      fresh for every test. `class`, `module`, `package` and `session` build it once for
+      that group and share it. Wider scopes suit expensive setup: a database container, a
+      loaded model, a large catalogue. They're also where tests start to leak into each
+      other, because one test's change to a shared object is visible to the next. Share only
+      things you don't mutate, or reset them in the teardown after `yield`.
+
+      Fixtures in a file called `conftest.py` are available to every test in that folder and
+      below, with no import. That's where a suite's shared fakes and clients live.
+
+      ```python
+      import json
+      import os
+
+      import pytest
+
+
+      def load_settings(path):
+          settings = json.loads(path.read_text())
+          settings["api_key"] = os.environ["SUPPORT_API_KEY"]
+          return settings
+
+
+      @pytest.fixture(scope="session")
+      def catalogue():
+          return ("lamp", "rug", "chair")  # a tuple, so no test can change it
+
+
+      @pytest.fixture
+      def settings_file(tmp_path):
+          path = tmp_path / "settings.json"
+          path.write_text('{"model": "small", "max_tokens": 200}')
+          return path
+
+
+      def test_reads_key_from_env(settings_file, monkeypatch):
+          monkeypatch.setenv("SUPPORT_API_KEY", "test-key")
+          assert load_settings(settings_file)["api_key"] == "test-key"
+
+
+      def test_missing_key_fails_loudly(settings_file, monkeypatch):
+          monkeypatch.delenv("SUPPORT_API_KEY", raising=False)
+          with pytest.raises(KeyError):
+              load_settings(settings_file)
+
+
+      @pytest.mark.parametrize("item", ["lamp", "rug"])
+      def test_catalogue_has(catalogue, item):
+          assert item in catalogue
+      ```
+
+      `settings_file` depends on the built-in `tmp_path`, a `pathlib.Path` to a new folder
+      for each test. `monkeypatch` sets or deletes an environment variable and restores the
+      original when the test ends, pass or fail. It can also replace an attribute with
+      `monkeypatch.setattr(obj, "name", value)`. The session-scoped `catalogue` is built once
+      for all its tests.
+  - title: Fakes, mocks and where to patch
+    body: |-
+      A **fake** is a small working implementation: the `FakeClient` in this lesson returns
+      recorded replies and records calls. A **mock** from `unittest.mock` is an object that
+      accepts any call, returns whatever you configure, and lets you assert how it was
+      called. Both replace a dependency. They lead to different tests.
+
+      A fake keeps the test about behaviour: given this reply, what does my code return?
+      Mocks push tests towards interactions: was `classify` called once with these
+      arguments? Interaction tests break when you refactor without changing behaviour, so
+      use them only where the call is the point, such as "a refund sends exactly one email".
+
+      A bare `Mock` has a second problem. It invents any attribute you touch, so a typo
+      passes. `create_autospec` builds a mock with the real class's methods and signatures.
+
+      ```python
+      from unittest.mock import Mock, create_autospec
+
+      import pytest
+
+
+      class ModelClient:
+          def classify(self, ticket: str) -> dict:
+              raise NotImplementedError("the real one calls the network")
+
+
+      def triage(client, ticket):
+          reply = client.classify(ticket)
+          return "auto:" + reply["label"] if reply["confidence"] >= 0.9 else "human"
+
+
+      def test_bare_mock_hides_a_typo():
+          client = Mock()
+          client.clasify("hello")  # misspelt, and still no error
+          client.clasify.assert_called_once()
+
+
+      def test_autospec_catches_the_typo():
+          client = create_autospec(ModelClient, instance=True)
+          with pytest.raises(AttributeError):
+              client.clasify("hello")
+
+
+      def test_triage_with_a_spec_mock():
+          client = create_autospec(ModelClient, instance=True)
+          client.classify.return_value = {"label": "refund", "confidence": 0.95}
+          assert triage(client, "Money back") == "auto:refund"
+          client.classify.assert_called_once_with("Money back")
+      ```
+
+      When code creates its own client inside a function, you have to patch. Patch the name
+      where it's **looked up**, not where it's defined. If `orders.py` does
+      `from mailer import send_email`, patch `orders.send_email`, because that's the name
+      `orders` calls. Patching `mailer.send_email` changes nothing for `orders`. Needing
+      patches is often a sign to pass the client in as a parameter instead.
+  - title: Testing async code
+    body: |-
+      Core pytest doesn't run coroutines. An `async def` test would only create a coroutine
+      object, so current pytest fails it with "async def functions are not natively supported" and
+      a list of plugins to install.
+
+      You have three options. The simplest needs nothing extra: keep the test synchronous
+      and run the coroutine with `asyncio.run`, which starts a fresh loop per test.
+
+      ```python
+      import asyncio
+
+
+      async def classify_all(reviews, classify):
+          return await asyncio.gather(*(classify(r) for r in reviews))
+
+
+      async def fake_classify(review):
+          await asyncio.sleep(0)
+          return review.upper()
+
+
+      def test_classify_all_keeps_order():
+          labels = asyncio.run(classify_all(["late", "broken"], fake_classify))
+          assert labels == ["LATE", "BROKEN"]
+      ```
+
+      The second is AnyIO's pytest plugin, which is installed with `anyio`, and `anyio` comes
+      with `httpx`. Mark the test with `@pytest.mark.anyio` and write it as `async def`. It
+      runs on asyncio by default. The third is the `pytest-asyncio` plugin, a separate
+      package: mark tests with `@pytest.mark.asyncio`, or set `asyncio_mode = "auto"` in the
+      config so every `async def` test runs.
+
+      Async fakes follow the same rules as sync ones. Make the fake's methods `async def`, and
+      use `asyncio.sleep(0)` or a short sleep to let other tasks run, as the concurrency
+      counter in the asyncio lesson did. For mocks, `unittest.mock.AsyncMock` returns an
+      awaitable from each call. Keep sleeps in tests short and never rely on timing for
+      correctness, or the suite turns flaky on a busy CI machine.
+pitfalls:
+  - '**Calling the real model in a unit test.** It''s slow, costs money, needs a key and a network, and its answer varies, so the test flakes. Inject a fake client with recorded replies.'
+  - '**A shared fixture that tests mutate.** A `session` or `module` scoped list changed by one test breaks the next, and only when they run in that order. Use function scope, or share something immutable.'
+  - '**A bare `Mock` for a real dependency.** It accepts misspelt methods, so the test passes while the code is broken. Use `create_autospec`, or a fake.'
+  - '**Patching where the name is defined.** After `from mailer import send_email`, patching `mailer.send_email` leaves the caller''s copy untouched. Patch `orders.send_email`, where it''s looked up.'
+  - '**Comparing floats with `==`.** Rounding makes `0.1 + 0.2 == 0.3` false. Use `pytest.approx`.'
+  - '**Extra lines inside `pytest.raises`.** Code after the line that raises never runs, so asserts there check nothing. Keep only the raising call inside the block.'
+  - '**`assert (value, "message")` with parentheses.** A non-empty tuple is always true, so the test can''t fail, and Python warns "assertion is always true". Write `assert value, "message"`.'
+  - '**An `async def` test with no plugin.** pytest fails it as unsupported. Add `anyio` or `pytest-asyncio`, or run the coroutine with `asyncio.run` in a normal test.'
+interview:
+  - question: How do you test code that calls an LLM?
+    answer: >-
+      Split it: unit tests with a fake client for my code, evals for the model. My code
+      takes the client as a parameter, so a test passes a fake that returns recorded replies
+      and records calls. Then I test what my code does with each kind of reply: a confident
+      answer, a low-confidence one on the boundary, malformed JSON, a timeout, a refusal.
+      Those tests are fast, free and deterministic. Separately, an eval suite runs the real
+      model over a labelled dataset and tracks scores over time, because model quality is a
+      statistical question a pass or fail unit test can't answer. A few contract tests
+      against the real API, run on a schedule rather than every commit, catch changes in the
+      provider's response shape.
+  - question: What's the difference between a fake and a mock, and which do you prefer?
+    answer: >-
+      A fake is a small working implementation, a mock is a programmable object that
+      records how it was called. I prefer fakes for most tests. A fake keeps the test about
+      behaviour: given this reply, the function returns this. Mocks lead to interaction
+      assertions such as `assert_called_once_with`, which break on harmless refactors and
+      can pass while behaviour is wrong. A bare `Mock` also accepts misspelt methods. I use
+      mocks where the interaction is the requirement, for example that a failed payment sends
+      exactly one alert, and then with `create_autospec` so the mock matches the real
+      interface. If I need many patches to test something, I take that as a design signal
+      and inject the dependency instead.
+  - question: Explain pytest fixture scopes and the risks of wide scopes.
+    answer: >-
+      Scope sets how long a fixture's value lives: function, class, module, package or
+      session, with function the default. Function scope rebuilds per test, so tests are
+      isolated. Wider scopes build once and share, which saves time for expensive setup such
+      as a database container or a loaded model. The risk is shared state. If one test
+      mutates a session-scoped object, later tests see it, and failures depend on test order,
+      which is the classic flaky suite. My rule: wide scopes only for expensive, read-only
+      resources. For a shared database, I keep the connection session-scoped and wrap each
+      test in a transaction that a function-scoped fixture rolls back.
+  - question: How do you test async functions with pytest?
+    answer: >-
+      With a plugin, because core pytest doesn't run `async def` tests and fails them as
+      unsupported. The common choices are `pytest-asyncio`, with `@pytest.mark.asyncio` or
+      auto mode, and AnyIO's plugin with `@pytest.mark.anyio`, which is already there if
+      the project uses `httpx`. With no plugin, a synchronous test can call `asyncio.run` on
+      the coroutine. The fakes become async too: `async def` methods, or `AsyncMock`. For
+      concurrency code I check behaviour with counters rather than timings, for example a
+      fake that records peak concurrency to prove a semaphore caps it. Timing assertions
+      turn flaky on shared CI runners.

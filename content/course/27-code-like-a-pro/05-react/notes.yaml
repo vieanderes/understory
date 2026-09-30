@@ -1,0 +1,390 @@
+summary: >-
+  Idiomatic React keeps as little state as possible and computes everything else while
+  rendering. A component is a function of its props and state. When a value can be worked out
+  from those, a second copy in state, kept in step by an effect, only adds a render, a moment
+  of stale screen and a chance to drift. That's the rule of **derive, don't sync**, and most
+  junior React code breaks it somewhere.
+
+
+  Effects follow from that. `useEffect` exists to keep a component in step with a system
+  outside React: a network connection, a timer, a browser API, a widget that isn't React.
+  Work caused by a click belongs in the handler, fresh state for a new item comes from a
+  `key`, and subscriptions to outside stores go through `useSyncExternalStore`. Structure
+  does the rest: state lives in the closest common parent of the components that need it,
+  and layouts receive ready-made parts as `children` instead of drilling props.
+
+
+  React 19 moves more of the old boilerplate into the library. Actions handle pending state,
+  errors and form resets; `useOptimistic` shows a change before the server confirms it; `use`
+  reads a promise or a context; and the React Compiler memoizes automatically, so most
+  hand-written `useMemo`, `useCallback` and `memo` become unnecessary. These notes cover the
+  mechanics behind each habit and the React 19 tools.
+remember:
+  - If a value can be computed from props or state, compute it during render instead of storing it.
+  - An effect is for synchronising with a system outside React, and its cleanup undoes what it set up.
+  - A key is a component's identity among its siblings, so a new key gives a fresh instance with fresh state.
+  - Use a stable id as the key, because index keys attach state to positions and move it onto the wrong item when the list reorders.
+  - Keep ids rather than copies of objects in state, and look the object up during render.
+  - Subscribe to outside stores and browser APIs with `useSyncExternalStore`, not an effect that copies values into state.
+  - State belongs in the closest common parent of the components that read it, and nowhere higher.
+  - With the React Compiler on, most manual `useMemo`, `useCallback` and `memo` can go, because the compiler memoizes for you.
+sections:
+  - title: Deciding what goes in state
+    body: |-
+      Before adding state, ask three questions. Does it change over time? Can it be computed
+      from props or other state? Does another piece of state already hold it? Only a value
+      that changes and can't be computed deserves `useState`.
+
+      That leads to a few structural rules:
+
+      - **No redundant state.** A `fullName` next to `first` and `last`, or a filtered list
+        next to the list and the filter, is a copy. Compute it.
+      - **No duplicated objects.** Store `selectedId`, not the selected object. An object
+        copy goes stale the moment the list updates, as the lesson's rename showed.
+      - **No contradictions.** `isSending` and `isSent` as two booleans allow both to be
+        `true`. One `status` field with `"typing" | "sending" | "sent"` allows only real
+        states.
+      - **Props are not initial state.** `useState(props.price)` reads the prop once and
+        ignores every later change. Either use the prop directly, or name it
+        `initialPrice` so the one-time read is obvious.
+
+      If a derived value is expensive, such as filtering ten thousand rows, don't move it to
+      state. Keep it in render and memoize it:
+
+      ```tsx
+      const visible = useMemo(
+        () => todos.filter((todo) => matches(todo, query, hideDone)),
+        [todos, query, hideDone],
+      );
+      ```
+
+      With the React Compiler turned on, even that `useMemo` is usually unnecessary: the
+      compiler caches the result and recomputes it only when an input changes. Either way,
+      the value is never out of date, because it's derived from the current props and state
+      on every render that needs it.
+  - title: Keys are identity
+    body: |-
+      React matches the elements of one render to the next by type and position, and in a
+      list, by **key**. State belongs to that identity. So the key decides which state goes
+      with which row.
+
+      With the array index as the key, identity is the position. Insert an item at the top
+      and every row's state moves down onto a different item. Run with React and jsdom, a
+      to-do list where each row keeps a local note showed exactly that. After marking "Buy
+      milk" as urgent and adding "Water plants" at the top:
+
+      ```text
+      index keys: [ 'Water plants: urgent', 'Buy milk: ', 'Call the bank: ' ]
+      id keys:    [ 'Water plants: ', 'Buy milk: urgent', 'Call the bank: ' ]
+      ```
+
+      The same happens to uncontrolled inputs, focus and animations. Use a stable, unique id
+      from the data. Index keys are only safe for a static list that never reorders, filters
+      or inserts, and whose rows hold no state.
+
+      Two more consequences of identity:
+
+      - **Never generate keys during render.** `key={Math.random()}` or
+        `key={crypto.randomUUID()}` gives every row a new identity on every render, so each
+        one is destroyed and rebuilt. Create ids when the data is created.
+      - **Never define a component inside another component.** A function declared in the
+        body is a new component type on every render, so React unmounts the old one and
+        mounts a new one, and its state and focus are lost each time. Define components at
+        the top level of the module.
+
+      Identity is also a tool. Changing a key on purpose resets a subtree, which replaces
+      the effect that clears a form when the selected contact changes:
+      `<EditContact key={contact.id} contact={contact} />`.
+  - title: What effects are for, and the replacements
+    body: |-
+      An effect runs after React has updated the screen. That makes it right for connecting
+      to things React doesn't control, and wrong for everything React can do itself. A
+      practical catalogue:
+
+      - **A value computed from props or state**: compute it during render.
+      - **Something a click, a submit or a keypress caused**: do it in the event handler,
+        where you know what happened.
+      - **Resetting state when an id changes**: render with that id as the `key`.
+      - **Telling a parent about a change**: call the parent's callback in the same handler
+        that changed the state.
+      - **Subscribing to a store or a browser API**: `useSyncExternalStore`.
+      - **Fetching data**: prefer your framework's loaders or Server Components, or a library
+        such as TanStack Query that handles caching, retries and races.
+
+      When an effect is the right tool, it must clean up after itself. React's Strict Mode
+      mounts, unmounts and remounts components in development, so a missing cleanup shows up
+      as a doubled connection early. A fetch in an effect needs cleanup too, or a slow
+      response for an old query can arrive last and overwrite a newer one:
+
+      ```tsx
+      export function useBookSearch(query: string) {
+        const [results, setResults] = useState<Book[]>([]);
+        const [error, setError] = useState<string | null>(null);
+
+        useEffect(() => {
+          if (!query) return;
+          const controller = new AbortController();
+          fetch(`/api/books?q=${encodeURIComponent(query)}`, { signal: controller.signal })
+            .then((response) => {
+              if (!response.ok) throw new Error(`Search failed: ${response.status}`);
+              return response.json() as Promise<Book[]>;
+            })
+            .then((books) => {
+              setResults(books);
+              setError(null);
+            })
+            .catch((err: unknown) => {
+              if (err instanceof Error && err.name === "AbortError") return;
+              setError(err instanceof Error ? err.message : "Search failed");
+            });
+          return () => controller.abort(); // a newer query cancels the older request
+        }, [query]);
+
+        return { results: query ? results : [], error };
+      }
+      ```
+
+      Sometimes an effect needs to read a value without reacting to it, such as showing a
+      message in the current theme without reconnecting when the theme changes. React 19.2
+      added `useEffectEvent` for that: wrap the handler in it and leave it out of the
+      dependencies. Don't use it to hide a dependency that really should restart the effect.
+  - title: Reading outside stores with useSyncExternalStore
+    body: |-
+      Browser APIs and non-React stores hold state that changes on its own: whether the
+      device is online, the window width, a value in `localStorage`, a store from Redux or
+      Zustand. The amateur pattern copies it into state in an effect. That renders once with
+      a wrong value, can tear during concurrent rendering, where two components show
+      different versions of the same store, and has no answer on the server.
+      `useSyncExternalStore` fixes all three.
+
+      ```tsx
+      import { useSyncExternalStore } from "react";
+
+      function subscribe(onChange: () => void) {
+        window.addEventListener("online", onChange);
+        window.addEventListener("offline", onChange);
+        return () => {
+          window.removeEventListener("online", onChange);
+          window.removeEventListener("offline", onChange);
+        };
+      }
+
+      export function useOnlineStatus() {
+        return useSyncExternalStore(
+          subscribe,
+          () => navigator.onLine, // the snapshot on the client
+          () => true, // the snapshot on the server and during hydration
+        );
+      }
+
+      function StatusBar() {
+        const isOnline = useOnlineStatus();
+        return <p>{isOnline ? "Online" : "Offline: changes will sync later"}</p>;
+      }
+      ```
+
+      Rendered with `renderToString` from `react-dom/server`, `StatusBar` produces
+      `<p>Online</p>`, from the server snapshot, where `navigator` doesn't exist.
+
+      Three rules keep it correct. `subscribe` receives a callback, calls it on every change,
+      and returns an unsubscribe function. Define `subscribe` outside the component, or React
+      resubscribes on every render. And `getSnapshot` must return the same value while
+      nothing has changed: returning a fresh object or array each time makes React think the
+      store always changed, and it warns about an infinite loop. Return a primitive, or cache
+      the object until the store really changes.
+  - title: Where state lives, and composition
+    body: |-
+      Put state in the **closest common parent** of every component that reads or changes
+      it. Two siblings that must agree, such as a list and a details panel, get their
+      shared state from the parent, which passes the value down and a callback to change it.
+      That's lifting state up. The opposite matters as much: state only one component uses
+      stays in that component. State placed too high re-renders more of the tree than
+      necessary and ties unrelated parts together.
+
+      When a prop only passes through layers that don't use it, reach for **composition**
+      before context. A layout that takes `children`, or named slots as props, doesn't need
+      to know what it arranges:
+
+      ```tsx
+      function Page({ header, children }: { header: ReactNode; children: ReactNode }) {
+        return (
+          <div className="page">
+            <header className="page-header">{header}</header>
+            <main>{children}</main>
+          </div>
+        );
+      }
+
+      <Page header={<CartButton count={cart.items.length} />}>
+        <ProductGrid products={products} />
+      </Page>;
+      ```
+
+      `Page` never sees `cart`. The component that owns the data builds the part and hands it
+      over, so the data travels one level instead of four.
+
+      **Context** is for values that many distant components need and that change rarely:
+      the signed-in user, the theme, the locale. Every consumer re-renders when the value
+      changes, so a fast-changing value in a widely used context can make the whole tree
+      re-render on each keystroke. Split contexts by how often they change, or keep such
+      state in a store read with `useSyncExternalStore`. In React 19 the context itself is
+      the provider: `<ThemeContext value="dark">` replaces `<ThemeContext.Provider>`.
+  - title: 'React 19: Actions, optimistic updates, use and the compiler'
+    body: |-
+      An **Action** is an async function run inside a transition. React tracks its pending
+      state, and passed to a form's `action`, it receives the form's `FormData`.
+      `useActionState` wraps one and returns the latest result, and `useOptimistic` shows the
+      expected outcome while the request is still in flight:
+
+      ```tsx
+      import { useActionState, useOptimistic } from "react";
+      import { useFormStatus } from "react-dom";
+
+      type Comment = { id: string; text: string; sending?: boolean };
+      type State = { comments: Comment[]; error: string | null; draft: string };
+
+      function SubmitButton() {
+        const { pending } = useFormStatus(); // reads the form this button sits in
+        return <button type="submit" disabled={pending}>{pending ? "Posting" : "Post"}</button>;
+      }
+
+      export function Comments({ initial }: { initial: Comment[] }) {
+        const [state, formAction] = useActionState(
+          async (previous: State, formData: FormData): Promise<State> => {
+            const text = String(formData.get("text") ?? "").trim();
+            if (!text) return { ...previous, error: "Write a comment first." };
+            addOptimistic({ id: crypto.randomUUID(), text, sending: true });
+            try {
+              const saved = await saveComment(text);
+              return { comments: [...previous.comments, saved], error: null, draft: "" };
+            } catch {
+              return { ...previous, error: "Couldn't post. Try again.", draft: text };
+            }
+          },
+          { comments: initial, error: null, draft: "" },
+        );
+        const [optimistic, addOptimistic] = useOptimistic(
+          state.comments,
+          (current: Comment[], added: Comment) => [...current, added],
+        );
+
+        return (
+          <form action={formAction}>
+            <ul>
+              {optimistic.map((comment) => (
+                <li key={comment.id}>{comment.text}{comment.sending ? " (sending)" : ""}</li>
+              ))}
+            </ul>
+            <label htmlFor="comment-text">Comment</label>
+            <textarea id="comment-text" name="text" defaultValue={state.draft} />
+            {state.error && <p role="alert">{state.error}</p>}
+            <SubmitButton />
+          </form>
+        );
+      }
+      ```
+
+      Run in jsdom, the new comment appeared at once as "Nice work (sending)" with the button
+      reading "Posting". When the save succeeded it became "Nice work". When the save failed,
+      the optimistic comment disappeared on its own, because optimistic state falls back to
+      the real state once the Action ends. One trap showed up too: React resets a form's
+      uncontrolled fields when its Action finishes, even if you returned an error, so the
+      typed text vanished. Returning it as `draft` and using it as `defaultValue` keeps it.
+
+      `use` reads a promise, suspending until it settles, or a context. Unlike other hooks it
+      may be called after an early return or inside a condition. Create the promise outside
+      the component that reads it, in a Server Component, a loader or a cache, because a
+      promise created during render is new on every render.
+
+      Function components now receive `ref` as an ordinary prop, so new code doesn't need
+      `forwardRef`. And the **React Compiler**, stable since version 1.0 and switched on in
+      Next.js 16 with `reactCompiler: true`, memoizes components and values at build time.
+      It relies on the Rules of React: where it detects a component breaking them, for
+      example by mutating props, it skips that component rather than compile it wrongly. Keep `useMemo` as an escape hatch, such as
+      keeping an effect dependency stable.
+pitfalls:
+  - "**Copying props into state.** `useState(props.value)` reads the prop once and ignores later changes. Use the prop directly, or name it `initialValue` so the one-time read is intended."
+  - "**Storing the selected object instead of its id.** The copy goes stale when the list updates. Keep `selectedId` and find the object during render."
+  - "**Index keys on a list that changes.** Row state and input values move to the wrong item when you insert or reorder. Use a stable id from the data."
+  - "**An effect that sets state from other state.** It renders twice and shows a stale value in between. Compute the value during render, with `useMemo` if it's expensive."
+  - "**Fetching in an effect with no cleanup.** A slow old response can overwrite a newer one. Abort in the cleanup, or use a data library or your framework's loaders."
+  - "**Lying about effect dependencies.** Leaving a used value out to stop re-runs causes stale values. Move the logic, restructure, or use `useEffectEvent` for code that shouldn't restart the effect."
+  - "**A fresh object from `getSnapshot`.** `useSyncExternalStore` then sees a change on every render and loops. Return a primitive or a cached object."
+  - "**Expecting form fields to survive a failed Action.** React resets uncontrolled fields when the Action finishes. Return the submitted values in state and use them as `defaultValue`."
+interview:
+  - question: When should you use `useEffect`, and when shouldn't you?
+    answer: >-
+      Use it to synchronise a component with a system outside React; almost everything else
+      has a better home. Good effects connect to a chat server, subscribe to a browser event,
+      start a timer or drive a non-React widget, and each has a cleanup that undoes it. A
+      value computed from props or state belongs in render. Work caused by a user action
+      belongs in the event handler. Resetting state for a new item is a `key`. Reading an
+      outside store is `useSyncExternalStore`. Data fetching is better done by a framework or
+      a library that handles caching and races. The test I apply in review is "what outside
+      system is this effect talking to?" If there's no answer, the effect goes. The cost of
+      getting it wrong is extra renders, stale frames and bugs from missed dependencies.
+  - question: Why is copying props or derived values into state considered an anti-pattern?
+    answer: >-
+      Because it creates two sources of truth that have to be kept in step, and they drift.
+      With state plus an effect, the first render shows the stale value, the effect runs
+      after paint, and React renders again. If a dependency is missed, the copy silently
+      stops updating, like a filtered list that ignores a checkbox. Server rendering shows the
+      empty initial value, since effects don't run there. Computing during render has none of
+      those problems: it's always current and takes one render. If the computation is
+      expensive, I memoize it with `useMemo`, or let the React Compiler do it, instead of
+      moving it into state. The narrow exception is a prop meant only as a starting value,
+      which I'd name `initialX`.
+  - question: Why do keys matter in React, and what's wrong with using the index?
+    answer: >-
+      A key is an element's identity among its siblings, and React attaches state, DOM nodes
+      and focus to that identity. With stable ids, React can tell that an item moved and keep
+      its state with it. With the index, identity becomes position. Insert at the top, and
+      every row's local state, typed input and focus now belongs to a different item: a note
+      marked on "Buy milk" jumps to the new first row. Index keys are fine only for static
+      lists that never reorder and hold no state. Random keys are worse, because every row is
+      remounted each render. Keys are also a tool: changing a component's key on purpose
+      resets its state, which removes the need for an effect that clears a form.
+  - question: What problem does `useSyncExternalStore` solve?
+    answer: >-
+      It lets a component read a value from a store React doesn't own, such as a browser API
+      or a state library, safely under concurrent rendering and on the server. The naive
+      version copies the value into state inside an effect, which renders once with a wrong
+      value, can tear, meaning two components show different versions during one render,
+      and has nothing to show on the server. `useSyncExternalStore` takes a `subscribe`
+      function, a `getSnapshot` for the client and an optional `getServerSnapshot`. React
+      re-renders when the snapshot changes and keeps every reader consistent. The details to
+      get right: define `subscribe` outside the component so it isn't recreated, and make
+      `getSnapshot` return the same value while nothing changed, or it loops.
+  - question: With the React Compiler, do you still need `useMemo`, `useCallback` and `memo`?
+    answer: >-
+      Mostly not. The compiler memoizes components, values and callbacks at build time, more
+      thoroughly than people do by hand, so in new code I leave them out and let it work. It
+      depends on the Rules of React: pure render, no mutation of props or state, hooks at the
+      top level. Where code breaks them, the compiler skips that component, and the React
+      Hooks ESLint plugin reports why. I still reach for `useMemo` as an escape hatch, for
+      example to keep an object stable when it's an effect dependency. In a codebase
+      without the compiler, I'd memoize only where profiling shows a real cost, because every
+      manual memo adds dependency arrays that can go stale. The trade-off is a build plugin
+      and slightly slower builds.
+  - question: How would you implement an optimistic update in React 19?
+    answer: >-
+      With `useOptimistic` inside an Action. I keep the confirmed data in state, often from
+      `useActionState`, and derive an optimistic version with `useOptimistic(state, reducer)`.
+      When the form submits, the Action calls the optimistic setter first, so the new item
+      appears at once, marked as sending, then awaits the server. On success, the Action
+      returns the new confirmed state and the optimistic layer is replaced by it. On failure,
+      the Action returns an error, and the optimistic item disappears on its own because
+      optimistic state falls back to real state when the Action ends. I'd show the error
+      near the form and return the typed text, because React resets uncontrolled fields when
+      the Action finishes. The trade-off is a brief moment where the UI shows something the
+      server may reject.
+  - question: How do you avoid prop drilling?
+    answer: >-
+      First with composition, then with context, and only then with a store. Often a
+      component passes a prop along only because it renders the child that needs it. If the
+      owner builds that child and passes it in as `children` or a slot prop, the middle
+      layers never see the data. When many distant components need the same slowly changing
+      value, such as the current user or theme, context is right. For fast-changing shared
+      state, context re-renders every consumer on each change, so I'd split contexts or use a
+      small store read with `useSyncExternalStore`. I avoid context as a default, because it
+      hides where data comes from and makes components harder to reuse and test.

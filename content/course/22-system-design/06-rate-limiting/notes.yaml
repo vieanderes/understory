@@ -1,0 +1,194 @@
+summary: >-
+  A rate limit caps how much one client can ask of a system in a period of time. It
+  protects the system from overload, protects each customer from the others, and puts a
+  price on abuse such as scraping, credential stuffing and spam. The lesson covers the edge
+  leak of fixed windows, the sliding window counter, atomic counters in Redis and the `429`
+  response.
+
+
+  These notes add the rest of the toolkit: a token bucket written out with its
+  `Retry-After`, a token bucket in Redis that is safe across servers, how the algorithms
+  compare, where in the stack limits belong, and what well-behaved clients do when they
+  are limited.
+
+
+  In a design, a rate limit appears wherever an expensive or abusable operation meets the
+  public: logins, sign-ups, link creation, search, and every call that costs you money, such
+  as an AI model call. Say what the limit is keyed by, what the numbers are, and what
+  happens when the limiter itself is down.
+remember:
+  - A token bucket's capacity caps the burst and its refill rate caps the average, which suits most APIs.
+  - A fixed window of N per minute can let 2N through in a moment, N either side of the boundary.
+  - A sliding window counter estimates the rolling count as the previous window times its remaining overlap plus the current window.
+  - A limit shared by many servers lives in one store such as Redis and is updated atomically, with `INCR` or a Lua script.
+  - A limited client gets `429 Too Many Requests` with `Retry-After` saying how many seconds to wait.
+  - The key decides who is limited, so key by account or API key where you can, and derive IPs only from headers your own proxy sets.
+  - Decide in advance whether the limiter fails open or closed when its store is unreachable, per endpoint.
+sections:
+  - title: A token bucket, with the wait worked out
+    body: |-
+      A token bucket doesn't need a timer. Each request works out how many tokens have
+      accrued since the last one, which is called lazy refill. The same arithmetic gives the
+      `Retry-After` value.
+
+      ```ts
+      type Verdict = { allowed: boolean; retryAfterSeconds: number };
+
+      function tokenBucket(capacity: number, perSecond: number) {
+        let tokens = capacity;
+        let last: number | undefined;
+        return (nowMs: number): Verdict => {
+          if (last !== undefined) {
+            tokens = Math.min(capacity, tokens + ((nowMs - last) / 1000) * perSecond);
+          }
+          last = nowMs;
+          if (tokens >= 1) {
+            tokens -= 1;
+            return { allowed: true, retryAfterSeconds: 0 };
+          }
+          return { allowed: false, retryAfterSeconds: Math.ceil((1 - tokens) / perSecond) };
+        };
+      }
+
+      const allow = tokenBucket(10, 0.5); // bursts of 10, 30 a minute on average
+      ```
+
+      Twelve requests at time 0: ten pass, and the eleventh and twelfth are refused with
+      `Retry-After: 2`, because half a token a second needs two seconds to make one token. At
+      1,000 ms the bucket holds half a token and still refuses, with `Retry-After: 1`. At
+      2,000 ms the request passes.
+
+      `Retry-After` takes whole seconds, so round up. Rounding down invites the client back
+      before a token exists.
+  - title: The same bucket in Redis, safe across servers
+    body: |-
+      With many servers, the bucket's state lives in Redis. Reading it, refilling and
+      writing back must happen as one step, or two servers will both spend the last token.
+      A Lua script runs atomically inside Redis.
+
+      ```text
+      -- KEYS[1] the bucket; ARGV[1] capacity; ARGV[2] tokens added per second
+      local capacity = tonumber(ARGV[1])
+      local rate = tonumber(ARGV[2])
+      local t = redis.call('TIME')
+      local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+      local state = redis.call('HMGET', KEYS[1], 'tokens', 'at')
+      local tokens = tonumber(state[1]) or capacity
+      local at = tonumber(state[2]) or now
+      tokens = math.min(capacity, tokens + (now - at) / 1000 * rate)
+      local allowed = 0
+      if tokens >= 1 then
+        tokens = tokens - 1
+        allowed = 1
+      end
+      redis.call('HSET', KEYS[1], 'tokens', tokens, 'at', now)
+      redis.call('PEXPIRE', KEYS[1], math.ceil(capacity / rate * 1000))
+      return allowed
+      ```
+
+      Run against Redis 8 with a capacity of 10 and one token a second, a quick loop of
+      13 calls returned ten 1s, then an extra 1 as a token accrued during the loop, then 0s.
+
+      Two details matter. The script reads Redis's own clock with `TIME`, so app servers
+      whose clocks disagree can't hand out extra tokens. And the key expires once a full
+      bucket would have refilled, so idle clients cost no memory.
+
+      At very high rates, one Redis key per client is a hot key. Large systems keep a small
+      local allowance per server and sync with the shared count every so often, accepting a
+      limit that is approximately right.
+  - title: Choosing an algorithm
+    body: |-
+      Five algorithms cover almost every case. Each trades accuracy, memory and burst
+      behaviour.
+
+      - **Fixed window counter.** One counter per client per interval. Cheapest, and leaks
+        up to twice the limit at boundaries. Fine for coarse daily quotas.
+      - **Sliding window log.** Store every request's timestamp and count those in the last
+        window. Exact, and memory grows with the limit: a limit of 10,000 an hour stores up
+        to 10,000 timestamps per client.
+      - **Sliding window counter.** Two counters and a weighted estimate. Close to exact
+        with constant memory. A good default for "N per minute".
+      - **Token bucket.** Allows bursts up to the capacity, then a steady rate. Matches how
+        clients behave: idle, then a flurry. Common for public APIs.
+      - **Leaky bucket.** Requests join a queue that drains at a fixed rate. Smooths output
+        completely, useful in front of a fragile downstream, and adds waiting.
+
+      Limits also come in more than one kind. A **rate** limit caps requests per time. A
+      **concurrency** limit caps requests in flight at once, which protects against slow,
+      expensive calls better than a rate does. A **quota** caps usage per billing period.
+      AI features usually need all three, plus a limit on tokens rather than requests,
+      because one request can cost a hundred times another.
+  - title: Where limits sit, and what clients should do
+    body: |-
+      Limits work in layers, each catching a different problem.
+
+      ```text
+      edge or CDN        per IP, crude, stops floods before they cost anything
+      API gateway        per API key or account, the contract with customers
+      service            per operation, such as 5 password attempts per account per hour
+      downstream client  your own calls to a provider, to stay under its limits
+      ```
+
+      The key matters as much as the number. Per-IP limits punish everyone behind one office
+      or mobile carrier address and are dodged by anyone with many addresses. Per-account
+      and per-API-key limits are fairer and harder to dodge. Login limits often combine a
+      per-account limit, against guessing one password, with a per-IP limit, against trying
+      one password on many accounts.
+
+      Decide the failure behaviour. If Redis is unreachable, **fail open** keeps the API up
+      without limits for a while, which suits ordinary endpoints. **Fail closed** refuses
+      requests, which suits endpoints where abuse is costly, such as sending SMS messages
+      that you pay for.
+
+      A good client treats `429` as a signal. It waits for `Retry-After` if present, and
+      otherwise backs off exponentially with jitter: wait a random time between zero and
+      `base × 2^attempt`, capped. The randomness stops thousands of clients retrying in the
+      same second. Clients should also retry only idempotent requests, or send an
+      idempotency key.
+pitfalls:
+  - "**Reading then writing a shared counter.** `GET` followed by `SET` loses increments under concurrency. Use `INCR`, or a Lua script for multi-step logic."
+  - "**`INCR` and `EXPIRE` as separate calls.** A crash between them leaves a key that never expires and blocks the client for good. Do both in one script, or set the expiry with the first write."
+  - "**Trusting the first `X-Forwarded-For` entry.** The client wrote it. Use the entry your own proxy appended, counting from the right."
+  - "**One limit per server instead of a shared one.** Ten servers with 100 each let 1,000 through. Keep the count in one place."
+  - "**Rate limiting requests when cost is per token or per second of work.** One call can cost far more than another. Limit the resource that costs money, and concurrency for slow calls."
+  - "**Clients retrying in lockstep.** Fixed retry delays make every client return at once. Honour `Retry-After` and add random jitter."
+interview:
+  - question: Design a rate limiter for a public API running on many servers.
+    answer: >-
+      A token bucket per API key, stored in Redis and updated by a Lua script, returning
+      `429` with `Retry-After`. The bucket fits API traffic: its capacity allows short
+      bursts and its refill rate caps the average, both set per pricing tier. The script
+      reads, refills and spends in one atomic step and uses Redis's clock, so servers with
+      skewed clocks can't overspend. Keys expire when idle. I'd put a crude per-IP limit at
+      the edge for floods, and fail open on ordinary endpoints if Redis is down, with an
+      alert, but fail closed on expensive ones. At very high volume, one key per client
+      becomes hot, so I'd add local allowances synced periodically, trading exactness for
+      throughput.
+  - question: What's wrong with a fixed-window rate limiter, and what would you use instead?
+    answer: >-
+      It resets at each boundary, so a client can send the full limit just before and again
+      just after, twice the limit in a moment. For a coarse daily quota that doesn't matter.
+      For "100 a minute" protecting a service, I'd use a sliding window counter: keep this
+      window's count and the previous one's, and estimate the rolling count as previous
+      times the fraction still overlapping plus current. It needs two numbers per client,
+      like the fixed window, and is close to exact. If I need precision, a sliding log is
+      exact, but it stores a timestamp per request, which is expensive for high limits.
+  - question: How do you rate-limit calls to an LLM provider from your product?
+    answer: >-
+      By tokens and concurrency, not only requests, on both sides: limits for my users and a
+      limiter in front of the provider. One request can carry 500 tokens or 50,000, so a
+      per-user token budget per minute and per day tracks cost far better than a request
+      count. A concurrency cap per user stops one person holding dozens of long streams.
+      Towards the provider, I track my own usage against its requests and tokens per minute
+      and queue or shed low-priority work, such as background summaries, before interactive
+      chats. When the provider returns `429`, I back off with jitter and fall back to a
+      smaller model if the product allows. The trade-off is fairness against utilisation.
+  - question: Your rate limiter depends on Redis. What happens when Redis goes down?
+    answer: >-
+      That's a decision to make per endpoint before it happens: fail open or fail closed.
+      Failing open means requests pass without limits for the duration, which keeps the API
+      available and is right for most read endpoints, especially with a crude local
+      per-server limit as a backstop. Failing closed means refusing, which is right where
+      abuse costs real money, such as sending SMS messages or starting expensive jobs. Either
+      way, the Redis call gets a short timeout so a slow Redis doesn't slow every request,
+      and an alert fires, because running without limits is a risk to fix quickly.

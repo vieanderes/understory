@@ -1,0 +1,271 @@
+id: security.csrf-and-cors
+title: CSRF and SameSite cookies
+objective: "Tell an origin from a site, see how another site can send requests with your cookies, and stop it with `SameSite` and a CSRF token."
+level: essential
+minutes: 10
+concepts: [security.csrf, security.samesite]
+prerequisites: [security.xss-and-csp, backend.sessions-and-tokens]
+opening:
+  text: >-
+    You'll see how a page on another site can move money from your account without you
+    clicking anything. Then you'll close that hole with a cookie setting and a token.
+
+steps:
+  - type: prose
+    id: origin-and-site
+    body: |-
+      An **origin** is a scheme, host and port together. A **site** is looser: the scheme plus
+      the domain you'd buy, like `notes.com`.
+
+      ```text
+      https://app.notes.com   https://api.notes.com   different origins, same site
+      https://notes.com       https://evil.example    different sites
+      ```
+
+      Cookies care about sites. Other browser rules, as the next lesson shows, care about
+      origins.
+
+  - type: multiple-choice
+    id: pick-same-site
+    concept: security.samesite
+    difficulty: 1
+    question: Which two addresses belong to the same site?
+    choices:
+      - text: '`https://shop.bakery.com` and `https://pay.bakery.com`'
+        correct: true
+        feedback: >-
+          Right. Different hosts, so different origins, but the same bought domain.
+      - text: '`https://bakery.com` and `https://bakery.net`'
+        feedback: >-
+          Similar names, but `.com` and `.net` are two domains someone bought separately.
+      - text: '`https://bakery.com` and `http://bakery.com`'
+        feedback: >-
+          The scheme counts too. Plain `http` and `https` are different sites.
+
+  - type: prose
+    id: what-csrf-is
+    body: |-
+      Your browser attaches a site's cookies to every request it sends there, whoever started
+      it. So a page on `evil.example` can hide this form:
+
+      ```html
+      <form method="POST" action="https://bank.example/transfer">
+        <input type="hidden" name="to" value="attacker">
+      </form>
+      <script>document.forms[0].submit()</script>
+      ```
+
+      Your bank cookie rides along, and the bank sees you. That's **cross-site request
+      forgery**, or CSRF.
+
+  - type: prose
+    id: samesite
+    body: >-
+      The fix starts with the cookie. `SameSite` tells the browser when to send it on a request
+      that starts on another site. `Strict`: never. `Lax`: only on a **top-level navigation**,
+      a GET that changes the address bar, like clicking a link. `None`: always, and it must
+      also say `Secure`.
+
+
+      Chrome treats a cookie with no `SameSite` as `Lax`. Other browsers may not, so set it
+      yourself.
+
+  # Chromium, bank.test and evil.test mapped to localhost: a Lax cookie was missing on the
+  # auto-submitted POST and on an img GET, and present on a form GET that navigated the page.
+  # A SameSite=None cookie without Secure was never stored.
+  - type: predict-output
+    id: predict-samesite-lax
+    concept: security.samesite
+    difficulty: 2
+    language: html
+    code: |
+      <!-- on evil.example; the bank's cookie is SameSite=Lax -->
+      <form method="POST" action="https://bank.example/transfer">...</form>
+      <img src="https://bank.example/transfer?to=attacker">
+      <a href="https://bank.example/">Visit your bank</a>
+    question: Which of the three sends the bank's cookie?
+    choices:
+      - text: Only the link, when clicked
+        correct: true
+        feedback: >-
+          Right. A click is a top-level navigation. The form POST and the image aren't.
+      - text: The form and the link
+        feedback: >-
+          The form changes the page, but it's a POST. Lax holds the cookie back on it.
+      - text: None of them
+        feedback: >-
+          That's `Strict`. Lax still lets a plain link arrive signed in.
+
+  - type: ai-review
+    id: review-get-transfer
+    concept: security.csrf
+    difficulty: 3
+    language: js
+    request: Add a quick transfer link to the dashboard. Our session cookie is SameSite=Lax.
+    flawClass: security
+    code: |
+      // The dashboard shows: <a href="/transfer?to=42&amount=50">Send 50</a>
+      app.get("/transfer", async (request) => {
+        const user = await requireUser(request);
+        await transfer(user.id, request.query.to, request.query.amount);
+        return new Response("Sent");
+      });
+    prompt: >-
+      An assistant wrote this. It works, and the cookie is `Lax`. Then a stranger's page
+      links to `/transfer?to=666&amount=500`. Tap the line at fault.
+    lines: [2]
+    reasons:
+      - text: A GET that moves money gets the Lax cookie
+        correct: true
+        feedback: >-
+          Yes. Clicking a link is a top-level GET. Make changes POST only.
+      - text: '`requireUser` should run after `transfer`'
+        feedback: >-
+          Checking the user first is right. The trouble is the method that carries the change.
+      - text: The amount should be a number
+        feedback: >-
+          Worth checking, but a stranger can send any valid amount through this route.
+    fix: |
+      // The dashboard shows a form with method="POST" and a CSRF token.
+      app.post("/transfer", async (request) => {
+        const user = await requireUser(request);
+        const form = await request.formData();
+        await transfer(user.id, form.get("to"), form.get("amount"));
+        return new Response("Sent");
+      });
+
+  - type: fill-blank
+    id: fill-session-cookie
+    concept: security.samesite
+    difficulty: 2
+    language: http
+    prompt: >-
+      Set the bank's session cookie: hidden from scripts, HTTPS only, and never sent on
+      requests that start on other sites.
+    template: |
+      Set-Cookie: sid=Wz7Njk5FxJhj9gi; Path=/; {{1}}; {{2}}; SameSite={{3}}
+    blanks:
+      - key: '1'
+        answer: HttpOnly
+      - key: '2'
+        answer: Secure
+      - key: '3'
+        answer: Strict
+    bank: [HttpOnly, Public, Secure, Strict, Lax, None]
+
+  - type: prose
+    id: csrf-token
+    body: >-
+      `SameSite` is the first wall. The second is a **CSRF token**: a random value the server
+      keeps in your session and also puts in a hidden field in its own forms.
+
+
+      On every POST, the server checks the two match. A page on another site can't read your
+      bank's pages, so it can't know the token. Its forged form arrives without one, and is
+      refused.
+
+  - type: code-challenge
+    id: write-csrf-check
+    concept: security.csrf
+    difficulty: 3
+    language: ts
+    prompt: >-
+      Write `csrfOk(method, formToken, sessionToken)`. `GET`, `HEAD` and `OPTIONS` are always
+      allowed. Any other method is allowed only when both tokens are present, not empty, and
+      equal. So `csrfOk('POST', 'q8Fz', 'q8Fz')` is `true`, and `csrfOk('POST', undefined,
+      undefined)` is `false`.
+    hints:
+      - The safe methods are already handled. Look at what reaches the last line.
+      - Two missing tokens are equal to each other. That must not count as a match.
+      - "Refuse first when either token is missing or empty: `if (!formToken || !sessionToken)`."
+
+  - type: explain-back
+    id: explain-why-both
+    concept: security.csrf
+    difficulty: 3
+    prompt: >-
+      A teammate says `SameSite=Lax` stops CSRF, so the form tokens can go. What would you
+      tell them?
+    rubric:
+      - Lax still sends the cookie on a top-level GET, so any GET that changes data is open.
+      - Not every browser or older cookie applies SameSite the same way.
+      - A token checked on every change refuses a forged request whatever the cookie does.
+    modelAnswer: >-
+      Lax helps a lot, but it has gaps. It still sends the cookie when someone clicks a link,
+      so one GET route that changes data is enough. Browsers also differ on cookies with no
+      `SameSite`. The token doesn't depend on any of that. Another site can't read our pages,
+      so it can't know the token, and the server refuses its request.
+
+recap:
+  - Tell an origin from a site, and know cookies travel by site.
+  - Set session cookies `HttpOnly`, `Secure` and `SameSite`, and change data only on POST.
+  - Check a CSRF token on every request that changes something.
+
+recall:
+  - id: card-csrf-mechanism
+    concept: security.csrf
+    front: In a CSRF attack, what does the attacker rely on the browser to do?
+    back: >-
+      Attach the victim's cookie to a request that the attacker's page starts.
+  - id: card-samesite-lax
+    concept: security.samesite
+    front: What does `SameSite=Lax` stop, and what does it still allow?
+    back: >-
+      It holds the cookie back on cross-site POSTs and background requests, and still sends
+      it when someone clicks a link to the site.
+  - id: card-origin-vs-site
+    concept: security.samesite
+    front: Are `https://app.notes.com` and `https://api.notes.com` the same origin? The same site?
+    back: >-
+      Different origins, because the hosts differ. The same site, because the bought domain,
+      `notes.com`, and the scheme match.
+  - id: card-csrf-token
+    concept: security.csrf
+    front: Why can't an attacker's page include the right CSRF token?
+    back: >-
+      The token is in your pages and your session. Another site can't read your pages, so it
+      never learns the value.
+
+references:
+  - kind: docs
+    title: Cross-Site Request Forgery Prevention
+    authors: OWASP
+    venue: OWASP Cheat Sheet Series
+    url: https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html
+    note: SameSite, tokens and origin checks, and when each is enough.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Set-Cookie header
+    authors: MDN contributors
+    venue: MDN Web Docs
+    url: https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Set-Cookie
+    note: '`SameSite` values, the default when it is missing, and `None` needing `Secure`.'
+    primary: true
+    verified: true
+  - kind: docs
+    title: Site
+    authors: MDN contributors
+    venue: MDN Web Docs glossary
+    url: https://developer.mozilla.org/en-US/docs/Glossary/Site
+    note: What makes two addresses the same site, with examples.
+    verified: true
+
+deepDive: >-
+  The "domain you'd buy" is the registrable domain: one label plus a public suffix such as
+  `.com` or `.co.uk`. Browsers read the Public Suffix List to find it. So `a.github.io` and
+  `b.github.io` are different sites, because `github.io` is on that list.
+
+
+  A server can also check the `Origin` header, which the browser sets on a POST and a page
+  can't change. A POST whose origin isn't yours is refused. OWASP suggests it alongside
+  tokens, not instead of them.
+
+
+  Chrome gives a fresh cookie with no `SameSite` a two-minute grace, during which a
+  cross-site POST still carries it. It exists for old sign-in flows, and it's one more
+  reason to set `SameSite` yourself.
+
+
+  Frameworks usually handle tokens for you. Next.js Server Actions check the `Origin`
+  header, and form libraries add hidden token fields.

@@ -1,0 +1,287 @@
+summary: >-
+  This lesson is the chapter put to work: a sketch becomes a working app in the order a
+  working developer builds it. Split the sketch into components that each do one job. Find
+  the least state that works. Decide which component owns each piece. Then wire data down as
+  props and changes up as callbacks, and load the starting data with a visible status.
+
+
+  The skill that matters most is saying no to state. Anything you can compute from props or
+  other state (the books on show, the count left to read, whether the form can submit) is
+  derived during render, not stored. Every stored copy is a second source of truth that some
+  future change will forget to update. Keep the minimum, and the rest is always right.
+
+
+  These steps are also how a component round in an interview is marked. The interviewer
+  watches whether you name your state before typing, whether each value lives in one place,
+  whether the form reports up instead of keeping a copy, and whether loading and failure
+  have states a person can see and a screen reader can hear.
+remember:
+  - Find the least state first; anything you can compute from props or other state is derived during render, never stored.
+  - Each piece of state has one owner, the closest common parent of every component that reads it.
+  - Data flows down as props and changes flow up through callbacks, so a child reports what happened and the owner updates.
+  - Store ids, not copies of objects, when you need to remember a selection, so the selection can't go stale.
+  - Use an updater function, `setBooks((current) => ...)`, when the change depends on the current value or runs after an `await`.
+  - A loading component needs three visible states, and an error that appears later needs `role="alert"` so screen readers announce it.
+  - Test the app the way a person uses it, by role and accessible name, so a test fails when the interface breaks.
+sections:
+  - title: The finished app in one file
+    body: |-
+      The lesson builds the list, the form and the loading in separate challenges. Here they
+      are together. Read it as a checklist: three pieces of state, two derived values, one
+      effect with a cleanup, and a form that owns nothing.
+
+      ```tsx
+      import { useEffect, useState } from 'react';
+
+      export type Book = { id: string; title: string; read: boolean };
+      type Filter = 'all' | 'unread' | 'read';
+      type Status = 'loading' | 'error' | 'ready';
+
+      const labels: Record<Filter, string> = { all: 'All', unread: 'To read', read: 'Read' };
+
+      function matches(book: Book, filter: Filter): boolean {
+        if (filter === 'unread') return !book.read;
+        if (filter === 'read') return book.read;
+        return true;
+      }
+
+      function AddBook({ onAdd }: { onAdd: (title: string) => void }) {
+        function add(formData: FormData) {
+          const title = String(formData.get('title') ?? '').trim();
+          if (title !== '') onAdd(title);
+        }
+        return (
+          <form action={add}>
+            <label>
+              Title
+              <input name="title" />
+            </label>
+            <button>Add</button>
+          </form>
+        );
+      }
+
+      export function ReadingList({ load }: { load: () => Promise<Book[]> }) {
+        // The least state: what the server sent plus what people changed, the filter, and the status.
+        const [books, setBooks] = useState<Book[]>([]);
+        const [filter, setFilter] = useState<Filter>('all');
+        const [status, setStatus] = useState<Status>('loading');
+
+        useEffect(() => {
+          let ignore = false;
+          load().then(
+            (loaded) => {
+              if (ignore) return;
+              setBooks(loaded);
+              setStatus('ready');
+            },
+            () => {
+              if (!ignore) setStatus('error');
+            },
+          );
+          return () => {
+            ignore = true;
+          };
+        }, [load]);
+
+        if (status === 'loading') return <p>Loading your books</p>;
+        if (status === 'error') return <p role="alert">Couldn't load your books</p>;
+
+        // Derived on every render, so they can't disagree with `books` and `filter`.
+        const visible = books.filter((book) => matches(book, filter));
+        const left = books.filter((book) => !book.read).length;
+
+        function toggle(id: string) {
+          setBooks((current) => current.map((book) => (book.id === id ? { ...book, read: !book.read } : book)));
+        }
+
+        function addBook(title: string) {
+          setBooks((current) => [...current, { id: crypto.randomUUID(), title, read: false }]);
+        }
+
+        return (
+          <section>
+            <p>{left} left to read</p>
+            {(['all', 'unread', 'read'] as const).map((option) => (
+              <button key={option} aria-pressed={filter === option} onClick={() => setFilter(option)}>
+                {labels[option]}
+              </button>
+            ))}
+            <ul>
+              {visible.map((book) => (
+                <li key={book.id}>
+                  <label>
+                    <input type="checkbox" checked={book.read} onChange={() => toggle(book.id)} />
+                    {book.title}
+                  </label>
+                </li>
+              ))}
+            </ul>
+            <AddBook onAdd={addBook} />
+          </section>
+        );
+      }
+      ```
+
+      Three details are deliberate. Every hook sits above the early returns, because hooks
+      must run in the same order on every render. The filter buttons use `aria-pressed`, so
+      a screen reader hears which one is on. And a new book gets a real id from
+      `crypto.randomUUID()`, never its title or its index, so the key stays stable when two
+      books share a name or the list reorders.
+  - title: Testing it the way a person uses it
+    body: |-
+      A good test for this app never looks at state or component names. It finds things the
+      way a person does, by role and visible name, and checks what they would see. Then any
+      refactor that keeps the interface working keeps the test green.
+
+      ```tsx
+      import { render, screen, within } from '@testing-library/react';
+      import userEvent from '@testing-library/user-event';
+      import { ReadingList, type Book } from './reading-list';
+
+      const books: Book[] = [
+        { id: '1', title: 'Dune', read: false },
+        { id: '2', title: 'Emma', read: true },
+      ];
+      // Defined once, outside the test, so its identity never changes between renders.
+      const load = () => Promise.resolve(books);
+
+      test('a reader adds a book, ticks it and filters', async () => {
+        const user = userEvent.setup();
+        render(<ReadingList load={load} />);
+
+        expect(await screen.findByText('1 left to read')).toBeInTheDocument();
+
+        await user.type(screen.getByRole('textbox', { name: 'Title' }), 'Middlemarch');
+        await user.click(screen.getByRole('button', { name: 'Add' }));
+        expect(screen.getByText('2 left to read')).toBeInTheDocument();
+        expect(screen.getByRole('textbox', { name: 'Title' })).toHaveValue('');
+
+        await user.click(screen.getByRole('button', { name: 'To read' }));
+        await user.click(screen.getByRole('checkbox', { name: 'Dune' }));
+
+        const list = screen.getByRole('list');
+        expect(within(list).getAllByRole('checkbox').map((box) => box.parentElement?.textContent)).toEqual(['Middlemarch']);
+        expect(screen.getByText('1 left to read')).toBeInTheDocument();
+      });
+
+      test('a failed load is announced', async () => {
+        render(<ReadingList load={() => Promise.reject(new Error('offline'))} />);
+        expect(await screen.findByRole('alert')).toHaveTextContent("Couldn't load your books");
+      });
+      ```
+
+      Both tests pass against the app above. `findBy` waits for the load to settle, where
+      `getBy` would fail on the loading screen. Getting the checkbox by the name `Dune`
+      also proves the label is wired up, so the test doubles as an accessibility check.
+      Notice `load` is defined outside the component under test: an inline arrow in a
+      parent that renders often would restart the effect each time.
+  - title: Ids, not copies
+    body: |-
+      Suppose the design grows a detail panel for the chosen book. The tempting state is
+      `const [selected, setSelected] = useState<Book | null>(null)`, holding the book itself.
+      That's a copy. When the book is ticked, `books` gets a new object and `selected` still
+      points at the old one.
+
+      ```ts
+      type Book = { id: string; title: string; read: boolean };
+
+      let books: Book[] = [{ id: '1', title: 'Dune', read: false }];
+      const selected = books[0]!; // a second reference to the same book object
+
+      books = books.map((book) => (book.id === '1' ? { ...book, read: true } : book));
+      console.log(selected.read); // false: the selection still points at the old object
+
+      const selectedId = '1';
+      console.log(books.find((book) => book.id === selectedId)?.read); // true
+      ```
+
+      Store `selectedId` and derive the book during render with `find`. The panel is then
+      always current, and deleting the book naturally leaves nothing selected. It's the same
+      rule databases follow to avoid duplicated data, and React's guide to choosing a state
+      structure names it too: avoid duplication.
+  - title: Updater functions after an await
+    body: |-
+      The solution writes `setBooks((current) => ...)` rather than `setBooks(books.map(...))`.
+      In a click handler that does one update, both behave the same. The difference shows
+      once saving goes to a server.
+
+      ```tsx
+      async function addBook(title: string) {
+        const saved = await api.saveBook(title);
+        setBooks([...books, saved]); // `books` is the snapshot from when the click happened
+      }
+      ```
+
+      While the save is in flight, the person ticks a book. That tick renders a new `books`,
+      but this handler still holds the old snapshot. When the save returns, it writes the
+      old list plus the new book, and the tick is gone. We reproduced this in a test: with a
+      value, the tick was lost; with `setBooks((current) => [...current, saved])`, both
+      changes survived, because an updater receives the latest state when React applies it.
+
+      A good default follows: whenever the next state is built from the previous state, use
+      the updater form. It costs nothing and removes a whole class of lost-update bugs. The
+      one place it doesn't help is a stale read for some other purpose, such as sending the
+      current list to the server; for that, read state in the render that needs it or keep
+      the latest value in a ref.
+pitfalls:
+  - >-
+    **Storing what you can compute.** `visible` or `left` in `useState` drifts the first time
+    a handler forgets to update it. Derive it during render; filtering a few hundred items is
+    far cheaper than a render.
+  - >-
+    **Giving the form its own copy of the list.** The list and the form then disagree about
+    what exists. The owner keeps the list and passes `onAdd`; the form only reports the title.
+  - >-
+    **Using the title or the index as a key.** Two books with the same title collide, and an
+    index key moves checked state to the wrong row after a filter or reorder. Give every item
+    a stable id when it's created.
+  - >-
+    **Keeping a selected object instead of its id.** The copy goes stale after any update.
+    Keep the id and find the object during render.
+  - >-
+    **Putting a hook below an early return.** `if (status === 'loading') return ...` above a
+    `useState` changes the hook order between renders and React throws. Put every hook at the
+    top.
+  - >-
+    **A silent error message.** Text that appears after a failure isn't read out unless it's
+    in a live region. Give it `role="alert"`.
+interview:
+  - question: You're given a mock-up. How do you decide what state the component needs?
+    answer: >-
+      I list every value that changes on screen, then cross off anything I can compute from
+      something else. For a filterable list with a count, the items and the chosen filter are
+      state: people change them and nothing else can tell me what they are. The visible items
+      and the count are derived during render. Then I place each piece in the closest common
+      parent of everything that reads it, pass it down as props, and pass callbacks for
+      changes. The benefit is that derived values can't drift, because there's only one
+      source. The one reason I'd store a derived value is measured cost, and even then I'd
+      reach for `useMemo` rather than a second `useState`.
+  - question: Why store an id for the selected item rather than the item itself?
+    answer: >-
+      Because the item in state is a copy that goes stale. When the list updates immutably,
+      the edited item becomes a new object, but the selection still points at the old one,
+      so the detail panel shows outdated data. With `selectedId`, I derive the item during
+      render with `find`, so it's always the current version, and deleting it naturally
+      clears the selection. It's the same normalisation idea as in a database: one fact in one
+      place. For very large lists I'd index by id in an object or a `Map` so the lookup stays
+      cheap.
+  - question: When do you use the updater form of a state setter?
+    answer: >-
+      Whenever the next state depends on the previous one, and always after an `await`. The
+      updater receives the latest state at the moment React applies it, while a value computed
+      in the handler uses the snapshot from the render where the event happened. If a save
+      takes a second and the person ticks an item meanwhile, `setBooks([...books, saved])`
+      overwrites the tick; `setBooks((current) => [...current, saved])` keeps both. For
+      setting something to a fixed value, like closing a menu, the plain form is fine. The
+      updater has no cost, so I default to it for anything built from the current value.
+  - question: How would you test this reading list?
+    answer: >-
+      With Testing Library, as a person would use it: render it with a fake `load`, wait for
+      the list with `findBy`, type a title into the textbox named Title, click Add, tick a
+      checkbox by the book's name, switch filters, and assert on the text a person reads,
+      like "1 left to read". A second test rejects the load and expects an element with role
+      alert. I avoid asserting on state or component internals, so a refactor that keeps the
+      behaviour keeps the tests green, and querying by accessible name means missing labels
+      fail the test. For the pure pieces, like the filter predicate, a plain unit test is
+      enough.

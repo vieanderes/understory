@@ -1,0 +1,321 @@
+summary: >-
+  Idiomatic modern JavaScript is the language as it's written today: `const` by default,
+  destructuring and spread, optional chaining and `??` for missing values, array methods that
+  say what they produce, `async` and `await` for anything that waits, and named exports.
+  None of this adds features you couldn't get before. It removes scaffolding, so the one line
+  that matters is the one a reader sees.
+
+
+  The idioms also carry meaning that the older forms blur. `??` says "only if missing",
+  where `||` also swallows `0`, `""` and `false`. `toSorted` says "a sorted copy", where
+  `sort` quietly reorders the caller's array. `Promise.all` says "these don't depend on each
+  other". Choosing the precise tool is how reviewers tell you know the language rather than
+  remember it.
+
+
+  These notes cover the mechanics behind the lesson's idioms, the newer built-ins that Node
+  24 and current browsers ship, and the async tools past `Promise.all`: `allSettled`,
+  cancellation with `AbortController`, async iteration, and limiting how much runs at once.
+remember:
+  - '`a ?? b` falls back only when `a` is `null` or `undefined`, while `a || b` also replaces `0`, `""`, `false` and `NaN`.'
+  - Default parameters and destructuring defaults apply only to `undefined`, so a `null` passes straight through.
+  - '`sort`, `reverse` and `splice` change the array in place, while `toSorted`, `toReversed`, `toSpliced` and `with` return a new one.'
+  - Spread makes a shallow copy, so nested objects are shared; `structuredClone` makes a deep copy of plain data but can't copy functions.
+  - '`map`, `filter` and `forEach` visit every item, while `find`, `some` and `every` stop at the first answer, and a `for...of` loop can `break`.'
+  - '`forEach` never waits for an `async` callback, so use `for...of` with `await` to go one by one, or `Promise.all` to go together.'
+  - '`Promise.all` rejects on the first failure without cancelling the rest, and `Promise.allSettled` waits for every result, success or failure.'
+  - Pass an `AbortSignal` to `fetch` to cancel it, and combine a caller's signal with `AbortSignal.timeout` using `AbortSignal.any`.
+sections:
+  - title: 'Missing values: ??, ?. and defaults, precisely'
+    body: |-
+      The three tools for missing values each react to a different set of values, and most
+      bugs come from assuming they're the same.
+
+      ```js
+      const settings = { volume: 0, nickname: "" };
+      console.log(settings.volume || 50, settings.volume ?? 50); // 50 0
+      console.log(settings.nickname || "Guest");                 // Guest
+
+      function greet(name = "Guest") { return `Hello, ${name}`; }
+      console.log(greet(undefined), greet(null)); // Hello, Guest Hello, null
+
+      const { theme = "light" } = { theme: null };
+      console.log(theme); // null
+      ```
+
+      `||` asks "is it falsy?", `??` asks "is it `null` or `undefined`?", and a default
+      parameter asks only "is it `undefined`?". An API that sends `null` for "not set" gets
+      past a default parameter, so write `name ?? "Guest"` inside the function when `null`
+      is possible.
+
+      Optional chaining stops the whole chain at the first `null` or `undefined` and returns
+      `undefined`. It works for properties, computed keys and calls:
+
+      ```js
+      const user = { address: null, getAvatar: undefined };
+      console.log(user.address?.city);         // undefined
+      console.log(user.address?.["city"]);     // undefined
+      console.log(user.getAvatar?.());         // undefined
+      console.log(user.profile?.address.city); // undefined, no error on .city
+
+      const options = { retries: 0 };
+      options.retries ??= 3;
+      options.timeout ??= 5000;
+      console.log(options); // { retries: 0, timeout: 5000 }
+      ```
+
+      Two rules keep this honest. First, `?.` is for values that are allowed to be missing.
+      Sprinkled everywhere, it hides the bug where something required didn't load, and the
+      page shows blanks instead of failing loudly. Second, you can't mix `??` with `||` or
+      `&&` without brackets: `a || b ?? c` is a `SyntaxError`, so write `(a || b) ?? c`.
+  - title: The newer built-ins, and what they replace
+    body: |-
+      Every method below is available in Node 24 and in current browsers. Each replaces a
+      hand-written helper or a copy you had to remember to make.
+
+      ```js
+      const orders = [
+        { id: 3, status: "paid", total: 40, placedAt: new Date("2026-03-02") },
+        { id: 1, status: "pending", total: 15, placedAt: new Date("2026-03-01") },
+        { id: 2, status: "paid", total: 25, placedAt: new Date("2026-03-03") },
+      ];
+
+      const byTotal = orders.toSorted((a, b) => a.total - b.total);
+      console.log(byTotal.map((o) => o.id), orders.map((o) => o.id)); // [1, 2, 3] [3, 1, 2]
+
+      console.log(orders.at(-1).id);                                    // 2
+      console.log(orders.findLast((o) => o.status === "paid").id);      // 2
+      const updated = orders.with(1, { ...orders[1], status: "paid" }); // copy, one item swapped
+
+      const byStatus = Object.groupBy(orders, (o) => o.status);
+      console.log(Object.keys(byStatus), byStatus.paid.length);         // ['paid', 'pending'] 2
+
+      const a = new Set(["tea", "cake"]);
+      const b = new Set(["cake", "scone"]);
+      console.log([...a.union(b)], [...a.intersection(b)]);            // ['tea', 'cake', 'scone'] ['cake']
+      ```
+
+      The copying methods matter most in React and Redux, where state must never be mutated:
+      `toSorted` replaces `[...list].sort()`, and `with(i, value)` replaces a `map` that swaps
+      one index. `Object.groupBy` replaces the classic `reduce` into an object. Its result has
+      a `null` prototype, so there's no `toString` or `hasOwnProperty` on it; use `Object.keys`
+      or `Object.hasOwn`. `Map.groupBy` does the same with a `Map`, which suits keys that
+      aren't strings.
+
+      For copies, know the depths:
+
+      ```js
+      const shallow = { ...orders[0] };
+      shallow.placedAt.setFullYear(2031);   // also changes orders[0].placedAt
+
+      const deep = structuredClone(orders[0]);
+      deep.placedAt.setFullYear(2030);      // orders[0] untouched, still a real Date
+
+      JSON.parse(JSON.stringify({ when: new Date() })).when; // a string, not a Date
+      ```
+
+      `structuredClone` keeps `Date`, `Map`, `Set` and circular references, and throws a
+      `DataCloneError` on functions. JSON round trips turn dates into strings and drop
+      `undefined`, so they're only safe for data that is already plain JSON.
+  - title: Loops, methods and async callbacks
+    body: |-
+      "Array methods visit every item" is true of `map`, `filter`, `forEach` and `reduce`. It
+      isn't true of `find`, `findIndex`, `some` and `every`, which stop at the first answer.
+      So "does any item match?" is `some`, not a loop with a flag, and "the first match" is
+      `find`, not `filter(...)[0]`, which builds a whole array to throw most of it away.
+
+      A `for...of` loop is still the right tool when each step does several things, updates
+      more than one value, or must wait before the next. And `reduce` is the most abused
+      method: if the accumulator is an object you're building, a loop or `Object.groupBy`
+      reads better. Keep `reduce` for folding to one value, like a sum.
+
+      The trap that matters most in production is an `async` callback:
+
+      ```js
+      async function saveAll(items) {
+        items.forEach(async (item) => {
+          await save(item);
+        });
+        console.log("done"); // runs before any save finishes
+      }
+      ```
+
+      `forEach` calls the callback, gets a promise back, and ignores it. Nothing waits, and a
+      failed save becomes an unhandled rejection. Pick the shape you mean:
+
+      ```js
+      for (const item of items) await save(item);        // one at a time, in order
+      await Promise.all(items.map((item) => save(item))); // all at once
+      ```
+
+      "All at once" has a limit in real systems. A thousand simultaneous requests can hit a
+      rate limit or exhaust a connection pool. A small worker pool caps it:
+
+      ```js
+      async function mapWithLimit(items, limit, task) {
+        const results = new Array(items.length);
+        let next = 0;
+        async function worker() {
+          while (next < items.length) {
+            const index = next++;
+            results[index] = await task(items[index], index);
+          }
+        }
+        await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+        return results;
+      }
+
+      const covers = await mapWithLimit(bookIds, 3, (id) => downloadCover(id));
+      ```
+
+      Run with seven items and a limit of three, at most three tasks were ever in flight and
+      the results came back in input order. Taking `next++` is safe without a lock because
+      JavaScript runs one piece of code at a time between `await`s.
+  - title: 'Async beyond Promise.all: settle, cancel, iterate'
+    body: |-
+      The promise combinators differ in what they wait for:
+
+      - `Promise.all` resolves with every value, or rejects with the first error. The other
+        promises keep running; nothing is cancelled.
+      - `Promise.allSettled` always resolves, with `{ status, value }` or `{ status, reason }`
+        for each. Use it when partial results are useful, such as a dashboard of widgets.
+      - `Promise.any` resolves with the first success and rejects only if all fail.
+      - `Promise.race` settles with whichever settles first, success or failure.
+
+      ```js
+      const results = await Promise.allSettled([loadStock(), loadPrices()]);
+      const loaded = results.filter((r) => r.status === "fulfilled").map((r) => r.value);
+      const failed = results.filter((r) => r.status === "rejected").map((r) => r.reason);
+      ```
+
+      To stop work, you need **cancellation**, and on the web that's `AbortController`. A
+      signal passed to `fetch` aborts the request; `AbortSignal.timeout(ms)` makes one that
+      aborts itself, and `AbortSignal.any` combines several:
+
+      ```js
+      async function searchBooks(query, { signal } = {}) {
+        const timeout = AbortSignal.timeout(5000);
+        const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
+        const response = await fetch(`/api/books?q=${encodeURIComponent(query)}`, {
+          signal: combined,
+        });
+        if (!response.ok) throw new Error(`Search failed: ${response.status}`);
+        return response.json();
+      }
+      ```
+
+      Tested against a slow local server, the timeout rejected with an error named
+      `TimeoutError`, and calling `controller.abort()` rejected with `AbortError`. Check the
+      name so a deliberate cancel isn't reported as a failure. Search-as-you-type is the
+      classic use: abort the previous request on each keystroke, so a slow old response
+      never overwrites a newer one.
+
+      **Async iteration** fits data that arrives in pages or chunks. An async generator hides
+      the paging, and `for await...of` consumes it:
+
+      ```js
+      async function* allBooks() {
+        let page = 1;
+        while (page !== null) {
+          const response = await fetch(`/api/books?page=${page}`);
+          const { items, next } = await response.json();
+          yield* items;
+          page = next;
+        }
+      }
+
+      for await (const book of allBooks()) {
+        if (book.title === "Dune") break; // no further pages are fetched
+      }
+      const everything = await Array.fromAsync(allBooks());
+      ```
+
+      Pages are fetched only as the loop asks for them, and `break` stops the generator.
+      Streaming responses from an AI model are read the same way, chunk by chunk.
+pitfalls:
+  - "**Using `||` for a default that can be `0`, `\"\"` or `false`.** A volume of `0` or an empty search becomes the fallback. Use `??` unless you really mean \"any falsy value\"."
+  - "**Sorting the caller's array.** `list.sort()` reorders it in place and returns the same array, which breaks React state and anyone else holding it. Use `toSorted`."
+  - "**Sorting numbers without a compare function.** The default sort compares as strings, so `[10, 9, 1].sort()` gives `[1, 10, 9]`. Pass `(a, b) => a - b`."
+  - "**Expecting spread to copy deeply.** `{ ...order }` shares its nested objects and dates, so editing the copy edits the original. Copy the nested part too, or use `structuredClone`."
+  - "**`await` inside `forEach`.** Nothing waits, and errors escape as unhandled rejections. Use `for...of` for sequence or `Promise.all` with `map` for parallel work."
+  - "**`Promise.all` over unbounded input.** Thousands of requests at once hit rate limits and connection caps. Cap concurrency with a worker pool or a library such as p-limit."
+  - "**Optional chaining on values that must exist.** `order?.total` on a required field turns a loud bug into a silent blank. Keep `?.` for data that is allowed to be missing."
+  - "**Treating an abort as a failure.** A cancelled fetch rejects with `AbortError`, and logging it as an error floods your alerts. Check `error.name` and ignore deliberate cancels."
+interview:
+  - question: What's the difference between `??` and `||`, and when does it matter?
+    answer: >-
+      `??` falls back only for `null` and `undefined`; `||` falls back for any falsy value,
+      which also includes `0`, `""`, `false` and `NaN`. It matters whenever a falsy value is
+      a real choice: a volume of `0`, an empty display name, a feature flag set to `false`.
+      With `settings.volume || 50`, a user who chose silence gets 50. So I default with `??`
+      and only use `||` when I really mean "any falsy value", such as treating an empty
+      string as missing. A related detail is that default parameters only apply to
+      `undefined`, so if an API sends `null` I use `??` inside the function. The one syntax
+      trap is that `??` can't be mixed with `||` without brackets.
+  - question: You need to call five independent APIs. How do you do it, and what if some fail?
+    answer: >-
+      I start them together, because awaiting one after another makes the total the sum of
+      all five instead of the slowest one. If every result is required, `Promise.all` is
+      right: it fails fast on the first rejection, though the other requests keep running
+      because promises aren't cancelled. If partial results are useful, like widgets on a
+      dashboard, I use `Promise.allSettled` and render what succeeded, reporting what
+      failed. I'd pass an `AbortSignal` with a timeout to each `fetch` so a hung service
+      can't stall the page. And if it were five hundred calls rather than five, I'd cap
+      concurrency with a small worker pool, because firing them all at once hits rate
+      limits and connection caps.
+  - question: Why doesn't `await` work inside `forEach`?
+    answer: >-
+      It does run, but `forEach` ignores the promise the callback returns, so nothing waits
+      for it. The loop finishes immediately, code after it runs before any of the work
+      completes, and a rejection becomes unhandled instead of reaching your `try`. The fix
+      depends on what you mean. For one at a time, in order, I use `for...of` with `await`
+      inside, which suits writes that must not overlap. For all at once, `await
+      Promise.all(items.map(async (item) => ...))`, which is faster but runs everything in
+      parallel. For large lists I'd limit concurrency between the two. The same trap exists
+      with `map` if you forget to await the array of promises it returns.
+  - question: How do you cancel a fetch request, and why would you?
+    answer: >-
+      I pass an `AbortSignal` from an `AbortController` in the fetch options and call
+      `controller.abort()`; the fetch then rejects with an `AbortError`. For timeouts,
+      `AbortSignal.timeout(ms)` gives a signal that aborts itself, and `AbortSignal.any`
+      combines it with a caller's signal. The main reasons are correctness and waste. In
+      search as you type, aborting the previous request stops a slow, older response from
+      overwriting a newer one. In React, aborting in an effect's cleanup stops a request for
+      a screen the user already left. On a server, a timeout stops one slow dependency tying
+      up requests. The trade-off is handling: callers must tell a deliberate abort apart from
+      a real failure by checking the error name.
+  - question: How do you copy an object in JavaScript, and what goes wrong?
+    answer: >-
+      It depends on how deep the copy needs to be. Spread, `{ ...obj }`, or
+      `Object.assign` makes a shallow copy: top-level fields are new, but nested objects,
+      arrays and dates are shared, so editing `copy.address.city` edits the original. For a
+      deep copy of data I use `structuredClone`, which keeps `Date`, `Map`, `Set` and even
+      circular references, but throws on functions and drops class prototypes. The old
+      `JSON.parse(JSON.stringify(obj))` turns dates into strings and drops `undefined`, so I
+      avoid it. In React state, I usually don't deep copy at all: I copy only the path I'm
+      changing with nested spreads, which keeps unchanged parts identical and cheap to
+      compare.
+terms:
+  - term: "`??`"
+    say: A newer `||`.
+    means: "`a ?? b` falls back only when `a` is `null` or `undefined`. `a || b` also replaces `0`,
+      `''`, `false` and `NaN`."
+  - term: Default parameter
+    say: It applies when the argument is missing or empty.
+    means: Defaults apply only to `undefined`, so `null`, `0` and `''` pass straight through.
+  - term: "`toSorted`"
+    say: The same as `sort`.
+    means: "`sort` reorders the caller's array in place; `toSorted` returns a sorted copy and leaves the
+      original alone."
+  - term: Spread copy
+    say: Spread copies the object.
+    means: Spread makes a *shallow* copy, so nested objects are shared. `structuredClone` copies plain
+      data deeply but can't copy functions.
+  - term: "`forEach` with `async`"
+    say: "`await` inside `forEach` waits for each item."
+    means: "`forEach` ignores the promises its callback returns, so nothing waits. Use `for...of` for
+      one at a time or `Promise.all` for all together."
+  - term: "`AbortSignal`"
+    say: A way to cancel a promise.
+    means: A signal you pass to `fetch` or another API that accepts one, which then stops its own work.
+      A promise itself can't be cancelled.

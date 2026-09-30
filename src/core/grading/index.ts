@@ -1,0 +1,18 @@
+export {
+  gradePlayground,
+  gradeRun,
+  gradeStep,
+  normaliseCell,
+  type Answer,
+  type ExplainBackAnswer,
+  type FeedbackItem,
+  type FillBlankAnswer,
+  type GradableStep,
+  type Grade,
+  type LabCheckpointAnswer,
+  type LineHuntAnswer,
+  type MultipleChoiceAnswer,
+  type ParsonsAnswer,
+  type PredictAnswer,
+  type TraceTableAnswer,
+} from './grade';

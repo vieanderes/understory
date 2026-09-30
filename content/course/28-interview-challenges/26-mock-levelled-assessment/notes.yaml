@@ -1,0 +1,374 @@
+summary: >-
+  A levelled assessment is one project that grows through four levels in ninety minutes.
+  Level 1 is basic operations and corner cases, level 2 adds processing such as rankings,
+  level 3 adds a feature with its own rules, and level 4 extends the design in a way that
+  punishes a model chosen without looking ahead. Every earlier level's tests keep counting,
+  so a refactor that breaks level 1 costs more than level 4 earns.
+
+
+  The bank system here is one of the reported variants. It rewards one habit above all:
+  read all four levels before writing a line, and give each fact a later level needs a home
+  from the start. An account is an object, not a number, because it will gain an outgoing
+  total, waiting payments and a history. Every method starts by running whatever payments
+  are due, so time-based rules live in one place.
+
+
+  These notes walk the ideal solution level by level with its complete code, explain the
+  two data structures that keep it fast (a min-heap with lazy deletion, and a sorted history
+  searched by binary search), show the stress test that checked it against the slow version,
+  and give a time plan with fallbacks.
+remember:
+  - Read every level before level 1 and choose a data model the last level will not break.
+  - Store each account as an object with balance, outgoing total, creation time, a timestamped history and its waiting payments.
+  - Put every time-based rule in one helper called at the start of every method, so each operation sees the state as of its timestamp.
+  - Waiting payments belong in a min-heap ordered by due time, then scheduling number, so running what is due costs O(log P) per payment.
+  - Cancel by marking and skip marked entries when they reach the top of the heap, which is lazy deletion.
+  - Timestamps only increase, so each account's history is already sorted and a past balance is a binary search.
+  - After every change, rerun all levels' tests, and prefer a slower structure that passes over a fast one that is half written.
+sections:
+  - title: The data model, chosen with level 4 in view
+    body: |-
+      Reading the four levels first gives a list of facts per account: balance (level 1),
+      outgoing total (level 2), waiting payments (level 3), history and existence over time
+      (level 4). Put them all in the account object on day one, even if level 1 uses only
+      the balance. Adding a field later is cheap; changing a `Map<string, number>` into a
+      map of objects halfway through level 3 touches every method.
+
+      ```ts
+      interface Account {
+        balance: number;
+        outgoing: number;
+        // [timestamp, balance] after every change, in time order, for getBalance.
+        history: [number, number][];
+        createdAt: number;
+        pending: Set<string>;
+      }
+
+      interface Payment {
+        id: string;
+        seq: number;
+        owner: string;
+        amount: number;
+        due: number;
+        status: 'pending' | 'done' | 'cancelled';
+      }
+
+      // Earlier due time first, then the order of scheduling.
+      const before = (a: Payment, b: Payment): boolean => a.due < b.due || (a.due === b.due && a.seq < b.seq);
+
+      class PaymentQueue {
+        private heap: Payment[] = [];
+
+        peek(): Payment | undefined {
+          return this.heap[0];
+        }
+
+        push(payment: Payment): void {
+          const heap = this.heap;
+          heap.push(payment);
+          let i = heap.length - 1;
+          while (i > 0) {
+            const parent = (i - 1) >> 1;
+            if (!before(heap[i]!, heap[parent]!)) break;
+            [heap[i], heap[parent]] = [heap[parent]!, heap[i]!];
+            i = parent;
+          }
+        }
+
+        pop(): Payment | undefined {
+          const heap = this.heap;
+          const top = heap[0];
+          const last = heap.pop();
+          if (heap.length > 0 && last !== undefined) {
+            heap[0] = last;
+            let i = 0;
+            for (;;) {
+              const left = 2 * i + 1;
+              const right = left + 1;
+              let smallest = i;
+              if (left < heap.length && before(heap[left]!, heap[smallest]!)) smallest = left;
+              if (right < heap.length && before(heap[right]!, heap[smallest]!)) smallest = right;
+              if (smallest === i) break;
+              [heap[i], heap[smallest]] = [heap[smallest]!, heap[i]!];
+              i = smallest;
+            }
+          }
+          return top;
+        }
+      }
+      ```
+
+      The bank itself keeps a `Map` of open accounts, a `Map` of merged-away accounts with
+      the time they closed, a `Map` of every payment by id, the queue, and a counter for
+      payment numbers. JavaScript has no built-in heap, so writing one from memory in about
+      five minutes is a skill worth practising. The tie-break by `seq` is not decoration:
+      the statement says payments due at the same time run in scheduling order, and a heap
+      is not stable on its own.
+  - title: Levels 1 and 2, written so later levels only add
+    body: |-
+      Every method begins with `this.runDue(timestamp)`. At level 1 it does nothing, but
+      writing it now means level 3 changes one helper instead of eight methods. Every
+      balance change goes through `change`, which also appends to the history that level
+      4 will read.
+
+      ```ts
+      export class Bank {
+        private accounts = new Map<string, Account>();
+        private closed = new Map<string, { account: Account; closedAt: number }>();
+        private payments = new Map<string, Payment>();
+        private queue = new PaymentQueue();
+        private scheduled = 0;
+
+        private change(account: Account, timestamp: number, delta: number): void {
+          account.balance += delta;
+          account.history.push([timestamp, account.balance]);
+        }
+
+        createAccount(timestamp: number, accountId: string): boolean {
+          this.runDue(timestamp);
+          if (this.accounts.has(accountId) || this.closed.has(accountId)) return false;
+          this.accounts.set(accountId, {
+            balance: 0, outgoing: 0, history: [[timestamp, 0]], createdAt: timestamp, pending: new Set(),
+          });
+          return true;
+        }
+
+        deposit(timestamp: number, accountId: string, amount: number): number | null {
+          this.runDue(timestamp);
+          const account = this.accounts.get(accountId);
+          if (!account) return null;
+          this.change(account, timestamp, amount);
+          return account.balance;
+        }
+
+        transfer(timestamp: number, sourceId: string, targetId: string, amount: number): number | null {
+          this.runDue(timestamp);
+          const source = this.accounts.get(sourceId);
+          const target = this.accounts.get(targetId);
+          if (!source || !target || sourceId === targetId || source.balance < amount) return null;
+          this.change(source, timestamp, -amount);
+          this.change(target, timestamp, amount);
+          source.outgoing += amount;
+          return source.balance;
+        }
+
+        topSpenders(timestamp: number, n: number): string[] {
+          this.runDue(timestamp);
+          return [...this.accounts]
+            .sort(([idA, a], [idB, b]) => b.outgoing - a.outgoing || (idA < idB ? -1 : idA > idB ? 1 : 0))
+            .slice(0, n)
+            .map(([id, account]) => `${id}(${account.outgoing})`);
+        }
+      ```
+
+      Two details trip people up. The tie-break compares ids with `<` and `>`, which is
+      plain string order as the statement asks; `localeCompare` can order some strings
+      differently. And `createAccount` also checks `closed`, because the statement says an
+      id is never reused, even after a merge. `topSpenders` sorts all accounts, O(A log A),
+      which is fine at these sizes; a heap of size n would matter only with many accounts
+      and frequent calls.
+  - title: Level 3, scheduled payments with a heap and lazy deletion
+    body: |-
+      All time-based behaviour lives in `runDue`. It pops every payment due at or before
+      the current timestamp, in due order then scheduling order, and applies each one at
+      its own due time. A cancelled payment stays in the heap and is skipped when it comes
+      up, because finding and removing it from the middle of a heap would cost O(P).
+
+      ```ts
+        private runDue(timestamp: number): void {
+          for (let next = this.queue.peek(); next && next.due <= timestamp; next = this.queue.peek()) {
+            this.queue.pop();
+            if (next.status !== 'pending') continue;
+            next.status = 'done';
+            const account = this.accounts.get(next.owner)!;
+            account.pending.delete(next.id);
+            if (account.balance >= next.amount) {
+              this.change(account, next.due, -next.amount);
+              account.outgoing += next.amount;
+            }
+          }
+        }
+
+        schedulePayment(timestamp: number, accountId: string, amount: number, delay: number): string | null {
+          this.runDue(timestamp);
+          const account = this.accounts.get(accountId);
+          if (!account) return null;
+          this.scheduled += 1;
+          const payment: Payment = {
+            id: `payment${this.scheduled}`, seq: this.scheduled, owner: accountId, amount, due: timestamp + delay, status: 'pending',
+          };
+          this.payments.set(payment.id, payment);
+          this.queue.push(payment);
+          account.pending.add(payment.id);
+          return payment.id;
+        }
+
+        cancelPayment(timestamp: number, accountId: string, paymentId: string): boolean {
+          this.runDue(timestamp);
+          const payment = this.payments.get(paymentId);
+          if (!payment || payment.status !== 'pending' || payment.owner !== accountId) return false;
+          payment.status = 'cancelled';
+          this.accounts.get(accountId)!.pending.delete(paymentId);
+          return true;
+        }
+      ```
+
+      The order inside `cancelPayment` matters: `runDue` first, so a payment due at this
+      very timestamp has already run and cannot be cancelled. A skipped payment (balance
+      too low) is marked `done` and never retried, as the statement says. Recording the
+      change at `next.due` rather than `timestamp` is what keeps level 4's history correct:
+      the payment happened at its due time, even if no operation arrived until later.
+  - title: Level 4, merging and reading the past
+    body: |-
+      Merging moves the second account's balance, outgoing total and waiting payments into
+      the first, then moves the second account to `closed` with the merge time. Its history
+      stays, so a past balance can still be read.
+
+      ```ts
+        mergeAccounts(timestamp: number, accountId1: string, accountId2: string): boolean {
+          this.runDue(timestamp);
+          const kept = this.accounts.get(accountId1);
+          const merged = this.accounts.get(accountId2);
+          if (!kept || !merged || accountId1 === accountId2) return false;
+          this.change(kept, timestamp, merged.balance);
+          kept.outgoing += merged.outgoing;
+          for (const id of merged.pending) {
+            this.payments.get(id)!.owner = accountId1;
+            kept.pending.add(id);
+          }
+          merged.pending.clear();
+          this.accounts.delete(accountId2);
+          this.closed.set(accountId2, { account: merged, closedAt: timestamp });
+          return true;
+        }
+
+        getBalance(timestamp: number, accountId: string, timeAt: number): number | null {
+          this.runDue(timestamp);
+          const open = this.accounts.get(accountId);
+          const gone = this.closed.get(accountId);
+          const account = open ?? gone?.account;
+          if (!account || timeAt < account.createdAt) return null;
+          if (gone && timeAt >= gone.closedAt) return null;
+          // Binary search for the last change at or before timeAt.
+          const history = account.history;
+          let low = 0;
+          let high = history.length - 1;
+          while (low < high) {
+            const middle = (low + high + 1) >> 1;
+            if (history[middle]![0] <= timeAt) low = middle;
+            else high = middle - 1;
+          }
+          return history[low]![1];
+        }
+      }
+      ```
+
+      Because waiting payments point at their owner by id, the merge re-points them in
+      O(W) for W waiting payments of the merged account, and the heap needs no change. The
+      binary search uses the upper middle, `(low + high + 1) >> 1`, because it moves `low`
+      up to `middle`; with the lower middle, two remaining entries would loop forever. The
+      history always starts with the creation entry, and `timeAt >= createdAt` has been
+      checked, so the search always finds an entry.
+  - title: Proving it, and a plan for the ninety minutes
+    body: |-
+      A levelled task has many interacting rules, so random operation sequences find bugs
+      that hand-written tests miss. Run the same random operations on the fast bank and
+      the slow one, and stop at the first differing result.
+
+      ```ts
+      const int = (lo: number, hi: number) => lo + Math.floor(Math.random() * (hi - lo + 1));
+      const pick = <T,>(xs: T[]) => xs[int(0, xs.length - 1)]!;
+
+      function randomRun(steps: number) {
+        const ops: [string, ...unknown[]][] = [];
+        const ids = ['a', 'b', 'c', 'd'];
+        let t = 0;
+        for (let i = 0; i < steps; i++) {
+          t += int(1, 3);
+          const kind = int(0, 7);
+          if (kind === 0) ops.push(['createAccount', t, pick(ids)]);
+          else if (kind === 1) ops.push(['deposit', t, pick(ids), int(1, 50)]);
+          else if (kind === 2) ops.push(['transfer', t, pick(ids), pick(ids), int(1, 50)]);
+          else if (kind === 3) ops.push(['topSpenders', t, int(1, 5)]);
+          else if (kind === 4) ops.push(['schedulePayment', t, pick(ids), int(1, 50), int(1, 6)]);
+          else if (kind === 5) ops.push(['cancelPayment', t, pick(ids), `payment${int(1, 6)}`]);
+          else if (kind === 6) ops.push(['mergeAccounts', t, pick(ids), pick(ids)]);
+          else ops.push(['getBalance', t, pick(ids), int(0, t)]);
+        }
+        return ops;
+      }
+      ```
+
+      Feeding 3,000 random runs to both versions compared about 39,000 operations with no
+      difference. Four ids and small amounts make collisions, merges and failed transfers
+      common, which is where the bugs are.
+
+      For the clock: 10 minutes reading all levels and writing the model; 15 minutes for
+      level 1; 10 for level 2; 25 for level 3; 20 for level 4; 10 to rerun everything. If
+      the heap is not working by the middle of level 3, keep waiting payments in an array
+      sorted by due time and scheduling number, inserting in order. It is O(P) per insert,
+      passes every correctness test, and can be swapped for the heap later behind the same
+      `peek` and `pop`.
+pitfalls:
+  - >-
+    **Storing a balance as a plain number.** Level 2 needs outgoing totals, level 3 waiting
+    payments, level 4 history. Start with an account object.
+  - >-
+    **Running due payments in only some methods.** Then `topSpenders` or `getBalance` sees
+    stale state. Call one `runDue` at the start of every method.
+  - >-
+    **Recording a payment at the operation's timestamp.** The payment happened at its due
+    time, and level 4 reads history by time. Record it at `due`.
+  - >-
+    **Ignoring the scheduling order on equal due times.** A heap is not stable, so two
+    payments due together can swap. Break ties with a sequence number.
+  - >-
+    **Removing cancelled payments from the heap.** Searching the heap is O(P). Mark them
+    and skip them when they reach the top.
+  - >-
+    **Deleting merged accounts completely.** `getBalance` for the merged-away id must still
+    answer for times before the merge, and the id must never be reused. Keep it in a closed
+    map with its closing time.
+  - >-
+    **Refactoring without rerunning old tests.** A level 3 change that breaks a level 1
+    rule loses points you had. Run every level after every change.
+interview:
+  - question: How do you approach a levelled task so level 4 doesn't force a rewrite?
+    answer: >-
+      I read all four levels before writing any code and list, for each level, the new
+      facts it needs about each entity. Then I design the model to hold all of them from
+      the start: here, an account object with balance, outgoing total, history, creation
+      time and waiting payments, rather than a map from id to a number. I also add the
+      cross-cutting hooks early, such as a `runDue` call at the top of every method and one
+      `change` helper for every balance update. Later levels then add methods and fill in
+      helpers instead of changing every caller. The trade-off is a slightly heavier level
+      1, which costs a few minutes and saves a rewrite under time pressure.
+  - question: Why a heap for scheduled payments, and how do you cancel one?
+    answer: >-
+      Because every operation must first run all payments that are due, in due order then
+      scheduling order. A min-heap keyed by due time and sequence number gives the next due
+      payment in O(1) and removes it in O(log P), so running k due payments costs O(k log
+      P). Scanning an array of all waiting payments on every call is O(P), which is what
+      the slow version does and why it takes seconds at the test sizes. Cancelling uses
+      lazy deletion: I mark the payment cancelled in a map by id, and `runDue` skips marked
+      entries when they reach the top, so a cancel is O(1). The cost is that cancelled
+      entries occupy the heap until they surface.
+  - question: How does getBalance answer for a time in the past efficiently?
+    answer: >-
+      Every balance change appends a pair of timestamp and new balance to the account's
+      history. Timestamps strictly increase across calls, and due payments are applied in
+      due order at their due time, so each history is already sorted. A past balance is
+      then a binary search for the last entry at or before the requested time, O(log H).
+      Existence is checked first: before creation or at or after a merge, the answer is
+      null. The alternative, replaying all changes from the start, is O(H) per call and
+      too slow for 25,000 lookups. The trade-off is memory: one entry per change, which is
+      acceptable here and could be compacted into snapshots if histories grew very long.
+  - question: You're behind at level 3. What do you do?
+    answer: >-
+      Protect the points I have and take the cheapest correct path. First I make sure
+      levels 1 and 2 still pass. Then I implement level 3 with a simpler structure, such as
+      waiting payments in an array kept sorted by due time and sequence number, which is
+      correct and passes the correctness tests even if it is slow on the largest inputs. I
+      keep it behind the same `peek` and `pop` methods, so swapping in a heap later is
+      local. I would rather have a clean level 3 than a broken level 4, because every test
+      counts the same and earlier levels keep scoring.

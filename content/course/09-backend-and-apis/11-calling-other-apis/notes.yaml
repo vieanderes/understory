@@ -1,0 +1,270 @@
+summary: >-
+  Most backends spend much of their time calling other services: a model API, a payment
+  provider, an email sender, a maps service. Each call is authorised with a secret key, costs
+  money or quota, and can be slow, down or wrong. Your server sits in the middle as a proxy,
+  so the key never reaches a browser, and so every way the other service can fail becomes a
+  clear, predictable answer for your own client.
+
+
+  The lesson covers the two essentials: keep the key server side, sent as a bearer token
+  from the environment, and give every call a deadline, mapping a timeout to 504 and a
+  failure to 502. In production a few more habits make the difference between an outage and
+  a blip: checking the status, because `fetch` doesn't throw on 4xx and 5xx; parsing the
+  response, because providers change; retrying only what is safe to retry, with backoff and
+  jitter; and cutting the caller's work short when they go away.
+
+
+  None of this is specific to AI. It applies to any dependency you don't control, which is
+  why interviewers ask about timeouts, retries, idempotency and circuit breakers under
+  headings as different as payments, microservices and LLM features.
+remember:
+  - A secret key lives only on the server, read from the environment, and the browser calls your endpoint, which calls the provider.
+  - Any variable prefixed `NEXT_PUBLIC_` is written into the JavaScript bundle at build time, so it must never hold a secret.
+  - Every outgoing call gets a deadline, such as `AbortSignal.timeout(10_000)`, because the default wait is minutes.
+  - "`fetch` rejects only on network errors and aborts; a 4xx or 5xx resolves normally, so check `response.ok`."
+  - Answer 504 when the service behind you was too slow and 502 when it failed or answered with something unusable, with your own message and the real error in your logs.
+  - Retry only network errors, timeouts, 408, 429 and 5xx, only for idempotent requests or with an idempotency key, with exponential backoff, jitter and a cap.
+  - Parse a provider's response with a schema before relying on it, since a changed field or an HTML error page can arrive with status 200.
+  - A leaked key is rotated, not hidden, because copies already exist wherever it was seen.
+sections:
+  - title: A production-grade upstream call
+    body: |-
+      The lesson's handler catches thrown errors. A real call has three more failure paths:
+      an error status, a body of the wrong shape, and a caller who has already left.
+
+      ```ts
+      import { z } from 'zod';
+
+      const Answer = z.object({ answer: z.string() });
+
+      export class UpstreamError extends Error {
+        constructor(readonly status: 502 | 503 | 504, message: string) {
+          super(message);
+        }
+      }
+
+      export async function askModel(question: string, callerSignal: AbortSignal): Promise<string> {
+        let response: Response;
+        try {
+          response = await fetch(`${process.env.MODEL_API_URL}/v1/answer`, {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${process.env.MODEL_API_KEY}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ question }),
+            // Stop at 10 seconds, or as soon as our own caller goes away.
+            signal: AbortSignal.any([AbortSignal.timeout(10_000), callerSignal]),
+          });
+        } catch (error) {
+          if (callerSignal.aborted) throw error; // nobody is waiting for an answer
+          if (error instanceof Error && error.name === 'TimeoutError') {
+            throw new UpstreamError(504, 'The model took too long');
+          }
+          throw new UpstreamError(502, 'The model could not be reached');
+        }
+
+        // fetch resolves on 4xx and 5xx, so check the status yourself.
+        if (response.status === 429) throw new UpstreamError(503, 'The model is busy, try again shortly');
+        if (!response.ok) {
+          console.error('model call failed', response.status, await response.text());
+          throw new UpstreamError(502, 'The model service failed');
+        }
+
+        const parsed = Answer.safeParse(await response.json().catch(() => null));
+        if (!parsed.success) throw new UpstreamError(502, 'The model sent an unexpected answer');
+        return parsed.data.answer;
+      }
+      ```
+
+      Tried against a local test server: a good answer returns `"42"`; a `401` from the
+      provider, meaning your key is wrong, becomes a 502; an unreachable host becomes a 502;
+      an eleven-second response becomes a 504 after ten seconds; and aborting the caller's
+      signal ends the call at once with an `AbortError`.
+
+      Two mappings are deliberate. The provider's `401` is your configuration problem, not
+      your user's, so it must never pass through as a `401` that tells a signed-in user
+      they're signed out. And the provider's `429` is a capacity problem, so a `503` with
+      `Retry-After` tells your client to come back later, while an alert tells you to raise
+      the quota.
+  - title: Retrying without making things worse
+    body: |-
+      Many failures are brief: a dropped connection, a deploy on the other side, a moment
+      of overload. A retry hides them. A careless retry also turns a small overload into a
+      large one, because every client retries at once, multiplying the load on a service
+      that is already struggling.
+
+      ```ts
+      const RETRYABLE = new Set([408, 429, 500, 502, 503, 504]);
+      const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+      // Retry-After is either whole seconds or an HTTP date.
+      function retryAfterMs(header: string | null): number | undefined {
+        if (header === null) return undefined;
+        const seconds = Number(header);
+        if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+        const date = Date.parse(header);
+        return Number.isNaN(date) ? undefined : Math.max(0, date - Date.now());
+      }
+
+      export async function fetchWithRetry(
+        url: string,
+        init: RequestInit,
+        { attempts = 3, baseMs = 200, capMs = 5_000 } = {},
+      ): Promise<Response> {
+        for (let attempt = 1; ; attempt++) {
+          let response: Response | undefined;
+          let failure: unknown;
+          try {
+            response = await fetch(url, init);
+            if (!RETRYABLE.has(response.status)) return response;
+          } catch (error) {
+            failure = error; // network error or timeout
+          }
+          // Full jitter: a random wait up to the exponential ceiling, so clients spread out.
+          const backoff = Math.random() * Math.min(capMs, baseMs * 2 ** attempt);
+          const wait = retryAfterMs(response?.headers.get('retry-after') ?? null) ?? backoff;
+          // Out of attempts, or told to wait longer than we will: hand back what we have.
+          if (attempt >= attempts || wait > capMs) {
+            if (response) return response;
+            throw failure;
+          }
+          await sleep(wait);
+        }
+      }
+      ```
+
+      Against a test server, a route that fails twice with 503 then succeeds returns 200 on
+      the third request. A `400` returns at once, because repeating a bad request gives the
+      same answer. A `429` with `Retry-After: 60` returns immediately rather than holding
+      the user for a minute.
+
+      The hard rule is **idempotency**. Retrying a `GET` is safe. Retrying a `POST` that
+      charges a card might charge twice, because the first attempt may have succeeded before
+      the connection dropped. Payment and email providers accept an idempotency key, a
+      unique value per logical operation sent in a header such as Stripe's
+      `Idempotency-Key`; the provider returns the first result for any repeat. Without one,
+      don't retry writes.
+
+      Keep one deadline for the whole operation, not per attempt, and check whether the
+      provider's SDK already retries. Two layers of three attempts make nine calls.
+  - title: Keeping keys secret, in practice
+    body: |-
+      The key stays out of the browser, and also out of everything else that might be
+      shared.
+
+      - **Build-time inlining.** In Next.js, `process.env.NEXT_PUBLIC_*` is replaced with the
+        value when the bundle is built, so the key ends up in a file every visitor
+        downloads. Only unprefixed variables stay on the server. Importing the `server-only`
+        package at the top of a module that reads secrets makes the build fail if a client
+        component imports it.
+      - **Logs and errors.** Never log request headers or a full request object to an
+        upstream. Error-tracking tools capture both by default, so scrub `Authorization`.
+      - **Scope and separate.** Use a separate key per environment and, where the provider
+        allows, per service, with the narrowest permissions and a spending limit. A leaked
+        development key then can't touch production or run up an unlimited bill.
+      - **Rotate without downtime.** Create the new key, deploy it, confirm traffic has moved,
+        then revoke the old one. Providers allow two active keys for exactly this.
+
+      A proxy creates one new risk. If any part of the upstream URL comes from the user,
+      such as "fetch this image URL and describe it", an attacker can point your server at
+      internal addresses like a cloud metadata service. That's **server-side request
+      forgery**. Build upstream URLs from fixed bases, and when a user-supplied URL is the
+      feature, allow-list schemes and hosts and refuse private address ranges.
+
+      Your proxy is also a cost gate. Because every call to a paid API passes through your
+      endpoint, it's the place to require a signed-in user, rate-limit per account and cap
+      input size. An open proxy with your key behind it is as bad as a leaked key.
+  - title: When the dependency is down for longer
+    body: |-
+      Timeouts and retries handle seconds. For a dependency that stays down, two more
+      patterns keep your own service healthy.
+
+      A **circuit breaker** counts recent failures to one dependency. Past a threshold it
+      "opens" and fails calls immediately for a cool-down period, without touching the
+      network, then lets a trial request through. If that succeeds it closes again. The
+      point is to stop spending threads, sockets and your users' time on a service that is
+      clearly down, and to give it room to recover.
+
+      A **bulkhead**, or concurrency limit, caps how many calls to one dependency can be in
+      flight at once. If the maps service hangs, only its share of connections waits, and
+      checkout keeps working.
+
+      Then decide what the product does meanwhile. Some calls have a good **fallback**: a
+      cached exchange rate, a smaller or different model, "we'll email your receipt shortly"
+      with the send queued for later. Others don't, and a clear, fast error is the best
+      answer. Moving non-urgent calls, like sending a confirmation email, onto a queue
+      removes them from the request path entirely, so a slow provider never slows a user.
+
+      Streaming model responses add one wrinkle. Once you've sent the first bytes with a
+      `200`, you can't change the status. An error halfway through has to travel inside the
+      stream, as a final event the client understands.
+pitfalls:
+  - '**Assuming `fetch` throws on an error status.** A `500` from the provider resolves normally, and `response.json()` then fails or returns an error object. Check `response.ok` before reading the body.'
+  - '**Passing the provider''s status straight through.** Forwarding its `401` tells your user they''re signed out when it''s your key that''s wrong. Map upstream failures to 502, 503 or 504 and alert on the cause.'
+  - '**Retrying non-idempotent requests.** A timed-out payment may have gone through. Retry writes only with an idempotency key the provider honours.'
+  - '**Retrying in lockstep.** Fixed delays bring every client back in the same instant. Use exponential backoff with random jitter, and honour `Retry-After`.'
+  - '**A timeout per attempt but none overall.** Three attempts of ten seconds keep a user waiting thirty. Give the whole operation one deadline.'
+  - '**Reading a secret through `NEXT_PUBLIC_`.** The value is copied into the client bundle at build time. Keep secrets in unprefixed variables read only in server code.'
+  - '**Deleting a leaked key from git history and moving on.** Copies already exist in clones, caches and scrapers. Rotate the key at the provider first.'
+interview:
+  - question: How would you call an unreliable third-party API from a request handler?
+    answer: >-
+      With a deadline, a status check, a parsed response, careful retries and clear mapping
+      to my own errors. Every call gets an `AbortSignal.timeout` combined with the caller's
+      signal, so work stops if the user leaves. I check `response.ok`, because `fetch` only
+      throws on network failures, and parse the body with a schema. Idempotent calls retry
+      on network errors, 429 and 5xx with exponential backoff and full jitter, honouring
+      `Retry-After`, within one overall deadline; writes retry only with an idempotency key.
+      Failures become 504 or 502 with my own message, and the real error goes to logs with a
+      request id. If the dependency is critical and often slow, I'd add a circuit breaker
+      and a fallback, or move the call onto a queue.
+  - question: Which errors are safe to retry, and why does jitter matter?
+    answer: >-
+      Retry what's transient and where a repeat can't do harm: connection failures, timeouts,
+      408, 429 and 5xx, for idempotent requests or ones carrying an idempotency key. Don't
+      retry 4xx such as 400 or 403, because the same request gets the same answer. Jitter
+      matters because failures are correlated. If a provider blips and ten thousand clients
+      all wait exactly one second, they return together and knock it over again. Randomising
+      each wait, for example uniformly between zero and the exponential ceiling, spreads
+      them out. I'd also cap attempts and total time, and watch for SDKs that already retry,
+      so layers don't multiply.
+  - question: Your frontend team wants to call the model API directly from the browser to save latency. What do you say?
+    answer: >-
+      No, because anything in the browser can be read, so the key would be public and anyone
+      could spend our money with it. The request goes through our endpoint, which adds the
+      key from the server's environment. That hop is also where we authenticate the user,
+      rate-limit per account, cap input size, log usage and choose the model, none of which
+      the browser can enforce. The latency cost is one extra hop to a nearby server,
+      usually tens of milliseconds against model calls taking seconds. If first-token speed
+      matters, stream the response through the proxy. Some providers offer short-lived,
+      narrowly scoped client tokens minted by your server, which is the exception.
+  - question: When do you return 502, 503 and 504 from your API?
+    answer: >-
+      All three say the problem is behind you, not with the client's request. 504 Gateway
+      Timeout means the upstream didn't answer within my deadline. 502 Bad Gateway means it
+      answered with something unusable: an error status, a malformed body, or it couldn't be
+      reached. 503 Service Unavailable means I can't serve right now but expect to soon,
+      such as when the provider rate-limits us or my circuit breaker is open, ideally with
+      `Retry-After`. The distinction helps clients and dashboards: a spike in 504s points at
+      latency, 502s at errors. None of them should leak the provider's own error text.
+  - question: What is a backend-for-frontend, and why use one for an AI feature?
+    answer: >-
+      A backend-for-frontend, or BFF, is a thin server layer owned with the front end and
+      shaped exactly for one client's screens. For an AI feature it's where the model call
+      lives. It holds the API key the browser must never see, checks who the user is,
+      applies rate limits and cost caps, validates input and model output, logs and traces
+      each call, and caches repeat work. It also shapes the protocol for the UI, for example
+      one streaming endpoint per chat that sends token, done and error events. The trade-off
+      is one more service to run and keep in step with the UI, which is why it usually
+      belongs to the team that owns the screens.
+  - question: How do front-end and backend decisions affect each other?
+    answer: >-
+      Through the contract between them. Streaming changes the protocol, from one JSON
+      response to an event stream, and the error model, since errors after the first byte
+      travel inside the stream. Pagination style decides what the UI can do: cursors suit
+      infinite scroll, page numbers suit a numbered list. Validation happens on both sides:
+      in the browser for instant feedback, on the server because it's the only side you can
+      trust. Payload size and shape decide how fast a screen renders, so responses should be
+      shaped for the screen. So I agree the contract first, often as an OpenAPI schema that
+      generates a typed client, and change it together.

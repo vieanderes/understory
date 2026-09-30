@@ -1,0 +1,277 @@
+summary: >-
+  A hold sets stock aside for one buyer for a limited time: seats while a card is charged, a
+  table while a booking form is filled in, the last copy of a library book while a member
+  collects it. It solves a timing problem. Payment and form filling take minutes. You can't
+  keep a database transaction or a lock open that long, so the promise lives in a row with
+  an expiry time.
+
+
+  A hold is a **lease**: a right that ends on its own unless it's renewed or used. Leases
+  are everywhere in back ends: job locks, leader election, cache entries with a TTL, a
+  worker's claim on a queued job. The lesson's hold carries the ideas that all leases need.
+  The check counts what's promised, not only what's sold. Every state change is one guarded
+  statement. You prove the invariant transition by transition, not by testing orders.
+
+
+  These notes add the full checkout in SQL, a way to make expiry exact without waiting for
+  the sweep, and the flaw every lease shares: the holder can lose it without noticing. The
+  fix for that is a **fencing token**. Reach for holds when a scarce thing must be promised
+  before a slow step finishes. Skip them when stock is plentiful or overselling is cheap to
+  fix, where a plain check at payment time is simpler.
+remember:
+  - The invariant is sold plus held never passes capacity, and every transition must keep it on its own.
+  - Reserve with one conditional statement, `WHERE sold + held + qty <= capacity`, and treat zero rows as sold out.
+  - Every status change names the status it expects, so of two racing actors exactly one sees a row change.
+  - A hold is live only while `expires_at` is in the future by the database's clock, whatever its status column says.
+  - Move the status and the counters in one transaction, or a crash between them leaves the counts wrong for good.
+  - A lease can expire while its holder is paused and still believes it holds it, so a lease alone is not mutual exclusion.
+  - A fencing token rises with each grant, and the protected store rejects any write carrying a lower token than it has seen.
+  - A `CHECK (sold + held <= capacity)` constraint turns a logic bug into a failed statement instead of an oversold show.
+sections:
+  - title: The whole checkout in SQL
+    body: |-
+      The lesson's transitions touch two tables: `holds` for the promise, `shows` for the
+      counts. A data-modifying CTE lets each transition change both in one statement, so
+      there is nothing to half-finish. This ran on PostgreSQL through PGlite.
+
+      ```sql
+      CREATE TABLE shows (
+        id bigint PRIMARY KEY,
+        capacity int NOT NULL,
+        sold int NOT NULL DEFAULT 0,
+        held int NOT NULL DEFAULT 0,
+        CHECK (sold >= 0 AND held >= 0 AND sold + held <= capacity)
+      );
+
+      CREATE TABLE holds (
+        id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        show_id bigint NOT NULL REFERENCES shows (id),
+        buyer text NOT NULL,
+        qty int NOT NULL CHECK (qty > 0),
+        status text NOT NULL DEFAULT 'active'
+          CHECK (status IN ('active', 'confirmed', 'expired')),
+        expires_at timestamptz NOT NULL
+      );
+
+      -- Only live holds are indexed, so the sweep stays fast as history grows.
+      CREATE INDEX holds_due ON holds (expires_at) WHERE status = 'active';
+
+      INSERT INTO shows (id, capacity) VALUES (1, 3);
+
+      -- Reserve: raise held and create the hold together.
+      WITH seats AS (
+        UPDATE shows SET held = held + 2
+        WHERE id = 1 AND sold + held + 2 <= capacity
+        RETURNING id
+      )
+      INSERT INTO holds (show_id, buyer, qty, expires_at)
+      SELECT id, 'ana', 2, now() + interval '10 minutes' FROM seats
+      RETURNING id;
+
+      -- Confirm: the guarded status change and the counter move.
+      WITH won AS (
+        UPDATE holds SET status = 'confirmed'
+        WHERE id = 1 AND status = 'active' AND expires_at > now()
+        RETURNING show_id, qty
+      )
+      UPDATE shows AS s SET held = s.held - won.qty, sold = s.sold + won.qty
+      FROM won
+      WHERE s.id = won.show_id
+      RETURNING s.sold, s.held;
+      ```
+
+      With a capacity of 3, the reserve returns a hold id. A second buyer asking for 2 gets
+      no row, so no hold is created. The confirm returns `sold` 2 and `held` 0.
+
+      The `CHECK` constraint is the safety net. If a future change breaks a transition, the
+      statement fails with `violates check constraint` instead of overselling. Constraints
+      don't replace the guarded statements, because a failed statement is still a bug your
+      buyer sees. They make the bug loud.
+
+      Note what the reserve doesn't need: an explicit transaction or a `SELECT ... FOR
+      UPDATE` first. One `UPDATE` with its condition in the `WHERE` clause is atomic on its
+      own. A concurrent reserve for the same show waits on the row lock. Then it re-checks
+      the condition against the updated row, so the last seat goes to exactly one of them.
+  - title: A sweep that can run on many machines
+    body: |-
+      The sweep gives seats back. Written as one statement per batch, it expires the holds
+      and lowers `held` for every show they belonged to.
+
+      ```sql
+      WITH due AS (
+        SELECT id FROM holds
+        WHERE status = 'active' AND expires_at <= now()
+        ORDER BY id
+        LIMIT 500
+        FOR UPDATE SKIP LOCKED
+      ), gone AS (
+        UPDATE holds AS h SET status = 'expired'
+        FROM due
+        WHERE h.id = due.id
+        RETURNING h.show_id, h.qty
+      ), per_show AS (
+        SELECT show_id, sum(qty) AS qty FROM gone GROUP BY show_id
+      )
+      UPDATE shows AS s SET held = s.held - per_show.qty
+      FROM per_show
+      WHERE s.id = per_show.show_id
+      RETURNING s.id, s.sold, s.held;
+      ```
+
+      Three details make it production-shaped. `LIMIT 500` keeps each transaction short, so
+      the sweep never holds thousands of row locks at once. Loop until it returns no rows.
+      `FOR UPDATE SKIP LOCKED` lets two sweepers run side by side: per the PostgreSQL
+      documentation, a row another transaction has locked is skipped rather than waited for.
+      A row a confirm is changing right now is skipped too, and the next batch sees its new
+      status.
+
+      Summing per show matters. One batch can expire three holds on the same show, and an
+      `UPDATE ... FROM` changes each target row at most once. Without the `GROUP BY`, only
+      one of the three quantities would be subtracted.
+
+      The sweep's timing now decides how long an abandoned seat stays unavailable. Running
+      it every minute means a seat can look taken for up to a minute past its expiry.
+  - title: Exact expiry without waiting for the sweep
+    body: |-
+      A counter such as `held` is only as fresh as the last sweep. The alternative is to
+      store no counter and derive availability from the holds themselves. A hold counts if
+      it's confirmed, or active with time left. Expiry is then exact to the moment, and the
+      sweep becomes tidying.
+
+      ```sql
+      BEGIN;
+      -- The row lock makes reserves for one show take turns.
+      SELECT capacity FROM shows WHERE id = 1 FOR UPDATE;
+
+      INSERT INTO holds (show_id, buyer, qty, expires_at)
+      SELECT 1, 'ben', 2, now() + interval '10 minutes'
+      WHERE (
+        SELECT coalesce(sum(qty), 0) FROM holds
+        WHERE show_id = 1
+          AND (status = 'confirmed' OR (status = 'active' AND expires_at > now()))
+      ) + 2 <= (SELECT capacity FROM shows WHERE id = 1)
+      RETURNING id;
+      COMMIT;
+      ```
+
+      With a capacity of 3, one confirmed seat and a two-seat hold that ran out a minute
+      ago, this inserts Ben's hold, although the old hold still says `active`.
+
+      The `FOR UPDATE` is not optional. A sum followed by an insert is check-then-act, and
+      without the lock two reserves could both sum 1 and both insert. Under Read Committed,
+      each statement takes a fresh snapshot, so once a reserve holds the lock, its insert
+      sees every hold committed by the reserve before it.
+
+      The trade-off: the counter reads one row, while the derived version sums the live
+      holds for the show on every reserve. Both serialise reserves for one show on its row,
+      so a very hot show is a hot row either way. At that scale, split stock into several
+      rows, such as one per seating block, and reserve from any block with room.
+  - title: When a lease outlives its holder, and fencing tokens
+    body: |-
+      A hold is safe because the database decides both sides: the clock and the write. Many
+      leases aren't. A worker takes a lock in Redis with `SET key value NX PX 30000`, then
+      writes to a file store or an external API. Now the lease service and the thing it
+      protects are different systems.
+
+      That gap breaks mutual exclusion. The worker takes the lease, then stops for 40
+      seconds: a long garbage collection pause, a suspended virtual machine, a slow disk. The
+      lease expires. A second worker takes it and writes. The first wakes, still sure it
+      holds the lease, and overwrites the second's work. No clock check inside the worker
+      helps, because the pause can fall between the check and the write.
+
+      The fix is a **fencing token**: a number the lease service increases with every grant.
+      The worker sends it with each write, and the store refuses any token lower than the
+      highest it has seen.
+
+      ```ts
+      class LeaseService {
+        private token = 0;
+        private holder: string | undefined;
+        private expiresAt = 0;
+
+        acquire(who: string, now: number, ttlMs: number): number | undefined {
+          if (this.holder !== undefined && now < this.expiresAt) return undefined;
+          this.holder = who;
+          this.expiresAt = now + ttlMs;
+          this.token += 1;
+          return this.token;
+        }
+      }
+
+      class FencedStore {
+        private highest = 0;
+        value = '';
+
+        write(token: number, value: string): boolean {
+          if (token < this.highest) return false;
+          this.highest = token;
+          this.value = value;
+          return true;
+        }
+      }
+
+      const leases = new LeaseService();
+      const store = new FencedStore();
+      const a = leases.acquire('worker-a', 0, 10_000)!; // token 1
+      // worker-a freezes for 15 seconds here
+      const b = leases.acquire('worker-b', 12_000, 10_000)!; // token 2
+      console.log(store.write(b, 'from b')); // true
+      console.log(store.write(a, 'from a')); // false
+      console.log(store.value); // from b
+      ```
+
+      In SQL the check is part of the write: `UPDATE documents SET body = $2, fence = $3
+      WHERE id = $1 AND fence <= $3`. A stale holder changes zero rows. The catch is that the
+      protected store must take part. If it's a third-party API that can't check tokens,
+      make the write idempotent instead, so a second writer does no harm.
+pitfalls:
+  - '**Counting sold seats but not held ones.** Held seats feel provisional, so the check leaves them out. They are promised to someone, so the reserve condition is `sold + held + qty <= capacity`.'
+  - '**Comparing `expires_at` with each app server''s clock.** Server clocks drift by seconds, so two servers disagree about whether a hold is live. Compare with the database''s `now()` inside the statement, so one clock decides.'
+  - '**Changing the status and the counters in separate transactions.** A crash between them leaves `held` too high, and those seats are lost until someone repairs the row. Put both in one statement or one transaction.'
+  - '**A hold shorter than the slowest payment.** Card checks such as 3-D Secure can take minutes, and a hold that expires mid-payment refunds buyers who did nothing wrong. Size the hold from real payment times and show the buyer a countdown.'
+  - '**Treating a lease as a lock.** A paused holder keeps working after its lease has gone to someone else. Pass a fencing token to the protected store, or make the protected write idempotent.'
+  - '**Capturing money before the seat is confirmed.** Charging first means a lost race ends in a refund. Many payment providers let you authorise first and capture later, so you capture only after the guarded confirm wins.'
+interview:
+  - question: Design seat reservations for a concert on sale to thousands of people at once.
+    answer: >-
+      I'd hold seats with a row per hold and an expiry, and guard every transition with a
+      conditional statement. Reserve is one `UPDATE` that raises `held` only if `sold + held
+      + qty <= capacity`, plus the hold insert, in one transaction. Confirm changes the hold
+      from active to confirmed only if it's still active and in time, and moves the count in
+      the same transaction. A batched sweep expires old holds with `SKIP LOCKED` so several
+      can run. A late payer is refunded, or better, the card was only authorised and is
+      released. The invariant is proven per transition, backed by a `CHECK` constraint. The
+      weak point is one hot row per show, so for a huge on-sale I'd split stock into blocks
+      and put a waiting room in front to cap concurrency.
+  - question: What is a fencing token, and why isn't a lease with a timeout enough?
+    answer: >-
+      A fencing token is a number that rises with every lease grant, checked by the resource
+      on each write. A lease alone fails when the holder pauses. A garbage collection pause
+      or a frozen virtual machine can outlast the lease, another process takes it, and the
+      first wakes up still believing it's the holder. Checking the clock before writing
+      doesn't help, since the pause can land between the check and the write. With tokens,
+      the second holder writes with 34 and the store records 34. The first holder's write
+      carries 33 and is rejected. The limitation is that the resource must cooperate: it has
+      to store and compare the token. When it can't, such as a third-party API, I'd make
+      the operation idempotent instead.
+  - question: How would you convince a reviewer that your booking code can never double-book?
+    answer: >-
+      I'd argue from transitions, not from tests. First, list every statement that changes
+      the numbers: reserve, confirm and expire. Second, show each one is a single atomic,
+      guarded statement, so the database applies them one at a time. Third, show each keeps
+      the invariant alone. Confirm moves seats from held to sold, so the sum doesn't change.
+      Expire only lowers it. Reserve raises it only when its own condition says the result
+      fits. Every possible history is a sequence of those moves, so the invariant holds for
+      all of them. I'd still run a randomised test that checks the invariant after thousands
+      of moves, because it catches a transition I forgot to list. A test finds bugs, the
+      argument shows there are none left.
+  - question: Should availability come from a counter column or from counting the holds?
+    answer: >-
+      Either works, and they trade freshness against cost. A `held` counter reads one row
+      and keeps reserve O(1). But it's only as fresh as the last sweep, so an expired hold
+      blocks its seats until the sweep runs. A bug can also make it drift from the holds. A
+      derived count sums live holds, counting a hold only while `expires_at > now()`, so
+      expiry is exact and there's nothing to drift. It costs a sum per reserve and needs a
+      `FOR UPDATE` lock on the show row to stop two reserves both summing the same total.
+      For normal traffic I'd pick the derived count for its exactness. For a very hot item I'd
+      keep counters, shard them across rows, and run the sweep often.

@@ -1,0 +1,227 @@
+summary: >-
+  Every render sees its own fixed copy of state. When React calls your component, `useState`
+  returns the values for that render, and every handler created in that render closes over
+  them. A setter doesn't change those values. It queues an update and asks for a new render,
+  where `useState` will return the new value.
+
+
+  This model explains three behaviours that look like bugs at first. Reading state on the line
+  after a setter gives the old value. Calling `setCount(count + 1)` three times adds one,
+  because all three read the same `count`. And code that runs later, after a timeout or an
+  `await`, still sees the values from the render that created it.
+
+
+  Two tools work with the model rather than against it. **Batching** means React waits until
+  your handler finishes and renders once for all the updates it queued, so nobody sees a
+  half-updated screen. An **updater function**, `setCount((n) => n + 1)`, receives the latest
+  pending value instead of the snapshot, so several updates in a row, or one after an
+  `await`, build on each other.
+remember:
+  - State in a render is a constant; a setter never changes it, it queues an update for the next render.
+  - Handlers close over the state of the render that created them, including code that runs after a timeout or an `await`.
+  - React batches every update queued in one event, including updates inside promises and timeouts, into a single render.
+  - Pass an updater, `setN((n) => n + 1)`, whenever the next value depends on the previous one and other updates may be queued.
+  - On the next render React applies queued updates in order; a plain value replaces the pending state and an updater transforms it.
+  - Updater functions must be pure, since React may call them twice in Strict Mode; no side effects inside them.
+  - If a handler needs the value it has computed, keep it in a local `const` rather than reading state back.
+  - '`flushSync` from `react-dom` forces React to commit an update at once, for the rare case where code must read the updated DOM.'
+sections:
+  - title: A snapshot is a closure
+    body: |-
+      There's no special mechanism behind snapshots. It's ordinary JavaScript closures. Each
+      render runs your component function, which declares `const` variables and creates new
+      handler functions that close over them. A handler from render three sees render three's
+      `const`s, forever.
+
+      ```tsx
+      import { useState } from 'react';
+
+      export function Chat({ send }: { send: (to: string, text: string) => void }) {
+        const [to, setTo] = useState('Alice');
+        const [text, setText] = useState('');
+
+        function handleSend() {
+          setTimeout(() => {
+            send(to, text); // the values from the render where Send was clicked
+          }, 2000);
+        }
+
+        return (
+          <div>
+            <select aria-label="To" value={to} onChange={(e) => setTo(e.target.value)}>
+              <option>Alice</option>
+              <option>Bob</option>
+            </select>
+            <input aria-label="Message" value={text} onChange={(e) => setText(e.target.value)} />
+            <button onClick={handleSend}>Send</button>
+          </div>
+        );
+      }
+      ```
+
+      Clicking Send and then switching to Bob still sends to Alice. That's the behaviour you
+      want here: the message goes where it was addressed when you pressed the button.
+
+      Sometimes you want the opposite, the latest value at the moment the delayed code runs.
+      For state you're about to update, the updater function gives you the latest pending
+      value. For reading a value without re-rendering, React has refs, covered in a later
+      lesson. What doesn't work is waiting: no amount of `await` makes `to` change inside an
+      old render, because it's a `const` in a function call that has already happened.
+  - title: How React works through the update queue
+    body: |-
+      Each `useState` hook has a queue. A setter call adds an entry and schedules a render.
+      During that render, when your component reaches the `useState` call, React starts from
+      the current value and applies every queued entry in order. A plain value replaces the
+      running result. An updater function is called with the running result and returns the
+      next one.
+
+      ```tsx
+      // count is 0 when the handler runs
+      setCount(5);            // 5
+      setCount((n) => n + 1); // 6
+      setCount(42);           // 42, the updater's work is replaced
+      setCount((n) => n * 2); // 84
+      ```
+
+      We ran exactly this sequence in React 19: one render followed, and it showed 84. Nothing
+      in between was ever rendered.
+
+      Two consequences follow. First, updaters run during rendering, so they must be pure: take
+      the pending value, return the next. An updater that also calls `sendAnalytics()` or
+      pushes to an outside array runs twice under Strict Mode, and could run again if React
+      restarts a render. Second, updaters get the latest pending value, not the latest
+      rendered one, which is what makes them safe after an `await`. When three quick taps
+      each wait for a save and then call `setLikes((n) => n + 1)`, the three updates stack.
+
+      A naming habit keeps updaters readable: call the argument after the state's first
+      letter, `setLikes((l) => l + 1)`, or name it in full, `(prevLikes) => prevLikes + 1`.
+  - title: Batching boundaries, and flushSync
+    body: |-
+      Since React 18, batching is automatic everywhere: inside event handlers, promises,
+      timeouts and native listeners. Updates queued in the same task render together. We
+      checked it by awaiting a promise and then calling two setters: one render.
+
+      React never batches across separate user events. Two clicks are two renders, so the
+      second click's handler sees state from the first click's render. That's what makes a
+      disabled button safe: after the first click commits, the second click sees it disabled.
+
+      Occasionally you need the DOM updated before the next line runs. The classic case is
+      scrolling to a message you've added: until React commits, the new element doesn't
+      exist. `flushSync` runs its callback and commits the resulting update synchronously.
+
+      ```tsx
+      import { useRef, useState } from 'react';
+      import { flushSync } from 'react-dom';
+
+      export function Messages() {
+        const [messages, setMessages] = useState<string[]>([]);
+        const listRef = useRef<HTMLUListElement>(null);
+
+        function add(text: string) {
+          flushSync(() => {
+            setMessages((m) => [...m, text]);
+          });
+          // The new <li> is in the DOM now.
+          listRef.current?.lastElementChild?.scrollIntoView({ block: 'nearest' });
+        }
+
+        return (
+          <>
+            <ul ref={listRef}>
+              {messages.map((m, i) => <li key={i}>{m}</li>)}
+            </ul>
+            <button onClick={() => add('Hello')}>Say hello</button>
+          </>
+        );
+      }
+      ```
+
+      Treat `flushSync` as an escape hatch. It skips batching and can hurt performance, and
+      most "I need the new value" problems are better solved by computing the value into a
+      local `const` first. The index key here is fine only because messages are never
+      reordered or removed; the lists lesson explains why.
+  - title: Choosing between a value and an updater
+    body: |-
+      Both forms are correct in the right place. A quick rule decides.
+
+      Use a plain value when the new state doesn't depend on the old one: `setQuery(e.target.value)`,
+      `setOpen(false)`, `setSelected(id)`. The snapshot is irrelevant, so there's nothing to go
+      stale.
+
+      Use an updater when it does depend on the old state and anything else could have queued
+      an update first: a counter, toggling with `setOpen((o) => !o)`, appending to a list, or any
+      update after an `await`. Many teams write every dependent update as an updater, which
+      costs nothing and removes a whole class of bug.
+
+      Objects and arrays follow the same rule, with a new value each time:
+
+      ```tsx
+      type Cart = { items: string[]; coupon: string | null };
+
+      // Safe even if several adds are queued in one event.
+      function addItem(setCart: (update: (c: Cart) => Cart) => void, item: string) {
+        setCart((c) => ({ ...c, items: [...c.items, item] }));
+      }
+      ```
+
+      And when a handler needs the result of its own update, don't read state back. Compute it
+      once, use it, then set it: `const next = count + 1; setCount(next); if (next === max)
+      notify();`. The local `const` is the value you meant, with no snapshot in the way.
+pitfalls:
+  - >-
+    **Reading state straight after setting it.** The line after `setError(msg)` still sees the
+    old `error`. Keep the new value in a local `const` and use that.
+  - >-
+    **Stacking plain values.** `setCount(count + 1)` three times adds one. Use
+    `setCount((n) => n + 1)` when updates build on each other.
+  - >-
+    **Using the snapshot after an `await`.** By the time the promise settles, other updates may
+    have landed. Use an updater for the state change.
+  - >-
+    **Side effects inside an updater.** Strict Mode calls it twice, so a request or a log inside
+    runs twice. Keep updaters pure and do the effect in the handler.
+  - >-
+    **Expecting a timeout to see new state.** A `setTimeout` created in one render reads that
+    render's values. Use an updater, or a ref for reading the latest value.
+  - >-
+    **Reaching for `flushSync` by default.** It turns off batching for that update and can make
+    the app slower. Use it only when code must read the committed DOM at once.
+interview:
+  - question: Why does calling `setCount(count + 1)` three times in one click only add one?
+    answer: >-
+      Because `count` is a constant in that render. The handler closes over the render's
+      snapshot, so all three calls compute `0 + 1` and queue "set to 1" three times. The setter
+      doesn't change `count` in place; it queues an update, and React renders once after the
+      handler, applying the queue. The fix is an updater, `setCount((n) => n + 1)`: React
+      applies updaters in order to the pending value, so they get 0, 1 and 2, and the next
+      render shows 3. I use the updater whenever the next state depends on the previous one,
+      which also makes the code safe after an `await`, where the snapshot is certainly old.
+  - question: What is batching in React, and when doesn't it happen?
+    answer: >-
+      Batching means React groups all state updates queued in the same event or task into one
+      render. Three setters in a click handler cause one render, so there's less work and no
+      half-updated screen between them. Since React 18 it's automatic everywhere, including
+      promises, timeouts and native listeners, not only React event handlers. It doesn't cross
+      separate user events: two clicks are always two renders, which is what guarantees the
+      second click sees the result of the first. The opt-out is `flushSync` from `react-dom`,
+      which commits synchronously, for cases like scrolling to an element you've added.
+      It's rarely needed and costs performance.
+  - question: Why isn't state updated immediately when you call the setter?
+    answer: >-
+      Because React treats each render as a consistent snapshot. Within one render, props,
+      state and every value derived from them agree with each other, and every handler sees the
+      same world. If a setter changed state in place, a handler could see half-updated values,
+      and the JSX already rendered would disagree with the variables. Deferring also enables
+      batching and lets React decide when to render, including interrupting and restarting
+      lower-priority work. The cost is surprise for newcomers who read state after setting it.
+      The fix is to compute the new value into a local variable, use it, and pass it to the
+      setter.
+  - question: A like button saves to the server, then increments. Fast taps show 1 instead of 3. What's wrong?
+    answer: >-
+      Each handler closed over the same snapshot, `likes` equal to 0, and after its `await` it
+      calls `setLikes(likes + 1)`, which is "set to 1" three times. The snapshot is stale by
+      the time the save finishes. Changing it to `setLikes((n) => n + 1)` makes each update
+      build on the pending value, so three successful saves give 3. For a real product I'd go
+      further: update optimistically before the request and roll back on failure, and make the
+      server the source of truth by setting the count it returns. Otherwise two devices, or a
+      failed save, drift from what's stored.

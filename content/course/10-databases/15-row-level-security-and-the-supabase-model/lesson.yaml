@@ -1,0 +1,246 @@
+id: db.row-level-security
+title: Row-level security and the Supabase model
+objective: Write policies so each user sees only their rows, and keep the service key off the browser.
+level: essential
+minutes: 10
+concepts: [db.rls-policies, db.supabase-roles, db.service-key]
+prerequisites: [db.migrations, backend.authorisation]
+opening:
+  text: >-
+    You'll make the database itself hide other people's rows, so one forgotten `WHERE` can't leak
+    them. It's how Supabase apps let the browser query the database directly.
+
+steps:
+  - type: prose
+    id: the-missing-where
+    body: >-
+      In the authorisation lesson, every query needed `WHERE owner = <the signed-in user>`. A
+      notes app might have fifty such queries. Forget it in one, and anyone reads everyone's
+      notes.
+
+
+      **Row-level security** moves that condition into the database. You write it once as a
+      **policy**. Postgres adds it to every query on the table, whoever wrote the query.
+
+  - type: prose
+    id: roles-and-settings
+    body: >-
+      A few words first. A **role** is a database user: your app connects as one. `GRANT` gives
+      a role permission to use a table.
+
+
+      A **setting** is a value for the current connection, like `app.user_id`. Your server sets
+      it to the signed-in user on each request, and `current_setting('app.user_id')` reads it
+      back. `SET ROLE app_user;` acts as that role, which is how we'll test.
+
+  - type: sql
+    id: write-the-policy
+    concept: db.rls-policies
+    difficulty: 3
+    prompt: >-
+      Row-level security is on, and Ana sees nothing: with no policy, no row passes. Add a policy
+      so each user sees only notes whose `owner` matches `app.user_id`.
+    setup: |
+      CREATE TABLE notes (id integer PRIMARY KEY, owner text NOT NULL, body text NOT NULL);
+      INSERT INTO notes VALUES
+        (1, 'ana', 'Buy milk'), (2, 'ben', 'Call the bank'), (3, 'ana', 'Book the dentist');
+      CREATE ROLE app_user;
+      GRANT USAGE ON SCHEMA public TO app_user;
+      GRANT SELECT, INSERT, UPDATE, DELETE ON notes TO app_user;
+      ALTER TABLE notes ENABLE ROW LEVEL SECURITY;
+    starter: |
+      -- Add the policy here, before switching role.
+
+      SET app.user_id = 'ana';
+      SET ROLE app_user;
+      SELECT * FROM notes;
+    solution: |
+      CREATE POLICY own_notes ON notes
+        USING (owner = current_setting('app.user_id'));
+
+      SET app.user_id = 'ana';
+      SET ROLE app_user;
+      SELECT * FROM notes;
+    checks:
+      ordered: false
+    showSchema: true
+    hints:
+      - '`CREATE POLICY name ON table USING (condition);`'
+      - The condition compares `owner` with `current_setting('app.user_id')`.
+
+  - type: prose
+    id: using-and-with-check
+    body: >-
+      `USING` decides which existing rows a user can see, change or delete. **WITH CHECK**
+      decides which new rows they may write. A policy with only `USING` uses it for both, so
+      Ana adding a note as Ben fails:
+
+
+      ```text
+
+      ERROR: new row violates row-level security policy for table "notes"
+
+      ```
+
+
+      Policies can also target one command: `FOR SELECT`, `FOR INSERT`, and so on.
+
+  - type: prose
+    id: the-supabase-model
+    body: >-
+      **Supabase** is hosted Postgres that lets the browser query tables directly. Each request
+      runs as the role `anon` (signed out) or `authenticated`. In a policy, `auth.uid()` gives
+      the signed-in user's id.
+
+
+      So row-level security is the only thing keeping users apart. The browser gets a
+      **publishable key**, which obeys every policy. The **secret key** skips them all and
+      belongs on your server only.
+
+  - type: fill-blank
+    id: fill-supabase-policy
+    concept: db.supabase-roles
+    difficulty: 2
+    language: sql
+    prompt: >-
+      Let signed-in users read and add their own orders, and nobody else's. Fill the gaps.
+    template: |
+      ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
+
+      CREATE POLICY read_own ON orders FOR SELECT
+        TO {{1}}
+        USING (owner_id = {{2}}());
+
+      CREATE POLICY insert_own ON orders FOR INSERT
+        TO authenticated
+        {{3}} (owner_id = auth.uid());
+    blanks:
+      - key: '1'
+        answer: authenticated
+      - key: '2'
+        answer: auth.uid
+      - key: '3'
+        answer: WITH CHECK
+    bank: [authenticated, anon, auth.uid, current_user, WITH CHECK, USING]
+
+  - type: ai-review
+    id: review-secret-key-in-browser
+    concept: db.service-key
+    difficulty: 4
+    language: ts
+    request: The orders page shows nothing after we enabled RLS. Make it work again.
+    flawClass: security
+    code: |
+      // app/orders/page.tsx, a Client Component
+      'use client';
+      const supabase = createClient(
+        'https://abc.supabase.co',
+        'sb_secret_9f2c...'
+      );
+      supabase.from('orders').select('*').then(({ data }) => show(data));
+    prompt: >-
+      An assistant wrote this. The orders appear again, and the test passes. Then a customer
+      opens the dev tools. Tap the line at fault.
+    lines: [5]
+    reasons:
+      - text: The secret key is in code every visitor downloads
+        correct: true
+        feedback: >-
+          Yes. It skips every policy, so anyone can read all orders. Fix the policy instead.
+      - text: '`select(''*'')` fetches too many columns'
+        feedback: >-
+          Column choice is a detail. The key hands over every row of every table.
+      - text: The page should be a Server Component
+        feedback: >-
+          That would hide the key, but the page still needs a working policy. Moving code
+          doesn't fix a bypass.
+    fix: |
+      // app/orders/page.tsx, a Client Component
+      'use client';
+      const supabase = createClient(
+        'https://abc.supabase.co',
+        'sb_publishable_4d1a...'
+      );
+      // The read_own policy now lets a signed-in user see their orders.
+      supabase.from('orders').select('*').then(({ data }) => show(data));
+
+  - type: explain-back
+    id: explain-why-rls-too
+    concept: db.rls-policies
+    difficulty: 3
+    prompt: >-
+      Your API already checks ownership in every handler. Why add row-level security as well?
+    rubric:
+      - One forgotten check in any handler leaks other users' rows.
+      - A policy is applied by the database to every query on the table, whoever wrote it.
+      - With Supabase the browser queries tables directly, so policies are the only protection.
+    modelAnswer: >-
+      Checks in handlers work until someone writes a new query and forgets one. Then that
+      endpoint leaks other people's data. A policy lives in the database and is added to every
+      query on the table. A forgotten `WHERE` can't leak anything. When the browser queries
+      the database directly, as with Supabase, the policy is the only guard there is.
+
+recap:
+  - Turn on row-level security and write a policy, so the database filters every query.
+  - Use `USING` for rows you can see, and `WITH CHECK` for rows you may write.
+  - Give browsers the publishable key only, and keep the secret key on the server.
+
+recall:
+  - id: card-rls-no-policy
+    concept: db.rls-policies
+    front: What does a normal role see when row-level security is on but the table has no policy?
+    back: No rows at all. Without a policy, nothing passes.
+  - id: card-using-with-check
+    concept: db.rls-policies
+    front: How do `USING` and `WITH CHECK` differ in a policy?
+    back: >-
+      `USING` filters the existing rows a user can see or change. `WITH CHECK` tests the new rows
+      they try to write.
+  - id: card-auth-uid
+    concept: db.supabase-roles
+    front: In a Supabase policy, how do you refer to the signed-in user?
+    back: "`auth.uid()`, compared with the row's owner column."
+  - id: card-secret-key
+    concept: db.service-key
+    front: Why must the Supabase secret key never reach a browser?
+    back: It skips every row-level security policy, so whoever has it can read and change every row.
+
+references:
+  - kind: docs
+    title: 5.9. Row Security Policies
+    authors: The PostgreSQL Global Development Group
+    venue: PostgreSQL 18 documentation
+    url: https://www.postgresql.org/docs/18/ddl-rowsecurity.html
+    note: Policies, `USING` and `WITH CHECK`, the default deny, and who bypasses them.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Row Level Security
+    authors: Supabase
+    venue: Supabase documentation
+    url: https://supabase.com/docs/guides/database/postgres/row-level-security
+    note: The `anon` and `authenticated` roles, `auth.uid()`, and the keys that bypass RLS.
+    primary: true
+    verified: true
+  - kind: docs
+    title: CREATE POLICY
+    authors: The PostgreSQL Global Development Group
+    venue: PostgreSQL 18 documentation
+    url: https://www.postgresql.org/docs/18/sql-createpolicy.html
+    note: Every option of a policy, including per-command policies.
+    verified: true
+
+deepDive: >-
+  The table's owner and superusers skip policies by default. That's why the app should connect
+  as a plain role, and why tests that run as the owner can pass while real users see nothing.
+  `ALTER TABLE notes FORCE ROW LEVEL SECURITY` applies policies to the owner too.
+
+
+  Policies run on every row a query touches, so keep them cheap. Index the owner column.
+  Supabase recommends `(select auth.uid())` over a bare `auth.uid()`, so Postgres works it out
+  once per query instead of once per row.
+
+
+  Several permissive policies on one table combine with `OR`: a row passes if any policy lets
+  it. `AS RESTRICTIVE` policies combine with `AND`, which suits a rule every access must meet,
+  such as "same organisation".

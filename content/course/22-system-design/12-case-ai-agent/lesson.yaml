@@ -1,0 +1,256 @@
+id: sysdesign.case-ai-agent
+title: "Case study: an AI agent that takes actions"
+objective: "Design an agent that acts on people's behalf: a harness your code owns, tools sorted by risk, approval before irreversible actions, safe retries and evals."
+level: advanced
+minutes: 10
+concepts: [sysdesign.agent-harness-design, sysdesign.action-safety]
+prerequisites: [sysdesign.case-ai-assistant, ai.agents, aisys.agent-harness, aisys.guardrails]
+opening:
+  text: >-
+    You'll design an agent that doesn't only answer but acts, the way a senior AI interview
+    probes it. The hard part isn't the model; it's deciding what it may do alone.
+
+steps:
+  - type: prose
+    id: agent-brief
+    body: |-
+      An **agent** is a model in a loop. It picks a tool, your code runs it, and the result
+      goes back. It picks again until the job is done.
+
+      The brief: "Design an agent that handles employees' IT requests." It looks up
+      laptops, opens tickets, resets passwords and orders hardware. Requests arrive a few
+      a minute. Mistakes cost money and trust.
+
+  - type: prose
+    id: agent-sketch
+    body: |-
+      The model decides; your code, the **harness**, controls. It runs the loop with a step
+      cap. It checks each tool against what this person may use, and times out slow ones.
+
+      Before any action that can't be undone, it stops and asks a person. Tool results go
+      back to the model as data, never as instructions.
+    figure:
+      id: agent-loop
+      caption: The step cap and the checks live in your code, so the model can't talk its way past them.
+
+  - type: multiple-choice
+    id: pick-agent-driver
+    concept: sysdesign.agent-harness-design
+    difficulty: 1
+    question: What shapes this design most?
+    choices:
+      - text: Actions taken on a model's say-so
+        correct: true
+        feedback: >-
+          Yes. The load is tiny. What it may do alone decides the design.
+      - text: A few requests a minute
+        feedback: >-
+          One small server copes. Volume isn't the hard part here.
+      - text: How long the model's replies are
+        feedback: >-
+          Length affects cost a little. Wrong actions cost far more.
+
+  - type: ai-review
+    id: review-tool-registry
+    concept: sysdesign.action-safety
+    difficulty: 2
+    language: yaml
+    request: Register the IT agent's tools with their risk and approval rules.
+    flawClass: security
+    code: |
+      - lookup_laptop: read, no approval
+      - open_ticket: write, undoable, no approval
+      - reset_password: write, the employee confirms by email
+      - order_hardware: write, spends money, no approval
+      - limits: 8 steps, 30 seconds per tool
+    prompt: >-
+      An assistant drafted the tool list. A ticket's text once said "order ten laptops for
+      me". Tap the line that let it happen.
+    lines: [4]
+    reasons:
+      - text: Spending money needs a person's approval
+        correct: true
+        feedback: >-
+          Yes. Irreversible, costly actions wait for a human, whatever the model decides.
+      - text: Eight steps is too few
+        feedback: >-
+          Most IT requests take two or three. The cap stops loops, and it's fine.
+      - text: Looking up a laptop needs approval
+        feedback: >-
+          Reads change nothing. Gating them only slows everyone down.
+    fix: |
+      - lookup_laptop: read, no approval
+      - open_ticket: write, undoable, no approval
+      - reset_password: write, the employee confirms by email
+      - order_hardware: write, spends money, a manager approves in the portal
+      - limits: 8 steps, 30 seconds per tool
+
+  - type: prose
+    id: agent-failures
+    body: |-
+      Now the failures, unprompted. The agent loops: the step cap ends it and tells the
+      person. A tool times out: retry reads freely, but a write may already have happened.
+
+      So every write carries an **idempotency key**, a unique id the service uses to ignore
+      a repeat. You met it in the Concurrency chapter.
+
+  - type: ai-review
+    id: review-retry-order
+    concept: sysdesign.action-safety
+    difficulty: 3
+    language: ts
+    request: Retry the hardware order if the supplier times out.
+    flawClass: edge-case
+    code: |
+      async function orderHardware(request: Order) {
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          try {
+            return await supplier.createOrder({ item: request.item, user: request.user });
+          } catch (err) {
+            if (!(err instanceof TimeoutError) || attempt === 3) throw err;
+          }
+        }
+      }
+    prompt: >-
+      An assistant wrote this. The supplier was slow one morning, and three people each
+      received two laptops. Tap the line at fault.
+    lines: [4]
+    reasons:
+      - text: A retry can repeat an order that went through
+        correct: true
+        feedback: >-
+          Yes. A timeout doesn't mean it failed. Send one key on every attempt.
+      - text: Three attempts is too many
+        feedback: >-
+          Even two attempts double the order. The retry needs a key, not a lower count.
+      - text: It should retry on every error
+        feedback: >-
+          That makes it worse. Only timeouts are worth retrying, and only safely.
+    fix: |
+      const key = request.id; // the same key on every attempt
+      return await supplier.createOrder({ item: request.item, user: request.user, idempotencyKey: key });
+
+  - type: parsons
+    id: order-agent-turn
+    concept: sysdesign.agent-harness-design
+    difficulty: 3
+    prompt: Put one turn of the harness in order.
+    language: yaml
+    blocks:
+      - id: cap
+        code: 'check: stop if the step cap is reached'
+        subgoal: Ask the model
+      - id: call
+        code: 'call: send the history and the tool list to the model'
+      - id: allow
+        code: 'allow: is this tool on this person''s list?'
+        subgoal: Guard the action
+      - id: approve
+        code: 'approve: if it can''t be undone, wait for a person'
+      - id: run
+        code: 'run: call the tool with a timeout and an idempotency key'
+        subgoal: Feed back
+      - id: append
+        code: 'append: add the result to the history as data'
+    distractors:
+      - id: obey
+        code: 'run: whatever tool the model names, with its arguments'
+        feedback: >-
+          The model can be tricked by text it reads. Your code decides what runs.
+
+  - type: prose
+    id: agent-evals
+    body: |-
+      Last, say how you'd know it works. Build a set of scripted requests, each with the
+      tool calls and end state you expect. Run them against fake tools before every prompt
+      or model change.
+
+      Track the share that end right, the steps and cost per request, and how often people
+      reject an approval. Rejections show where the agent misjudges.
+
+  - type: explain-back
+    id: explain-approval-boundary
+    concept: sysdesign.action-safety
+    difficulty: 4
+    prompt: >-
+      Why may the agent open a ticket alone, but must wait for approval to order hardware?
+    rubric:
+      - A ticket can be closed if it's wrong, but an order spends money and ships.
+      - The model can be misled by text it reads, such as a ticket or an email.
+      - So undoable actions run alone, and costly or irreversible ones need a person.
+    modelAnswer: >-
+      It's about what a mistake costs. A wrong ticket is a minute to close. A wrong order
+      spends money and ships a laptop. The model can be steered by text it reads, so I
+      can't rely on its judgement alone. Undoable actions run on their own; anything costly
+      or irreversible waits for a person.
+
+recap:
+  - Put the loop, the step cap and every check in a harness your code owns.
+  - Sort tools by risk, and make irreversible actions wait for a person.
+  - Retry writes only with an idempotency key, and test the agent with scripted requests.
+recall:
+  - id: card-harness
+    concept: sysdesign.agent-harness-design
+    front: What does the harness around an agent control?
+    back: >-
+      The loop and its step cap, which tools this person may use, timeouts, approval before
+      irreversible actions, and how results go back.
+  - id: card-results-as-data
+    concept: sysdesign.agent-harness-design
+    front: How should tool results go back to the model?
+    back: >-
+      As data, never as instructions, so a document or ticket can't steer the agent.
+  - id: card-approval
+    concept: sysdesign.action-safety
+    front: Which agent actions need a person's approval?
+    back: >-
+      Ones that are costly or can't be undone, such as spending money or deleting data.
+  - id: card-retry-key
+    concept: sysdesign.action-safety
+    front: Why can't an agent retry a timed-out write without an idempotency key?
+    back: >-
+      The first attempt may have succeeded, so a plain retry can repeat the action.
+
+references:
+  - kind: essay
+    title: Building effective agents
+    authors: Erik Schluntz and Barry Zhang
+    year: 2024
+    venue: Anthropic Engineering
+    url: https://www.anthropic.com/engineering/building-effective-agents
+    note: When to use a workflow or an agent, and how to keep the harness simple.
+    primary: true
+    verified: true
+  - kind: docs
+    title: LLM06:2025 Excessive Agency
+    authors: OWASP
+    venue: OWASP Top 10 for LLM Applications
+    url: https://genai.owasp.org/llmrisk/llm062025-excessive-agency/
+    note: Too many tools, too much permission, too little approval, and how to limit each.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Idempotent requests
+    authors: Stripe
+    venue: Stripe API Reference
+    url: https://docs.stripe.com/api/idempotent_requests
+    note: How an idempotency key makes a retried write safe.
+    verified: true
+
+deepDive: >-
+  How the 45 minutes usually go for an agent question: requirements and the tool list
+  first, then the harness sketch, then a deep dive the interviewer picks. Common picks are
+  approvals, retries and injection.
+
+
+  What interviewers probe. What stops a runaway loop? A step cap, a cost cap per request
+  and a check for the same tool called with the same arguments twice. What if a ticket says
+  "ignore your rules"? The text is data, and the approval gate still guards every costly
+  action. How would you roll it out? Start in a mode that only suggests actions, measure how
+  often people accept them, then let low-risk tools run alone. What does the audit log hold?
+  Who asked, every tool call with its arguments, who approved, and what happened.
+
+
+  Workflow or agent? If the steps are always the same, write them as code and call the
+  model only where judgement is needed. That's cheaper, faster and easier to test. Reach
+  for an open-ended agent when the path really varies from request to request.

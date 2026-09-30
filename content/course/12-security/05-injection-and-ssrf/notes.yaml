@@ -1,0 +1,327 @@
+summary: >-
+  Injection happens when data crosses into a place where it's read as code. SQL is the
+  classic case: a value glued into the query text can close its quotes and write SQL of its
+  own. The same shape turns up in shell commands, NoSQL filters, templates and, more
+  recently, language model prompts. The cure is always to keep code and data on separate
+  channels: parameters for values, and a fixed list of your own for names.
+
+
+  Server-side request forgery, SSRF, is the network version. Your server fetches a URL that
+  a user supplied, and the request leaves from inside your network, where `localhost`, private
+  services and the cloud metadata address at `169.254.169.254` answer. OWASP's Top 10 for 2025
+  files injection under A05 Injection and folds SSRF into A01 Broken Access Control, because
+  both come down to letting input decide what your system does.
+
+
+  You reach for these defences on every query and every server-side fetch, not only the ones
+  that look risky. Parameterised queries cost nothing and fix real bugs too, such as a name
+  with an apostrophe. For fetches, an exact host allow-list is the main defence, and when you
+  can't have one, because users may link anywhere, you resolve the host yourself, refuse
+  private addresses and connect to the address you checked.
+remember:
+  - Send every value as a parameter, so the database parses the SQL before it ever sees the data.
+  - Parameters hold values, never identifiers or keywords, so table names, columns and sort directions come from an allow-list you wrote.
+  - Escaping by hand is not a defence, because one missed context or encoding reopens the hole.
+  - SSRF works because the server's request starts inside your network, where `localhost`, private ranges and `169.254.169.254` are reachable.
+  - An exact host allow-list beats any block-list, because there is always another way to spell a private address.
+  - When any host is allowed, resolve the name, refuse every private or link-local answer, and connect to that exact address so a DNS rebind can't swap it.
+  - Every redirect is a new URL and goes through the same checks as the first one.
+  - Parse URLs with the WHATWG `URL` class that your HTTP client uses, so your check and your fetch agree on the host.
+sections:
+  - title: Why parameters work, and where they stop
+    body: |-
+      With a parameterised query, the driver uses PostgreSQL's extended protocol. It sends
+      the SQL in a *Parse* message and the values later in a *Bind* message. By the time a
+      value arrives, the query's shape is fixed, so the value can only ever fill a hole. The
+      extended protocol also refuses more than one statement per query, so a stacked
+      `; DELETE FROM ...` fails outright.
+
+      Here's the difference, run against PostgreSQL through PGlite:
+
+      ```ts
+      import { PGlite } from '@electric-sql/pglite';
+
+      const db = new PGlite();
+      await db.exec(`
+        CREATE TABLE books (id integer PRIMARY KEY, title text, author text);
+        INSERT INTO books VALUES (1, 'Night Rain', 'O''Brien');
+        CREATE TABLE users (id integer PRIMARY KEY, email text, password_hash text);
+        INSERT INTO users VALUES (1, 'ana@example.com', '$argon2id$...');
+      `);
+
+      const author = "x' UNION SELECT email, password_hash FROM users --";
+
+      const glued = await db.query(`SELECT title, author FROM books WHERE author = '${author}'`);
+      console.log(glued.rows); // [ { title: 'ana@example.com', author: '$argon2id$...' } ]
+
+      const safe = await db.query('SELECT title, author FROM books WHERE author = $1', [author]);
+      console.log(safe.rows); // []
+
+      try {
+        await db.query('SELECT * FROM books WHERE id = $1; DELETE FROM books', [1]);
+      } catch (err) {
+        console.log((err as Error).message); // cannot insert multiple commands into a prepared statement
+      }
+      ```
+
+      The glued version runs a `UNION` that reads the users table. The parameterised one looks
+      for an author with that odd name and finds nobody.
+
+      Parameters stop at values. A table name, a column, `ASC` or `DESC`, and a `LIMIT` built
+      into the text all sit outside their reach. Worse, a parameter in the wrong place can
+      fail silently: `ORDER BY $1` with `'year'` sorts by the constant string `'year'`, which
+      means not sorting at all. That's why the lesson picks the column from a list you wrote.
+  - title: Dynamic queries without gluing
+    body: |-
+      Real screens need queries that change shape: filters that may or may not apply, a list
+      of ids, a search box. Each has a safe pattern.
+
+      ```ts
+      import { PGlite } from '@electric-sql/pglite';
+
+      const db = new PGlite();
+      await db.exec(`
+        CREATE TABLE books (id integer PRIMARY KEY, title text, year integer);
+        INSERT INTO books VALUES (1, 'Night Rain', 2019), (2, 'Salt Roads', 2021),
+          (3, '100% Proof', 2020);
+      `);
+
+      // A list of ids: one array parameter, not a string of commas.
+      const byIds = await db.query('SELECT id FROM books WHERE id = ANY($1::int[]) ORDER BY id', [[1, 3]]);
+      console.log(byIds.rows); // [ { id: 1 }, { id: 3 } ]
+
+      // A search box: escape LIKE's own wildcards, then pass the pattern as a value.
+      const likeEscape = (s: string) => s.replace(/[\\%_]/g, (c) => `\\${c}`);
+      const found = await db.query('SELECT title FROM books WHERE title LIKE $1', [`%${likeEscape('%')}%`]);
+      console.log(found.rows); // [ { title: '100% Proof' } ]
+
+      // An optional filter and a sort: SQL fragments from your code, values as parameters.
+      const SORTS = { newest: 'year DESC', title: 'title ASC' } as const;
+      function listBooks(filter: { fromYear?: number }, sort: string) {
+        const where: string[] = [];
+        const values: unknown[] = [];
+        if (filter.fromYear !== undefined) {
+          values.push(filter.fromYear);
+          where.push(`year >= $${values.length}`);
+        }
+        const order = SORTS[sort as keyof typeof SORTS] ?? SORTS.title;
+        const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+        return db.query(`SELECT title FROM books ${clause} ORDER BY ${order}`, values);
+      }
+      console.log((await listBooks({ fromYear: 2020 }, 'newest')).rows);
+      // [ { title: 'Salt Roads' }, { title: '100% Proof' } ]
+      ```
+
+      The rule in the last function: every piece of SQL text comes from a string literal in
+      your code, and every piece of user input goes into `values`. The placeholders are
+      numbered as you go, so a skipped filter can't shift them.
+
+      Without the escape, a search for `%` matches every row, which is a correctness bug
+      rather than injection, but a costly one on a big table. When you truly need a name from
+      data, such as a column the admin configured, PostgreSQL's `format('%I', name)` quotes it
+      as an identifier. An allow-list is still simpler to reason about.
+
+      ORMs and query builders parameterise by default. Their escape hatches don't: Prisma's
+      `$queryRawUnsafe` and any builder's "raw" helper take whatever string you build. Prisma's
+      tagged `$queryRaw` template, by contrast, turns each `${value}` into a parameter.
+  - title: Injection beyond SQL
+    body: |-
+      Every interpreter has the same weakness, and the same cure: an API that takes the data
+      separately.
+
+      A **shell** is an interpreter. `exec` passes one string to `/bin/sh`, so `;`, `$(...)`
+      and backticks in user input run commands. `execFile` starts the program directly with an
+      array of arguments, and no shell ever reads them.
+
+      ```js
+      import { execFile } from 'node:child_process';
+      import { promisify } from 'node:util';
+
+      const run = promisify(execFile);
+      const name = 'report; echo pwned';
+
+      // The format string is yours. The name arrives as one argument, never parsed by a shell.
+      const { stdout } = await run('printf', ['%s\n', name]);
+      console.log(stdout); // report; echo pwned
+      ```
+
+      `printf` printed the whole string, semicolon included, because no shell split it. One
+      gap remains: a value starting with `-` can still be read as an option. Most tools
+      accept `--` to mean "options end here", so put it before user-supplied arguments.
+
+      **NoSQL operator injection** needs no quotes at all. If a login handler passes
+      `req.body.password` straight into a MongoDB filter, a JSON body with
+      `{"password": {"$ne": null}}` turns an equality check into "any password". The fix is
+      to validate types at the edge: a password is a string, so reject anything else before it
+      reaches a query. A schema library such as Zod does this in one line per field.
+
+      **Templates** are interpreters too. Rendering a user's text as a template, rather than
+      as data inside one, lets them run template code on your server. Pass user text only as
+      values to a fixed template.
+
+      **Prompt injection** is the same pattern with no parser to fix: a language model reads
+      instructions and data in one stream. You can't parameterise it away, so you limit what
+      the model's output is allowed to do. Chapters 20 and 21 cover it.
+  - title: Parsing a URL the way your HTTP client does
+    body: |-
+      The lesson's `isAllowedUrl` slices strings by hand, which works for its tests and
+      teaches the idea. Production code should parse with the WHATWG `URL` class, because
+      that's what `fetch` and Node's `http` use. If your check and your client disagree about
+      which part is the host, an attacker writes a URL that passes one and reaches the other.
+
+      ```js
+      const cases = [
+        'http://0x7f.1/',
+        'http://2130706433/',
+        'http://[::ffff:169.254.169.254]/',
+        'http://api.weather.com@evil.test/',
+        'https://evil.test\\@api.weather.com/',
+      ];
+      for (const raw of cases) {
+        const url = new URL(raw);
+        console.log(raw, '->', url.hostname);
+      }
+      // http://0x7f.1/ -> 127.0.0.1
+      // http://2130706433/ -> 127.0.0.1
+      // http://[::ffff:169.254.169.254]/ -> [::ffff:a9fe:a9fe]
+      // http://api.weather.com@evil.test/ -> evil.test
+      // https://evil.test\@api.weather.com/ -> evil.test
+      ```
+
+      Each line is a reason block-lists fail. Hex and decimal forms both mean `127.0.0.1`. The
+      IPv4-mapped IPv6 form reaches the metadata address. Text before `@` is a username, not
+      the host. And for `http` and `https`, the parser treats a backslash as a slash, so the
+      last URL goes to `evil.test`, while a naive `split('@')` would say `api.weather.com`.
+
+      So the shape of a good check is: `new URL(input)`, then compare `url.protocol` with
+      `'https:'` (and `'http:'` only if you must), refuse a non-empty `url.username` or
+      `url.password`, and compare `url.hostname` exactly with your list. The hostname comes
+      back lower-cased, but a trailing dot survives (`api.weather.com.`), so an exact
+      comparison refuses it, which is the safe way to fail.
+  - title: 'Resolve, check, then connect: SSRF when any host is allowed'
+    body: |-
+      A link-preview or webhook feature can't use an allow-list: users may point at any public
+      site. Now you must refuse private destinations, and the check has to hold at the moment
+      of connecting. Checking the name and then calling `fetch` leaves a gap: **DNS rebinding**
+      answers your check with a public IP and the connection, a moment later, with
+      `169.254.169.254`. The fix is to resolve once and hand the socket the address you checked.
+      Node's `http` and `https` accept a `lookup` function for exactly that.
+
+      ```js
+      import { lookup as dnsLookup } from 'node:dns';
+      import { BlockList, isIP } from 'node:net';
+      import http from 'node:http';
+      import https from 'node:https';
+
+      const blocked = new BlockList();
+      for (const [net, bits] of [['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10],
+        ['127.0.0.0', 8], ['169.254.0.0', 16], ['172.16.0.0', 12], ['192.168.0.0', 16],
+        ['224.0.0.0', 4], ['240.0.0.0', 4]]) blocked.addSubnet(net, bits, 'ipv4');
+      for (const [net, bits] of [['::', 128], ['::1', 128], ['fc00::', 7], ['fe80::', 10],
+        ['ff00::', 8]]) blocked.addSubnet(net, bits, 'ipv6');
+
+      // IPv4 rules also match IPv4-mapped IPv6 such as ::ffff:169.254.169.254.
+      const isPublic = (ip) => !blocked.check(ip, isIP(ip) === 6 ? 'ipv6' : 'ipv4');
+
+      function checkedLookup(hostname, options, callback) {
+        dnsLookup(hostname, { all: true }, (err, addresses) => {
+          if (err) return callback(err);
+          const bad = addresses.find((a) => !isPublic(a.address));
+          if (bad) return callback(new Error(`refused: ${hostname} is ${bad.address}`));
+          if (options.all) return callback(null, addresses);
+          callback(null, addresses[0].address, addresses[0].family);
+        });
+      }
+
+      function guardedGet(raw, hopsLeft = 3) {
+        return new Promise((resolve, reject) => {
+          const url = new URL(raw);
+          if (!['http:', 'https:'].includes(url.protocol)) return reject(new Error('scheme'));
+          if (url.username || url.password) return reject(new Error('credentials'));
+          // Node skips lookup for an IP literal, so check literals here.
+          const literal = url.hostname.replace(/^\[|\]$/g, '');
+          if (isIP(literal) && !isPublic(literal)) return reject(new Error(`refused: ${literal}`));
+          const client = url.protocol === 'https:' ? https : http;
+          const req = client.get(url, { lookup: checkedLookup, timeout: 5000 }, (res) => {
+            res.resume();
+            const next = res.headers.location;
+            if (res.statusCode >= 300 && res.statusCode < 400 && next) {
+              if (hopsLeft === 0) return reject(new Error('too many redirects'));
+              return resolve(guardedGet(new URL(next, url).href, hopsLeft - 1));
+            }
+            resolve(res.statusCode);
+          });
+          req.on('timeout', () => req.destroy(new Error('timeout')));
+          req.on('error', reject);
+        });
+      }
+
+      for (const raw of ['http://localhost:8080/', 'http://[::ffff:169.254.169.254]/', 'https://example.com/']) {
+        console.log(raw, await guardedGet(raw).catch((e) => e.message));
+      }
+      // http://localhost:8080/ refused: localhost is ::1 (or 127.0.0.1)
+      // http://[::ffff:169.254.169.254]/ refused: ::ffff:a9fe:a9fe
+      // https://example.com/ 200
+      ```
+
+      Three details carry the weight. Every resolved address is checked, not only the first,
+      because a name can return one public and one private answer. Redirects are followed by
+      hand, so each hop is a fresh URL through the same checks; `fetch` with its default
+      `redirect: 'follow'` would skip them. And the address list here is a starting point, not
+      complete: OWASP's SSRF cheat sheet lists more special ranges.
+
+      Keep the network on your side too. Run fetchers where they can't reach internal services,
+      turn on IMDSv2 on AWS so the metadata service needs a token that a simple GET can't get,
+      cap response size and time, and never return the raw response body to the user when a
+      yes or no will do.
+pitfalls:
+  - '**Escaping quotes instead of parameterising.** A home-made `replace(/''/g, "''")` misses backslashes, encodings and every non-string context. Use parameters for values and an allow-list for names.'
+  - '**Trusting a query builder''s raw helper.** `$queryRawUnsafe`, `sql.raw` and friends exist for SQL you wrote, and people pass request data to them when a query gets awkward. Keep user input in the parameter list, even in raw SQL.'
+  - '**Putting a column or direction in a parameter.** `ORDER BY $1` runs without error and sorts by nothing, so the bug hides. Map request values to SQL fragments through a fixed object.'
+  - '**A block-list of bad addresses for SSRF.** `127.0.0.1` has decimal, hex, IPv6 and DNS spellings, and a list always misses one. Allow-list hosts, or resolve and check every address against private ranges.'
+  - '**Checking the host, then letting the HTTP client resolve it again.** A rebinding DNS server answers the two lookups differently. Resolve once and connect to the address you checked.'
+  - '**Following redirects automatically.** A public URL can redirect to `http://169.254.169.254/`. Set redirects to manual and validate each `Location` as a new URL.'
+interview:
+  - question: How do parameterised queries prevent SQL injection, and what can't they protect?
+    answer: >-
+      They send the query and the values on separate channels, so a value can never change
+      the query's structure. In PostgreSQL's extended protocol the SQL is parsed first with
+      `$1` placeholders, and the values arrive afterwards in a bind step, already typed as
+      data. A quote in a name is only a character. What they can't protect is anything that
+      isn't a value: identifiers, keywords, sort directions and fragments built from input. A
+      sort column from the request has to be mapped through a fixed list in code. The other
+      gap is people: ORM raw-query escape hatches accept any string, so code review should
+      flag string interpolation near them. Parameters also fix real bugs, such as names with
+      apostrophes, so there's no reason to skip them for "trusted" input.
+  - question: A feature fetches a URL the user gives us. How do you stop SSRF?
+    answer: >-
+      With an exact allow-list of hosts if the feature allows one, and with resolve, check,
+      connect if it doesn't. I parse with the same `URL` parser the client uses, allow only
+      `https`, refuse credentials in the URL, and compare the hostname exactly. For open
+      features such as link previews, I resolve the name myself, refuse if any address is
+      loopback, private, link-local like `169.254.169.254`, or an IPv4-mapped form of those,
+      and pass that checked address to the socket, which closes DNS rebinding. Redirects are
+      followed by hand and each hop is checked again. Around the code, the fetcher runs in a
+      network segment with no route to internal services, IMDSv2 is on, and responses are
+      size and time capped. The trade-off is complexity, which is why the allow-list wins
+      whenever the product allows it.
+  - question: What is DNS rebinding and why does it defeat a naive SSRF check?
+    answer: >-
+      It's a DNS server that gives different answers to the same name over time, so your
+      check and your connection see different addresses. A naive check resolves the host,
+      sees a public IP and approves it. Then `fetch` resolves the name again, and the
+      attacker's server, with a very short TTL, now answers `169.254.169.254` or `127.0.0.1`.
+      The check was correct about an address you never used. The fix is to resolve once and
+      connect to that exact address, for example with a custom `lookup` function in Node's
+      `http` module, while still sending the original hostname for TLS and the `Host` header.
+      Network egress rules are the backstop, because code-level checks can have bugs.
+  - question: Is SQL injection still a real risk if everyone uses an ORM?
+    answer: >-
+      Yes, less often but still real, and it's still in OWASP's 2025 Top 10 as A05 Injection.
+      ORMs parameterise their normal query methods, which removed the everyday string-gluing
+      bugs. The risk moved to the edges: raw-query helpers used for a report or a complex
+      search, dynamic `orderBy` or column selection fed from the request, JSON filters passed
+      through to the ORM that let a client add operators, and stored procedures that build SQL
+      internally. I review for interpolation inside raw helpers, map any request-driven names
+      through allow-lists, validate filter shapes with a schema, and give the app's database
+      role only the privileges it needs, so a hole that slips through reads less.

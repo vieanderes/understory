@@ -1,0 +1,249 @@
+summary: >-
+  HTTP is request and response: the client asks, the server answers, the exchange ends. Some
+  features need the server to speak first: a new chat message, a price change, a model's
+  answer arriving word by word. There are three ways to get that effect. **Polling** asks
+  again on a timer. **Server-sent events** (SSE) keep one response open and let the server
+  keep writing to it. A **WebSocket** upgrades a connection into a two-way channel that stays
+  open.
+
+
+  The choice follows who talks and how often. Polling is fine when updates are rare and a
+  delay of a minute is acceptable. SSE fits one-way streams from server to browser, which
+  covers streamed model output, notifications and live dashboards, and it's plain HTTP, so
+  proxies, auth and logging keep working. WebSockets fit traffic in both directions many
+  times a second: chat with typing indicators, multiplayer editing, games.
+
+
+  Every open connection costs memory and a connection slot on every hop, idle or not. These
+  notes cover a production SSE endpoint with resume and heartbeats, reading a streamed
+  `POST` response the way model SDKs do, what WebSockets need that HTTP gives for free, and
+  how realtime fan-out works across more than one server.
+remember:
+  - Pick polling, server-sent events or a WebSocket by the direction and frequency of messages, not by novelty.
+  - An SSE response is `text/event-stream`, and each event is `data:` lines ended by a blank line.
+  - "`EventSource` reconnects on its own and sends `Last-Event-ID`, so give events an `id:` if clients should resume without gaps."
+  - "`EventSource` only makes `GET` requests without custom headers, so streamed model answers to a `POST` are read with `fetch` and a stream parser."
+  - An open connection costs memory and a slot on the server, the load balancer and every proxy, for as long as it lasts.
+  - Send a heartbeat comment every few seconds so proxies and load balancers don't close an idle stream.
+  - A WebSocket handshake must check the `Origin` header and authenticate, because browsers send cookies with it and can't add custom headers.
+  - With more than one server, a pub/sub channel such as Redis or PostgreSQL `LISTEN`/`NOTIFY` carries each event to the server holding the client's connection.
+sections:
+  - title: An SSE endpoint that survives real networks
+    body: |-
+      The lesson's stream works on a laptop. In production, connections drop, proxies close
+      idle streams and users switch networks. The format has three features for that: `id:`
+      names an event, `retry:` tells the browser how many milliseconds to wait before
+      reconnecting, and a line starting with `:` is a comment the browser ignores. On
+      reconnect, `EventSource` sends the last id it saw in a `Last-Event-ID` header, so the
+      server can resend what was missed.
+
+      ```ts
+      const encoder = new TextEncoder();
+
+      export function eventsHandler(request: Request, history: { id: number; data: unknown }[]): Response {
+        const lastSeen = Number(request.headers.get('last-event-id') ?? 0);
+        let heartbeat: ReturnType<typeof setInterval> | undefined;
+
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            const send = (text: string) => controller.enqueue(encoder.encode(text));
+            send('retry: 5000\n\n');
+            for (const event of history.filter((e) => e.id > lastSeen)) {
+              send(`id: ${event.id}\ndata: ${JSON.stringify(event.data)}\n\n`);
+            }
+            // A comment line keeps proxies from closing an idle connection.
+            heartbeat = setInterval(() => send(': ping\n\n'), 15_000);
+            request.signal.addEventListener('abort', () => {
+              clearInterval(heartbeat);
+              controller.close();
+            });
+          },
+          cancel() {
+            clearInterval(heartbeat);
+          },
+        });
+
+        return new Response(stream, {
+          headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' },
+        });
+      }
+      ```
+
+      A request with `Last-Event-ID: 1` against a history of three events receives the
+      `retry` line and events 2 and 3 only. Cleaning up matters as much as sending: the
+      interval must stop when the client goes, or every closed tab leaves a timer writing
+      into nothing.
+
+      Two proxy traps catch people. Response buffering holds events until a buffer fills, so
+      nothing arrives for a while and then everything at once; nginx honours an
+      `X-Accel-Buffering: no` response header to turn it off per response. Compression can
+      buffer in the same way. If events arrive in bursts, look at every hop between you and
+      the browser.
+  - title: Reading a streamed POST, as model SDKs do
+    body: |-
+      A chat sends the conversation in a `POST` body with an API key or session, which
+      `EventSource` can't do. So clients use `fetch`, read `response.body` as a stream and
+      parse the events themselves. The catch is that network chunks don't line up with
+      events: one chunk can end in the middle of a line.
+
+      ```ts
+      export async function* readEvents(response: Response): AsyncGenerator<string> {
+        const reader = response.body!.pipeThrough(new TextDecoderStream()).getReader();
+        let buffer = '';
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) return;
+          buffer += value;
+          // Events end with a blank line; a chunk can stop in the middle of one.
+          let end: number;
+          while ((end = buffer.indexOf('\n\n')) !== -1) {
+            const block = buffer.slice(0, end);
+            buffer = buffer.slice(end + 2);
+            const data = block
+              .split('\n')
+              .filter((line) => line.startsWith('data:'))
+              .map((line) => line.slice(5).replace(/^ /, ''))
+              .join('\n');
+            if (data === '[DONE]') return;
+            if (data !== '') yield data;
+          }
+        }
+      }
+      ```
+
+      Fed the chunks `data: {"text":"Te`, `a"}` plus a `: ping` comment, and the rest split
+      mid-word, it yields two events that join to `"Tea is"`. `TextDecoderStream` matters
+      too: a multi-byte character such as an emoji can be split across chunks, and decoding
+      each chunk separately would corrupt it. This sketch assumes `\n` line endings; the
+      format also allows `\r\n`, which a full parser handles.
+
+      To let the user press stop, pass an `AbortController`'s signal to `fetch` and abort
+      it. The server sees the disconnect, and a well-written handler stops calling the model,
+      which stops the bill.
+  - title: What a WebSocket needs that HTTP gave you
+    body: |-
+      A WebSocket starts as an HTTP `GET` with `Upgrade: websocket`; the server answers
+      `101 Switching Protocols`, and from then on the connection carries WebSocket frames.
+      That's the last moment HTTP helps. Several things you took for granted become your
+      job.
+
+      - **Authentication.** The browser `WebSocket` constructor can't set an `Authorization`
+        header. Use the session cookie, which the browser sends with the handshake, or a
+        short-lived ticket fetched over normal HTTP and passed in the URL or first message.
+      - **Origin checks.** Because cookies ride along, any site can open a socket to your
+        server as your user. The server must check the `Origin` header on the handshake and
+        refuse unknown origins. This attack is called cross-site WebSocket hijacking.
+      - **Message validation.** Every incoming message is untrusted input, like a request
+        body. Validate it with the same schema discipline, and cap its size.
+      - **Reconnection.** Unlike `EventSource`, a `WebSocket` doesn't reconnect by itself.
+        The client needs backoff with jitter and a way to catch up on missed messages.
+      - **Backpressure.** `socket.send()` queues data if the network is slow; `bufferedAmount`
+        tells you how much is waiting. A server writing to a slow client must notice and
+        drop or disconnect it, or memory grows.
+      - **Heartbeats.** The protocol has ping and pong frames; servers use them to find dead
+        connections that never closed cleanly.
+
+      Libraries such as Socket.IO bundle reconnection, rooms and fallbacks, at the cost of
+      their own protocol on top of WebSockets, so both ends must use the library.
+  - title: Fan-out across many servers
+    body: |-
+      With one server, sending "new message in room 7" means looping over the connections in
+      memory. With ten servers behind a load balancer, the sender's request lands on one
+      server and the room's members are connected to the other nine. The servers need a
+      shared channel.
+
+      ```text
+      client A --POST message--> server 1 --publish room:7--> Redis pub/sub
+                                                                  |
+                  server 2 <-------- room:7 ---------------------+
+                  server 3 <-------- room:7 ---------------------+
+      clients in room 7 <--SSE / WebSocket-- servers 2 and 3
+      ```
+
+      Each server subscribes to the channels its clients care about and forwards messages to
+      its own connections. Redis pub/sub is fire and forget: a server that's disconnected
+      misses messages. PostgreSQL's `LISTEN` and `NOTIFY` works too, with payloads limited to
+      8,000 bytes by default. So store the message in the database first and publish only a
+      notice, then let clients catch up from storage after any gap.
+
+      Connection counts shape capacity. Each tab holds a connection for hours, so load
+      balancers need idle timeouts longer than your heartbeat interval, and deploys need to
+      drain connections gradually, or every client reconnects in the same second. Browsers
+      allow only about six HTTP/1.1 connections per origin, shared across tabs, so several
+      open SSE streams can starve ordinary requests; HTTP/2 multiplexes them over one
+      connection and removes that limit in practice.
+pitfalls:
+  - '**Polling fast to feel live.** Ten requests a second per tab brings the API down and most answers say "no change". Poll slowly, or push.'
+  - '**Letting `EventSource` reconnect after a finished answer.** A stream that ends looks like a drop, so the request runs again. Close the source on your end marker.'
+  - '**No heartbeat.** Load balancers and proxies close connections that are idle for a minute or so. Send a comment line every 15 to 30 seconds.'
+  - '**Leaking timers and subscriptions on disconnect.** Each closed tab leaves work running. Clean up on abort and in the stream''s `cancel`.'
+  - '**Parsing each network chunk as a whole event.** Chunks split events and characters. Buffer until a blank line, and decode with `TextDecoderStream`.'
+  - '**Skipping the `Origin` check on WebSocket handshakes.** Cookies make every site a potential client as your user. Allow only your own origins.'
+  - '**Keeping realtime state only in one server''s memory.** The next deploy or a second server loses it. Store first, publish a notice, and let clients catch up.'
+interview:
+  - question: How would you stream an LLM's response to the browser?
+    answer: >-
+      Server-sent events over a `POST`, read with `fetch` on the client. The browser posts the
+      conversation to my API, which authenticates, calls the provider with streaming on and
+      forwards each chunk as a `data:` event in a `text/event-stream` response, then a done
+      marker. The client reads `response.body` through `TextDecoderStream`, buffers until
+      blank lines and appends text as it arrives. An `AbortController` lets the user stop,
+      and the server passes that on to the provider so billing stops too. I use SSE rather
+      than a WebSocket because the flow is one-way and SSE stays plain HTTP. The trade-off is
+      that each generation holds a connection for its whole duration, which sets capacity.
+  - question: When would you choose WebSockets over server-sent events?
+    answer: >-
+      When the client also sends frequent, low-latency messages on the same channel. A chat
+      with typing indicators, collaborative editing and games send many small messages both
+      ways, and a WebSocket carries them without a new HTTP request each time. For one-way
+      streams such as notifications, dashboards or model output, SSE is simpler: it's plain
+      HTTP, reconnects on its own with `Last-Event-ID`, and works with existing auth,
+      proxies and logging. WebSockets make you handle reconnection, heartbeats, Origin
+      checks and backpressure yourself. A common middle ground is SSE for server-to-client
+      plus ordinary `POST` requests for the occasional client message.
+  - question: How do you scale a chat's realtime delivery across many servers?
+    answer: >-
+      Persist first, then fan out through a pub/sub layer. A new message is written to the
+      database, then published on a channel such as `room:7` in Redis. Every server
+      subscribes to the rooms its connected clients are in and forwards the message on their
+      sockets. Because pub/sub is fire and forget, clients track the last message id they
+      saw and fetch anything newer after a reconnect. Capacity planning is about connections,
+      not requests: memory per connection, file descriptor limits, load balancer idle
+      timeouts and gradual draining on deploy. At larger scale I'd split connection-holding
+      gateway servers from the application servers that do the work.
+  - question: What does an open connection cost compared with a poll?
+    answer: >-
+      A poll costs a burst of work and then nothing; an open connection costs memory and a
+      slot all the time. Each stream or socket holds a file descriptor, buffers and any
+      per-connection state on the server, plus an entry on the load balancer and every proxy
+      in between, whether or not anything is sent. So moving from a 30-second poll to a
+      stream per tab cuts requests but can hit connection or memory limits first. The fix is
+      to measure memory per connection, raise limits deliberately, and keep per-connection
+      state small. For data that changes rarely, a slow poll with caching can be the cheaper
+      design.
+terms:
+  - term: Polling
+    say: Outdated, never use it.
+    means: Asking again on a timer. It is simple and fine when updates are rare and a delay is
+      acceptable.
+  - term: Long polling
+    say: Polling more often.
+    means: A request the server holds open until there is news or a timeout, then the client
+      asks again at once.
+  - term: Server-sent events
+    say: A one-way WebSocket.
+    means: One HTTP response of type `text/event-stream` that the server keeps writing events
+      to. `EventSource` reconnects on its own and resumes with `Last-Event-ID`.
+  - term: WebSocket
+    say: Always the right choice for realtime.
+    means: A connection upgraded from HTTP into a two-way channel that stays open. It suits
+      frequent messages in both directions, and needs its own auth and `Origin` check.
+  - term: Heartbeat
+    say: A health check endpoint.
+    means: A small message sent every few seconds on an open stream so proxies and load
+      balancers don't close it as idle.
+  - term: Pub/sub
+    say: A message queue.
+    means: A channel that delivers each event to every subscriber, so with many servers the
+      event reaches whichever one holds the client's connection. Every subscriber gets a
+      copy, where a queue hands each message to one worker.

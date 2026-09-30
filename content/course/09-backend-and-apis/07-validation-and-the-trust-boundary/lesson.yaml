@@ -1,0 +1,301 @@
+id: backend.validation
+title: Validation at the trust boundary
+objective: Parse every request body at the boundary, keep only the fields you named, and answer bad input with a 400.
+level: essential
+minutes: 10
+concepts: [backend.trust-boundary, backend.parse-dont-validate, backend.client-side-checks]
+prerequisites: [backend.error-responses, ts.typing-the-boundary]
+opening:
+  text: >-
+    You'll turn whatever a client sends into a value your code can trust, or refuse it with a
+    clear 400. After this, no request body reaches your data unchecked.
+
+steps:
+  - type: prose
+    id: forms-are-a-courtesy
+    body: |-
+      Your order form says `max="10"`, so the browser refuses 500 kettles. But `curl` never
+      loads the form:
+
+      ```bash
+      $ curl -H "Content-Type: application/json" \
+          -d '{"productId":"kettle","quantity":500}' localhost:3000/orders
+      {"productId":"kettle","quantity":500}
+      ```
+
+      A handler that saves what it's sent has now stored 500. A script, or a page someone edited
+      in the dev tools, can do the same.
+
+  - type: prose
+    id: the-trust-boundary
+    body: >-
+      Everything a client sends is text you haven't checked. The **trust boundary** is the
+      line where that text becomes a value your code relies on: the top of your handler.
+      Check there, on every request.
+
+
+      Keep `min` and `max` on the form too. Those **client-side checks** answer the person
+      typing at once, without a round trip. They're for feedback, never for safety.
+
+  - type: multiple-choice
+    id: pick-who-checks
+    concept: backend.client-side-checks
+    difficulty: 1
+    question: Which check stops a `curl` request from saving 500 kettles?
+    choices:
+      - text: The handler checking the body on the server
+        correct: true
+        feedback: >-
+          Right. Every request passes through the handler, whoever sent it.
+      - text: '`max="10"` on the form''s input'
+        feedback: >-
+          Only a browser showing the form runs that check. `curl` never saw the form.
+      - text: Disabling the submit button past 10
+        feedback: >-
+          The button lives in the page too. A request doesn't need a button to be sent.
+
+  - type: prose
+    id: parse-dont-validate
+    body: |-
+      You met zod in TypeScript 05. Here it guards a server:
+
+      ```js
+      const OrderSchema = z.object({
+        productId: z.string().min(1),
+        quantity: z.number().int().min(1).max(10),
+      });
+
+      const result = OrderSchema.safeParse(await request.json());
+      ```
+
+      `result.data` is a new value holding only the fields the schema names. That's **parse,
+      don't validate**: you get back a checked value, not a yes or no.
+
+  - type: predict-output
+    id: predict-string-quantity
+    concept: backend.parse-dont-validate
+    difficulty: 2
+    language: bash
+    code: |
+      $ curl -H "Content-Type: application/json" \
+          -d '{"productId":"kettle","quantity":"2"}' localhost:3000/orders
+    question: The handler answers failures with a 400 and zod's first message. What comes back?
+    choices:
+      - text: 'A 400: expected number, received string'
+        correct: true
+        feedback: >-
+          Yes. `"2"` is text, and `z.number()` doesn't convert it.
+      - text: 'A 201, with `quantity` as the number 2'
+        feedback: >-
+          Converting is what `z.coerce.number()` does. A plain `z.number()` refuses a string.
+      - text: 'A 201, with `quantity` as the text `"2"`'
+        feedback: >-
+          The schema asked for a number, so a string never gets through to be saved.
+
+  - type: fill-blank
+    id: fill-parse-at-boundary
+    concept: backend.parse-dont-validate
+    difficulty: 2
+    language: js
+    prompt: >-
+      Parse the body at the boundary. On failure answer 400 with the first problem. On success
+      save the parsed value, never the raw body. Fill the gaps.
+    template: |
+      const result = OrderSchema.{{1}}(await request.json());
+      if (!result.{{2}}) {
+        const detail = result.error.issues[0].message;
+        return Response.json({ title: "Invalid order", status: 400, detail }, { status: 400 });
+      }
+      orders.push(result.{{3}});
+    blanks:
+      - key: '1'
+        answer: safeParse
+      - key: '2'
+        answer: success
+      - key: '3'
+        answer: data
+    bank: [safeParse, parse, success, ok, data, input]
+
+  - type: prose
+    id: extra-fields
+    body: |-
+      Send fields the schema never named, and they vanish:
+
+      ```bash
+      $ curl -H "Content-Type: application/json" \
+          -d '{"productId":"kettle","quantity":1,"isAdmin":true}' localhost:3000/orders
+      {"productId":"kettle","quantity":1}
+      ```
+
+      Saving the raw body instead would store `isAdmin` too. Letting a client set fields it
+      shouldn't touch has a name: **mass assignment**.
+
+  - type: ai-review
+    id: review-mass-assignment
+    concept: backend.trust-boundary
+    difficulty: 3
+    language: js
+    request: Let a user update their name and email from the settings form.
+    flawClass: security
+    code: |
+      const ProfileSchema = z.object({ name: z.string().min(1), email: z.email() });
+
+      async function updateProfile(request, user) {
+        const body = await request.json();
+        const result = ProfileSchema.safeParse(body);
+        if (!result.success) return Response.json({ error: "Bad profile" }, { status: 400 });
+        users.set(user.id, { ...user, ...body });
+        return Response.json({ saved: true });
+      }
+    prompt: >-
+      An assistant wrote this. `user` is the signed-in user. Bad emails get a 400, and the test
+      passes. Then someone sends `"role":"admin"` and becomes an admin. Tap the line at fault.
+    lines: [7]
+    reasons:
+      - text: It spreads the raw body instead of the parsed value
+        correct: true
+        feedback: >-
+          Yes. The schema was only asked a question. `result.data` holds only two fields.
+      - text: '`role` should be added to the schema as optional'
+        feedback: >-
+          Then anyone could set it. Keep the schema as it is, and save what it hands back.
+      - text: '`safeParse` should be `parse`'
+        feedback: >-
+          Both give the same checked value. The bug is that neither value was used.
+    fix: |
+      const ProfileSchema = z.object({ name: z.string().min(1), email: z.email() });
+
+      async function updateProfile(request, user) {
+        const body = await request.json();
+        const result = ProfileSchema.safeParse(body);
+        if (!result.success) return Response.json({ error: "Bad profile" }, { status: 400 });
+        users.set(user.id, { ...user, ...result.data });
+        return Response.json({ saved: true });
+      }
+
+  - type: code-challenge
+    id: write-create-order
+    concept: backend.parse-dont-validate
+    difficulty: 3
+    language: ts
+    editable: '26-27'
+    prompt: >-
+      `createOrder` trusts whatever arrives. The sandbox has no zod, so check by hand. Answer
+      `problem(detail)` for each failure, checked in this order:
+
+
+      Text that isn't JSON: `'Body must be JSON'`. JSON that isn't an object: `'Body must be an
+      object'`. A missing or empty `productId`: `'productId must be a non-empty string'`. A
+      `quantity` that isn't a whole number from 1 to 10: `'quantity must be a whole number from
+      1 to 10'`.
+
+
+      Otherwise answer `201` with only `productId` and `quantity`.
+    hints:
+      - '`JSON.parse` throws on text that isn''t JSON. Catch that first.'
+      - '`typeof` tells a string from a number, and `Number.isInteger` a whole number from a fraction.'
+      - 'Start with `let data;` and a `try { data = JSON.parse(request.body); } catch { ... }`.'
+
+  - type: explain-back
+    id: explain-why-both-checks
+    concept: backend.client-side-checks
+    difficulty: 3
+    prompt: >-
+      The form already refuses a quantity over 10. A teammate says the server check is
+      duplicated work. Why do you keep both?
+    rubric:
+      - The form only runs in a browser that shows it, and any client can skip it.
+      - The server check is the only one every request passes, so it's the one that protects the data.
+      - The form check gives the person fast feedback, which the server can't, so both have a job.
+    modelAnswer: >-
+      They do different jobs. The form's `max` tells the person at once, without a round trip.
+      But it only runs in a browser that loaded the form. `curl`, a script or an edited page
+      skips it. The server's parser is the one check every request goes through, so it guards
+      the data. Keep the fast one for people and the real one for everything.
+
+recap:
+  - Treat every request body as unchecked text until your handler parses it.
+  - Save only the parsed value, so fields you never named can't sneak in.
+  - Answer bad input with a 400 that says what's wrong, and keep form checks for feedback.
+
+recall:
+  - id: card-trust-boundary
+    concept: backend.trust-boundary
+    front: What is the trust boundary, and where does checking belong?
+    back: >-
+      The line where client text becomes a value your code relies on. Check at the top of the
+      handler, on every request.
+  - id: card-parse-vs-validate
+    concept: backend.parse-dont-validate
+    front: What does `result.data` from `safeParse` give you that the raw body doesn't?
+    back: >-
+      A checked value of a known type, holding only the fields the schema names.
+  - id: card-mass-assignment
+    concept: backend.trust-boundary
+    front: What goes wrong when a handler saves `{ ...body }` after a schema check?
+    back: >-
+      Mass assignment. Fields the schema never named, like `role`, reach your data. Save
+      `result.data` instead.
+  - id: card-client-checks
+    concept: backend.client-side-checks
+    front: What are `min`, `max` and `required` on a form input for?
+    back: >-
+      Fast feedback for the person typing. Any client can skip them, so they protect nothing.
+  - id: card-json-400
+    concept: backend.parse-dont-validate
+    front: A client sends text that isn't JSON. What should the handler answer?
+    back: >-
+      A 400 saying the body must be JSON. Left uncaught, `JSON.parse` throws and the client
+      gets a 500.
+
+references:
+  - kind: docs
+    title: Defining schemas
+    authors: Colin McDonnell
+    venue: zod.dev
+    url: https://zod.dev/api
+    note: '`z.object`, number checks, coercion, and why unknown keys are stripped by default.'
+    primary: true
+    verified: true
+  - kind: essay
+    title: Parse, don't validate
+    authors: Alexis King
+    year: 2019
+    venue: lexi-lambda.github.io
+    url: https://lexi-lambda.github.io/blog/2019/11/05/parse-don-t-validate/
+    note: The essay that named the idea, in Haskell, and the argument for it.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Mass Assignment Cheat Sheet
+    authors: OWASP
+    venue: OWASP Cheat Sheet Series
+    url: https://cheatsheetseries.owasp.org/cheatsheets/Mass_Assignment_Cheat_Sheet.html
+    note: The attack, its other names, and allow-listing the fields a request may set.
+    verified: true
+  - kind: docs
+    title: Client-side form validation
+    authors: MDN contributors
+    venue: MDN Web Docs
+    url: https://developer.mozilla.org/en-US/docs/Learn_web_development/Extensions/Forms/Form_validation
+    note: What the browser checks, and its own warning that it must not replace server checks.
+    verified: true
+
+deepDive: >-
+  zod strips unknown keys by default, which is what saved the review step once `result.data`
+  was used. `z.strictObject(...)` turns an unknown key into an error instead. That suits an
+  admin API, where a stray field usually means a bug. `z.looseObject(...)` keeps them, and is
+  rarely what you want at a boundary.
+
+
+  A body that isn't JSON makes `await request.json()` throw before any schema runs. Left
+  alone, that's a 500 with an empty body. Catch it and answer 400: the client sent the wrong
+  thing, the server didn't fail.
+
+
+  One schema can serve both checks. Share it with a React form, or generate `min`, `max` and
+  `required` from it, so the two can't drift apart.
+
+
+  Next in the journey, Next.js route handlers put this same parse at the top of an endpoint
+  inside a Next.js app.

@@ -1,0 +1,193 @@
+summary: >-
+  Events let one part of a system announce a fact, such as `RoomBooked`, without knowing
+  who cares. Commands ask one known receiver to do something. Choosing events flips the
+  dependency: the publisher stops knowing about email, billing and analytics, and each of
+  those subscribes on its own. New listeners arrive without the publisher changing.
+
+
+  The hard part is making the announcement reliable. Saving to the database and publishing
+  to a broker are two writes to two systems, and no transaction covers both, so a crash
+  between them loses the event or announces something that never committed. The
+  **transactional outbox** fixes it by writing the event as a row in the same transaction
+  as the change, and letting a relay publish it afterwards.
+
+
+  The price is at-least-once delivery. A relay that crashes after publishing and before
+  marking the row sends it again, so every consumer must be idempotent. The notes below
+  build a production outbox table and relay query, an idempotent consumer, and the event
+  design choices that decide whether events stay useful as the system grows.
+remember:
+  - An event states a past fact to whoever listens; a command asks one receiver to act and can be refused.
+  - Writing to a database and publishing to a broker is a dual write, and a crash between them loses or invents an event.
+  - The outbox writes the event as a row in the same transaction as the state change, so the event exists exactly when the change does.
+  - A relay marks a row sent only after the broker accepts it, which gives at-least-once delivery, never at-most-once.
+  - Every consumer is idempotent, usually by recording processed event ids in the same transaction as its own effect.
+  - '`FOR UPDATE SKIP LOCKED` lets several relays or workers claim different rows from one table without blocking each other.'
+  - Give every event a unique id, a type, a version and a timestamp, and treat its shape as a public contract.
+sections:
+  - title: A production outbox table and relay
+    body: |-
+      The lesson's outbox has an id, a type and a payload. A real one adds a globally
+      unique event id for consumers to deduplicate on, timestamps for monitoring, and a
+      partial index so finding unsent rows stays fast however large the table grows.
+
+      ```sql
+      CREATE TABLE outbox (
+        id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        event_id     uuid NOT NULL DEFAULT gen_random_uuid() UNIQUE,
+        type         text NOT NULL,
+        payload      jsonb NOT NULL,
+        created_at   timestamptz NOT NULL DEFAULT now(),
+        published_at timestamptz
+      );
+      CREATE INDEX outbox_unpublished ON outbox (id) WHERE published_at IS NULL;
+
+      BEGIN;
+      WITH b AS (INSERT INTO bookings (room) VALUES ('Oak') RETURNING id)
+      INSERT INTO outbox (type, payload)
+      SELECT 'RoomBooked', jsonb_build_object('bookingId', b.id, 'room', 'Oak') FROM b;
+      COMMIT;
+      ```
+
+      The relay runs every second or so. In one transaction it claims a batch, publishes
+      each row, and marks the batch sent:
+
+      ```sql
+      SELECT id, event_id, type, payload
+      FROM outbox
+      WHERE published_at IS NULL
+      ORDER BY id
+      LIMIT 100
+      FOR UPDATE SKIP LOCKED;
+      -- publish each row to the broker, then:
+      UPDATE outbox SET published_at = now() WHERE id = ANY($1);
+      ```
+
+      Run on PostgreSQL, the claim returned the booking's row, and after the update a
+      second claim returned none. `SKIP LOCKED` makes a second relay pass over rows the
+      first has locked, so two relays share the work instead of duplicating it.
+
+      Two operational details matter. Holding the transaction open while publishing keeps
+      the rows locked, so keep batches small and the broker call short. And delete or
+      archive published rows on a schedule, since an outbox that grows for ever slows
+      every query on it. Watch the age of the oldest unpublished row: if it climbs, the
+      relay is stuck.
+  - title: The idempotent consumer
+    body: |-
+      At-least-once delivery means a consumer will see some events twice: after a relay
+      crash, a broker redelivery, or a consumer that crashed before acknowledging. The fix
+      is to record each processed event id in the consumer's own database, in the same
+      transaction as the work, so the work and the record commit together.
+
+      ```ts
+      type Tx = { query(sql: string, params?: unknown[]): Promise<{ rows: unknown[] }> };
+      type RoomBooked = { event_id: string; payload: { bookingId: number } };
+
+      async function onRoomBooked(tx: Tx, event: RoomBooked): Promise<void> {
+        const fresh = await tx.query(
+          `INSERT INTO processed_events (event_id) VALUES ($1)
+           ON CONFLICT DO NOTHING RETURNING event_id`,
+          [event.event_id],
+        );
+        if (fresh.rows.length === 0) return; // seen before
+        await tx.query('INSERT INTO emails (booking_id) VALUES ($1)', [event.payload.bookingId]);
+      }
+      ```
+
+      The caller wraps this in a transaction and acknowledges the message only after the
+      commit. Delivered twice, it inserted one email row, not two.
+
+      This covers effects inside the consumer's database. An effect outside it, such as
+      calling an email provider, can't join the transaction. There you pass the event id
+      as the provider's idempotency key if it supports one, or accept a rare duplicate.
+      That is why "exactly once" is best described as **exactly-once effect**: delivery is
+      at least once, and idempotency makes the repeats harmless.
+
+      The same table on the receiving side has a name, the **inbox** pattern. It pairs
+      naturally with the outbox: one guarantees the event leaves, the other guarantees it
+      is applied once.
+  - title: Designing events that age well
+    body: |-
+      Once other teams consume an event, its shape is a public API. Changing it is as
+      hard as changing an endpoint, and harder, because old events may sit in a queue or a
+      log for days.
+
+      A useful envelope carries the same fields on every event:
+
+      ```json
+      {
+        "eventId": "0b8e1c1e-5d0f-4f3e-9a55-2f4f0c7d9a10",
+        "type": "RoomBooked",
+        "version": 2,
+        "occurredAt": "2026-10-01T09:30:00Z",
+        "data": { "bookingId": 3, "room": "Oak", "nights": 2 }
+      }
+      ```
+
+      There's a real choice about how much goes in `data`. A **thin event** carries ids
+      only, and consumers call back for details. It stays small and never leaks fields,
+      but every consumer now depends on the publisher's API being up, and it may read a
+      newer state than the event described. A **fat event**, sometimes called event-carried
+      state transfer, includes what consumers need. Consumers work offline and see the
+      state as of the event, and the payload becomes a larger contract to keep stable.
+
+      Evolve events the way you evolve an API. Adding an optional field is safe. Renaming
+      or removing one breaks consumers, so bump `version`, publish both versions for a
+      while, or convert old versions on read. Consumers should ignore fields they don't
+      know.
+
+      Ordering is weaker than people assume. Several relays with `SKIP LOCKED`, retries
+      and broker partitions can all reorder events. If order matters per booking, route
+      every event for one booking to the same partition, and have consumers compare a
+      per-entity version so a late, older event can't overwrite a newer state.
+pitfalls:
+  - "**Publishing inside the transaction.** The broker hears about a change that may still roll back, and consumers read a row that isn't committed yet. Publish only from the outbox, after the commit."
+  - "**Marking a row sent before publishing it.** A crash in between loses the event for good. Publish, then mark, and accept that a crash means a duplicate."
+  - "**Assuming the broker delivers exactly once.** Brokers redeliver after timeouts and restarts. Deduplicate on the event id in the consumer's own transaction."
+  - "**Using commands disguised as events.** `SendWelcomeEmail` published to a topic still ties the publisher to the email job. Name the fact, `AccountCreated`, and let the email module decide."
+  - "**Letting the outbox grow for ever.** Millions of published rows slow the relay's query. Keep a partial index on unpublished rows and delete old published ones on a schedule."
+  - "**Relying on global event order.** Parallel relays and retries reorder events. Guarantee order only per entity, with a partition key or a version check."
+interview:
+  - question: What is the dual write problem, and how does the transactional outbox solve it?
+    answer: >-
+      It's writing to two systems, usually a database and a message broker, with no
+      transaction spanning them, so a crash between the writes leaves them disagreeing.
+      Save first and crash, and the change happens silently. Publish first and the
+      transaction rolls back, and consumers act on something that never happened. The
+      outbox makes the event a row in the same database transaction as the change, so
+      both commit or neither does. A relay then reads unsent rows, publishes them and
+      marks them sent. The trade-offs are a small delay before publishing, a table to
+      maintain, and at-least-once delivery, because a relay crash between publish and mark
+      sends a row twice. Consumers must therefore be idempotent.
+  - question: Can you get exactly-once delivery from a message broker?
+    answer: >-
+      Not end to end in any useful sense, so I design for at-least-once delivery with
+      exactly-once effect. Networks and crashes mean a sender can't always tell whether a
+      message arrived, so either it retries and risks a duplicate, or it doesn't and
+      risks a loss. I choose duplicates and make them harmless: every event carries a
+      unique id, and the consumer inserts that id into a processed-events table in the
+      same transaction as its work, skipping it on conflict. For effects outside my
+      database, I pass the id as an idempotency key to the external API. Some brokers
+      advertise exactly-once within their own boundary, but the moment my handler writes
+      to another system, idempotency is back on me.
+  - question: When would you use an event rather than a direct call between services?
+    answer: >-
+      When the publisher doesn't need an answer and shouldn't know who reacts. A booking
+      being made is a fact that email, billing and analytics each care about, and none of
+      their failures should block the booking. An event keeps the booking path fast and
+      lets new consumers subscribe without touching bookings. I'd use a direct call when
+      the caller needs a result to continue, such as checking a price before showing it,
+      or when the user must see the outcome at once. Events cost visibility: the overall
+      flow is spread across consumers, so you need tracing, a dead-letter queue for events
+      that keep failing, and monitoring of consumer lag.
+  - question: Two relay processes read the same outbox table. How do you stop them sending the same row?
+    answer: >-
+      Claim rows with `SELECT ... FOR UPDATE SKIP LOCKED` inside a transaction. Each relay
+      locks the rows it selects, and the other relay skips locked rows instead of waiting,
+      so they take different batches. Rows are marked published in the same transaction,
+      after the broker accepts them, and the locks release at commit. If a relay crashes
+      mid-batch, its transaction rolls back, the locks go, and another relay picks those
+      rows up. Some of them may already have reached the broker, which is why consumers
+      deduplicate anyway. The trade-off is ordering: parallel relays can publish
+      neighbouring rows out of order, so if order matters I partition by entity or run a
+      single relay.

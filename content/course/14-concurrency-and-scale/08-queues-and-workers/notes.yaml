@@ -1,0 +1,267 @@
+summary: >-
+  A queue separates accepting work from doing it. The request stores a job and answers at
+  once. Workers, separate processes, take jobs and run them at a pace the system can sustain.
+  That buys three things: fast responses for slow work, survival through a downstream outage,
+  and a place to absorb bursts. Transcribing audio, generating thumbnails, sending email,
+  running a batch of model calls and processing webhooks all belong on a queue.
+
+
+  The price is a new failure model. A worker can crash at any point, so a queue hands out a
+  job for a limited time, the **visibility timeout**, and resends it if no acknowledgement
+  arrives. Delivery is **at-least-once**: nothing is lost, and anything may run twice. Every
+  handler must be idempotent, retries need backoff and a cap, and jobs that can never succeed
+  go to a **dead-letter queue**.
+
+
+  These notes build a real queue in Postgres with `FOR UPDATE SKIP LOCKED`. They cover
+  heartbeats for long jobs and graceful shutdown on deploy. Then how many workers you need,
+  and what to do when work arrives faster than you can finish it. Reach for a queue when work takes longer than a
+  request should, can fail and be retried, or arrives in bursts. Don't, when the caller needs
+  the result inside the request and the work is fast: a queue adds latency, moving parts and
+  a second place for bugs.
+remember:
+  - A worker acknowledges a job only after the work is done, so a crash means a repeat, never a loss.
+  - Delivery is at-least-once, so exactly-once effects come from idempotent handlers, not from the queue.
+  - The visibility timeout must outlast the slowest job, or a heartbeat must keep extending it while the job runs.
+  - In Postgres, `FOR UPDATE SKIP LOCKED` lets many workers claim different rows at once without waiting on each other.
+  - Count an attempt when a job is claimed, not when it fails, so a job that crashes its worker still reaches the dead-letter queue.
+  - Workers needed is roughly arrival rate times average job time, so 2 jobs a second at 90 seconds each needs about 180 running at once.
+  - Watch queue depth and the age of the oldest job, and alert when the dead-letter queue grows.
+  - Enqueue in the same transaction as the data the job is about, or use an outbox, so a job and its row can't disagree.
+sections:
+  - title: A job queue in Postgres
+    body: |-
+      You may not need a separate broker. If your data is in Postgres, a table can be the
+      queue, and that has one big advantage: you can enqueue in the same transaction as the
+      upload row, so a job exists if and only if its upload does.
+
+      ```sql
+      CREATE TABLE jobs (
+        id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        kind text NOT NULL,
+        payload jsonb NOT NULL,
+        status text NOT NULL DEFAULT 'queued'
+          CHECK (status IN ('queued', 'running', 'done', 'dead')),
+        attempts int NOT NULL DEFAULT 0,
+        max_attempts int NOT NULL DEFAULT 5,
+        run_at timestamptz NOT NULL DEFAULT now(),
+        locked_by text,
+        locked_until timestamptz,
+        last_error text
+      );
+
+      -- Workers only ever look for ready jobs, so index only those.
+      CREATE INDEX jobs_ready ON jobs (run_at) WHERE status = 'queued';
+
+      INSERT INTO jobs (kind, payload) VALUES ('transcribe', '{"uploadId": 41}');
+
+      -- Claim: a short transaction. The claim outlives it in locked_until.
+      UPDATE jobs
+      SET status = 'running', attempts = attempts + 1,
+          locked_by = 'worker-3', locked_until = now() + interval '10 minutes'
+      WHERE id = (
+        SELECT id FROM jobs
+        WHERE status = 'queued' AND run_at <= now()
+        ORDER BY run_at
+        LIMIT 1
+        FOR UPDATE SKIP LOCKED
+      )
+      RETURNING id, payload, attempts;
+      ```
+
+      The subquery picks the oldest ready job and locks it. Per the PostgreSQL
+      documentation, `SKIP LOCKED` skips any row that can't be locked immediately. So ten
+      workers claiming at once each get a different job, instead of nine queuing behind the
+      first. The docs also warn that this gives an inconsistent view of the table, which is
+      fine for a queue and wrong for general queries.
+
+      There are two ways to hold a job. You can keep the transaction open for the whole job,
+      so the row lock is the visibility timeout and ends when the connection dies. That's
+      neat for jobs of a few seconds. For minutes of model calls it ties up a connection per
+      job, and long transactions hold back vacuum on a table that churns constantly. The
+      version above commits the claim at once and records a deadline in `locked_until`
+      instead, which the next section builds on.
+
+      To avoid polling, the enqueuing transaction can run `NOTIFY jobs_ready`. Postgres
+      delivers it only when that transaction commits, and idle workers that ran `LISTEN
+      jobs_ready` wake at once. Keep a slow poll as well, because notifications sent while a
+      worker was disconnected are not replayed.
+  - title: Finishing, failing and the reaper
+    body: |-
+      With a committed claim, three more statements complete the queue. Each is guarded by
+      `locked_by` and `attempts`. Every claim raises `attempts`, so it works as a fencing
+      token: a worker whose claim expired and was taken over can't finish or fail a job that
+      now belongs to someone else.
+
+      ```sql
+      -- Heartbeat: extend the claim while the work runs.
+      UPDATE jobs SET locked_until = now() + interval '10 minutes'
+      WHERE id = 1 AND status = 'running' AND locked_by = 'worker-3' AND attempts = 1
+      RETURNING id;
+
+      -- Complete: only the claim that is still current may finish the job.
+      UPDATE jobs SET status = 'done', locked_by = NULL, locked_until = NULL
+      WHERE id = 1 AND status = 'running' AND locked_by = 'worker-3' AND attempts = 1
+      RETURNING id, status;
+
+      -- Fail: back off with full jitter, or park the job once attempts run out.
+      UPDATE jobs
+      SET status = CASE WHEN attempts >= max_attempts THEN 'dead' ELSE 'queued' END,
+          run_at = now() + interval '30 seconds' * (2 ^ (attempts - 1)) * random(),
+          locked_by = NULL, locked_until = NULL,
+          last_error = 'model API returned 503'
+      WHERE id = 1 AND status = 'running' AND locked_by = 'worker-3' AND attempts = 1;
+
+      -- Reaper, run every minute: claims whose worker went quiet go back.
+      UPDATE jobs
+      SET status = CASE WHEN attempts >= max_attempts THEN 'dead' ELSE 'queued' END,
+          locked_by = NULL, locked_until = NULL
+      WHERE status = 'running' AND locked_until < now()
+      RETURNING id, status;
+      ```
+
+      If a heartbeat returns no row, the worker has lost the job. It should stop and throw
+      the result away rather than finish work another worker is now doing.
+
+      `status = 'dead'` is the dead-letter queue: the same table, a different status. Retrying
+      one by hand after a fix is `UPDATE jobs SET status = 'queued', attempts = 0` for that
+      id. Keep `last_error`, because the first question about a dead job is why it died.
+
+      Counting attempts at claim time matters more than it looks. A malformed file that
+      crashes the worker never reaches the fail statement. If attempts only rose on failure,
+      the reaper would requeue it for ever and it would crash a worker every ten minutes.
+      Counted at claim, it dies after `max_attempts` crashes.
+  - title: Long jobs, deploys and graceful shutdown
+    body: |-
+      Choosing a visibility timeout is a trade. Too short, and a slow but healthy job
+      reappears and runs twice at once. Too long, and a job whose worker crashed waits the
+      whole timeout before anyone retries it. A heartbeat escapes the trade: keep the timeout
+      short, a few minutes, and extend it every minute while the work runs. Managed queues
+      offer the same move. Amazon SQS has a `ChangeMessageVisibility` call, and BullMQ renews
+      its job lock automatically while the worker's event loop is free.
+
+      Deploys are the most common crash. A platform stops a process by sending `SIGTERM`, then
+      kills it after a grace period, 30 seconds by default on Kubernetes. A worker that
+      stops claiming on `SIGTERM` and finishes the jobs in hand turns most deploy restarts
+      into no repeats at all.
+
+      ```ts
+      import { setTimeout as sleep } from 'node:timers/promises';
+
+      type Job = { id: number; ms: number };
+      const pending: Job[] = Array.from({ length: 8 }, (_, i) => ({ id: i + 1, ms: 100 }));
+
+      // Stand-ins for the SQL claim and the real work.
+      const claim = async () => pending.shift();
+      const handle = async (job: Job) => {
+        await sleep(job.ms);
+        console.log(`done ${job.id}`);
+      };
+
+      let stopping = false;
+      process.once('SIGTERM', () => {
+        console.log('SIGTERM: finishing jobs in hand, claiming no more');
+        stopping = true;
+      });
+
+      async function loop(): Promise<void> {
+        while (!stopping) {
+          const job = await claim();
+          if (job === undefined) {
+            await sleep(50); // idle: poll again soon
+            continue;
+          }
+          await handle(job); // a job in hand is finished, even while stopping
+        }
+      }
+
+      // Three loops: this process runs at most three jobs at once.
+      setTimeout(() => process.kill(process.pid, 'SIGTERM'), 150);
+      await Promise.all([loop(), loop(), loop()]);
+      console.log(`exiting, ${pending.length} jobs left for other workers`);
+      ```
+
+      Run as an ES module in Node 24, it prints jobs 1 to 3, the `SIGTERM` line, jobs 4 to 6
+      and "2 jobs left". The three loops were mid-job when the signal came, so each finished
+      the job it held and claimed nothing more.
+
+      A job longer than the grace period can't finish this way. Split it into steps that each
+      save progress, so the next worker resumes rather than restarts.
+  - title: How many workers, and when work arrives too fast
+    body: |-
+      Little's law sizes the pool: jobs in progress equals arrival rate times time per job.
+      Uploads arriving at 2 a second, each taking 90 seconds, keep about 180 jobs running at
+      any moment. Fewer slots than that and the queue grows without limit, however long you
+      wait. Leave headroom, because arrivals come in bursts.
+
+      Often the pool is capped by a downstream limit rather than by your servers. If the model
+      API allows 50 concurrent requests, 180 workers only earn you `429` replies. Size to the
+      tightest limit, and let the queue hold the rest.
+
+      The queue's depth is not the best signal of trouble. **The age of the oldest ready job**
+      is, because it's what users feel. Scale workers on backlog per worker, and alert on age.
+
+      When arrivals outrun capacity for long, a queue only turns overload into delay.
+      **Back-pressure** pushes the limit back to the producer instead:
+
+      - Cap the queue, and answer new submissions with `503` and `Retry-After` when it's full.
+      - Cap jobs per customer, so one account enqueueing 10,000 files can't delay everyone.
+        Separate queues per priority, or fair claiming across accounts, does the same job.
+      - Give jobs a deadline, and skip a job whose answer nobody is waiting for any more.
+
+      Ordering is the other thing a queue quietly gives up. Retries, several workers and
+      backoff all reorder jobs. If order matters per entity, such as edits to one document,
+      process per key: Amazon SQS FIFO queues keep order within a message group, and Kafka
+      keeps it within a partition. Better still, make each job carry a version, and ignore
+      one older than what's stored.
+pitfalls:
+  - '**Holding a transaction open for a long job.** It feels tidy because the lock frees itself on a crash. It pins a connection per job and holds back vacuum. Commit the claim, record `locked_until`, and heartbeat.'
+  - '**Polling with `FOR UPDATE` but without `SKIP LOCKED`.** Every worker waits on the same first row, so ten workers process one job at a time. Add `SKIP LOCKED` and a partial index on ready jobs.'
+  - '**Enqueuing outside the transaction that creates the data.** A rollback after the enqueue leaves a job for a row that doesn''t exist, and a crash before it leaves a row that never gets processed. Enqueue in the same transaction, or write an outbox row and relay it.'
+  - '**Counting attempts only when the handler throws.** A job that crashes or hangs its worker never throws, so it loops for ever. Count the attempt at claim time.'
+  - '**Putting the whole file in the job.** Queues and job tables slow down with large payloads, and some brokers cap message size. Store the file in object storage and put its id or URL in the job.'
+  - '**A dead-letter queue nobody watches.** Jobs park silently and customers wait for results that never come. Alert when it grows, record the last error, and make retrying a parked job one command.'
+interview:
+  - question: Design a system that transcribes uploaded audio files with a model API.
+    answer: >-
+      The upload endpoint stores the file in object storage, inserts the upload row and a
+      transcription job in one transaction, and returns `202` with the job id. Workers claim
+      jobs with `SKIP LOCKED` in Postgres, or from SQS, run the model call and save the
+      transcript keyed by upload id, so a repeat overwrites instead of duplicating. They ack
+      after saving. Claims have a visibility timeout with a heartbeat, retries back off with
+      jitter, and after five attempts a job goes to the dead-letter queue with its error. The
+      pool is sized by the model API's concurrency limit, not by CPUs. The page polls or
+      gets a push when the job finishes. The main trade-off is latency and complexity for
+      reliability: nothing is lost in an outage, but results arrive seconds later.
+  - question: How does a Postgres table work as a job queue, and when would you use a real broker?
+    answer: >-
+      Workers claim with `SELECT ... FOR UPDATE SKIP LOCKED LIMIT 1` inside an `UPDATE` that
+      marks the row running with a `locked_until` deadline. `SKIP LOCKED` means concurrent
+      workers pass over rows others have locked instead of waiting, so claims don't
+      contend. A reaper requeues expired claims. The big win is transactional enqueue: the
+      job commits with the data it's about, and there's one fewer system to run. Libraries
+      such as pg-boss do this in Node. I'd move to a broker such as SQS, RabbitMQ or Kafka
+      in three cases: thousands of jobs a second, many services consuming the same events,
+      or churn that hurts the main database. Then I'd keep
+      atomicity with an outbox table relayed to the broker.
+  - question: A worker crashes halfway through a job. Walk me through what happens.
+    answer: >-
+      The job reappears and runs again, which is why handlers must be idempotent. The worker
+      never acked, so the queue still has the job, hidden until its visibility timeout ends.
+      Then it becomes visible, another worker claims it, and the attempt count goes up. The
+      new run can't tell how far the first got, so the handler checks the effects it owns:
+      if the transcript for this upload is already saved, it skips the model call. Any
+      external call carries an idempotency key derived from the job id. If the crash repeats
+      every time, attempts reach the cap and the job lands in the dead-letter queue instead
+      of looping. The trade-off is the timeout: shorter retries sooner but risks duplicates
+      for slow jobs.
+  - question: Your queue is growing and not coming back down. What do you do?
+    answer: >-
+      First, find out whether arrivals went up or throughput went down, because the fixes
+      differ. I'd look at the arrival rate, job duration, error and retry rate, and the age
+      of the oldest job. If jobs got slower or are failing and retrying, adding workers
+      makes it worse, especially with a struggling downstream. Then I'd fix the dependency
+      or trip a breaker on it. If arrivals really rose, Little's law says how many workers I need, capped
+      by downstream limits. If the capacity doesn't exist, I apply back-pressure: cap
+      the queue, refuse new work with `503` and `Retry-After`, limit per customer, and drop
+      jobs past their deadline. An unbounded queue only hides overload as delay.

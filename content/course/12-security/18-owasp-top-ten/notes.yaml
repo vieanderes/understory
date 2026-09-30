@@ -1,0 +1,237 @@
+summary: >-
+  The OWASP Top 10 is a ranked list of the most common serious risk categories in web
+  applications, rebuilt every few years from data that testing firms and companies share,
+  plus a community survey for risks the data can't see yet. The 2025 edition is the map this
+  whole chapter followed. The capstone turns the map into a method: read code as an attacker,
+  name each flaw and its fix, and make every check fail closed.
+
+
+  These notes tie the ten categories together. Each gets a one-line take you could say in an
+  interview, with the lesson that taught it. Then come the groupings that make the list
+  memorable, what changed from 2021, how to run a review and rank findings, a fail-closed
+  check with a deadline, and a stranger test for AI-written code.
+
+
+  Use the Top 10 as an awareness document and a review checklist. Don't treat it as a
+  standard to certify against or as the complete list of what can go wrong. For a
+  verification standard, OWASP publishes the ASVS, and for APIs and apps built on language
+  models it keeps separate top tens.
+remember:
+  - Broken access control is first on the 2025 list, so ask "is this user allowed this object?" on every request, on the server.
+  - The 2025 order is access control, misconfiguration, supply chain, cryptography, injection, insecure design, authentication, integrity, logging and alerting, and exceptional conditions.
+  - Every category is a family of root causes, not one bug, so a review asks which input reaches the code and which family it could trigger.
+  - Mishandling of exceptional conditions is new in 2025, and its core rule is that a check that errors must fail closed.
+  - Software supply chain failures widen the old "vulnerable and outdated components" to builds, registries and everything you install.
+  - Rank findings by harm times reach, and rotate any secret that has shipped, because removing it doesn't unleak it.
+  - AI-written code tends to pass the happy path and miss the stranger case, so write the other-user and anonymous tests before accepting it.
+  - The Top 10 is for awareness, while the ASVS is the checklist to verify against.
+sections:
+  - title: The ten, one take each
+    body: |-
+      Each category in one sentence, with the idea you'd lead with in an interview.
+
+      - **A01 Broken Access Control.** The server doesn't check that this user may do this
+        to this object, as with the unowned delete in the capstone. SSRF now sits here too.
+      - **A02 Security Misconfiguration.** Unsafe defaults and settings: debug mode, open
+        storage buckets, missing headers, verbose errors, secrets sent to the browser.
+      - **A03 Software Supply Chain Failures.** Trusting code you didn't write: dependencies,
+        build pipelines, registries, and the packages an assistant suggests.
+      - **A04 Cryptographic Failures.** Sensitive data unprotected or protected badly: no
+        TLS, fast hashes for passwords, home-made crypto, keys in the repository.
+      - **A05 Injection.** Data read as code: SQL glued from strings, HTML from untrusted
+        text, shell commands. XSS lives here.
+      - **A06 Insecure Design.** A flaw no fix in the code can close, such as account
+        recovery that relies on security questions, or no threat model at all.
+      - **A07 Authentication Failures.** Weak login and sessions: credential stuffing
+        allowed, sessions that never expire, user enumeration.
+      - **A08 Software or Data Integrity Failures.** Accepting code or data without checking
+        it's genuine: unsigned updates, unsafe deserialisation, tokens whose signature nobody checks.
+      - **A09 Security Logging and Alerting Failures.** An attack happens and nobody is told,
+        because nothing was logged or nothing raised an alert.
+      - **A10 Mishandling of Exceptional Conditions.** Errors, timeouts and odd states
+        handled unsafely: a check that fails open, a crash that leaks a stack trace.
+
+      Compared with 2021, SSRF lost its own entry and joined broken access control. The old
+      "vulnerable and outdated components" widened into supply chain failures. Logging now
+      says alerting, because a log nobody watches doesn't help. And A10 is a new category.
+  - title: Four questions that cover the list
+    body: |-
+      Ten items are hard to hold in your head during a review. They fold into four questions
+      about trust.
+
+      **Who is asking, and may they?** Authentication failures and broken access control.
+      Authentication proves identity. Access control decides what that identity may touch.
+      Most serious findings in real apps come from the second.
+
+      **Is this data being treated as code?** Injection, and the parsing side of integrity
+      failures. The fix is always the same shape: keep data and instructions in separate
+      channels, with parameters, `textContent`, argument arrays and schema validation.
+
+      **Do we trust code or data we haven't verified?** Supply chain and integrity failures.
+      Lockfiles, provenance, signatures and pinned versions answer it.
+
+      **What happens when things aren't normal?** Misconfiguration, exceptional conditions,
+      and logging and alerting. Defaults, errors, timeouts and outages are where apps fail
+      open, and logging is how you find out.
+
+      Cryptographic failures and insecure design cut across all four. Cryptography protects
+      data wherever it travels or rests. Design decides whether the other defences exist at
+      all.
+
+      These groupings also show how categories chain. A misconfiguration leaks a stack trace,
+      the trace reveals an internal id, and missing access control lets an attacker use it.
+      Fixing access control breaks the most chains, which is one reason it tops the list.
+  - title: Fail closed, with a deadline
+    body: |-
+      The capstone's `isAllowed` refuses when a check throws. Production adds one more case:
+      a check that never answers. A hung database call shouldn't hold a request forever, and
+      the timeout path must refuse too.
+
+      ```ts
+      type Decision = 'allow' | 'deny';
+
+      async function decide(
+        check: (signal: AbortSignal) => Promise<unknown>,
+        ms: number,
+      ): Promise<Decision> {
+        const signal = AbortSignal.timeout(ms);
+        try {
+          const answer = await Promise.race([
+            check(signal),
+            new Promise((_, reject) => {
+              signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+            }),
+          ]);
+          return answer === true ? 'allow' : 'deny';
+        } catch (error) {
+          console.warn('permission check failed closed:', (error as Error).name);
+          return 'deny';
+        }
+      }
+
+      const slow = () => new Promise((resolve) => setTimeout(() => resolve(true), 500));
+      const broken = async () => {
+        throw new TypeError("Cannot read properties of undefined (reading 'ownerId')");
+      };
+
+      console.log(await decide(async () => true, 100)); // allow
+      console.log(await decide(slow, 100));             // deny, TimeoutError
+      console.log(await decide(broken, 100));           // deny, TypeError
+      console.log(await decide(async () => 'yes', 100)); // deny
+      ```
+
+      Run with `npx tsx` as a `.mts` file under Node 24, it prints the four results in the
+      comments. `AbortSignal.timeout` rejects with a `TimeoutError`, and the check receives
+      the signal so it can cancel its own query.
+
+      Note the `TypeError`. A missing row makes `book.ownerId` throw, and fail-closed code
+      turns that bug into a refusal instead of access. Failing closed isn't always right:
+      a public product page can fail open to a cached copy. Decide per check, and write the
+      decision down.
+  - title: Running the review and writing it up
+    body: |-
+      A review walks entry points, not files. List every place outside input arrives:
+      routes, form fields, headers, cookies, file uploads, webhooks, queue messages, and
+      anything a model reads. For each one, trace where the value goes and which family it
+      could trigger. Then check the four questions from above.
+
+      Each finding in the report gets the same fields, so a team can act on it without you
+      in the room.
+
+      ```text
+      Title     Any member can delete any review
+      Where     deleteReview, DELETE /reviews/:id
+      Category  A01 Broken Access Control
+      Impact    Any signed-in member removes other members' reviews
+      Reach     Every account, no special role needed
+      Proof     Signed in as test user B, deleted test user A's review 17
+      Fix       Add AND author_id = $2, return 404 when nothing matched
+      ```
+
+      Rank by **harm times reach**. A flaw every visitor can use outranks one that needs an
+      admin's password. A leaked secret is special: it's exploitable already, so the fix
+      includes rotation, and you check logs for use since it shipped.
+
+      For AI-written code, add one habit. Assistants satisfy the tests you describe, so the
+      gap is the actor nobody described. Before accepting the code, write the stranger test.
+
+      ```js
+      import { test } from 'node:test';
+      import assert from 'node:assert/strict';
+
+      const reviews = new Map([[1, { id: 1, authorId: 'ana', text: 'Loved it' }]]);
+
+      async function deleteReview(session, reviewId) {
+        if (!session) return 401;
+        const review = reviews.get(reviewId);
+        if (!review || review.authorId !== session.userId) return 404;
+        reviews.delete(reviewId);
+        return 204;
+      }
+
+      const cases = [
+        { who: 'anonymous', session: null, expected: 401 },
+        { who: 'another member', session: { userId: 'ben' }, expected: 404 },
+        { who: 'the author', session: { userId: 'ana' }, expected: 204 },
+      ];
+
+      for (const { who, session, expected } of cases) {
+        test(`delete as ${who} answers ${expected}`, async () => {
+          assert.equal(await deleteReview(session, 1), expected);
+        });
+      }
+      ```
+
+      `node --test` passes all three. Remove the `authorId` check and the "another member"
+      row fails, answering `204` instead of `404`. That's the bug. The author row fails
+      too, because the stranger already deleted the review.
+pitfalls:
+  - '**Using the Top 10 as a compliance checklist.** It''s an awareness list of categories, not testable requirements. Verify against the ASVS, and threat-model risks specific to your app.'
+  - '**Stopping at authentication.** Code that checks "signed in" looks careful. Access control is the next question: may this user touch this object? Add the owner condition to the query.'
+  - '**Removing a leaked secret without rotating it.** Deleting it from the code feels like the fix. Anyone who downloaded the bundle still has it. Rotate, then check logs for use.'
+  - '**Catching errors by returning the permissive answer.** Teams want a flaky dependency not to block users, so `catch` returns `true`. Return the refusal, and make availability a separate, written decision.'
+  - '**Ranking findings by category order.** A01 isn''t always the first fix. Rank each finding by harm times reach in your app.'
+interview:
+  - question: Walk me through the OWASP Top 10. Which categories matter most in practice?
+    answer: >-
+      The 2025 list runs broken access control, security misconfiguration, supply chain
+      failures, cryptographic failures, injection, insecure design, authentication failures,
+      integrity failures, logging and alerting failures, and mishandling of exceptional
+      conditions. In practice, access control matters most: the server must check on every
+      request that this user may act on this object, and it's often missed because the
+      happy-path test passes. Misconfiguration and supply chain come next, because they're
+      everywhere and mostly fixed by defaults and process, not code. I group the list into
+      four questions: who is asking and may they, is data treated as code, do we trust
+      unverified code, and what happens when things break. The caveat is that it's an
+      awareness list. For verification I'd use the ASVS.
+  - question: What changed between the 2021 and 2025 OWASP Top 10?
+    answer: >-
+      The biggest changes are a new category and a widened one. Mishandling of exceptional
+      conditions is new at A10: failing open, leaking errors, bad handling of odd states.
+      Vulnerable and outdated components widened into software supply chain failures, which
+      covers builds, registries and dependencies as a whole. SSRF, its own entry in 2021, was
+      folded into broken access control, which stays first. Security misconfiguration moved
+      up to second. Logging and monitoring became logging and alerting, stressing that logs
+      only help if someone is told. I'd add that the rank matters less than the categories:
+      a review should check all of them.
+  - question: What does it mean for a system to fail closed, and when would you fail open instead?
+    answer: >-
+      Failing closed means that when a security check can't decide, because a dependency
+      errors, times out or returns something unexpected, the answer is no. An outage then
+      costs availability, not confidentiality. Permission checks, token validation and
+      payment authorisation should fail closed, and I'd enforce it by comparing with
+      `=== true` and returning the refusal in every `catch` and timeout path. Failing open is
+      a deliberate trade for non-security features: a recommendations service, or a rate
+      limiter on a cheap read endpoint where blocking everyone would be worse than a short
+      unlimited window. The key is that it's a written decision per check, with an alert,
+      never an accident of a `catch` block.
+  - question: How do you review AI-generated code for security?
+    answer: >-
+      With the same checklist as human code, applied harder to what the prompt didn't ask
+      for. Assistants satisfy the stated requirement and the happy-path test, so the usual
+      gap is a missing check: an ownership condition, a role test, a timeout that fails open.
+      I trace each entry point, ask which input reaches it and which category it could
+      trigger, and write the tests for the other user and the anonymous caller before I
+      accept the code. I also check every new dependency it suggests exists and is the
+      package I expect, because a plausible invented name is a supply chain risk. The
+      trade-off is review time, so I focus it on code touching auth, data access and secrets.

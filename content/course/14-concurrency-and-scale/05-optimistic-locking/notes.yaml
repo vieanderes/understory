@@ -1,0 +1,308 @@
+summary: >-
+  Optimistic locking stops a stale save from overwriting a newer one without holding any
+  lock. Each row carries a version. A client loads the row with its version, and the save
+  says "update only if the version is still the one I loaded", bumping it in the same
+  statement. If someone saved first, the update matches zero rows, and the application
+  decides: ask a person to review the newer data, or let a program re-read and retry.
+
+
+  It's the right tool when the gap between reading and writing is long and conflicts are
+  rare: forms people edit for minutes, documents, settings, admin screens, and background
+  jobs that update records people also touch. **Pessimistic locking** with `SELECT ... FOR
+  UPDATE` is the other tool: it makes rivals wait instead of failing them, which suits short
+  transactions on rows that are contended all the time, such as a balance or a stock count.
+
+
+  These notes add a save that tells "saved", "conflict" and "not found" apart in one round
+  trip, the HTTP form of the same idea with `ETag`, `If-Match` and `412`, how to retry a
+  program's save without making contention worse, the Postgres locking options (`NOWAIT`,
+  `SKIP LOCKED`, `lock_timeout`) and deadlocks, and what makes a good version value.
+remember:
+  - Optimistic locking saves with `WHERE id = $1 AND version = $2` and sets `version = version + 1` in the same `UPDATE`.
+  - An `UPDATE` that matches zero rows isn't an error in Postgres, so the application must check the row count.
+  - Zero rows can mean a conflict or a missing row, so tell them apart before answering `409` or `404`.
+  - A person whose save conflicts gets `409 Conflict` with the current data, and a program re-reads, reapplies its change and retries a few times.
+  - Over HTTP, the version travels as an `ETag`, comes back in `If-Match`, and a stale save gets `412 Precondition Failed`.
+  - Pessimistic locking with `SELECT ... FOR UPDATE` makes rivals wait, which suits short transactions on busy rows.
+  - Never hold a row lock across a person's think time or a slow external call, because everyone else waits behind it.
+  - Deadlocks come from taking locks in different orders, so lock rows in a consistent order, such as by id.
+sections:
+  - title: Saved, conflict or not found, in one round trip
+    body: |-
+      "Zero rows changed" has two causes: someone saved first, or the row doesn't exist,
+      perhaps because it was deleted meanwhile. They need different answers, `409` and
+      `404`. You could run a second query after a zero, but a data-modifying CTE answers
+      both in the same statement:
+
+      ```sql
+      CREATE TABLE tickets (
+        id integer PRIMARY KEY,
+        status text NOT NULL,
+        reply text,
+        version integer NOT NULL DEFAULT 1
+      );
+      INSERT INTO tickets (id, status) VALUES (7, 'open');
+
+      -- $1 id, $2 status, $3 reply, $4 the version the client loaded
+      WITH saved AS (
+        UPDATE tickets SET status = $2, reply = $3, version = version + 1
+        WHERE id = $1 AND version = $4
+        RETURNING id, status, reply, version
+      )
+      SELECT 'saved' AS outcome, * FROM saved
+      UNION ALL
+      SELECT 'conflict', id, status, reply, version FROM tickets
+      WHERE id = $1 AND NOT EXISTS (SELECT 1 FROM saved);
+      ```
+
+      We ran it on PostgreSQL 18 with three saves in a row:
+
+      ```text
+      (7, 'waiting', 'New link sent', 1)  ->  saved     version 2
+      (7, 'closed', 'Fixed', 1)           ->  conflict  current row: waiting, version 2
+      (8, 'closed', 'Fixed', 1)           ->  no rows, so ticket 8 doesn't exist
+      ```
+
+      The conflict branch returns the current row, which is exactly what the client needs
+      to show the person what changed. The outer `SELECT` sees the table as it was before
+      the CTE's update, which is fine here: when the update matched nothing, that's still
+      the current row.
+
+      In the handler, the mapping is short:
+
+      ```ts
+      type Outcome = { outcome: "saved" | "conflict"; version: number };
+
+      function toResponse(rows: Outcome[]): Response {
+        const row = rows[0];
+        if (!row) return new Response(null, { status: 404 });
+        if (row.outcome === "conflict") return Response.json(row, { status: 409 });
+        return Response.json(row);
+      }
+
+      console.log(toResponse([]).status); // 404
+      console.log(toResponse([{ outcome: "conflict", version: 2 }]).status); // 409
+      console.log(toResponse([{ outcome: "saved", version: 2 }]).status); // 200
+      ```
+  - title: The HTTP version, ETag and If-Match
+    body: |-
+      HTTP has optimistic concurrency built in, as **conditional requests**. The server
+      sends the version as an `ETag` header when the client reads. The client sends it back
+      in `If-Match` when it writes. If the resource has changed, the server answers `412
+      Precondition Failed`. A server that insists on the check answers `428 Precondition
+      Required` to a write that has no `If-Match` at all.
+
+      ```ts
+      type Ticket = { id: number; status: string; version: number };
+      const tickets = new Map<number, Ticket>([[7, { id: 7, status: "open", version: 3 }]]);
+
+      const etagOf = (ticket: Ticket) => `"v${ticket.version}"`;
+
+      function getTicket(id: number): Response {
+        const ticket = tickets.get(id);
+        if (!ticket) return new Response(null, { status: 404 });
+        return Response.json(ticket, { headers: { ETag: etagOf(ticket) } });
+      }
+
+      async function patchTicket(id: number, request: Request): Promise<Response> {
+        const ticket = tickets.get(id);
+        if (!ticket) return new Response(null, { status: 404 });
+        const ifMatch = request.headers.get("If-Match");
+        if (ifMatch === null) return new Response(null, { status: 428 }); // Precondition Required
+        if (ifMatch !== etagOf(ticket)) {
+          // Stale: send the current state so the client can show it or redo the change.
+          return Response.json(ticket, { status: 412, headers: { ETag: etagOf(ticket) } });
+        }
+        const { status } = await request.json();
+        // In a database this is one UPDATE ... WHERE id = $1 AND version = $2.
+        const saved = { ...ticket, status, version: ticket.version + 1 };
+        tickets.set(id, saved);
+        return Response.json(saved, { headers: { ETag: etagOf(saved) } });
+      }
+
+      const etag = getTicket(7).headers.get("ETag")!; // "v3"
+      const edit = (status: string, headers: Record<string, string>) =>
+        new Request("http://localhost/tickets/7", {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json", ...headers },
+          body: JSON.stringify({ status }),
+        });
+
+      console.log((await patchTicket(7, edit("waiting", { "If-Match": etag }))).status); // 200
+      console.log((await patchTicket(7, edit("closed", { "If-Match": etag }))).status); // 412
+      console.log((await patchTicket(7, edit("closed", {}))).status); // 428
+      ```
+
+      An ETag is a quoted string, so `"v3"` includes the quotes. A weak ETag, written
+      `W/"v3"`, never matches in `If-Match`, because a write needs the strong comparison.
+      The in-memory map keeps this example short; with a database, compare the version in
+      the `UPDATE` itself, as in the previous section, or the check and the save have a gap
+      between them again.
+
+      `412` and `409` overlap in meaning. `412` says a precondition the client sent failed,
+      and fits APIs that use `If-Match`. `409` says the request clashes with the current
+      state, and fits APIs that send the version in the body. Pick one per API and document
+      it.
+  - title: Retrying a program's save
+    body: |-
+      When a program conflicts, such as a classifier adding a label, it can retry: read
+      again, apply the change to the fresh data, save with the new version. Two rules make
+      that safe.
+
+      First, the change must be safe to run more than once. It should be a function of the
+      data it's given, like "add the label `urgent` if it's missing", with no side effects
+      such as sending an email or charging a card. Side effects belong after the save
+      succeeds.
+
+      Second, rivals that clashed once shouldn't clash again on the same beat. Waiting a
+      random time before the retry, growing with each attempt, spreads them out:
+
+      ```ts
+      const sleep = (ms: number) => new Promise((done) => setTimeout(done, ms));
+
+      // Retries a guarded save. `attempt` must be safe to run more than once: read, change, saveIf.
+      async function withConflictRetry<T>(
+        attempt: () => Promise<T | "conflict">,
+        { tries = 5, baseMs = 20, capMs = 500 } = {},
+      ): Promise<T> {
+        for (let i = 0; i < tries; i++) {
+          const result = await attempt();
+          if (result !== "conflict") return result;
+          // Full jitter: a random wait up to an exponentially growing ceiling, so rival
+          // writers who clashed once don't clash again on the same beat.
+          await sleep(Math.random() * Math.min(capMs, baseMs * 2 ** i));
+        }
+        throw new Error(`Still conflicting after ${tries} tries`);
+      }
+
+      let clashesLeft = 2;
+      const saved = await withConflictRetry(async () => {
+        if (clashesLeft-- > 0) return "conflict";
+        return { labels: ["billing", "urgent"] };
+      });
+      console.log(saved); // { labels: [ 'billing', 'urgent' ] }
+      ```
+
+      If retries keep running out, the row is hot, and optimistic locking is the wrong
+      tool for it: every writer does the work, and most throw it away. Switch to an atomic
+      update such as `SET likes = likes + 1`, which needs no version at all, or to a short
+      pessimistic lock, or split the hot row, for example one counter row per shard summed
+      on read.
+  - title: Pessimistic locking in Postgres
+    body: |-
+      `SELECT ... FOR UPDATE` inside a transaction locks the selected rows until commit or
+      rollback. Other transactions that try to update or lock them wait; plain reads don't.
+      Postgres has options for when waiting is the wrong behaviour:
+
+      ```sql
+      BEGIN;
+      SET LOCAL lock_timeout = '2s';   -- wait at most 2 seconds for any lock
+
+      -- Fail at once if another transaction holds the row.
+      SELECT * FROM tickets WHERE id = 7 FOR UPDATE NOWAIT;
+
+      -- Take up to 10 open tickets that nobody else has locked, skipping the rest.
+      SELECT * FROM tickets WHERE status = 'open'
+      ORDER BY id LIMIT 10
+      FOR UPDATE SKIP LOCKED;
+
+      COMMIT;
+      ```
+
+      `NOWAIT` and an expired `lock_timeout` both fail with SQLSTATE `55P03`, which your
+      code can turn into "busy, try again". `SKIP LOCKED` is how several workers take jobs
+      from one table without handing the same job to two of them, which the queues lesson
+      uses.
+
+      **Deadlocks** happen when two transactions each hold a lock the other wants. One
+      locks ticket 7 then ticket 9, the other locks 9 then 7, and both wait for ever.
+      Postgres checks for this after `deadlock_timeout`, one second by default, and aborts
+      one transaction with SQLSTATE `40P01`. The prevention is a consistent order: lock
+      rows sorted by id, for example with a single `SELECT ... WHERE id = ANY($1) ORDER BY
+      id FOR UPDATE`. Keep a retry for the rare deadlock that still slips through.
+
+      The golden rule: a lock lasts as long as its transaction. Never open a transaction,
+      lock a row, and then wait for a person, a model API or a payment provider. Everyone
+      else who touches the row waits too, and the transaction holds a pooled connection the
+      whole time. Do the slow work first, then lock, change and commit in milliseconds.
+  - title: What makes a good version
+    body: |-
+      Anything that changes on every write and can be compared exactly works as a version.
+      The options have different costs.
+
+      - **An integer column.** Clear, portable and cheap. Every write path must bump it,
+        which is the one thing to get right, and a trigger can enforce it if many code paths
+        write the table. This is what most ORMs use: Rails calls the column
+        `lock_version`, and JPA marks it with `@Version`.
+      - **An `updated_at` timestamp.** Tempting because the column often exists already.
+        It's weaker: two writes within the clock's precision get the same value, and a
+        timestamp that loses precision on its way through JSON and back won't compare
+        equal. Use it only with care.
+      - **A content hash.** Hash the row's fields, and send the hash as the `ETag`. It needs
+        no extra column and works for data that isn't in one row. It costs a hash per read
+        and per write.
+      - **Postgres `xmin`.** Every row has a hidden `xmin` column, the id of the
+        transaction that wrote this version of the row. It changes on every update, so some
+        libraries use it as a free version. It's specific to Postgres, and it isn't
+        something you set, so a no-op update changes it too.
+
+      ```sql
+      SELECT xmin::text FROM tickets WHERE id = 7;   -- for example 753
+      UPDATE tickets SET status = 'closed' WHERE id = 7;
+      SELECT xmin::text FROM tickets WHERE id = 7;   -- now a newer id, such as 754
+      ```
+
+      Sometimes a conflict doesn't need refusing. If Ana changed the status and Ben changed
+      the assignee, both edits can stand. Tracking versions per field, or sending only
+      changed fields and checking only those, lets unrelated edits merge. Keep whole-row
+      refusal for text a person wrote, where silently combining edits is worse than asking.
+pitfalls:
+  - '**Checking the version but never bumping it.** The `WHERE` matches forever and stale saves still win. Every guarded `UPDATE` sets `version = version + 1`, in the same statement.'
+  - '**Ignoring the row count.** Postgres reports `UPDATE 0` without an error, so code that doesn''t check `rowCount` tells the user their save worked. Treat zero as a conflict or a missing row.'
+  - '**Reading the version in one query and comparing it in application code.** Another writer can save between your `SELECT` and your `UPDATE`. The comparison belongs in the `UPDATE`''s `WHERE`.'
+  - '**Retrying a person''s edit automatically.** Their change was a decision about the text they saw. Return `409` or `412` with the current data and let them redo it.'
+  - '**Holding `FOR UPDATE` while a person edits or a slow API answers.** Every other writer waits, and the transaction ties up a connection. Keep locks to short transactions.'
+  - '**Locking rows in different orders in different code paths.** Two transactions each wait for the other and Postgres aborts one with a deadlock error. Lock in a consistent order, such as by id.'
+interview:
+  - question: What is optimistic locking, and how do you implement it?
+    answer: >-
+      Optimistic locking detects conflicting writes instead of preventing them with locks.
+      Each row has a version column. The client reads the row and its version, and the save
+      is `UPDATE ... SET ..., version = version + 1 WHERE id = $1 AND version = $2`. If
+      another writer saved in between, the version has moved and the update matches zero
+      rows, which the application treats as a conflict: `409` or `412` with the current data
+      for a person, or re-read and retry for a program. Nothing waits and nothing is held,
+      so it scales well when conflicts are rare. When they're frequent, most writers do
+      work and throw it away, so I'd use an atomic update or a short pessimistic lock
+      instead.
+  - question: Optimistic or pessimistic locking, how do you choose?
+    answer: >-
+      By how long the gap is and how often writers collide. Optimistic suits long gaps and
+      rare conflicts: someone edits a form for ten minutes, and holding a lock that long
+      would block everyone, so I detect the clash on save instead. Pessimistic, with `SELECT
+      ... FOR UPDATE`, suits short transactions on contended rows, such as decrementing a
+      wallet balance many times a second: waiting a few milliseconds for a lock is cheaper
+      than retries that keep failing. The costs differ too. Optimistic costs a retry or a
+      user-facing conflict. Pessimistic costs waiting, connections held, and deadlock risk,
+      which I manage with consistent lock ordering, `lock_timeout` and a retry on `40P01`.
+  - question: How would you stop lost updates in a REST API where clients edit resources?
+    answer: >-
+      With conditional requests. `GET` returns an `ETag` derived from the resource's version.
+      The client sends it back in `If-Match` on `PUT` or `PATCH`, and the server performs
+      the update only if the version still matches, in a single `UPDATE ... WHERE version
+      = $n` so there's no gap between check and write. A mismatch returns `412
+      Precondition Failed` with the current representation, and a write without `If-Match`
+      can be rejected with `428 Precondition Required` so clients can't skip the check. The
+      ETag must be strong for `If-Match` to match. The trade-off is client work: every
+      client has to keep the ETag and handle the 412 by showing the newer state.
+  - question: What causes a deadlock in a database, and how do you prevent it?
+    answer: >-
+      Two transactions each hold a lock the other needs, so neither can continue. The
+      typical case is locking the same rows in opposite orders: one transfer locks account A
+      then B, another locks B then A. Postgres detects the cycle after `deadlock_timeout`
+      and aborts one transaction with SQLSTATE `40P01`. Prevention is lock ordering: always
+      lock rows in the same order, such as ascending id, ideally in one `SELECT ... ORDER BY
+      id FOR UPDATE`. Keeping transactions short shrinks the window, and never waiting on
+      external calls while holding locks helps too. Because some deadlocks still slip
+      through, the code that runs the transaction should retry on `40P01`, the same way it
+      retries serialization failures.

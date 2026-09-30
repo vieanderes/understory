@@ -1,0 +1,324 @@
+summary: >-
+  An upload endpoint lets a stranger put bytes on your infrastructure and, usually, get them
+  served back to other people. Everything about that request is attacker-chosen: the bytes,
+  the file name, the declared type and the size. Most upload bugs come from trusting one of
+  those four, and most path traversal bugs come from building a file path out of a name
+  someone else typed.
+
+
+  The lesson checks size and signature, names files with a random id, and blocks `../` with
+  an allow-list of names and a folder check that ends in a separator. These notes cover the
+  whole pipeline around those checks: limits that hold while bytes are still arriving, the
+  headers that decide whether a browser renders or downloads a file, containment checks that
+  survive absolute paths, symlinks and Windows separators, archive extraction (zip slip and
+  zip bombs), and why images get re-encoded and SVG gets special treatment.
+
+
+  Reach for this whenever users send files or name files: avatars, attachments on support
+  tickets, CSV imports, document downloads. The best design keeps uploads off the application
+  server entirely, in object storage, served from a separate domain. You still need every
+  check here for whatever your code does touch.
+remember:
+  - Every part of an upload (bytes, name, declared type, size) is attacker input, so decide the type from the bytes and the name yourself.
+  - Enforce the size limit while streaming, because `Content-Length` can lie and buffering first lets one request fill memory.
+  - Store files outside the web root under a random name, and keep the original name only as display data.
+  - 'Serve uploads with the type you detected, `X-Content-Type-Options: nosniff` and `Content-Disposition: attachment`, ideally from a separate domain.'
+  - Contain a path with `path.resolve` then `path.relative`, refusing results that start with `..` or are absolute.
+  - Zip slip is path traversal through archive entry names, so check every entry before writing and cap entries and expanded size.
+  - A file signature proves only the first bytes, so re-encode images to strip anything else inside them.
+  - SVG is XML that can carry scripts, so refuse it, sanitise it, or serve it where scripts can't run.
+sections:
+  - title: Limits that hold while bytes arrive
+    body: |-
+      A size check on a finished `Buffer` comes too late. By then the whole body sits in
+      memory, and a few parallel requests of a gigabyte each take the server down. The
+      `Content-Length` header is only a claim, and chunked uploads don't send one at all.
+
+      Count bytes as they stream through and stop the moment the limit is passed.
+
+      ```js
+      import { Readable, Transform } from 'node:stream';
+      import { pipeline } from 'node:stream/promises';
+
+      // Counts bytes as they arrive and stops the moment the limit is passed.
+      function limitBytes(max) {
+        let seen = 0;
+        return new Transform({
+          transform(chunk, _encoding, done) {
+            seen += chunk.length;
+            if (seen > max) done(new Error('too large'));
+            else done(null, chunk);
+          },
+        });
+      }
+
+      async function receive(source, max) {
+        const chunks = [];
+        // In production this last stage streams to object storage instead of memory.
+        const collect = new Transform({
+          transform(chunk, _e, done) {
+            chunks.push(chunk);
+            done();
+          },
+        });
+        await pipeline(source, limitBytes(max), collect);
+        return Buffer.concat(chunks);
+      }
+
+      const upload = () => Readable.from([Buffer.alloc(1_000_000), Buffer.alloc(1_000_000), Buffer.alloc(1_000_000)]);
+      console.log((await receive(upload(), 5_000_000)).length); // 3000000
+      await receive(upload(), 2_000_000).catch((e) => console.log(e.message)); // too large
+      ```
+
+      `pipeline` destroys every stream in the chain when one fails, so the request stops being
+      read and nothing half-written is left open. Libraries such as busboy expose the same
+      idea as a `limits.fileSize` option. Set limits at every layer that buffers: the reverse
+      proxy (nginx's `client_max_body_size`), the framework's body parser and your own code.
+
+      Size isn't the only budget. Cap the number of files per request and the number of form
+      fields, and for images check the pixel dimensions before decoding. A small, highly
+      compressed PNG can declare tens of thousands of pixels each way and expand to gigabytes
+      in memory, a decompression bomb. Image libraries have a pixel limit setting for exactly
+      this.
+
+      With object storage, the best limit is one the storage enforces. A presigned POST policy
+      can carry a `content-length-range` condition, so an oversized file is refused before it
+      reaches you.
+  - title: Accepting a file and serving it back
+    body: |-
+      The accept step turns untrusted input into three values you control: a storage key, a
+      detected type and a display name. The serve step decides how a browser treats the bytes.
+
+      ```js
+      import { randomUUID } from 'node:crypto';
+
+      // Signature, the type you will serve, and the extension you will store.
+      const ALLOWED = [
+        { magic: [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], type: 'image/png', ext: 'png' },
+        { magic: [0xff, 0xd8, 0xff], type: 'image/jpeg', ext: 'jpg' },
+        { magic: [0x25, 0x50, 0x44, 0x46, 0x2d], type: 'application/pdf', ext: 'pdf' }, // %PDF-
+      ];
+
+      function accept(bytes, originalName) {
+        const kind = ALLOWED.find(({ magic }) => magic.every((b, i) => bytes[i] === b));
+        if (!kind) return null;
+        return {
+          storageKey: `${randomUUID()}.${kind.ext}`, // the only name the file system ever sees
+          contentType: kind.type,
+          // Kept as data for display, never used as a path. Control characters stripped, length capped.
+          displayName: originalName.replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 200),
+        };
+      }
+
+      // RFC 6266 and RFC 8187: an ASCII fallback plus a UTF-8 form for everything else.
+      function contentDisposition(name) {
+        const ascii = name.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_');
+        const utf8 = encodeURIComponent(name).replace(/['()*]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+        return `attachment; filename="${ascii}"; filename*=UTF-8''${utf8}`;
+      }
+
+      function downloadHeaders(record) {
+        return {
+          'Content-Type': record.contentType, // the type you detected, not the one the uploader claimed
+          'Content-Disposition': contentDisposition(record.displayName),
+          'X-Content-Type-Options': 'nosniff',
+          'Content-Security-Policy': "default-src 'none'; sandbox",
+        };
+      }
+
+      const record = accept(Buffer.from('%PDF-1.7\n...'), 'Café invoice "final".pdf');
+      console.log(downloadHeaders(record)['Content-Disposition']);
+      // attachment; filename="Caf_ invoice _final_.pdf"; filename*=UTF-8''Caf%C3%A9%20invoice%20%22final%22.pdf
+      console.log(accept(Buffer.from('<html><script>'), 'avatar.png')); // null
+      ```
+
+      Each header closes a door. `nosniff` stops the browser guessing a type from the content,
+      so bytes labelled `image/png` are never run as HTML or script. `attachment` makes the
+      browser download instead of render. The CSP `sandbox` directive means that even if
+      something renders, it runs in an opaque origin with no scripts. The quoted filename is
+      stripped of quotes and backslashes, so a name can't break out of the header value.
+
+      Keep files outside any folder your web server serves statically. If `public/uploads` is
+      served as-is, the server picks the type from the extension and every check above is
+      bypassed. Object storage behind signed URLs on a separate domain is the strongest form of
+      this: a page that slips through runs on `files.example`, not on your site.
+  - title: Containing a path, properly
+    body: |-
+      The lesson's check, `startsWith(UPLOADS + "/")`, is right on Linux. `path.relative`
+      expresses the same rule in a way that also holds on Windows, where the separator is `\`
+      and a path on another drive can't be made relative at all.
+
+      ```js
+      import path from 'node:path';
+
+      // True only when target is strictly inside root. Works with either separator.
+      function isInside(root, target) {
+        const rel = path.relative(root, target);
+        return rel !== '' && rel !== '..' && !rel.startsWith('..' + path.sep) && !path.isAbsolute(rel);
+      }
+
+      function resolveInside(root, name) {
+        const full = path.resolve(root, name);
+        if (!isInside(root, full)) throw new Error(`refused: ${name}`);
+        return full;
+      }
+
+      const root = '/srv/app/uploads';
+      for (const name of ['invoice.pdf', 'a/../invoice.pdf', '../.env', '/etc/passwd', '../uploads-private/keys.txt', '..', '..notes.txt']) {
+        try {
+          console.log(name, '->', resolveInside(root, name));
+        } catch (e) {
+          console.log(e.message);
+        }
+      }
+      // invoice.pdf -> /srv/app/uploads/invoice.pdf
+      // a/../invoice.pdf -> /srv/app/uploads/invoice.pdf
+      // refused: ../.env
+      // refused: /etc/passwd
+      // refused: ../uploads-private/keys.txt
+      // refused: ..
+      // ..notes.txt -> /srv/app/uploads/..notes.txt
+      ```
+
+      Note `/etc/passwd`: `path.resolve` restarts at an absolute segment, so a name that is
+      itself absolute replaces the folder. And `..notes.txt` is a legal file name inside the
+      folder, which a careless `rel.startsWith('..')` would refuse.
+
+      Two more edges. `path.resolve` is string arithmetic and doesn't know about symlinks. If a
+      link inside the folder points outside, the string passes and the read escapes. When the
+      folder can contain links, call `fs.realpath` on the result and check that too. Better
+      still, make sure nothing can create links there. And a null byte in a path used to truncate it in
+      some languages; Node's `fs` functions throw `ERR_INVALID_ARG_VALUE` instead.
+
+      The strongest version remains the lesson's: never let a user-supplied name reach the
+      file system. Look the file up by an id in your database and read the storage key you
+      generated.
+  - title: Zip slip and zip bombs
+    body: |-
+      An archive is a list of entries, each with a name chosen by whoever built it. **Zip
+      slip** is path traversal through those names: an entry called `../../app/server.js`
+      writes outside the extraction folder when code joins names naively. It affected
+      extraction code in many ecosystems, and tar files have the same problem, plus symlink and
+      hard link entries that point anywhere.
+
+      A **zip bomb** is the other archive hazard: a few kilobytes that expand to gigabytes,
+      either by extreme compression or by many overlapping entries. Both are handled by
+      checking the archive's directory before writing a single byte.
+
+      ```js
+      import path from 'node:path';
+
+      const isInside = (root, target) => {
+        const rel = path.relative(root, target);
+        return rel !== '' && rel !== '..' && !rel.startsWith('..' + path.sep) && !path.isAbsolute(rel);
+      };
+
+      const LIMITS = { entries: 1000, totalBytes: 200_000_000, ratio: 100 };
+
+      // entries: what a zip library reports from the archive's directory, before any extraction.
+      function planExtraction(root, entries) {
+        if (entries.length > LIMITS.entries) throw new Error('too many entries');
+        let total = 0;
+        return entries.map((entry) => {
+          const name = entry.name.replaceAll('\\', '/'); // archives made on Windows use backslashes
+          const target = path.resolve(root, name);
+          if (!isInside(root, target)) throw new Error(`entry escapes the folder: ${entry.name}`);
+          if (entry.isSymlink) throw new Error(`symlink entry refused: ${entry.name}`);
+          total += entry.uncompressedSize;
+          if (total > LIMITS.totalBytes) throw new Error('archive expands too far');
+          if (entry.uncompressedSize > entry.compressedSize * LIMITS.ratio) throw new Error('suspicious ratio');
+          return target;
+        });
+      }
+
+      const root = '/srv/app/imports/job-7';
+      console.log(planExtraction(root, [{ name: 'books/catalogue.csv', compressedSize: 4000, uncompressedSize: 20000 }]));
+      // [ '/srv/app/imports/job-7/books/catalogue.csv' ]
+      ```
+
+      With the entries `../../../app/server.js` and `..\..\app\server.js`, this throws "entry
+      escapes the folder". With one entry claiming a billion bytes, it throws "archive expands
+      too far".
+
+      The sizes in an archive's directory are claims, like `Content-Length`. Count the bytes
+      actually written during extraction too, and abort past the same budget. Extract into a
+      fresh, empty temporary folder, never over existing files, and run the whole job in a
+      worker with its own memory and time limits.
+  - title: Polyglots, image re-encoding and SVG
+    body: |-
+      A signature check proves the first few bytes. A **polyglot** is a file that is valid in
+      two formats at once, for example a real JPEG whose metadata or trailing bytes also form
+      HTML or JavaScript. It passes the signature check honestly. It becomes dangerous when
+      something later treats it as the other format: a browser sniffing its type, a page
+      including it as a script, or a server-side tool that parses it.
+
+      The layered defence you've already seen handles most of it: `nosniff`, the detected
+      type, `attachment` and a separate domain. For images, add **re-encoding**. Decode the
+      picture with an image library and write a fresh file at a size you choose. Only the
+      pixels survive. Trailing data, odd chunks and metadata are gone, including EXIF location
+      data, which is a privacy win on its own. Run the decoder in a worker or a separate
+      service, with a pixel limit, because image decoders are complex parsers and have had
+      memory-safety bugs.
+
+      **SVG** is the special case. It's an image format written in XML, and XML can contain
+      `script` elements, event handler attributes and links. Shown through an `img` tag, a
+      browser doesn't run its scripts. Opened directly as a document from your origin, it
+      does, and that's stored XSS. Your options, safest first: refuse SVG uploads; rasterise
+      them to PNG on the server; sanitise them with an SVG-aware sanitiser such as DOMPurify
+      and still serve them from the files domain with a restrictive CSP.
+
+      The same reasoning covers HTML files, which you should never serve inline from your own
+      origin, and office documents or PDFs, which carry macros and scripts for their own
+      viewers. Scanning with an antivirus engine catches known malware; it doesn't replace any
+      of the above.
+pitfalls:
+  - '**Trusting the declared `Content-Type` or extension.** Both are typed by the uploader, so `shell.html` renamed to `photo.png` passes. Detect the type from the leading bytes and serve that type.'
+  - '**Checking size after buffering the body.** One large request fills memory before the check runs. Enforce limits while streaming, at the proxy, the parser and your own code.'
+  - '**Saving uploads under the web root.** The web server then serves them with a type guessed from the extension, bypassing your checks. Store outside it, ideally in object storage on another domain.'
+  - '**A prefix check without a separator.** `startsWith("/app/uploads")` also matches `/app/uploads-private`. Use `path.relative` or compare against the folder plus `path.sep`.'
+  - '**Extracting archives with a naive join.** Entry names are attacker input, so `../` entries write anywhere. Check every entry against the folder, refuse link entries, and cap count and size.'
+  - '**Accepting SVG as a harmless image.** Opened directly, an SVG runs its scripts in your origin. Refuse it, rasterise it, or sanitise it and serve it sandboxed from a separate domain.'
+interview:
+  - question: Design a secure file upload feature for user avatars and document attachments.
+    answer: >-
+      I'd keep the bytes off the app server: the client gets a presigned upload URL to object
+      storage with a size range and a key I generate, a random id. When the upload completes,
+      a worker reads the first bytes to detect the type against an allow-list, re-encodes
+      images to strip metadata and hidden content, and scans documents. Only then does the
+      record flip to available. Downloads come from a separate domain via short-lived signed
+      URLs, with the detected `Content-Type`, `nosniff`, `Content-Disposition: attachment` for
+      documents and a sandboxing CSP. The original file name is stored as display text only.
+      The trade-off is latency and moving parts; for a small internal tool, a streamed upload
+      with the same checks, stored outside the web root, is fine.
+  - question: How do you prevent path traversal when serving files by name?
+    answer: >-
+      Best, don't serve by name: look the file up by an id in the database and read the storage
+      key you generated, so user input never reaches the file system. When a name must be
+      used, allow-list it: letters, digits, hyphens and one known extension, which makes every
+      traversal trick unwritable. As a second, independent wall, resolve the full path and
+      check containment with `path.relative`, refusing results that start with `..` or are
+      absolute, which also covers Windows separators and absolute names. If the folder can
+      contain symlinks, check the `realpath` too. What I'd avoid is stripping `../` from the
+      input: block-lists miss encodings, absolute paths and sequences that reform after
+      stripping.
+  - question: What is zip slip, and how would you defend against it?
+    answer: >-
+      Zip slip is path traversal through archive entry names. An entry named
+      `../../app/server.js` writes outside the extraction folder if code joins the name onto
+      the target directory without checking. It can overwrite code or config and lead to
+      remote code execution. The defence is to treat every entry name as untrusted: normalise
+      backslashes, resolve it against the target, and refuse anything that lands outside, before
+      writing. Refuse symlink and hard link entries too, especially in tar files. In the same
+      pass I'd guard against zip bombs by capping entry count, total expanded size and
+      compression ratio, and counting real bytes written, since the directory's sizes can lie.
+      Extraction runs in an isolated worker into an empty temporary folder.
+  - question: Why serve user uploads from a separate domain?
+    answer: >-
+      Because the browser's security boundary is the origin, and uploaded content is the
+      easiest place for attacker-controlled HTML to slip in. If a malicious file ever renders
+      as a page on your main domain, through sniffing, an SVG, a polyglot or a missed check,
+      its scripts run with your users' cookies and can call your APIs: stored XSS. On a
+      separate registrable domain, such as a dedicated files domain, the same script runs in an
+      origin with no session and no access to your site. It's defence in depth: you still send
+      the correct type, `nosniff` and `attachment`. The cost is a second domain, its TLS
+      certificate and CORS configuration if your frontend fetches from it.

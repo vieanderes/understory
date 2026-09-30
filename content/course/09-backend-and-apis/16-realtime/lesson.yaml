@@ -1,0 +1,304 @@
+id: backend.realtime
+title: Realtime and streaming
+objective: Push updates to the browser with server-sent events or a WebSocket, stream a model's answer, and know what open connections cost.
+level: advanced
+minutes: 10
+concepts: [backend.polling, backend.sse, backend.websockets, backend.connection-cost]
+prerequisites: [backend.first-endpoint, js.fetch-cancellation]
+opening:
+  text: >-
+    You'll show a model's answer word by word as it's written, the way every AI chat does.
+    And you'll know which of three ways to push news fits, and what each costs.
+
+steps:
+  - type: prose
+    id: server-cant-call
+    body: >-
+      The client opens every connection, and a server only answers. So how does a page hear
+      about a new price? How does it show an answer the model is still writing?
+
+
+      Three ways. **Polling**: ask again on a timer. **Server-sent events**: keep one
+      response open and let the server keep writing. A **WebSocket**: a two-way line that
+      stays open.
+
+  - type: ai-review
+    id: review-poll-every-100ms
+    concept: backend.polling
+    difficulty: 3
+    language: js
+    request: Keep the dashboard's order count fresh.
+    flawClass: performance
+    code: |
+      function watchOrders(onCount) {
+        setInterval(async () => {
+          const response = await fetch("/api/orders/count");
+          onCount(await response.json());
+        }, 100);
+      }
+    prompt: >-
+      An assistant wrote this. The count updates on the tester's laptop, and the test passes.
+      With 2,000 dashboards open, the API falls over. Tap the line at fault.
+    lines: [2]
+    reasons:
+      - text: Ten requests a second per dashboard, for a slow number
+        correct: true
+        feedback: >-
+          Yes. Almost every answer is "no change". Poll far slower, or let the server push.
+      - text: '`await` inside `setInterval` isn''t allowed'
+        feedback: >-
+          It's allowed. The timer fires on time whether or not the last fetch returned, which
+          makes it worse.
+      - text: '`onCount` should get the response, not the JSON'
+        feedback: >-
+          The parsing is fine. The rate is what breaks the server.
+    fix: |
+      function watchOrders(onCount) {
+        setInterval(async () => {
+          const response = await fetch("/api/orders/count");
+          onCount(await response.json());
+        }, 30000);
+      }
+
+  - type: prose
+    id: what-sse-is
+    body: |-
+      **Server-sent events**, or SSE, are one long response with the type
+      `text/event-stream`. Each event is a `data:` line and a blank line. It's how AI APIs
+      stream an answer. `curl -N` prints each event as it arrives:
+
+      ```bash
+      $ curl -N localhost:3000/answer
+      data: {"text":"Tea"}
+
+      data: {"text":" is"}
+
+      data: {"text":" best"}
+
+      data: [DONE]
+      ```
+
+      `[DONE]` is a common way to say the answer is complete.
+
+  - type: prose
+    id: eventsource-in-the-page
+    body: |-
+      In the browser, `EventSource` opens the stream and calls `onmessage` for each event:
+
+      ```js
+      const source = new EventSource("/answer");
+      source.onmessage = (event) => {
+        output.textContent += event.data;
+      };
+      ```
+
+      `event.data` is the text after `data:`. If the connection drops, `EventSource`
+      reconnects by itself, a few seconds later.
+
+  - type: predict-output
+    id: predict-sse-reconnect
+    concept: backend.sse
+    difficulty: 2
+    language: text
+    code: |
+      data: {"text":"Tea"}
+      data: {"text":" is best"}
+      data: [DONE]
+      (the server ends the response)
+    question: The page above reads this stream. What happens a few seconds after the end?
+    choices:
+      - text: The answer streams in a second time
+        correct: true
+        feedback: >-
+          Yes. An ended response looks like a dropped one. Call `source.close()` on `[DONE]`.
+      - text: Nothing more, since the response ended
+        feedback: >-
+          Most people expect that. `EventSource` treats the end as a drop and reconnects, so
+          the model runs again.
+      - text: The page shows a connection error
+        feedback: >-
+          No error appears. It quietly reconnects and asks for the answer again.
+
+  - type: fill-blank
+    id: fill-eventsource-client
+    concept: backend.sse
+    difficulty: 2
+    language: js
+    prompt: >-
+      Show each chunk of the answer, and stop listening when the server says it's done. Fill
+      the gaps.
+    template: |
+      const source = new {{1}}("/answer");
+      source.{{2}} = (event) => {
+        if (event.data === "[DONE]") {
+          source.{{3}}();
+          return;
+        }
+        output.textContent += JSON.parse(event.data).text;
+      };
+    blanks:
+      - key: '1'
+        answer: EventSource
+      - key: '2'
+        answer: onmessage
+      - key: '3'
+        answer: close
+    bank: [EventSource, WebSocket, onmessage, onclick, close, reset]
+
+  - type: code-challenge
+    id: write-frame-answer
+    concept: backend.sse
+    difficulty: 3
+    language: ts
+    editable: '3-8'
+    prompt: >-
+      Write `frameAnswer(chunks)`, the server's side. Turn each chunk of the model's answer
+      into `data: {"text":"..."}` and a blank line, using `JSON.stringify({ text: chunk })`.
+      Skip empty chunks. End with `data: [DONE]` and a blank line.
+
+
+      So `['Tea']` gives `'data: {"text":"Tea"}\n\ndata: [DONE]\n\n'`.
+    hints:
+      - Each event ends in two line breaks, `\n\n`. The second makes the blank line.
+      - '`JSON.stringify` turns a line break inside a chunk into `\n` text, so one chunk stays one event.'
+      - 'Start with `let text = '''';` and add one event per chunk inside the loop.'
+
+  - type: prose
+    id: what-a-websocket-is
+    body: |-
+      SSE only flows from server to browser. A chat or a shared drawing board needs both
+      ways, many times a second. That's a **WebSocket**: one connection that stays open for
+      messages in either direction.
+
+      ```js
+      const socket = new WebSocket("wss://chat.example/room/7");
+      socket.onmessage = (event) => show(event.data);
+      socket.send("Hello");
+      ```
+
+      Every open socket or stream costs the server memory and a connection it must hold.
+
+  - type: multiple-choice
+    id: pick-the-channel
+    concept: backend.websockets
+    difficulty: 2
+    question: Players on a shared drawing board send strokes and see others' strokes live. Which fits?
+    choices:
+      - text: A WebSocket
+        correct: true
+        feedback: >-
+          Right. Messages flow both ways, many times a second, on one open line.
+      - text: Server-sent events
+        feedback: >-
+          SSE only goes from server to browser. Every stroke sent would need its own request.
+      - text: Polling every second
+        feedback: >-
+          A second's lag between strokes feels broken, and most polls would bring nothing.
+
+  - type: explain-back
+    id: explain-ten-thousand-tabs
+    concept: backend.connection-cost
+    difficulty: 4
+    prompt: >-
+      A price ticker moves from polling every 30 seconds to one open stream per tab. Fewer
+      requests, yet the server now runs out of room when many tabs are open. Why?
+    rubric:
+      - Each open stream or socket holds memory and a connection for as long as the tab stays open.
+      - A poll costs a moment of work and then nothing; an open connection costs something all the time.
+      - The server's limits on open connections and memory now set how many tabs it can serve, so measure them.
+    modelAnswer: >-
+      A poll is a short visit: the server answers and forgets the tab until the next one. An
+      open stream never leaves. Every tab holds memory and a connection on the server, busy
+      or idle. With enough tabs, the server hits its limit on open connections or memory
+      before it runs short of work. Fewer requests, but a cost that's paid all the time.
+
+recap:
+  - Pick polling, server-sent events or a WebSocket by who talks and how often.
+  - "Stream a model's answer as `data:` events, and close the `EventSource` on `[DONE]`."
+  - Count what open connections cost before thousands of them arrive.
+
+recall:
+  - id: card-polling-waste
+    concept: backend.polling
+    front: What does polling on a short timer waste?
+    back: >-
+      Requests. Most answers say "no change", and a real change still waits up to one interval.
+  - id: card-sse-reconnect
+    concept: backend.sse
+    front: What does `EventSource` do when the response ends, and how do you stop it?
+    back: >-
+      It reconnects a few seconds later and asks again. Call `source.close()` when the answer
+      is done.
+  - id: card-sse-format
+    concept: backend.sse
+    front: What does one server-sent event look like on the wire?
+    back: >-
+      A `data:` line with the text, then a blank line, in a `text/event-stream` response.
+  - id: card-websocket-when
+    concept: backend.websockets
+    front: When do you need a WebSocket instead of server-sent events?
+    back: >-
+      When messages flow both ways, often, like a chat or a shared board. SSE only goes from
+      server to browser.
+  - id: card-connection-cost
+    concept: backend.connection-cost
+    front: What does every idle open connection hold on the server?
+    back: >-
+      Memory and a connection slot, for as long as it stays open, whether anything is sent or
+      not.
+
+references:
+  - kind: spec
+    title: HTML Standard, server-sent events
+    authors: WHATWG
+    venue: WHATWG
+    url: https://html.spec.whatwg.org/multipage/server-sent-events.html
+    note: The `text/event-stream` format, `EventSource`, and reconnection.
+    primary: true
+    verified: true
+  - kind: rfc
+    title: 'RFC 6455: The WebSocket Protocol'
+    authors: I. Fette and A. Melnikov
+    year: 2011
+    venue: IETF
+    url: https://www.rfc-editor.org/rfc/rfc6455
+    note: The opening handshake, `101 Switching Protocols`, and message framing.
+    primary: true
+    verified: true
+  - kind: docs
+    title: EventSource
+    authors: MDN contributors
+    venue: MDN Web Docs
+    url: https://developer.mozilla.org/en-US/docs/Web/API/EventSource
+    note: The browser API, its events, `close()`, and automatic reconnection.
+    verified: true
+  - kind: docs
+    title: WebSocket API (WebSockets)
+    authors: MDN contributors
+    venue: MDN Web Docs
+    url: https://developer.mozilla.org/en-US/docs/Web/API/WebSockets_API
+    note: The browser `WebSocket` object and when to reach for it.
+    verified: true
+
+deepDive: >-
+  The stream above comes from a handler that returns `new Response(stream, { headers:
+  { "Content-Type": "text/event-stream" } })`, where `stream` is a `ReadableStream`. Its
+  `start(controller)` calls `controller.enqueue(text)` for each event and
+  `controller.close()` at the end. Measured with Node's own `EventSource`: after the stream
+  ended, it reconnected about three seconds later and streamed the answer again.
+
+
+  `EventSource` can only send a `GET`. A chat that posts a prompt uses `fetch` with a
+  `POST` and reads `response.body` chunk by chunk instead, parsing the `data:` lines itself.
+  Model SDKs do exactly that for you.
+
+
+  Long polling is the middle way: the server holds each request open until there's news,
+  then answers, and the client asks again at once. One request per change, but a new
+  connection each time.
+
+
+  A WebSocket starts life as an HTTP request with `Upgrade: websocket`. The server answers
+  `101 Switching Protocols`, and from then on the connection carries WebSocket frames, not
+  HTTP. Proxies and load balancers must be told to allow that, which is one reason SSE,
+  plain HTTP all the way, is often the easier choice.

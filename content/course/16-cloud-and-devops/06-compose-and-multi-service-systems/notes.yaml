@@ -1,0 +1,254 @@
+summary: >-
+  Real systems are several processes: an API, a database, often a cache and a worker.
+  Compose describes all of them in one `compose.yaml` and starts them with one command, on
+  a private network where each service is reachable by name. The file becomes the shared,
+  written-down truth about how the system fits together, instead of a page of `docker run`
+  commands in someone's notes.
+
+
+  Three ideas carry most of the weight. The network: services talk by name, and only
+  published ports reach the host. Volumes: data lives outside containers, so containers can
+  be thrown away and replaced. Health checks: "started" and "ready" are different, and a
+  check that asks a real question is what lets other services and load balancers wait for
+  the second.
+
+
+  Compose runs well on a laptop, in CI for integration tests, and on a single server for a
+  small product. These notes add how its networking and file merging work, how to keep
+  secrets out of the file, how to back up a volume, what a health check should and
+  shouldn't test, and where Compose stops and an orchestrator starts.
+remember:
+  - On a Compose network each service name is a host name, and inside a container `localhost` means that container alone.
+  - Only ports listed under `ports` reach the host, so publish the API and keep the database unpublished.
+  - A named volume survives `docker compose down` and is deleted by `down -v`, so never put `-v` in a deploy script.
+  - 'Plain `depends_on` waits only for a container to start; `condition: service_healthy` waits for its health check to pass.'
+  - A health check asks what the service needs to do its work, answers quickly, and has a timeout of its own.
+  - Apps should still retry their first connections, because health checks order start-up but can't keep a dependency up.
+  - Secrets come from the environment, a `.env` file kept out of Git, or Compose `secrets`, never written into `compose.yaml`.
+  - A volume on one server is not a backup; dump the database to somewhere else on a schedule.
+sections:
+  - title: How the Compose network works
+    body: |-
+      `docker compose up` creates a network named after the project, such as
+      `booking_default`, and attaches every service to it. Docker runs a small DNS server for
+      that network. When the API looks up `db`, it gets the database container's current
+      address. Replace the container and the name follows the new one, which is why you never
+      hard-code container IP addresses.
+
+      The host is outside that network. It reaches a container only through a published
+      port. There are three levels of exposure:
+
+      ```yaml
+      services:
+        api:
+          ports:
+            - "127.0.0.1:8080:3000"   # host's loopback only, for a local reverse proxy
+        admin:
+          ports:
+            - "9000:9000"             # every host interface: the internet, if the firewall allows
+        db:
+          expose:
+            - "5432"                  # documents the port, publishes nothing
+      ```
+
+      A service with no `ports` at all can still be reached by its neighbours on the
+      network, which is exactly right for a database. Remember lesson 2's warning: Docker's
+      published ports can go round ufw, so bind to `127.0.0.1` whenever a proxy on the same
+      machine is the only caller.
+
+      You can split a system into several networks, for example `front` for the proxy and
+      API and `back` for the API and database, so the proxy can't reach the database even
+      if it's compromised. For most small systems the single default network is fine.
+  - title: A compose file for a server, with secrets out of it
+    body: |-
+      The lesson's file puts the password in plain text, which is fine on a laptop. On a
+      server, the values come from outside. Compose reads a `.env` file in the project
+      folder automatically and substitutes `${NAME}` anywhere in `compose.yaml`. The form
+      `${NAME:?message}` refuses to start when the value is missing.
+
+      ```yaml
+      services:
+        api:
+          build: .
+          image: booking-api:dev
+          ports:
+            - "127.0.0.1:8080:3000"
+          environment:
+            DATABASE_URL: postgres://app:${DB_PASSWORD:?set DB_PASSWORD}@db:5432/bookings
+          depends_on:
+            db:
+              condition: service_healthy
+              restart: true
+          restart: unless-stopped
+
+        db:
+          image: postgres:17
+          environment:
+            POSTGRES_USER: app
+            POSTGRES_DB: bookings
+            POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD}
+          volumes:
+            - dbdata:/var/lib/postgresql/data
+          healthcheck:
+            test: ["CMD", "pg_isready", "-U", "app", "-d", "bookings"]
+            interval: 5s
+            timeout: 3s
+            retries: 10
+            start_period: 10s
+          restart: unless-stopped
+
+      volumes:
+        dbdata:
+      ```
+
+      Without `DB_PASSWORD`, `docker compose config` stopped with "required variable
+      DB_PASSWORD is missing a value". With it, `docker compose up -d --wait` returned once
+      both services reported healthy. `--wait` is useful in scripts and CI, because the
+      command itself fails if a service never becomes healthy. `restart: true` under
+      `depends_on` restarts the API when Compose restarts or updates the database.
+
+      Compose also merges files. A `compose.override.yaml` beside the main file is applied
+      automatically, which suits local extras such as a bind-mounted source folder. For
+      values you'd rather not have in any environment variable, top-level `secrets` mount a
+      file at `/run/secrets/<name>`; the Postgres image reads `POSTGRES_PASSWORD_FILE` for
+      exactly that.
+  - title: Volumes, bind mounts and backups
+    body: |-
+      Compose offers two kinds of mount. A **named volume**, such as `dbdata`, is storage
+      Docker manages in its own folder. A **bind mount**, such as `./src:/app/src`, maps a
+      folder from the host. Use named volumes for databases: Docker creates them with the
+      right ownership, and they're independent of where the project sits. Use bind mounts
+      in development, so edits on your laptop appear in the container at once.
+
+      Two cautions for databases. Mount the volume at the path the image stores its data,
+      which the image's documentation gives; for `postgres:17` that's
+      `/var/lib/postgresql/data`. A volume at the wrong path looks fine until the first
+      restart loses everything. And the official image only creates the user, database and
+      password on first start with an **empty** data folder. Change `POSTGRES_PASSWORD` later
+      and nothing happens, because the volume already holds a database.
+
+      A volume sits on the same disk as the server. A dead disk, a deleted server or a stray
+      `down -v` takes it and every copy of your data at once. A backup lives elsewhere:
+
+      ```bash
+      docker compose exec -T db pg_dump -U app -Fc bookings > bookings-$(date +%F).dump
+      ```
+
+      `-T` stops Compose allocating a terminal, so the binary dump isn't corrupted on its
+      way to the file. `-Fc` is Postgres's custom format, which `pg_restore` reads. Copy the
+      file off the server, to object storage in another region, and test a restore now and
+      then. Lesson 12 goes into backups properly; the rule to take from here is that a
+      volume keeps data across container replacements, not across disasters.
+  - title: What a health check should test
+    body: |-
+      A health check answers one question: should this instance get work right now? Get the
+      scope wrong in either direction and it hurts.
+
+      Too shallow, and it never fails: the lesson's always-`ok` endpoint kept a broken API in
+      service. Too deep, and it fails for the wrong reasons. If the API's check calls a
+      third-party payment provider, a provider outage marks every instance unhealthy, and
+      the load balancer removes all of them, turning a partial outage into a total one.
+
+      A good rule: check what this instance **owns and needs for most requests**, such as its
+      database connection, and leave out shared, optional dependencies. Keep it cheap,
+      `SELECT 1` not a report query, because it runs every few seconds on every instance. Give
+      it a deadline shorter than the checker's timeout, as the lesson's `health()` does.
+
+      Readiness and liveness are two questions, and Kubernetes asks them separately.
+      Readiness says "send me traffic"; failing it takes the instance out of rotation.
+      Liveness says "I'm not stuck"; failing it restarts the instance. A liveness check that
+      tests the database restarts every copy when the database blips, which helps nobody.
+
+      Start-up needs care too. Ordering by health checks doesn't cover the database
+      restarting later, so the app should retry its connection with backoff:
+
+      ```ts
+      async function connectWithRetry(
+        connect: () => Promise<void>,
+        { attempts = 8, baseMs = 250, maxMs = 5000 } = {},
+      ): Promise<void> {
+        for (let attempt = 1; ; attempt++) {
+          try {
+            await connect();
+            return;
+          } catch (error) {
+            if (attempt === attempts) throw error;
+            const wait = Math.random() * Math.min(maxMs, baseMs * 2 ** attempt);
+            await new Promise((resolve) => setTimeout(resolve, wait));
+          }
+        }
+      }
+      ```
+
+      The random wait, called jitter, stops many instances retrying in the same instant.
+      After the last attempt it gives up and throws, so the process exits and its restart
+      policy takes over, rather than hanging forever.
+  - title: Where Compose stops
+    body: |-
+      Compose on one server is a legitimate way to run a small product. It restarts crashed
+      containers, starts everything at boot with `restart: unless-stopped`, and
+      `docker compose up -d` after a new image replaces only the services that changed.
+
+      Its limits are about more than one machine. It doesn't spread containers across
+      servers, doesn't move them when a server dies, and has no built-in way to release a new
+      version while the old one still serves: replacing a container means a short gap, which
+      lesson 9 closes with a proxy in front. It also doesn't manage the server itself:
+      patches, disk space and backups remain your job.
+
+      When you need several servers, automatic placement and rolling releases, you reach for
+      a managed container platform or Kubernetes, lessons 13 and 19. Much of the thinking
+      carries straight over: services, names on a network, volumes, health checks and
+      environment. The Compose file is often the first draft of that setup, and it stays in
+      the repository for local development and integration tests long after production has
+      moved on.
+pitfalls:
+  - '**Using `localhost` to reach another service.** Inside a container it means that container. Use the service name, such as `db`.'
+  - '**`docker compose down -v` in a deploy script.** It deletes the database volume and every row in it. Use `docker compose up -d --build`, which keeps volumes.'
+  - '**Publishing the database port.** It becomes reachable from outside, and Docker''s rules can bypass ufw. Leave it unpublished, or bind to `127.0.0.1`.'
+  - '**Plain `depends_on` and hoping.** The API connects while Postgres is still starting and crashes. Add a health check and `condition: service_healthy`, and retry in the app.'
+  - '**A health check that tests everything downstream.** One third-party outage marks every instance unhealthy. Check what the instance owns and needs.'
+  - '**Changing `POSTGRES_PASSWORD` and expecting it to apply.** The image only uses it on an empty data folder. Change the password inside the database, then the variable.'
+  - '**Passwords written into `compose.yaml`.** The file lives in Git. Substitute from a `.env` file that Git ignores, or use Compose secrets.'
+  - '**Treating the volume as the backup.** It dies with the disk. Dump to storage somewhere else, and test the restore.'
+interview:
+  - question: How do containers in a Compose setup find each other, and what can the outside world reach?
+    answer: >-
+      By service name: Compose puts every service on a project network with its own DNS, so
+      the API connects to `db:5432` and the name follows the container when it's replaced.
+      From outside, only ports published under `ports` are reachable, so I publish the API,
+      ideally on `127.0.0.1` behind a reverse proxy, and leave the database unpublished. It's
+      still reachable by the API over the internal network. The trap is `localhost`, which
+      inside a container means that container. For stricter separation I can split front
+      and back networks so the proxy can't reach the database at all, at the cost of a little
+      more configuration.
+  - question: What makes a good health check for a web service?
+    answer: >-
+      One that answers "should this instance get traffic?" honestly, quickly and without
+      depending on things it doesn't own. It checks what most requests need, usually a
+      `SELECT 1` against its own database, with a timeout shorter than the checker's, and
+      returns 503 on failure. It leaves out shared optional dependencies such as a payment
+      provider, because an outage there would take every instance out of rotation at once.
+      I'd separate readiness, which removes an instance from traffic, from liveness, which
+      restarts it, and keep liveness shallow so a database blip doesn't restart everything.
+      And the app still retries connections with backoff, because health checks don't prevent
+      failures after start-up.
+  - question: A developer ran a deploy and all the data in the database disappeared. The setup uses Docker Compose. What likely happened, and how do you prevent it?
+    answer: >-
+      Most likely the database volume was deleted or never used. `docker compose down -v`
+      removes named volumes, and a deploy script with `-v` wipes the data every release.
+      Other causes: the volume mounted at the wrong path, so data lived in the container's
+      writable layer and vanished with it, or a renamed project creating a fresh volume. To
+      recover, restore from a backup, which exists only if dumps went somewhere off the
+      server. To prevent it, deploy with `docker compose up -d --build`, which recreates only
+      changed services and keeps volumes, check the mount path against the image's docs, and
+      schedule `pg_dump` to storage elsewhere with a tested restore.
+  - question: When would you run production on Docker Compose, and when would you move off it?
+    answer: >-
+      Compose on a single server suits a small product with modest traffic and a team that
+      wants few moving parts. It restarts crashed containers, starts on boot, and keeps the
+      whole system in one readable file. I'd move off it when I need more than one server
+      for capacity or availability, releases without any gap, automatic recovery when a
+      machine dies, or scaling on load. Then a managed container platform, or Kubernetes if
+      the team can run it, takes over. The trade-off is operational weight: Kubernetes solves
+      those problems and brings a lot of its own, so I wouldn't adopt it before the problems
+      are real.

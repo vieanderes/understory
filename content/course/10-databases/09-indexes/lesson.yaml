@@ -1,0 +1,324 @@
+id: db.indexes
+title: Indexes
+objective: "Turn a full-table read into an index lookup, read the difference in `EXPLAIN`, and spot when an index can't help."
+level: essential
+minutes: 10
+concepts: [db.btree-index, db.composite-index, db.index-selectivity]
+prerequisites: [db.from-code, cs.trees]
+opening:
+  text: >-
+    You'll take a sign-in lookup from reading every row to jumping straight to one. It's the
+    single change that fixes more slow pages than any other.
+
+steps:
+  - type: prose
+    id: what-an-index-is
+    body: >-
+      Finding "photosynthesis" in a textbook, you don't read every page. You use the index at
+      the back: sorted words, each with page numbers.
+
+
+      A database **index** is the same. It's a sorted copy of one column, with a pointer to each
+      row. Postgres keeps it in a **B-tree**, the shallow sorted tree from the trees lesson. A
+      lookup takes a few steps, even among millions of rows.
+
+  - type: prose
+    id: explain-in-two-lines
+    body: >-
+      Put `EXPLAIN` before a query and Postgres shows its **plan**, how it will find the rows,
+      without running it:
+
+
+      ```text
+
+      Seq Scan on users  (cost=0.00..417.00 rows=1 width=35)
+
+        Filter: (email = 'user500@example.com'::text)
+
+      ```
+
+
+      `Seq Scan` means read every row and keep the matches. With an index, it says `Index Scan
+      using users_email_idx` instead: jump to the row. Ignore the brackets for now.
+
+  - type: sql
+    id: add-email-index
+    concept: db.btree-index
+    difficulty: 2
+    prompt: >-
+      Signing in looks users up by email, among 20,000 rows. Run the `EXPLAIN`: it reads every
+      row. Add an index on `email`, then run the `EXPLAIN` again.
+    setup: |
+      CREATE TABLE users (id integer PRIMARY KEY, email text NOT NULL, name text NOT NULL);
+      INSERT INTO users
+        SELECT n, 'user' || n || '@example.com', 'User ' || n FROM generate_series(1, 20000) AS n;
+      ANALYZE users;
+      -- Reports whether the plan for a query uses any index.
+      CREATE FUNCTION uses_index(query text) RETURNS boolean LANGUAGE plpgsql AS $f$
+      DECLARE line text;
+      BEGIN
+        FOR line IN EXECUTE 'EXPLAIN (COSTS OFF) ' || query LOOP
+          IF line LIKE '%Index%Scan%' THEN RETURN true; END IF;
+        END LOOP;
+        RETURN false;
+      END $f$;
+    starter: |
+      EXPLAIN SELECT * FROM users WHERE email = 'user500@example.com';
+    solution: |
+      CREATE INDEX ON users (email);
+      EXPLAIN SELECT * FROM users WHERE email = 'user500@example.com';
+    checks:
+      query: >-
+        SELECT uses_index($$SELECT * FROM users WHERE email = 'user500@example.com'$$)
+        AS lookup_uses_an_index
+    showSchema: true
+    hints:
+      - The statement is `CREATE INDEX ON table (column);`.
+      - Put it above the `EXPLAIN`, so the plan sees the new index.
+
+  - type: lab
+    id: lab-btree-explorer
+    concept: db.composite-index
+    lab: btree-index-explorer
+    intro: >-
+      An index can cover two columns. It's sorted by the first, then by the second, like a
+      phone book sorted by surname, then first name. Run the query against each
+      index and swap the two columns.
+    preset:
+      scenario: event-newest
+      rows: 1000000
+    checkpoint:
+      question: The query filters `status` and sorts by `created_at`. Which index serves it in one seek?
+      difficulty: 3
+      choices:
+        - text: '`(status, created_at)`'
+          correct: true
+          feedback: >-
+            Right. Seek to the status, and the matching rows are already in date order.
+        - text: '`(created_at, status)`'
+          feedback: >-
+            Dates first means every status is mixed in. The search reads far more than it keeps.
+        - text: '`(status)` alone'
+          feedback: >-
+            It finds the rows, but they come out in no order, so the sort is a second pass.
+    fallback:
+      type: multiple-choice
+      id: pick-composite-order
+      concept: db.composite-index
+      difficulty: 3
+      language: sql
+      code: |
+        SELECT * FROM tickets
+        WHERE status = 'open'
+        ORDER BY created_at DESC
+        LIMIT 20;
+      question: >-
+        An index is sorted by its first column, then its second. Which index serves this query
+        best?
+      choices:
+        - text: '`(status, created_at)`'
+          correct: true
+          feedback: >-
+            Right. Jump to the open tickets, and they're already in date order.
+        - text: '`(created_at, status)`'
+          feedback: >-
+            Dates first scatters the open tickets through the whole index. Put the filter first.
+        - text: '`(status)` alone'
+          feedback: >-
+            It finds the open tickets, but then every one of them must be sorted.
+
+  - type: prose
+    id: a-function-hides-the-index
+    body: >-
+      People type their email as `Ana@Example.com` one day and `ana@example.com` the next, so
+      sign-in code often compares `lower(email)`.
+
+
+      But the index holds emails as stored, sorted as stored. It holds no lowercased copies, so
+      `WHERE lower(email) = ...` can't use it and reads every row. The fix is an index on the
+      expression itself: `CREATE INDEX ON users (lower(email))`. Its plan may say `Bitmap Index
+      Scan`, which is still the index.
+
+  - type: sql
+    id: fix-lower-email
+    concept: db.index-selectivity
+    difficulty: 3
+    prompt: >-
+      `email` already has an index, yet this case-insensitive lookup reads every row. Run the
+      `EXPLAIN` to see it. Add the index that lets it jump straight to the row.
+    setup: |
+      CREATE TABLE users (id integer PRIMARY KEY, email text NOT NULL, name text NOT NULL);
+      INSERT INTO users
+        SELECT n, 'user' || n || '@example.com', 'User ' || n FROM generate_series(1, 20000) AS n;
+      CREATE INDEX users_email_idx ON users (email);
+      ANALYZE users;
+      -- Reports whether the plan for a query uses any index.
+      CREATE FUNCTION uses_index(query text) RETURNS boolean LANGUAGE plpgsql AS $f$
+      DECLARE line text;
+      BEGIN
+        FOR line IN EXECUTE 'EXPLAIN (COSTS OFF) ' || query LOOP
+          IF line LIKE '%Index%Scan%' THEN RETURN true; END IF;
+        END LOOP;
+        RETURN false;
+      END $f$;
+    starter: |
+      EXPLAIN SELECT * FROM users WHERE lower(email) = 'user500@example.com';
+    solution: |
+      CREATE INDEX ON users (lower(email));
+      EXPLAIN SELECT * FROM users WHERE lower(email) = 'user500@example.com';
+    checks:
+      query: >-
+        SELECT uses_index($$SELECT * FROM users WHERE lower(email) = 'user500@example.com'$$)
+        AS lookup_uses_an_index
+    showSchema: true
+    hints:
+      - The existing index is sorted by `email`, not by `lower(email)`.
+      - Index the same expression the `WHERE` uses, inside the brackets.
+
+  - type: prose
+    id: foreign-keys-have-no-index
+    body: >-
+      Postgres makes an index for every primary key and `UNIQUE` column by itself. It does
+      **not** make one for a foreign key.
+
+
+      So `orders.customer_id` has no index unless you add one. Every "orders for this customer"
+      page reads the whole orders table. Deleting a customer does too, since Postgres must check
+      no order still points at them. It's fast in testing and slow a year later.
+
+  - type: ai-review
+    id: review-missing-fk-index
+    concept: db.index-selectivity
+    difficulty: 3
+    language: sql
+    request: Add an orders table for the shop. Customers see their order history on their account page.
+    flawClass: performance
+    code: |
+      CREATE TABLE orders (
+        id integer PRIMARY KEY,
+        customer_id integer NOT NULL REFERENCES customers(id),
+        placed_at timestamptz NOT NULL DEFAULT now(),
+        total_pence integer NOT NULL CHECK (total_pence >= 0)
+      );
+    prompt: >-
+      An assistant wrote this, and tests pass. At two million orders, the account page takes
+      seconds. Tap the line at fault.
+    lines: [3]
+    reasons:
+      - text: '`customer_id` has no index, so each lookup reads every order'
+        correct: true
+        feedback: >-
+          Right. Foreign keys get no index by themselves. Add one on `customer_id`.
+      - text: '`DEFAULT now()` runs a slow function on every read'
+        feedback: >-
+          The default runs once, when a row is inserted. Reads never call it.
+      - text: The `CHECK` is tested on every page load
+        feedback: >-
+          Constraints are checked on writes only. Reading orders never runs it.
+    fix: |
+      CREATE TABLE orders (
+        id integer PRIMARY KEY,
+        customer_id integer NOT NULL REFERENCES customers(id),
+        placed_at timestamptz NOT NULL DEFAULT now(),
+        total_pence integer NOT NULL CHECK (total_pence >= 0)
+      );
+      CREATE INDEX ON orders (customer_id);
+
+  - type: explain-back
+    id: explain-why-not-every-column
+    concept: db.btree-index
+    difficulty: 3
+    prompt: >-
+      Indexes make reads fast, so a teammate wants one on every column. What does each extra
+      index cost?
+    rubric:
+      - Every insert, update and delete must also change each index on the table.
+      - Each index takes disk space and memory.
+      - So index the columns your queries filter, join or sort by, and no others.
+    modelAnswer: >-
+      An index is a second copy of the column, kept sorted. Every insert, update and delete has
+      to change each index too, so writes slow down with every one you add. They also take disk
+      and memory. The right set is the columns your real queries filter, join and sort on,
+      which `EXPLAIN` helps you find.
+
+recap:
+  - Add an index on a column your queries search, and check the plan says `Index Scan`.
+  - Order a two-column index with the filtered column first.
+  - Index a foreign key yourself, and index `lower(email)` when that's what you search.
+
+recall:
+  - id: card-index-is
+    concept: db.btree-index
+    front: What is a database index?
+    back: >-
+      A sorted copy of a column with a pointer to each row, kept in a B-tree, so a lookup
+      jumps to the rows instead of reading them all.
+  - id: card-seq-vs-index
+    concept: db.btree-index
+    front: In `EXPLAIN` output, what's the difference between `Seq Scan` and `Index Scan`?
+    back: "`Seq Scan` reads every row. `Index Scan` uses an index to jump to the matches."
+  - id: card-leading-column
+    concept: db.composite-index
+    front: Which queries does an index on `(status, created_at)` help?
+    back: >-
+      Ones that filter on `status`, and ones that filter on `status` then sort or filter by
+      `created_at`. On `created_at` alone it serves well only through PostgreSQL 18's skip
+      scan, when `status` has few distinct values. Otherwise lead with `created_at`.
+  - id: card-lower-email
+    concept: db.index-selectivity
+    front: Why can't an index on `email` serve `WHERE lower(email) = $1`?
+    back: >-
+      It holds emails as stored, not lowercased. Index the expression: `CREATE INDEX ON users
+      (lower(email))`.
+
+references:
+  - kind: docs
+    title: Chapter 11. Indexes
+    authors: The PostgreSQL Global Development Group
+    venue: PostgreSQL 18 documentation
+    url: https://www.postgresql.org/docs/18/indexes.html
+    note: What indexes are, the index types, and when the planner uses one.
+    primary: true
+    verified: true
+  - kind: docs
+    title: 11.7. Indexes on Expressions
+    authors: The PostgreSQL Global Development Group
+    venue: PostgreSQL 18 documentation
+    url: https://www.postgresql.org/docs/18/indexes-expressional.html
+    note: The `lower(col)` index, as the official example.
+    verified: true
+  - kind: docs
+    title: 11.3. Multicolumn Indexes
+    authors: The PostgreSQL Global Development Group
+    venue: PostgreSQL 18 documentation
+    url: https://www.postgresql.org/docs/18/indexes-multicolumn.html
+    note: Why the leading columns matter most.
+    verified: true
+  - kind: paper
+    title: The Ubiquitous B-Tree
+    authors: Douglas Comer
+    year: 1979
+    venue: ACM Computing Surveys, 11(2)
+    url: https://doi.org/10.1145/356770.356776
+    note: The survey that explains why databases settled on B-trees.
+    verified: true
+
+deepDive: >-
+  An index doesn't always win. If a condition matches a large share of the table, reading it
+  straight through is cheaper than jumping about, and the planner picks `Seq Scan` on purpose.
+  The lab's row slider shows where that line falls.
+
+
+  A **partial index** holds only some rows: `CREATE INDEX ON orders (placed_at) WHERE status =
+  'pending'` stays tiny when most orders are done. A **covering index** adds columns with
+  `INCLUDE`, so a query can be answered from the index alone.
+
+
+  On a busy production table, plain `CREATE INDEX` blocks writes until it finishes.
+  `CREATE INDEX CONCURRENTLY` doesn't, at the cost of taking longer. The migrations lesson
+  uses it.
+
+
+  Postgres has other index types for other shapes of data: GIN for full-text search and JSON,
+  GiST for ranges and maps. The `pgvector` extension adds HNSW indexes, which find the nearest
+  embeddings for AI search in the same way a B-tree finds an email.

@@ -1,0 +1,339 @@
+summary: >-
+  JavaScript shares behaviour between objects through **prototypes**. Every object has a
+  hidden link to another object, its prototype. When you read a property the object doesn't
+  have, the lookup follows that link, then the next one, until it finds the name or reaches
+  `null`. That chain is the whole inheritance model: no copying, only delegation.
+
+
+  `class` is the modern way to write it. A class declaration creates a constructor function,
+  puts the methods on its `prototype` object, and wires `extends` chains for you. It's more
+  than cosmetic, though: class bodies are strict, methods are non-enumerable, you can't call a
+  class without `new`, and only classes have `#private` fields.
+
+
+  You reach for a class when many objects share a shape and behaviour: bookings, errors,
+  chat messages, UI widgets. Keep data per instance in the constructor or in fields, and
+  behaviour on the prototype. When the relationships get deep, composition, objects holding
+  other objects, usually ages better than long `extends` chains.
+remember:
+  - Reading a property walks the prototype chain until it finds the name or reaches `null`, while writing always creates or changes an own property.
+  - "`new C(...)` creates an object linked to `C.prototype`, runs the constructor with `this` bound to it, and returns it unless the constructor returns another object."
+  - A class is a constructor function plus a prototype, but it's strict, not callable without `new`, not hoisted into use, and its methods are non-enumerable.
+  - Methods live once on the prototype and are shared, so mutable data such as arrays must be created per instance in the constructor or a field.
+  - "`#private` fields are enforced by the language, invisible to `Object.keys` and JSON, and `#field in obj` checks for them safely."
+  - A subclass constructor must call `super(...)` before it touches `this`, or it throws a `ReferenceError`.
+  - "`x instanceof C` checks whether `C.prototype` is anywhere on `x`'s chain, so it fails across realms such as iframes and can be fooled with `Object.setPrototypeOf`."
+  - "`Object.hasOwn(obj, key)` asks about own properties only, while `key in obj` also searches the chain."
+sections:
+  - title: The prototype chain without classes
+    body: |-
+      Take classes away and the mechanism is plain to see. `Object.create(proto)` makes an
+      empty object whose prototype is `proto`. `Object.getPrototypeOf` reads the link.
+
+      ```js
+      const animal = {
+        describe() {
+          return `${this.name} says ${this.sound}`;
+        },
+      };
+      const dog = Object.create(animal);
+      dog.name = "Rex";
+      dog.sound = "woof";
+
+      console.log(dog.describe()); // Rex says woof
+      console.log(Object.getPrototypeOf(dog) === animal); // true
+      console.log(Object.getPrototypeOf(animal) === Object.prototype); // true
+      console.log(Object.getPrototypeOf(Object.prototype)); // null
+
+      console.log(Object.hasOwn(dog, "name")); // true
+      console.log(Object.hasOwn(dog, "describe")); // false
+      console.log("describe" in dog); // true
+
+      dog.describe = () => "shadowed";
+      console.log(dog.describe()); // shadowed
+      console.log(animal.describe.call(dog)); // Rex says woof
+
+      const dict = Object.create(null);
+      dict.toString = "a plain key";
+      console.log("hasOwnProperty" in dict); // false
+      ```
+
+      Four things to notice. `describe` runs with `this` set to `dog`, because `this` comes
+      from the call, not from where the method was found. Assigning `dog.describe` doesn't
+      touch `animal`: it creates an own property that **shadows** the inherited one. The
+      chain ends at `Object.prototype`, whose prototype is `null`, which is why every object
+      has `toString`. And `Object.create(null)` makes an object with no chain at all, a safe
+      dictionary where a key like `toString` or `__proto__` can't collide with anything.
+
+      Arrays, functions and dates work the same way. `[1, 2].map` is found on
+      `Array.prototype`, and `Array.prototype`'s own prototype is `Object.prototype`. Long
+      chains are cheap to read, because engines cache lookups, but changing an object's
+      prototype after creation with `Object.setPrototypeOf` makes those caches useless. Set
+      the prototype when you create the object instead.
+  - title: What `new` and `class` do underneath
+    body: |-
+      `new Constructor(...args)` does four things: create an empty object, link it to
+      `Constructor.prototype`, run the constructor with `this` set to it, and return it. If the
+      constructor returns an object of its own, that wins instead. You can write it yourself:
+
+      ```js
+      function myNew(Constructor, ...args) {
+        const obj = Object.create(Constructor.prototype); // create and link
+        const result = Constructor.apply(obj, args); // run with this = obj
+        const isObject = (typeof result === "object" && result !== null) || typeof result === "function";
+        return isObject ? result : obj; // a returned object wins, anything else is ignored
+      }
+
+      function Booking(guest, nights) {
+        this.guest = guest;
+        this.nights = nights;
+      }
+      Booking.prototype.summary = function () {
+        return `${this.guest}, ${this.nights} nights`;
+      };
+
+      const booking = myNew(Booking, "Ada", 3);
+      console.log(booking.summary()); // Ada, 3 nights
+      console.log(booking instanceof Booking); // true
+      ```
+
+      That's how code looked before 2015, and a class compiles to the same shape. But the
+      class adds rules the function version lacks:
+
+      ```js
+      class Timer {
+        constructor(label) {
+          this.label = label;
+        }
+        start() {
+          return `${this.label} started`;
+        }
+      }
+      function OldTimer(label) {
+        this.label = label;
+      }
+      OldTimer.prototype.start = function () {
+        return `${this.label} started`;
+      };
+
+      console.log(typeof Timer); // function
+      console.log(Object.keys(Timer.prototype)); // []
+      console.log(Object.keys(OldTimer.prototype)); // [ 'start' ]
+      try {
+        Timer("tea");
+      } catch (error) {
+        console.log(error.message); // Class constructor Timer cannot be invoked without 'new'
+      }
+      ```
+
+      Class methods are non-enumerable, so `for...in` doesn't list them. Calling a class
+      without `new` throws, where the old function would quietly set properties on the global
+      object in sloppy mode. The class body is always strict. And a class declaration is in
+      the temporal dead zone until its line runs, so using it earlier throws a
+      `ReferenceError`, whereas function declarations are hoisted whole. So "classes are
+      syntactic sugar" is mostly right about the prototype model and wrong about the details.
+  - title: Fields, private state, getters and statics
+    body: |-
+      Modern classes declare their data as **fields**. A public field such as `owner;` becomes
+      an own property on each instance. A `#private` field is not a property at all: it's a
+      slot that only code inside the class body can name. Getters and setters look like
+      properties to callers but run code. `static` members belong to the class itself.
+
+      ```js
+      class Account {
+        static #count = 0;
+        #balance = 0; // private: only code in this class body can touch it
+        owner;
+
+        constructor(owner) {
+          this.owner = owner;
+          Account.#count++;
+        }
+
+        get balance() {
+          return this.#balance;
+        }
+
+        deposit(pence) {
+          if (!Number.isInteger(pence) || pence <= 0) {
+            throw new RangeError("Deposit a whole, positive number of pence");
+          }
+          this.#balance += pence;
+          return this;
+        }
+
+        static isAccount(value) {
+          return #balance in value; // a brand check that never throws
+        }
+
+        static get count() {
+          return Account.#count;
+        }
+
+        toJSON() {
+          return { owner: this.owner, balance: this.#balance };
+        }
+      }
+
+      const account = new Account("Sam").deposit(500).deposit(250);
+      console.log(account.balance); // 750
+      console.log(Object.keys(account)); // [ 'owner' ]
+      console.log(JSON.stringify(account)); // {"owner":"Sam","balance":750}
+      console.log(Account.isAccount(account), Account.isAccount({ balance: 1 })); // true false
+      console.log(Account.count); // 1
+      ```
+
+      A getter with no setter makes `balance` read-only: assigning to it throws a `TypeError`
+      in strict code and is silently ignored in a sloppy script. Every change goes through
+      `deposit`, which guards the rule. That's the point of encapsulation: the class keeps
+      its invariants, and callers can't break them.
+
+      Compare the older options. An `_balance` naming convention is a polite request. A
+      TypeScript `private` modifier is checked at compile time and gone at runtime. A closure
+      is truly private but creates functions per object. `#private` is enforced at runtime and
+      methods stay shared. One limit: a subclass can't read its parent's `#fields`, so
+      share through protected-style methods or getters instead.
+  - title: Inheritance, `super` and `instanceof`
+    body: |-
+      `class B extends A` sets up two links: `B.prototype` inherits from `A.prototype`, for
+      instance methods, and `B` inherits from `A`, for static ones. In a subclass constructor,
+      the parent builds the object, so `this` doesn't exist until `super(...)` returns.
+
+      ```js
+      class ValidationError extends Error {
+        constructor(field, options) {
+          super(`${field} is invalid`, options);
+          this.name = "ValidationError";
+          this.field = field;
+        }
+      }
+
+      const error = new ValidationError("email", { cause: new Error("no @ sign") });
+      console.log(error instanceof ValidationError); // true
+      console.log(error instanceof Error); // true
+      console.log(error.message, "|", error.cause.message); // email is invalid | no @ sign
+
+      // instanceof asks one question: is Class.prototype on the chain?
+      function isInstance(value, Class) {
+        if (value === null || (typeof value !== "object" && typeof value !== "function")) {
+          return false;
+        }
+        let proto = Object.getPrototypeOf(value);
+        while (proto !== null) {
+          if (proto === Class.prototype) return true;
+          proto = Object.getPrototypeOf(proto);
+        }
+        return false;
+      }
+      console.log(isInstance(error, Error)); // true
+      console.log(isInstance(5, Number)); // false, as 5 instanceof Number is
+
+      // So it can be fooled both ways.
+      const fake = Object.create(ValidationError.prototype);
+      console.log(fake instanceof ValidationError); // true, never constructed
+      ```
+
+      Passing `options` through to `super` keeps the standard `cause`, which chains a
+      low-level error to the one you throw.
+
+      There's a construction-order trap. The parent constructor runs before the subclass's
+      fields are set, so a parent that calls an overridden method sees an unfinished object:
+
+      ```js
+      class Widget {
+        constructor() {
+          this.render(); // runs before the subclass has set its fields
+        }
+        render() {}
+      }
+      class Badge extends Widget {
+        label = "New";
+        render() {
+          console.log(`label is ${this.label}`);
+        }
+      }
+      new Badge(); // label is undefined
+      ```
+
+      Keep constructors to setting state, and call methods like `render` from outside once the
+      object exists. As for `instanceof`, it breaks across realms: an array from an iframe has
+      that frame's `Array.prototype`. Prefer `Array.isArray`, and for errors from other code,
+      check `error.name` or a known property.
+pitfalls:
+  - >-
+    **Putting mutable data on the prototype.** An array or object on `Class.prototype` is one
+    value that every instance reads and mutates.
+    Create it per instance: `this.items = []` in the constructor, or an `items = []` field.
+  - >-
+    **Touching `this` before `super()`.** A subclass constructor that sets a property before
+    calling `super(...)` throws a `ReferenceError`. Call `super` first, then set your own
+    state.
+  - >-
+    **Calling overridable methods from a constructor.** The parent constructor runs before
+    subclass fields exist, so an override sees `undefined` values. Keep constructors to
+    assigning state and call behaviour after construction.
+  - >-
+    **Trusting `instanceof` across boundaries.** Arrays from an iframe, or objects from
+    another copy of a library, fail the check although they look right. Use `Array.isArray`,
+    or check a `name` or a known property instead.
+  - >-
+    **Deep inheritance chains.** Every level couples the child to the parent's internals, and
+    a change high up ripples down. Prefer composition: a `Booking` that holds a `Payment`
+    rather than a `PaidBooking extends Booking`.
+  - >-
+    **Expecting methods in JSON or `Object.keys`.** Methods live on the prototype and private
+    fields aren't properties, so neither appears. Add a `toJSON` method when you control what
+    gets serialised.
+interview:
+  - question: How does prototypal inheritance work in JavaScript?
+    answer: >-
+      Objects delegate to other objects through a prototype link, instead of copying from a
+      class blueprint. Every object has an internal `[[Prototype]]`. When you read a property
+      that isn't own, the engine follows that link, then the next, until it finds the name or
+      hits `null`. Methods live once on a shared prototype, so a thousand instances share one
+      function. Writes don't walk the chain: assignment creates an own property that shadows
+      the inherited one. `class` and `extends` build exactly these links, which is why
+      `typeof` a class is `"function"`. The trade-off is flexibility against predictability:
+      you can change a prototype at runtime and every instance sees it, which is also how
+      monkey-patching built-ins causes bugs.
+  - question: What does the `new` keyword do? Could you implement it?
+    answer: >-
+      `new` creates an object, links it to the constructor's `prototype`, runs the constructor
+      with `this` bound to that object, and returns it, unless the constructor explicitly
+      returns another object. Implemented by hand, it's `Object.create(Constructor.prototype)`,
+      then `Constructor.apply(obj, args)`, then return the result if it's an object or a
+      function, otherwise `obj`. Classes add a guard: calling one without `new` throws a
+      `TypeError`. And arrow functions can't be used with `new` at all, because they have no
+      `prototype` and no construct behaviour. Knowing the four steps explains why forgetting
+      `new` with an old-style constructor used to set properties on the global object.
+  - question: Are JavaScript classes only syntactic sugar?
+    answer: >-
+      Mostly for the model, not for the details. A class still produces a constructor function
+      with methods on its `prototype`, and inheritance is still the prototype chain. But
+      classes behave differently from hand-written constructors. The body is always strict.
+      Methods are non-enumerable. Calling a class without `new` throws. Class declarations
+      sit in the temporal dead zone until their line runs. Subclasses must call `super()`
+      before using `this`, which also lets you extend built-ins like `Error` and `Array`
+      properly. And `#private` fields have no pre-class equivalent. So I'd
+      say classes are sugar over prototypes, with extra safety rules and features you can't
+      fully reproduce by hand.
+  - question: How do you make data private in a JavaScript class?
+    answer: >-
+      Use `#private` fields. They're enforced by the language: code outside the class body
+      can't read them, and `obj.#x` outside is a syntax error, not `undefined`. They don't
+      appear in `Object.keys` or `JSON.stringify`, and `#x in obj` gives a safe brand
+      check. Before that, people used an underscore convention, which is only a signal, or
+      closures, which are truly private but put a copy of every method on each instance.
+      TypeScript's `private` keyword is compile-time only and disappears in the output. The
+      trade-off with `#` fields is rigidity: subclasses can't access them, and tests can't
+      poke at them, so you expose what's needed through methods or getters.
+  - question: How does `instanceof` work, and when does it give the wrong answer?
+    answer: >-
+      `x instanceof C` walks `x`'s prototype chain looking for `C.prototype`. It returns
+      `false` for primitives, so `5 instanceof Number` is `false`. It can be wrong in both
+      directions. An object from another realm, such as an array from an iframe, has a
+      different `Array.prototype`, so the check fails even though it's a real array. Two
+      copies of a library in one bundle cause the same failure for its classes. Going the
+      other way, `Object.create(C.prototype)` passes without the constructor ever running, and
+      `Symbol.hasInstance` can override the check. So I use `Array.isArray` for arrays, and
+      for errors or cross-boundary objects I check a `name` or the shape.

@@ -1,0 +1,265 @@
+summary: >-
+  An operation is idempotent when doing it twice has the same effect as doing it once. That
+  matters because networks lose replies. A client that times out can't tell "the server
+  never got it" from "the server did it and the answer got lost". So the only safe recovery
+  is to retry, and the only safe retry is one the server can recognise.
+
+
+  An **idempotency key** makes a non-idempotent `POST` safe to repeat. The client makes one
+  random id per operation and sends it on every attempt. The server claims the key before
+  doing the work, stores the reply with it, and replays that reply for repeats. The same idea
+  protects queue consumers, webhook handlers and AI agents that retry tool calls, because all
+  of them receive the same message more than once.
+
+
+  These notes add what the lesson's in-memory version leaves out. You'll see the key table
+  in Postgres, and fingerprinting so a reused key can't smuggle in a different body. Then
+  what happens when the server crashes halfway, and how to make a consumer idempotent
+  without a key table at all. Reach for keys on any `POST` that moves money, sends messages or creates records a
+  person would notice twice. Skip them for `GET`, `PUT` and `DELETE`, which are idempotent by
+  definition, and for effects that are naturally idempotent already.
+remember:
+  - A timeout means the outcome is unknown, so retry with the same idempotency key rather than report failure.
+  - The client makes one key per operation, before the first attempt, and sends that key on every retry.
+  - The server claims the key before the work, with a unique constraint, so two concurrent attempts can't both run it.
+  - The stored reply is replayed exactly, status and body, including error replies such as a declined card.
+  - A repeat of a key with a different request body is a client bug and gets `422`, while a repeat during the first attempt gets `409`.
+  - Scope keys per account, so one customer's key can never collide with or reveal another's reply.
+  - Keep keys longer than the client's longest retry schedule, because after the deduplication window a repeat counts as new.
+  - When the work calls another service, pass a key derived from yours downstream, so the external step is idempotent too.
+sections:
+  - title: The key table in Postgres
+    body: |-
+      The lesson's `Map` becomes a table whose primary key does the claiming. The account
+      id is part of the key, so two customers who happen to send the same string never meet.
+
+      ```sql
+      CREATE TABLE idempotency_keys (
+        account_id bigint NOT NULL,
+        key text NOT NULL,
+        request_hash text NOT NULL,
+        status text NOT NULL DEFAULT 'running' CHECK (status IN ('running', 'done')),
+        response_code int,
+        response_body jsonb,
+        locked_at timestamptz NOT NULL DEFAULT now(),
+        created_at timestamptz NOT NULL DEFAULT now(),
+        PRIMARY KEY (account_id, key)
+      );
+
+      -- 1. Claim. A row back means this attempt owns the key.
+      INSERT INTO idempotency_keys (account_id, key, request_hash)
+      VALUES (7, '5b0e6f1c-key', 'a1f3')
+      ON CONFLICT (account_id, key) DO NOTHING
+      RETURNING key;
+
+      -- 2. No row back? Read what's there and decide.
+      SELECT status, request_hash, response_code, response_body
+      FROM idempotency_keys
+      WHERE account_id = 7 AND key = '5b0e6f1c-key';
+
+      -- 3. The owner stores the reply once the work is done.
+      UPDATE idempotency_keys
+      SET status = 'done', response_code = 201,
+          response_body = '{"id": "ch_1", "pence": 1250}'
+      WHERE account_id = 7 AND key = '5b0e6f1c-key' AND status = 'running';
+
+      -- 4. A cleanup job ends the deduplication window.
+      DELETE FROM idempotency_keys WHERE created_at < now() - interval '24 hours';
+      ```
+
+      Run twice, the claim returns the key the first time and no row the second. After
+      step 3, the read returns `done` with the stored `201` and body, ready to replay.
+
+      When the work itself is a write to the same database, such as inserting an order, put
+      the claim, the work and step 3 in one transaction. Then a crash rolls all three back,
+      and the key and its effect can never disagree. A concurrent attempt blocks on the
+      uncommitted primary key until the first commits, then its `ON CONFLICT DO NOTHING`
+      returns no row. That's the strongest form, and the reason to keep the keys in the same
+      database as the data they protect.
+  - title: Fingerprints, and deciding what to answer
+    body: |-
+      A key says "same operation". A fingerprint of the body checks the claim. Stripe, for
+      one, compares the parameters of a repeat with the original and rejects a mismatch. A
+      client that reuses a key for a different payment has a bug, and you want it loud.
+
+      Hash a canonical form, so the same data always gives the same text whatever order its
+      keys arrive in.
+
+      ```ts
+      import { createHash } from 'node:crypto';
+
+      type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
+
+      // Same data, same text: object keys are sorted at every level.
+      function canonical(value: Json): string {
+        if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
+        if (value !== null && typeof value === 'object') {
+          const keys = Object.keys(value).sort();
+          return `{${keys.map((k) => `${JSON.stringify(k)}:${canonical(value[k]!)}`).join(',')}}`;
+        }
+        return JSON.stringify(value);
+      }
+
+      const fingerprint = (body: Json) =>
+        createHash('sha256').update(canonical(body)).digest('hex');
+
+      type Stored = {
+        status: 'running' | 'done';
+        requestHash: string;
+        reply?: { code: number; body: Json };
+      };
+      type Decision =
+        | { kind: 'replay'; code: number; body: Json }
+        | { kind: 'reject'; code: 409 | 422; body: string };
+
+      // Called when the claim returned no row: this key was used before.
+      function decide(stored: Stored, requestHash: string): Decision {
+        if (stored.requestHash !== requestHash) {
+          return { kind: 'reject', code: 422, body: 'Key reused with a different request' };
+        }
+        if (stored.status === 'running') {
+          return { kind: 'reject', code: 409, body: 'Still in progress' };
+        }
+        return { kind: 'replay', ...stored.reply! };
+      }
+
+      const first = fingerprint({ pence: 1250, currency: 'gbp' });
+      const retry = fingerprint({ currency: 'gbp', pence: 1250 });
+      console.log(first === retry); // true
+
+      const done: Stored = { status: 'done', requestHash: first, reply: { code: 201, body: { id: 'ch_1' } } };
+      console.log(decide(done, retry).code); // 201, replayed
+      console.log(decide(done, fingerprint({ pence: 9999, currency: 'gbp' })).code); // 422
+      console.log(decide({ status: 'running', requestHash: first }, first).code); // 409
+      ```
+
+      Check the fingerprint before the status. A mismatched body is wrong whether the first
+      attempt has finished or not. Fingerprint only the fields that define the operation:
+      a client-side timestamp or trace id that changes per attempt would make every retry
+      look different.
+
+      Which replies to store is a design choice. Stripe stores the first
+      result for a key even when it's a `500`, so a repeat never runs the work a second
+      time. The client sees the same failure it saw before. Other APIs skip storing server errors so
+      that a retry can try again. Either is defensible if it's documented, because the
+      client needs to know whether a retry after a `500` can still do the work.
+  - title: Crashing halfway, when the work leaves your database
+    body: |-
+      One transaction covers you only while all the work is in your database. A payment
+      handler usually calls a provider in the middle, and no transaction spans your Postgres
+      and someone else's API.
+
+      So picture a crash after the claim and the external charge, before step 3. The key
+      stays `running` for ever, every retry gets `409`, and the customer can't pay. Two
+      changes fix it.
+
+      First, treat the claim as a lease. That's what the `locked_at` column is for. A retry
+      may take over a `running` key whose `locked_at` is older than a few minutes:
+
+      ```sql
+      UPDATE idempotency_keys SET locked_at = now()
+      WHERE account_id = 9 AND key = 'stuck' AND status = 'running'
+        AND locked_at < now() - interval '5 minutes'
+      RETURNING key;
+      ```
+
+      One row back means you now own the key. The guarded `UPDATE` lets only one retry win
+      the takeover.
+
+      Second, make the external step idempotent by itself, because the takeover may repeat
+      it. Pass the provider a key derived from yours, such as the key plus `:charge`. If the
+      first attempt's charge went through, the provider replays it instead of charging again.
+
+      Longer flows split into **atomic phases**, each a local transaction that records how
+      far the request got, with every external call between phases carrying a derived key. A
+      retry reads the recorded phase and resumes from there. A widely read write-up of
+      Stripe-like idempotency keys in Postgres calls the recorded phases **recovery points**.
+      They turn "crashed halfway" into "resumed halfway".
+  - title: Idempotent consumers, with and without a key table
+    body: |-
+      Queues and webhooks deliver at least once, so every consumer needs the same protection.
+      The message id plays the key. The best version needs no key table at all: make the
+      effect itself refuse a repeat.
+
+      ```sql
+      CREATE TABLE accounts (id bigint PRIMARY KEY, balance bigint NOT NULL);
+      INSERT INTO accounts VALUES (1, 10000);
+
+      -- Not idempotent: a redelivered message takes the money twice.
+      UPDATE accounts SET balance = balance - 500 WHERE id = 1;
+      UPDATE accounts SET balance = balance - 500 WHERE id = 1;
+      SELECT balance FROM accounts WHERE id = 1; -- 9000
+
+      -- Idempotent: the transfer id is the primary key of the effect.
+      CREATE TABLE ledger (
+        transfer_id text PRIMARY KEY,
+        account_id bigint NOT NULL,
+        pence bigint NOT NULL
+      );
+      INSERT INTO ledger VALUES ('tr_91', 1, -500) ON CONFLICT (transfer_id) DO NOTHING;
+      INSERT INTO ledger VALUES ('tr_91', 1, -500) ON CONFLICT (transfer_id) DO NOTHING;
+      SELECT 10000 + sum(pence) AS balance FROM ledger WHERE account_id = 1; -- 9500
+      ```
+
+      Other naturally idempotent shapes: an upsert keyed by the thing's own id, a guarded
+      status change such as `WHERE status = 'pending'`, and setting a value rather than
+      adding to it. Increments, appends and sends are the dangerous ones.
+
+      When the effect can't be made idempotent, keep a `processed_messages` table with the
+      message id as primary key, and insert into it in the same transaction as the effect.
+
+      The mirror problem is on the sending side. Writing an order and then publishing an
+      "order placed" event can crash in between. The **transactional outbox** writes the event
+      to an `outbox` table in the same transaction as the order, and a relay publishes rows
+      from it. The relay can publish a row twice, which is fine, because consumers are
+      idempotent.
+pitfalls:
+  - '**Storing the key after the work instead of claiming it before.** It looks equivalent in a test with one request. Two attempts that arrive together both find no key and both charge. Claim first with a unique constraint.'
+  - '**Keeping the keys in Redis and the orders in Postgres.** A crash between the two writes leaves an order with no key, or a key with no order. Store the key in the same database and transaction as the effect where you can.'
+  - '**One global key space.** A key that isn''t scoped to the account lets two customers collide, and can replay one customer''s receipt to another. Make the account part of the primary key.'
+  - '**Ignoring the request body on a repeat.** Replaying the old reply for a different body hides a client bug and can confirm a payment that never happened. Store a fingerprint and answer a mismatch with `422`.'
+  - '**A `running` key that can never recover.** A crash between claim and reply locks the customer out for the whole window. Record when the claim was taken, allow a takeover after a timeout, and make each external step idempotent with a derived key.'
+  - '**Trusting that a unique message id makes the consumer safe.** The id only helps if something checks it. Put the check in the same transaction as the effect, or make the effect refuse a repeat.'
+interview:
+  - question: Design an idempotent payments endpoint.
+    answer: >-
+      The client sends an `Idempotency-Key` header, one UUID per payment, reused on every
+      retry. The server stores keys in Postgres with the account id and key as primary key,
+      plus a hash of the canonical request body, a status and the stored reply. It claims
+      with `INSERT ... ON CONFLICT DO NOTHING`. Owning the key, it runs the payment. Not
+      owning it, it compares the hash, then answers `422` for a different body, `409` while
+      the first attempt runs, or replays the stored reply, errors included. The charge at the
+      card provider carries a key derived from ours, so a takeover after a crash can't
+      charge twice. Keys live 24 hours or longer than any client retries. The cost is a write
+      per request and a table to prune, which is cheap next to a double charge.
+  - question: Can you get exactly-once processing from a message queue?
+    answer: >-
+      Not exactly-once delivery, but exactly-once effects: at-least-once delivery plus an
+      idempotent consumer. Delivery can't be exactly once. A consumer can finish the work
+      and crash before acknowledging, and the broker can't tell that from a crash before the
+      work. So it redelivers. What you control is the effect. Either make it refuse a repeat
+      by construction, such as a ledger row keyed by the transfer id. Or record the message
+      id in a processed table, in the same transaction as the effect. Some brokers offer
+      exactly-once within their own system, such as Kafka transactions for read-process-
+      write inside Kafka. But once the effect is an email or a card charge,
+      the consumer still needs its own guard.
+  - question: A payment request timed out. What should the client do?
+    answer: >-
+      Retry with the same idempotency key, because a timeout means the outcome is unknown,
+      not that it failed. The charge may have gone through with only the reply lost. Showing
+      "Payment failed" risks the customer paying again by hand, and a blind retry without a
+      key risks charging twice. With the same key, the server either replays the first
+      reply or does the work for the first time. The retries should back off with jitter and
+      stop within the server's deduplication window. If retries run out, the honest message
+      is "we're checking your payment", followed by a status lookup by key, rather than a
+      definite failure.
+  - question: Which HTTP methods are idempotent, and does that mean you can always retry them?
+    answer: >-
+      `GET`, `HEAD`, `OPTIONS`, `PUT` and `DELETE` are idempotent by definition in HTTP, and
+      `POST` and `PATCH` are not. The definition is about the intended effect on the server,
+      so a correct `PUT` of the same body twice leaves the same state. It doesn't make every
+      retry safe. The server must actually implement the method that way, and a `DELETE`
+      retried after someone recreated the resource deletes the new one. Idempotent also
+      doesn't mean the reply is identical: a second `DELETE` may return `404`. So I retry
+      idempotent methods freely on network errors, and for `POST` I retry only with an
+      idempotency key.

@@ -1,0 +1,272 @@
+summary: >-
+  An eval is a test suite for a model's answers. Unit tests fake the model, so they prove
+  your code handles a reply; they can't tell you whether the reply is right. An eval runs the
+  real model on a fixed set of real inputs, grades every output, and reports a pass rate per
+  slice. It turns "the new prompt feels better" into a number you can compare.
+
+
+  The problem it solves is invisible regression. A model is sensitive to small changes: a
+  reworded instruction, a new model version, a different chunk size in retrieval. Any of
+  them can fix ten cases and quietly break twenty others. Without an eval you learn about it
+  from users. With one, the change is blocked in CI before it ships.
+
+
+  Reach for an eval as soon as a model's output reaches a person or drives an action, and
+  build it before you tune anything, because tuning without a baseline is guessing. Grade
+  with code wherever the rule is exact, and use a model as judge only for qualities code
+  can't check, after you have measured how often it agrees with people. An eval doesn't
+  replace unit tests, monitoring or human review of samples; it's the layer between them.
+remember:
+  - An eval runs the real model on a fixed set of real inputs and grades each output, so it tests answers, where unit tests with a fake model test code.
+  - Build the eval set from real inputs and past failures, and keep it apart from the prompt's examples, or the model is graded on text it was shown.
+  - Grade with code whenever the rule is exact, such as a label, valid JSON or a citation, because code is fast, free and consistent.
+  - A model judge leans towards the first answer, the longer answer and its own style, so ask yes or no questions and count a pairwise win only when both orders agree.
+  - Trust a judge only after grading a sample by hand and measuring agreement, and recheck whenever the judge model or the rubric changes.
+  - Gate every change to the prompt, model or retrieval on each slice's pass rate, because a rising average can hide one slice collapsing.
+  - Model output varies from run to run, so a small eval set has wide error bars, and a one-case gain is noise.
+sections:
+  - title: A minimal eval harness
+    body: |-
+      A harness needs three things: cases on disk, a function that calls the model, and a
+      grader. Store cases as JSON Lines, one case per line, in Git beside the prompt, so a
+      pull request that changes the prompt can also add the case that motivated it. Give each
+      case an `id` and a `slice`, and keep every output, not only the verdict, so you can read
+      the failures.
+
+      ```python
+      import json
+      from collections import defaultdict
+
+      CASES_JSONL = """\
+      {"id": "r1", "slice": "refunds", "email": "I want my money back for order 12", "expected": "refund"}
+      {"id": "r2", "slice": "refunds", "email": "Charged twice, please return one", "expected": "refund"}
+      {"id": "d1", "slice": "delivery", "email": "Where is my parcel?", "expected": "delivery"}
+      {"id": "d2", "slice": "delivery", "email": "Courier left it at the wrong door", "expected": "delivery"}
+      {"id": "b1", "slice": "billing", "email": "Can I get a VAT invoice?", "expected": "billing"}
+      """
+
+
+      def load_cases(text):
+          return [json.loads(line) for line in text.splitlines() if line.strip()]
+
+
+      def stub_classify(email):
+          """Stands in for the real model call."""
+          text = email.lower()
+          if "parcel" in text or "courier" in text:
+              return {"category": "delivery"}
+          if "money back" in text:
+              return {"category": "refund"}
+          return {"category": "billing"}
+
+
+      def run_eval(cases, classify):
+          results = []
+          for case in cases:
+              output = classify(case["email"])
+              results.append({
+                  "id": case["id"],
+                  "slice": case["slice"],
+                  "passed": output.get("category") == case["expected"],
+                  "output": output,
+              })
+          return results
+
+
+      def report(results):
+          by_slice = defaultdict(list)
+          for r in results:
+              by_slice[r["slice"]].append(r["passed"])
+          for name, passes in sorted(by_slice.items()):
+              print(f"{name:9} {sum(passes)}/{len(passes)}")
+          print("failed:", [r["id"] for r in results if not r["passed"]])
+
+
+      report(run_eval(load_cases(CASES_JSONL), stub_classify))
+      # billing   1/1
+      # delivery  2/2
+      # refunds   1/2
+      # failed: ['r2']
+      ```
+
+      In CI, the results list feeds the lesson's `regressions` function against the stored
+      results of the last release. Save each run with the prompt version and model name, so
+      you can tell which change moved which slice.
+  - title: Noise, and how big the set needs to be
+    body: |-
+      A model samples its output, so the same prompt on the same cases can score a little
+      differently each run. A pass rate is an estimate, and its error bar shrinks only with
+      the square root of the number of cases.
+
+      ```python
+      import math
+
+
+      def margin(pass_rate, n):
+          """Roughly 95% of runs land within this distance of the true rate."""
+          return 1.96 * math.sqrt(pass_rate * (1 - pass_rate) / n)
+
+
+      for n in (20, 100, 400):
+          print(n, round(margin(0.8, n), 3))
+      # 20 0.175
+      # 100 0.078
+      # 400 0.039
+      ```
+
+      This is the normal approximation, rough for small sets, but the lesson is clear. With
+      20 cases at 80%, a score anywhere from about 63% to 97% is consistent with no change at
+      all. With 400, the band is about four points each way. That's why the gate has a
+      `tolerance`, and why it should be wider for small slices than for large ones.
+
+      Three practical habits follow. Run small sets more than once and compare the averages.
+      Use a low sampling temperature for classification tasks if your provider lets you, so
+      runs vary less. And when a change moves a slice by one case, read that case's output
+      before you celebrate or panic: often the old answer was lucky, not right.
+  - title: Choosing a grader
+    body: |-
+      Graders sit on a ladder, cheapest and most trustworthy first. Move down only when the
+      rung above can't express the rule.
+
+      1. **Exact checks in code.** The label matches, the JSON parses against a schema, the
+         answer cites a source that was in the retrieved set, the reply is under 80 words, no
+         email address appears in the output. Deterministic and free.
+      2. **Reference checks in code.** The answer contains the key fact from a reference
+         answer, such as the right date or price. Good for extractive tasks, brittle for free
+         text, because a correct reply can phrase the fact differently.
+      3. **A model judge with a rubric.** For qualities like "answers the question asked",
+         "stays faithful to the sources" or "polite without grovelling". Ask one yes or no
+         question per criterion, give the judge the sources and the question, and ask for a
+         one-line reason before the verdict so you can audit it.
+      4. **People.** The ground truth for the judge, and the final word on new kinds of
+         failure. Expensive, so spend it on calibrating the rungs above.
+
+      Many real evals mix rungs: code checks format and citations on every case, and a judge
+      scores faithfulness only on cases that passed the format check. That keeps the judge's
+      bill down and its questions narrow.
+  - title: Checking the judge
+    body: |-
+      A judge is itself a model, so it needs its own eval. Two checks catch most problems:
+      position bias, and agreement with people beyond what chance would give.
+
+      ```python
+      def stub_judge(question, first, second):
+          """A biased stand-in for a model judge: it always prefers the first answer."""
+          return "first"
+
+
+      def compare(judge, question, a, b):
+          """Returns 'a', 'b' or 'tie'. A win counts only when both orders agree."""
+          one = judge(question, first=a, second=b)
+          two = judge(question, first=b, second=a)
+          if one == "first" and two == "second":
+              return "a"
+          if one == "second" and two == "first":
+              return "b"
+          return "tie"
+
+
+      print(compare(stub_judge, "How do I reset my password?", "Use the link.", "Go to Settings."))
+      # tie
+
+
+      def agreement(judge_labels, human_labels):
+          """Share of cases where judge and person gave the same yes or no."""
+          same = sum(j == h for j, h in zip(judge_labels, human_labels))
+          return same / len(human_labels)
+
+
+      def cohen_kappa(judge_labels, human_labels):
+          """Agreement corrected for what two raters would reach by chance."""
+          n = len(human_labels)
+          observed = agreement(judge_labels, human_labels)
+          p_judge = sum(judge_labels) / n
+          p_human = sum(human_labels) / n
+          chance = p_judge * p_human + (1 - p_judge) * (1 - p_human)
+          return (observed - chance) / (1 - chance)
+
+
+      human = [True] * 18 + [False] * 2
+      lazy_judge = [True] * 20   # says "helpful" to everything
+      print(agreement(lazy_judge, human), round(cohen_kappa(lazy_judge, human), 2))
+      # 0.9 0.0
+      ```
+
+      The second result is the trap. A judge that says yes to everything agrees with people
+      90% of the time when 90% of replies are good, and catches none of the bad ones. Cohen's
+      kappa corrects for that and scores it 0. Also look at the cases people marked bad: the
+      share of them the judge also marks bad is what tells you it can find failures.
+pitfalls:
+  - '**Using the prompt''s examples as the eval set.** The model has seen them, so it passes them whatever you change. Collect real inputs, including ones that failed, and keep them in a separate file.'
+  - '**Gating on the average.** A new prompt can gain on common slices and collapse on one that matters. Compare each slice against the last release and block on any drop beyond the tolerance.'
+  - '**Trusting a judge without calibration.** A judge that says yes to almost everything shows high agreement when most outputs are good. Grade a sample by hand, check agreement on the bad cases too, and recheck after any judge or rubric change.'
+  - '**Scores out of ten.** Judges cluster numeric scores and drift between runs. Ask one yes or no question per criterion and count the yeses.'
+  - '**Reading a one-case change as a result.** With a small set, sampling noise moves scores by several points. Run it again, widen the tolerance for small slices, and read the changed outputs.'
+  - '**Letting the eval set freeze.** Traffic changes and the set ages. Turn every bug report and every thumbs-down worth fixing into a new case.'
+  - '**Keeping only the verdicts.** A pass rate says something broke, not what. Store every output with the prompt version and model, so a failure can be read and diffed.'
+interview:
+  - question: How would you know whether a prompt change made your AI feature better or worse?
+    answer: >-
+      I'd run an eval set before and after the change and gate the release on it. The set is
+      a few hundred real inputs from logs, including past failures, each with an expected
+      answer or a grading rule, and none of them taken from the prompt's own examples. Exact
+      rules like labels, JSON validity and citations are graded in code; qualities like
+      faithfulness get a model judge I've checked against human labels. I compare pass rates
+      per slice, such as refunds, billing and delivery, and block the change if any slice
+      drops beyond a tolerance sized to its case count. The limit is that an eval only covers
+      what's in the set, so I keep adding real cases and watch production signals like
+      thumbs-down rate by prompt version.
+  - question: When would you use an LLM as a judge, and how do you make its grades trustworthy?
+    answer: >-
+      I use a judge only for qualities code can't check, such as helpfulness or faithfulness
+      to sources, and I calibrate it before trusting it. First I grade a sample of a hundred
+      or so outputs by hand and measure agreement, with a chance-corrected measure like
+      Cohen's kappa, and specifically how many of the bad outputs it catches. I design against
+      its known leanings: one yes or no question per criterion instead of a score, a short
+      reason before the verdict, and pairwise comparisons run in both orders, counting a win
+      only when both agree. I recalibrate when the judge model or rubric changes. The
+      trade-off is cost and speed: a judge call per output per criterion adds up, so code
+      checks run first and the judge sees only what they can't decide.
+  - question: Why gate a release on slices rather than the overall pass rate?
+    answer: >-
+      Because an average can rise while one kind of input breaks. Suppose a new prompt fixes
+      delivery and billing questions but refund answers fall from nine in ten right to four
+      in ten. The overall rate can still go up, and the refund customers, often the ones who
+      matter most, get worse answers. Slicing by intent, language, customer tier or input
+      length shows each group's rate, and the gate blocks if any slice drops by more than a
+      tolerance. The cost is more cases, because each slice needs enough of them to measure;
+      a slice with ten cases has error bars too wide to gate tightly. So I size the tolerance
+      to the slice and grow the thin slices first.
+  - question: Your eval passes but users report bad answers. What's going on?
+    answer: >-
+      The eval set doesn't represent the traffic, or the grader is too lenient. First I'd
+      pull the reported conversations and check whether anything like them is in the set;
+      usually they're a kind of input nobody collected, such as a new product or another
+      language. Those become new cases and maybe a new slice. Second, I'd check the grader: a
+      reference check can pass an answer that contains the right keyword in a wrong sentence,
+      and a judge can be lenient on long confident replies. I'd hand-grade the failing
+      examples and see whether the grader agrees. Third, I'd check the cases aren't leaking
+      into the prompt. The fix is a loop, not a one-off: production failures feed the set every
+      week.
+terms:
+  - term: Eval
+    say: A benchmark score.
+    means: "A test suite for your own task: a fixed set of real inputs run through the real
+      model, each output graded, with a pass rate per slice."
+  - term: Eval set
+    say: The examples from the prompt.
+    means: Real inputs and past failures kept apart from the prompt's examples, so the model
+      isn't graded on text it was shown.
+  - term: LLM-as-judge
+    say: Objective automatic grading.
+    means: A model grading outputs against a rubric. It leans towards the first answer, the
+      longer one and its own style, so it is trusted only after its grades are checked
+      against people's.
+  - term: Slice
+    say: A random sample of the test cases.
+    means: A subset defined by a property, such as language, topic or length, with its own pass
+      rate. A rising average can hide one slice collapsing.
+  - term: Regression gate
+    say: Running the evals now and then.
+    means: A check in CI that blocks a change to the prompt, model or retrieval when any slice
+      drops below its threshold.

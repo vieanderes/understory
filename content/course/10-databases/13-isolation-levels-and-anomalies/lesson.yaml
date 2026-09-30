@@ -1,0 +1,326 @@
+id: db.isolation-levels
+title: Two writers at once
+objective: "Spot a lost update, fix it with an atomic `UPDATE` or `FOR UPDATE`, and know what read committed and serializable promise."
+level: advanced
+minutes: 10
+concepts: [db.anomalies, db.read-committed, db.row-locks, db.serializable]
+prerequisites: [db.constraints]
+opening:
+  text: >-
+    You'll watch two sales of the last kettle both succeed, and a stock count quietly lose one.
+    Then you'll fix it three ways and know which to reach for.
+
+steps:
+  - type: prose
+    id: lost-update
+    body: >-
+      Two customers buy a kettle at the same moment. Each request reads `stock = 5`, works out
+      4 in JavaScript, and writes 4 back. Two kettles left the shelf, and the count dropped by
+      one.
+
+
+      That's a **lost update**: one write silently replaces another. Postgres's default setting,
+      **read committed**, doesn't stop it. Each statement sees data committed before it began,
+      and both reads began before either write.
+
+  - type: lab
+    id: lab-isolation-stepper
+    concept: db.anomalies
+    lab: isolation-anomaly-stepper
+    intro: >-
+      Step the two sessions and watch the stock count. Then switch the variant to `stock =
+      stock - 1`, and to `FOR UPDATE`, and step again. Notice where the second session has to
+      wait.
+    preset:
+      scenario: lost-update
+      variant: read-modify-write
+      level: read-committed
+    checkpoint:
+      question: With `stock = stock - 1`, why does the count come out right?
+      difficulty: 2
+      choices:
+        - text: The second update waits, then subtracts from the new value
+          correct: true
+          feedback: >-
+            Right. The row is locked by the first update, and the second rereads it after.
+        - text: The two updates run one day apart
+          feedback: >-
+            They run at the same moment in the lab. The database orders them for you.
+        - text: Read committed turns into serializable
+          feedback: >-
+            The level stays read committed. The update itself reads and writes in one step.
+    fallback:
+      type: multiple-choice
+      id: pick-atomic-update
+      concept: db.anomalies
+      difficulty: 2
+      language: sql
+      code: |
+        -- run by two sessions at once, stock starts at 5
+        UPDATE products SET stock = stock - 1 WHERE id = 1;
+      question: Why does this never lose a sale, even at read committed?
+      choices:
+        - text: The second update waits, then subtracts from the new value
+          correct: true
+          feedback: >-
+            Right. Reading and writing happen in one step, with the row locked in between.
+        - text: Postgres runs every statement one at a time
+          feedback: >-
+            Postgres runs many statements at once. It only makes writers of the same row wait.
+        - text: '`stock - 1` is cached for both sessions'
+          feedback: >-
+            Nothing is cached. The second session reads the row again after the first commits.
+
+  - type: prose
+    id: let-the-database-do-the-maths
+    body: >-
+      The first fix is the simplest. Don't read the value into your app and write back a number.
+      Send the change itself:
+
+
+      ```sql
+
+      UPDATE products SET stock = stock - 1 WHERE id = 1 AND stock > 0;
+
+      ```
+
+
+      The update locks the row while it works. A second update of the same row waits, then
+      starts from the new value. No sale is lost, and `stock > 0` stops an oversell too.
+
+  - type: bug-hunt
+    id: find-read-modify-write
+    concept: db.anomalies
+    difficulty: 3
+    language: js
+    code: |
+      async function sellOne(productId) {
+        const { rows } = await pool.query("SELECT stock FROM products WHERE id = $1", [productId]);
+        const stock = rows[0].stock;
+        await pool.query("UPDATE products SET stock = $1 WHERE id = $2", [stock - 1, productId]);
+      }
+    prompt: >-
+      On a busy sale day, stock counts drift above what's really on the shelf. Tap the line that
+      loses sales.
+    lines: [4]
+    reasons:
+      - text: It writes a number worked out from an old read
+        correct: true
+        feedback: >-
+          Right. Another sale can land between the read and this write. Use `stock = stock - 1`.
+      - text: The `SELECT` needs a `LIMIT 1`
+        feedback: >-
+          The id is a primary key, so one row comes back anyway. The write is the problem.
+      - text: '`rows[0]` may be undefined'
+        feedback: >-
+          True for a missing product, and worth handling. It doesn't explain the drifting count.
+    fix: |
+      async function sellOne(productId) {
+        await pool.query(
+          "UPDATE products SET stock = stock - 1 WHERE id = $1 AND stock > 0",
+          [productId],
+        );
+      }
+
+  - type: prose
+    id: for-update
+    body: >-
+      Sometimes your app must read, decide, then write, such as checking a wallet covers a
+      purchase. Then lock the row as you read it, inside a transaction:
+
+
+      ```sql
+
+      SELECT balance_pence FROM wallets WHERE id = 7 FOR UPDATE;
+
+      ```
+
+
+      `FOR UPDATE` takes a **row lock** until `COMMIT`. Another session reading that row
+      `FOR UPDATE` waits its turn. Lock rows in the same order everywhere, or two sessions can
+      wait on each other for ever: a **deadlock**, which Postgres ends by cancelling one.
+
+  - type: fill-blank
+    id: fill-for-update
+    concept: db.row-locks
+    difficulty: 3
+    language: sql
+    prompt: >-
+      Charge a wallet only after the app checks the balance. Lock the row as you read it, and
+      make the change permanent. Fill the gaps.
+    template: |
+      BEGIN;
+      SELECT balance_pence FROM wallets WHERE id = 7 {{1}};
+      -- the app checks the balance covers the purchase
+      UPDATE wallets SET balance_pence = balance_pence - 1200 WHERE id = 7;
+      {{2}};
+    blanks:
+      - key: '1'
+        answer: FOR UPDATE
+      - key: '2'
+        answer: COMMIT
+    bank: [FOR UPDATE, WITH LOCK, LOCKED, COMMIT, SAVE]
+
+  - type: prose
+    id: serializable
+    body: >-
+      Some rules span many rows: "a room takes three bookings", "one doctor stays on call".
+      Locking one row can't protect them.
+
+
+      **Serializable** is the strictest level: `BEGIN ISOLATION LEVEL SERIALIZABLE;`. Postgres
+      watches what each transaction read. If two couldn't have run one after the other, it
+      cancels one with `could not serialize access`. Your code then runs that transaction again
+      from the start.
+
+  - type: multiple-choice
+    id: pick-serializable-retry
+    concept: db.serializable
+    difficulty: 3
+    question: >-
+      A serializable transaction fails with `could not serialize access`. What should your code
+      do?
+    choices:
+      - text: Roll back and run the whole transaction again
+        correct: true
+        feedback: >-
+          Right. It's normal at this level. Retry from `BEGIN`, a few times at most.
+      - text: Run the failed statement once more
+        feedback: >-
+          The transaction is already cancelled, so every further statement fails too.
+      - text: Show the user an error and give up
+        feedback: >-
+          A retry usually succeeds, because the other transaction has finished by then.
+      - text: Lower the level to read committed
+        feedback: >-
+          That brings back the problem serializable was protecting you from.
+
+  - type: ai-review
+    id: review-memory-lock
+    concept: db.anomalies
+    difficulty: 4
+    language: js
+    request: Stop two requests selling the same product at the same moment.
+    flawClass: race
+    code: |
+      const busy = new Set();
+      async function sellOne(productId) {
+        if (busy.has(productId)) throw new Error("Busy, try again");
+        busy.add(productId);
+        try {
+          const { rows } = await pool.query("SELECT stock FROM products WHERE id = $1", [productId]);
+          await pool.query("UPDATE products SET stock = $1 WHERE id = $2", [rows[0].stock - 1, productId]);
+        } finally {
+          busy.delete(productId);
+        }
+      }
+    prompt: >-
+      An assistant wrote this, and a local test with two requests passes. The shop runs four
+      copies of the server. Oversells continue. Tap the first line at fault.
+    lines: [1]
+    reasons:
+      - text: Each server copy has its own `busy` set
+        correct: true
+        feedback: >-
+          Right. Memory isn't shared between copies. Let the database lock the row instead.
+      - text: '`finally` runs before the update finishes'
+        feedback: >-
+          The update is awaited, so `finally` runs after it. The lock itself is the problem.
+      - text: A `Set` can't hold numbers
+        feedback: >-
+          It can. The trouble is that this set lives in one process's memory.
+    fix: |
+      async function sellOne(productId) {
+        await pool.query(
+          "UPDATE products SET stock = stock - 1 WHERE id = $1 AND stock > 0",
+          [productId],
+        );
+      }
+
+  - type: explain-back
+    id: explain-read-committed-limit
+    concept: db.read-committed
+    difficulty: 4
+    prompt: >-
+      A teammate thinks Postgres's default isolation level stops two requests from losing each
+      other's stock updates. Explain what it does promise, and what you'd do instead.
+    rubric:
+      - Read committed shows each statement only data committed before it began.
+      - It doesn't stop two requests reading the same value and each writing back its own result.
+      - Fix it with an atomic `SET stock = stock - 1`, a `FOR UPDATE` lock, or serializable with retries.
+    modelAnswer: >-
+      Read committed only promises that each statement sees committed data, never half-done
+      work. Two requests can still both read 5 and both write 4, so one sale is lost. The
+      simplest fix is to send the change itself, `stock = stock - 1`, so Postgres locks and
+      rereads the row. If the app must decide in between, `FOR UPDATE` locks the row first.
+
+recap:
+  - Spot a lost update, where a value read into the app is written back as a number.
+  - Fix it with `SET x = x - 1`, or lock the row first with `FOR UPDATE`.
+  - Use serializable for rules across many rows, and retry when it cancels you.
+
+recall:
+  - id: card-lost-update
+    concept: db.anomalies
+    front: What is a lost update?
+    back: >-
+      Two requests read the same value, each writes back its own result, and one change
+      silently replaces the other.
+  - id: card-read-committed
+    concept: db.read-committed
+    front: What does read committed, Postgres's default, promise each statement?
+    back: It sees only data that was committed before the statement began.
+  - id: card-for-update
+    concept: db.row-locks
+    front: What does `SELECT ... FOR UPDATE` do?
+    back: >-
+      It locks the rows it reads until the transaction ends, so another session wanting to
+      change them waits.
+  - id: card-serializable-retry
+    concept: db.serializable
+    front: What must code do when a serializable transaction is cancelled?
+    back: Roll back and run the whole transaction again from `BEGIN`.
+
+references:
+  - kind: docs
+    title: 13.2. Transaction Isolation
+    authors: The PostgreSQL Global Development Group
+    venue: PostgreSQL 18 documentation
+    url: https://www.postgresql.org/docs/18/transaction-iso.html
+    note: What each level promises, how updates wait at read committed, and serialization failures.
+    primary: true
+    verified: true
+  - kind: docs
+    title: 13.3. Explicit Locking
+    authors: The PostgreSQL Global Development Group
+    venue: PostgreSQL 18 documentation
+    url: https://www.postgresql.org/docs/18/explicit-locking.html
+    note: Row locks, `FOR UPDATE`, and how Postgres detects and breaks deadlocks.
+    verified: true
+  - kind: paper
+    title: A Critique of ANSI SQL Isolation Levels
+    authors: Hal Berenson, Phil Bernstein, Jim Gray, Jim Melton, Elizabeth O'Neil, Patrick O'Neil
+    year: 1995
+    venue: Proceedings of the 1995 ACM SIGMOD International Conference on Management of Data
+    url: https://doi.org/10.1145/223784.223785
+    note: The paper that named lost updates and write skew precisely.
+    verified: true
+
+deepDive: >-
+  Postgres offers three levels in practice. **Read committed**, the default, gives each
+  statement a fresh view. **Repeatable read** gives the whole transaction one view taken at
+  its first statement, and cancels an update of a row someone changed since. **Serializable**
+  adds the read tracking you met here.
+
+
+  The doctors case is called **write skew**: two transactions read the same rows, then each
+  changes a different one, and together they break a rule. Only serializable catches it.
+  The lab's scenario switcher has it.
+
+
+  Job queues use a cousin of `FOR UPDATE`: `SELECT ... FOR UPDATE SKIP LOCKED LIMIT 1` lets many
+  workers each take a different job without waiting. The concurrency chapter builds one.
+
+
+  Retrying needs care. Retry the whole transaction, a few times, with a short random pause.
+  Everything inside it must be safe to run twice, so send emails only after `COMMIT`.

@@ -1,0 +1,246 @@
+summary: >-
+  Python gives you three ways to do more than one thing at once, and the job decides which.
+  asyncio and threads overlap **waiting**: network calls, disk reads, database queries.
+  Processes overlap **computing**, because each process has its own interpreter, its own
+  memory and its own GIL, so they really use several cores.
+
+
+  The GIL, the global interpreter lock, is the twist. In the standard CPython build only
+  the thread holding it runs Python bytecode. A thread lets go while it waits on I/O, and
+  much compiled code, such as NumPy, hashing and compression, lets go while it works. So
+  threads help with waiting and with those libraries, and not with pure-Python loops.
+
+
+  Processes pay for their parallelism. Starting one is slower than starting a thread, and
+  every argument and result is pickled and copied between them. Use them for heavy,
+  chunky work where the computing outweighs the copying. Since Python 3.13 there's also an
+  optional free-threaded build without the GIL, experimental in 3.13 and supported but
+  still not the default in 3.14.
+remember:
+  - For work that waits, use asyncio or threads; for pure-Python work that computes, use processes.
+  - The GIL lets one thread run Python bytecode at a time, and a thread releases it while waiting on I/O or inside much compiled code.
+  - The GIL doesn't make your code thread-safe, so a check-then-update on shared data still needs a `threading.Lock`.
+  - Process pools pickle every function, argument and result, so lambdas and nested functions can't be sent to a worker.
+  - On macOS and Windows new processes start with spawn, which re-imports your main file, hence the `if __name__ == "__main__":` guard.
+  - '`future.result()` re-raises the worker''s exception in your thread, so an error inside a pool is never lost if you collect results.'
+  - Free-threaded CPython removes the GIL as an opt-in build, experimental in 3.13, and an extension not marked safe turns the GIL back on.
+sections:
+  - title: What the GIL protects, and what it doesn't
+    body: |-
+      CPython tracks memory with reference counts on every object. Without a lock, two
+      threads updating the same count at once could corrupt it. The GIL is one big lock that
+      makes those updates safe and keeps single-threaded code fast.
+
+      The interpreter hands the GIL between threads. A thread that blocks on I/O releases it
+      straight away. A thread that computes is asked to release it every few milliseconds,
+      the switch interval, which `sys.getswitchinterval()` reports as 0.005 seconds by
+      default. So threads that compute take turns on one core.
+
+      Taking turns still means switching at points you don't control. The GIL keeps the
+      interpreter's own data consistent. It says nothing about your data. Any sequence of
+      read, decide, write on shared state can interleave with another thread.
+
+      ```python
+      import threading
+      import time
+
+
+      class Stock:
+          def __init__(self, count):
+              self.count = count
+              self.lock = threading.Lock()
+
+          def reserve_unsafe(self):
+              if self.count > 0:
+                  time.sleep(0.05)  # any wait here lets another thread in
+                  self.count -= 1
+                  return True
+              return False
+
+          def reserve(self):
+              with self.lock:  # check and update as one step
+                  if self.count > 0:
+                      time.sleep(0.05)
+                      self.count -= 1
+                      return True
+                  return False
+
+
+      def buy_all(stock, method, buyers=10):
+          threads = [threading.Thread(target=getattr(stock, method)) for _ in range(buyers)]
+          for t in threads:
+              t.start()
+          for t in threads:
+              t.join()
+          return stock.count
+
+
+      print(buy_all(Stock(3), "reserve_unsafe"))  # -7: ten sold from three
+      print(buy_all(Stock(3), "reserve"))  # 0
+      ```
+
+      The sleep makes the race show up every time. In real code the gap is a log line, a
+      network call or nothing at all, and the bug appears once a week in production. Keep
+      the locked section small, and never wait on the network while holding a lock. Often
+      the better design shares nothing: hand work to threads through a `queue.Queue`, which
+      is thread-safe, and let one thread own each piece of state.
+  - title: Thread pools in practice
+    body: |-
+      `ThreadPoolExecutor` is the tool for blocking I/O when you have no async library, or
+      when the rest of your program is synchronous. `map` keeps the input order. `submit`
+      returns a **future** per job, and `as_completed` yields them as they finish, which
+      lets you handle each result or error as it lands.
+
+      ```python
+      import time
+      from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+      def fetch_price(item):
+          time.sleep(0.2)  # waiting on the network releases the GIL
+          if item == "gift card":
+              raise ValueError("no price for gift card")
+          return item, len(item) * 1.5
+
+
+      items = ["lamp", "rug", "gift card", "chair"]
+      started = time.perf_counter()
+      with ThreadPoolExecutor(max_workers=4) as pool:
+          futures = {pool.submit(fetch_price, item): item for item in items}
+          for future in as_completed(futures):
+              try:
+                  print(future.result())  # re-raises the worker's exception here
+              except ValueError as error:
+                  print("failed:", futures[future], error)
+      print(f"{time.perf_counter() - started:.1f}s")  # about 0.2s, not 0.8s
+      ```
+
+      An exception inside a worker is stored on its future. Nothing is printed until you
+      call `result()`, so a pool whose results you never collect fails silently. The `with`
+      block waits for every job before it exits.
+
+      Without `max_workers`, Python 3.13 uses `min(32, os.process_cpu_count() + 4)` threads.
+      For network calls you can go higher, but the limit that matters is usually the other
+      side: a provider's concurrency cap or a database's connection pool.
+
+      Threads or asyncio for waiting? asyncio scales to thousands of concurrent waits with
+      little memory, and cancellation and timeouts are built in. Threads work with any
+      blocking library unchanged. Inside async code, `asyncio.to_thread` gives you the second
+      without leaving the first.
+  - title: Processes, pickling and start methods
+    body: |-
+      A worker process has its own memory, so everything crosses the boundary as bytes.
+      `ProcessPoolExecutor` pickles the function by name, pickles each argument, sends them
+      over a pipe, and pickles the result back. Three rules follow.
+
+      The function must be importable by name: defined at the top level of a module. A
+      lambda, a nested function or a method of a local class can't be pickled.
+
+      ```python
+      import pickle
+      from concurrent.futures import ProcessPoolExecutor
+
+
+      def word_count(text):
+          return len(text.split())
+
+
+      if __name__ == "__main__":
+          texts = ["one two", "three four five"]
+          with ProcessPoolExecutor(max_workers=2) as pool:
+              print(list(pool.map(word_count, texts)))  # [2, 3]
+              try:
+                  list(pool.map(lambda t: len(t.split()), texts))
+              except pickle.PicklingError as error:
+                  print(type(error).__name__)  # PicklingError
+      ```
+
+      Copying costs time, so send small inputs and get small results back. Pass a file path
+      rather than the file's contents, and a summary rather than a large object. For many
+      tiny jobs, `pool.map(fn, items, chunksize=500)` sends them in batches, which cuts the
+      per-job overhead.
+
+      The **start method** decides how a worker begins. `spawn` starts a fresh interpreter
+      and imports your main module, which is why the guard is needed: without it, each
+      worker would run your pool code again. `spawn` is the default on macOS and Windows. On
+      Linux, 3.13 still defaults to `fork`, which copies the parent process as it is,
+      locks and threads' half-finished state included. Python 3.14 moved Linux to
+      `forkserver`. Code written for spawn, guarded and with top-level functions, works
+      everywhere.
+
+      The pool needs your main module to be importable, so it doesn't work from the
+      interactive interpreter, and functions defined in a notebook cell often can't be found
+      by the workers. Put the worker functions in a `.py` module and import them.
+  - title: Free-threaded Python
+    body: |-
+      PEP 703 made the GIL optional. Since Python 3.13 you can install a second build, usually
+      named `python3.13t`, in which threads run Python bytecode in parallel on several cores.
+
+      Be precise about its status. In 3.13 it's experimental: the docs warn of bugs and
+      measure about 40% overhead on the pyperformance suite for single-threaded code. In 3.14
+      it's officially supported, the overhead is down to a few percent, and it's still not the
+      default build. The standard `python3` keeps its GIL.
+
+      A few facts help when you meet it. `sys._is_gil_enabled()` tells you whether the GIL is
+      on right now. `PYTHON_GIL=0` or `-X gil=0` controls it at start-up. Importing a
+      compiled extension that isn't marked as supporting free threading switches the GIL back
+      on, with a warning, so one old dependency can quietly undo the gain.
+
+      Removing the GIL also removes the accidental protection some code relied on. Races that
+      were rare become common, so shared state needs the same locks it always should have
+      had.
+
+      For AI work today, the practical rule stands: asyncio or threads for model calls,
+      processes for pure-Python preprocessing, and vectorised NumPy for number crunching, which
+      often releases the GIL already. Move to free threading when your libraries support it
+      and a measurement shows the gain.
+pitfalls:
+  - '**Threads for pure-Python computing.** They take turns on the GIL, so eight threads run about as fast as one. Use a process pool, or vectorise with NumPy.'
+  - '**Assuming the GIL makes code thread-safe.** Threads switch at points you don''t control, so check-then-update on shared data races. Guard it with a `threading.Lock`, or share nothing and pass messages through a `queue.Queue`.'
+  - '**No `if __name__ == "__main__":` guard.** With spawn, each worker imports your file and tries to start a pool of its own, and Python stops with a `RuntimeError`. Put pool creation behind the guard.'
+  - '**Sending a lambda to a process pool.** It can''t be pickled, so the call fails with `PicklingError`. Define the function at the top level of a module.'
+  - '**Shipping big data to every job.** Each argument is pickled and copied, and the copying can cost more than the work. Send paths or IDs, return small results, and batch with `chunksize`.'
+  - '**Never collecting results.** A worker''s exception waits on its future and is only raised by `result()`. Use `map` or loop over `as_completed` and call `result()` on each.'
+  - '**Holding a lock while waiting.** A network call inside a locked section makes every other thread queue behind it. Do the slow part outside the lock and keep the critical section to the update.'
+interview:
+  - question: Explain the GIL and what it means for concurrency in Python.
+    answer: >-
+      The GIL is a lock in standard CPython that lets only one thread run Python bytecode
+      at a time. It exists because CPython manages memory with reference counts, and one
+      lock keeps those updates safe and single-threaded code fast. A thread releases it
+      while blocked on I/O, and much compiled code such as NumPy and hashing releases it
+      too. So threads overlap waiting well, which is why a thread pool speeds up downloads,
+      but pure-Python computing runs on one core however many threads you add. For that I
+      use processes. Since 3.13 there's an optional free-threaded build without the GIL,
+      experimental in 3.13 and supported in 3.14, but it's not the default and depends on
+      your extensions supporting it.
+  - question: Does the GIL make Python code thread-safe?
+    answer: >-
+      No. It protects the interpreter's internals, not your program's logic. The
+      interpreter switches threads at points you don't control, so an operation like
+      reading a stock count, checking it and writing it back can interleave with another
+      thread doing the same, and you oversell. Even `counter += 1` is a read and a write. Any
+      shared mutable state that more than one thread writes needs a `threading.Lock`
+      around the whole read-decide-write, or a design that shares nothing, such as a
+      `queue.Queue` feeding workers that each own their data. This matters more with
+      free-threaded builds, where races that were rare under the GIL become frequent.
+  - question: You have three jobs. Call a model API 5,000 times, tokenise a million documents in pure Python, and multiply large NumPy matrices. What do you use for each?
+    answer: >-
+      asyncio for the API calls, processes for tokenising, and NumPy's own parallel code for
+      the matrices. The API calls are almost all waiting, so an async client with a
+      semaphore overlaps them on one thread, or a thread pool if the client is synchronous.
+      Tokenising in pure Python is computing, so the GIL rules out threads, and a
+      `ProcessPoolExecutor` with a sensible `chunksize` uses every core. I'd send file paths,
+      not document text, to keep pickling cheap. Matrix multiplication already runs in
+      compiled BLAS code that releases the GIL and often uses several cores itself, so adding
+      processes could make it slower. I'd measure each before tuning.
+  - question: Why does a process pool need the `__main__` guard, and why does it crash only on some machines?
+    answer: >-
+      Because of the spawn start method. Spawn starts a fresh interpreter for each worker
+      and imports your main module to find the function. Without the guard, that import
+      runs the pool creation again, and Python stops it with a `RuntimeError` about the
+      bootstrapping phase. Spawn is the default on macOS and Windows. On Linux, Python 3.13
+      defaults to fork, which copies the running parent instead of re-importing, so the same
+      unguarded script can work there. Fork has its own problem: it copies locks held by
+      other threads, which can deadlock the child. Writing for spawn, guarded and with
+      top-level functions, gives code that runs on every platform.

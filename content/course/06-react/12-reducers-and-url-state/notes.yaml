@@ -1,0 +1,293 @@
+summary: >-
+  This lesson is about two homes for state beyond a plain `useState`. A **reducer** moves the
+  rules for changing state out of scattered handlers and into one pure function,
+  `(state, action) => nextState`. Handlers then only report what happened, and the reducer
+  decides what that means. Because it's a plain function, you test every rule without
+  rendering anything.
+
+
+  **URL state** is for values that a reload or a shared link should carry: the open tab, the
+  search text, the filters, the page number. The address is the one piece of state that
+  travels between browsers, survives a refresh and works with Back and Forward. Keeping those
+  values anywhere else, component state, context or `localStorage`, loses them the moment the
+  link is sent.
+
+
+  Neither is the default. Start with `useState` in the component that uses the value. Reach
+  for a reducer when several values change together under rules that are getting hard to
+  follow, and for the URL when a person would reasonably expect to bookmark or share what
+  they see.
+remember:
+  - A reducer is a pure function from the current state and an action to the next state, and it never changes the state it was given.
+  - Handlers dispatch what happened, and the reducer holds every rule for what that means, so the rules live in one testable place.
+  - React queues dispatched actions and runs each on the latest state, so two dispatches in one handler both apply.
+  - The `dispatch` function keeps the same identity for the life of the component, so it's safe to pass down and to list in dependencies.
+  - Put state in the URL when a reload, a bookmark or a shared link should reproduce the view.
+  - Values from the URL are untrusted strings, so parse and validate them, with a default for anything unexpected.
+  - "`history.replaceState` changes the address without a new history entry and fires no event, so React must be told about the change."
+  - A reducer in one context and `dispatch` in another lets components that only send actions skip renders when the state changes.
+sections:
+  - title: A typed reducer that can't forget an action
+    body: |-
+      In TypeScript, describe the actions as a **discriminated union**: every action has a
+      `type` string, and each type carries its own fields. Inside a `switch` on
+      `action.type`, TypeScript narrows the action, so `action.qty` exists only in the case
+      that has it. A `never` check in the `default` branch turns a forgotten case into a
+      compile error.
+
+      ```ts
+      type CartItem = { id: string; name: string; price: number; qty: number };
+      export type CartState = { items: CartItem[]; coupon: string | null };
+
+      export type CartAction =
+        | { type: 'added'; item: { id: string; name: string; price: number } }
+        | { type: 'quantity-changed'; id: string; qty: number }
+        | { type: 'removed'; id: string }
+        | { type: 'coupon-applied'; code: string };
+
+      export function cartReducer(state: CartState, action: CartAction): CartState {
+        switch (action.type) {
+          case 'added': {
+            const existing = state.items.find((item) => item.id === action.item.id);
+            const items = existing
+              ? state.items.map((item) => (item.id === action.item.id ? { ...item, qty: item.qty + 1 } : item))
+              : [...state.items, { ...action.item, qty: 1 }];
+            return { ...state, items };
+          }
+          case 'quantity-changed': {
+            // One rule, in one place: a quantity of zero or less removes the line.
+            const items =
+              action.qty <= 0
+                ? state.items.filter((item) => item.id !== action.id)
+                : state.items.map((item) => (item.id === action.id ? { ...item, qty: action.qty } : item));
+            return { ...state, items };
+          }
+          case 'removed':
+            return { ...state, items: state.items.filter((item) => item.id !== action.id) };
+          case 'coupon-applied':
+            return { ...state, coupon: action.code.trim().toUpperCase() };
+          default: {
+            // If a new action type is added to CartAction and not handled, this line stops compiling.
+            const unhandled: never = action;
+            throw new Error(`Unknown action: ${JSON.stringify(unhandled)}`);
+          }
+        }
+      }
+
+      const empty: CartState = Object.freeze({ items: [], coupon: null });
+      let s = cartReducer(empty, { type: 'added', item: { id: 'mug', name: 'Mug', price: 8 } });
+      s = cartReducer(s, { type: 'added', item: { id: 'mug', name: 'Mug', price: 8 } });
+      console.log(s.items); // [{ id: 'mug', name: 'Mug', price: 8, qty: 2 }]
+      s = cartReducer(s, { type: 'quantity-changed', id: 'mug', qty: 0 });
+      console.log(s.items.length); // 0
+      console.log(cartReducer(s, { type: 'coupon-applied', code: ' spring10 ' }).coupon); // 'SPRING10'
+      ```
+
+      Name actions after what happened (`added`, `quantity-changed`), not after the state
+      change you expect (`set-items`). An event name keeps the decision in the reducer. A
+      `set-items` action pushes the logic back into every handler, which is the mess the
+      reducer was meant to remove.
+  - title: What React does with a dispatch
+    body: |-
+      `dispatch(action)` doesn't change anything straight away. It queues the action and
+      asks React to render. On that render, React runs the reducer once per queued action,
+      each on the result of the previous one. That's why two `add` dispatches in one click
+      give 2, where two `setCount(count + 1)` calls give 1: an action behaves like an
+      updater function, not like a fixed value.
+
+      Three consequences are worth knowing.
+
+      - **The reducer must be pure.** In development, Strict Mode calls your reducer twice
+        per action to catch impurity. A reducer that pushes into the old array, calls
+        `fetch` or reads the clock shows the bug at once. Side effects go in the handler
+        or an effect, never in the reducer.
+      - **Returning the same state skips the render.** React compares the old and new state
+        with `Object.is`. If the reducer returns `state` unchanged, for example for an
+        action that doesn't apply, React can bail out of rendering the children.
+      - **Lazy initial state.** `useReducer(reducer, initialArg, init)` calls
+        `init(initialArg)` once, on the first render. Use it when building the first state
+        is expensive, such as parsing a saved draft, instead of doing the work on every
+        render and throwing it away.
+
+      Reading state right after `dispatch` in the same handler gives you the old value, for
+      the same snapshot reason as `useState`. If you need the next state there, compute it
+      by calling the reducer yourself: `cartReducer(cart, action)`.
+  - title: URL state as an external store
+    body: |-
+      The address bar is state that lives outside React. The React way to read such state is
+      `useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot)`. One wrinkle: Back and
+      Forward fire `popstate`, but `history.replaceState` and `pushState` fire nothing, so the
+      writer announces its own change.
+
+      ```tsx
+      import { useSyncExternalStore } from 'react';
+
+      const CHANGE = 'searchparamschange';
+
+      function subscribe(onChange: () => void) {
+        // popstate covers Back and Forward; our own event covers replaceState, which fires nothing.
+        window.addEventListener('popstate', onChange);
+        window.addEventListener(CHANGE, onChange);
+        return () => {
+          window.removeEventListener('popstate', onChange);
+          window.removeEventListener(CHANGE, onChange);
+        };
+      }
+
+      export function useSearchParam(name: string): string | null {
+        return useSyncExternalStore(
+          subscribe,
+          () => new URLSearchParams(location.search).get(name), // a string or null: stable between checks
+          () => null, // on the server there is no location, so render the default
+        );
+      }
+
+      export function setSearchParam(name: string, value: string | null) {
+        const params = new URLSearchParams(location.search);
+        if (value === null) params.delete(name);
+        else params.set(name, value);
+        const query = params.toString();
+        history.replaceState(null, '', query ? `?${query}` : location.pathname);
+        window.dispatchEvent(new Event(CHANGE));
+      }
+
+      const TABS = ['details', 'reviews', 'delivery'] as const;
+      type Tab = (typeof TABS)[number];
+
+      // The address is input from outside: anyone can type ?tab=banana.
+      function parseTab(value: string | null): Tab {
+        return TABS.find((tab) => tab === value) ?? 'details';
+      }
+
+      export function ProductTabs() {
+        const tab = parseTab(useSearchParam('tab'));
+        return (
+          <div>
+            {TABS.map((name) => (
+              <button key={name} aria-pressed={tab === name} onClick={() => setSearchParam('tab', name)}>
+                {name}
+              </button>
+            ))}
+            <p>Showing {tab}</p>
+          </div>
+        );
+      }
+      ```
+
+      We tested it: `?tab=banana&x=1` shows details, clicking reviews gives
+      `?tab=reviews&x=1` and keeps the other parameter, and a `popstate` updates the view.
+      The snapshot returns a string, not a `URLSearchParams` object. A new object on every
+      call would look like a change on every check, and React would render in a loop.
+
+      There's no `useState` copy of the tab at all. The URL is the single source of truth,
+      so it can't drift from what's on screen. In Next.js you'd use the framework's own
+      `useSearchParams` and router instead of writing this.
+  - title: Reducer and context together
+    body: |-
+      When many components deep in a tree read and change the same state, pair the reducer
+      with context. Put the state in one context and `dispatch` in another. `dispatch`
+      never changes identity, so components that only send actions don't render again when
+      the state changes. We tested this: an Add button that reads only the dispatch context
+      rendered once across two clicks, while the item count updated.
+
+      ```tsx
+      import { createContext, use, useReducer, type Dispatch, type ReactNode } from 'react';
+      import { cartReducer, type CartAction, type CartState } from './cart-reducer';
+
+      const CartContext = createContext<CartState | null>(null);
+      const CartDispatchContext = createContext<Dispatch<CartAction> | null>(null);
+
+      export function CartProvider({ children }: { children: ReactNode }) {
+        const [cart, dispatch] = useReducer(cartReducer, { items: [], coupon: null });
+        return (
+          <CartContext value={cart}>
+            <CartDispatchContext value={dispatch}>{children}</CartDispatchContext>
+          </CartContext>
+        );
+      }
+
+      export function useCart(): CartState {
+        const cart = use(CartContext);
+        if (cart === null) throw new Error('useCart must be used inside CartProvider');
+        return cart;
+      }
+
+      export function useCartDispatch(): Dispatch<CartAction> {
+        const dispatch = use(CartDispatchContext);
+        if (dispatch === null) throw new Error('useCartDispatch must be used inside CartProvider');
+        return dispatch;
+      }
+      ```
+
+      React 19 lets you render a context object as its own provider,
+      `<CartContext value={cart}>`, and read it with `use`. The `null` default plus the throwing hook turns
+      "forgot the provider" into a clear error instead of a crash deep in a component.
+
+      Don't reach for this first. For state that two siblings share, lifting it to their
+      parent is shorter and clearer. Context earns its place when many distant components
+      need the same value.
+pitfalls:
+  - >-
+    **Mutating state inside the reducer.** `state.items.push(item); return state;` returns
+    the same object, so React sees no change and skips the render, and Strict Mode's second
+    call adds the item twice. Build new arrays and objects with spread, `map` and `filter`.
+  - >-
+    **Side effects in the reducer.** A `fetch` or a `localStorage` write in a reducer runs
+    twice in development and can run at surprising times. Keep the reducer pure and do the
+    effect in the handler.
+  - >-
+    **Actions named like setters.** `{ type: 'set-total', total }` makes every handler work
+    out the total again, so the rules scatter. Dispatch what happened and let the reducer
+    derive the rest.
+  - >-
+    **Trusting the query string.** `?page=-3` or `?sort=drop` arrives as a string anyone can
+    type. Parse it into your own type, clamp or fall back to a default, and never pass it
+    straight to a query.
+  - >-
+    **Copying URL state into `useState`.** A copy stops following the address when someone
+    presses Back. Read the value from the URL on every render instead.
+  - >-
+    **`pushState` on every keystroke.** Typing a search adds one history entry per letter, so
+    Back steps through `c`, `co`, `cof`. Use `replaceState` while typing, and `pushState` for
+    deliberate moves like changing page.
+interview:
+  - question: When would you choose useReducer over useState?
+    answer: >-
+      When several values change together under rules, or when the next state depends on the
+      previous one in more than a trivial way. A checkout with items, a coupon and a shipping
+      option is a good case: adding an item, changing a quantity to zero and applying a coupon
+      each touch several fields, and with `useState` those rules spread across handlers. A
+      reducer puts them in one pure function, handlers dispatch events like `quantity-changed`,
+      and I can unit test every rule without rendering. With a discriminated union for actions
+      and a `never` check, TypeScript tells me when I forget one. For a single toggle or a text
+      field, `useState` is shorter and a reducer is ceremony.
+  - question: Which state belongs in the URL, and how do you keep it in sync?
+    answer: >-
+      Anything a person would expect a reload, a bookmark or a shared link to keep: search
+      text, filters, sort order, the open tab, the page number. The URL should be the only
+      source of truth for those, not a copy in component state, so Back and Forward work for
+      free. I read the value on every render, parse and validate it because it's untrusted
+      text, and write with `replaceState` for typing and `pushState` for deliberate navigation.
+      Outside a framework I'd subscribe with `useSyncExternalStore`, listening for `popstate`
+      and my own change event. In Next.js I'd use its `useSearchParams` and router. Things like
+      a hover state or an unsaved draft don't belong there.
+  - question: Why must a reducer be pure, and how does React enforce it?
+    answer: >-
+      Because React decides when and how often to run it. Dispatches are queued and applied
+      during the next render, React may render more than once before committing, and Strict
+      Mode deliberately calls the reducer twice in development. A pure reducer gives the same
+      answer each time, so none of that matters. An impure one shows up as duplicated items
+      when it mutates, or double network calls when it fetches. Purity also buys testability:
+      a reducer is a function I can call in a plain unit test with a frozen state to prove it
+      never mutates. Side effects go in the event handler that dispatched, or in an effect that
+      reacts to the new state.
+  - question: How would you share a reducer's state across a deep component tree without extra renders?
+    answer: >-
+      Put the state and `dispatch` in two separate contexts. `dispatch` keeps the same identity
+      for the component's whole life, so components that only send actions read a context
+      value that never changes and don't render again when the state does. Components that
+      read the state still update. I'd wrap each context in a small hook that throws if the
+      provider is missing, so mistakes fail loudly. If one state context grew large and many
+      components read small parts of it, I'd split it further or use an external store with
+      selectors. And I'd check first whether lifting state to a common parent is enough, since
+      that needs no context at all.

@@ -1,0 +1,265 @@
+summary: >-
+  Kubernetes runs containers across a cluster of machines and keeps them matching what you
+  declared. You write objects such as a Deployment and a Service; controllers compare them
+  with what's running and act on the difference, over and over. That loop is why a deleted
+  Pod comes back, why a failing node's work moves elsewhere, and why a release whose Pods
+  never become ready stops before users see it.
+
+
+  The pieces that matter day to day are few: a Deployment for the Pods and their rollout, a
+  Service for a stable address, probes that tell the cluster when a container is ready or
+  stuck, and resource requests and limits that decide where Pods fit and when they're
+  killed. Get those right and most services run well.
+
+
+  These notes add a complete production-shaped manifest, what the control plane does with
+  it, how requests and limits turn into quality-of-service classes, how to shut down
+  without dropping requests, and how configuration, secrets, outside traffic and
+  autoscaling fit in. The lesson's closing point stands: for a small team, a managed
+  platform usually gives the same healing and rollouts without a cluster to run.
+remember:
+  - Kubernetes is a set of control loops that keep reality matching the declared state, so you change the declaration, not the containers.
+  - A Deployment manages ReplicaSets, which manage Pods, and a rollout creates a new ReplicaSet and shifts Pods to it step by step.
+  - A Service selects Pods by label and sends traffic only to those passing their readiness probe.
+  - Readiness decides traffic, liveness decides restarts, and a startup probe protects slow starters, so liveness never checks dependencies.
+  - The scheduler places Pods by their requests, going over the memory limit kills the container, and going over the CPU limit throttles it.
+  - On shutdown a Pod gets `SIGTERM` while it's removed from endpoints, so the app finishes requests in flight and exits within the grace period, 30 seconds by default.
+  - Secrets are base64-encoded, not encrypted, unless the cluster turns on encryption at rest, so access to them is controlled with RBAC.
+sections:
+  - title: A complete Deployment and Service
+    body: |-
+      The lesson's snippets left fields out to stay short. A real manifest needs an
+      `apiVersion`, a `selector` that matches the Pod labels, and usually a rollout strategy,
+      probes and resources. This passes `kubeconform -strict` against the Kubernetes schemas.
+
+      ```yaml
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: orders
+      spec:
+        replicas: 3
+        selector:
+          matchLabels: { app: orders }
+        strategy:
+          type: RollingUpdate
+          rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }
+        template:
+          metadata:
+            labels: { app: orders }
+          spec:
+            terminationGracePeriodSeconds: 30
+            containers:
+              - name: orders
+                image: registry.example/orders:2.4.0
+                ports:
+                  - containerPort: 8080
+                env:
+                  - name: DATABASE_URL
+                    valueFrom:
+                      secretKeyRef: { name: orders-secrets, key: database-url }
+                resources:
+                  requests: { cpu: 250m, memory: 256Mi }
+                  limits: { memory: 512Mi }
+                startupProbe:
+                  httpGet: { path: /live, port: 8080 }
+                  periodSeconds: 2
+                  failureThreshold: 30
+                readinessProbe:
+                  httpGet: { path: /ready, port: 8080 }
+                  periodSeconds: 5
+                livenessProbe:
+                  httpGet: { path: /live, port: 8080 }
+                  periodSeconds: 10
+                  failureThreshold: 3
+                lifecycle:
+                  preStop:
+                    exec: { command: ['sleep', '5'] }
+      ---
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: orders
+      spec:
+        selector: { app: orders }
+        ports:
+          - port: 80
+            targetPort: 8080
+      ```
+
+      `maxUnavailable: 0` with `maxSurge: 1` means a rollout adds one new Pod, waits for it
+      to be ready, then removes one old Pod, so capacity never drops. The **startup probe**
+      gives a slow starter up to 60 seconds (30 tries every 2 seconds); liveness and
+      readiness checks begin only after it passes. The image tag is a specific version, so
+      a rollback means pointing back at a known image.
+  - title: What the control plane does with it
+    body: |-
+      `kubectl apply` sends the objects to the **API server**, which validates them and
+      stores them in **etcd**, the cluster's database. Nothing runs yet. Everything else
+      watches the API server and reacts.
+
+      - The **Deployment controller** sees a Deployment with no matching ReplicaSet and
+        creates one. A **ReplicaSet** keeps a fixed number of identical Pods.
+      - The **ReplicaSet controller** sees zero Pods where three are wanted and creates three
+        Pod objects.
+      - The **scheduler** sees Pods with no node and picks one for each, based on their
+        requests and each node's free capacity.
+      - The **kubelet** on each chosen node sees a Pod assigned to it, pulls the image, starts
+        the container and runs the probes.
+      - The **EndpointSlice controller** adds each ready Pod's address to the Service, and
+        the node's proxy, usually kube-proxy, routes Service traffic to those addresses.
+
+      Changing the image triggers a rollout: the Deployment controller creates a second
+      ReplicaSet with the new template and scales it up while scaling the old one down,
+      within `maxSurge` and `maxUnavailable`. Old ReplicaSets are kept, scaled to zero,
+      which is why `kubectl rollout undo` is fast: it scales an old one back up.
+
+      Every component works the same way: watch the desired state, compare, act, repeat.
+      No component calls another directly. That's why the system heals: if a node dies,
+      its Pods disappear, the ReplicaSet counts too few, and new Pods are scheduled
+      elsewhere without anyone being paged.
+  - title: Requests, limits and quality of service
+    body: |-
+      **Requests** are a reservation. The scheduler adds up the requests on each node and
+      only places a Pod where its requests fit. A Pod that requests too little gets packed
+      onto a busy node; one that requests too much wastes money and can stay `Pending`.
+
+      **Limits** are a ceiling, enforced differently per resource. Memory can't be taken
+      back, so a container over its memory limit is killed, `OOMKilled` with exit code 137.
+      CPU can be shared out over time, so a container over its CPU limit is throttled: it
+      keeps running, slower. Throttling shows up as latency, not errors, which makes it hard
+      to spot.
+
+      The combination gives each Pod a **quality-of-service class**:
+
+      - **Guaranteed**: every container sets requests equal to limits for both CPU and
+        memory. These are the last to be evicted when a node runs short.
+      - **Burstable**: at least one request or limit is set, but not equal. Most apps land
+        here, like the manifest above.
+      - **BestEffort**: nothing set. First to be evicted under pressure.
+
+      A common practice, though not universal, is to set memory requests and limits
+      carefully, set a CPU request, and leave out the CPU limit so a Pod can use idle CPU
+      instead of being throttled. Set requests from measurements: run a load test and watch
+      real usage, then request a little above the typical figure and limit memory
+      comfortably above the peak.
+
+      Node.js needs one extra step: its heap limit is set by the runtime, so align it with
+      the container limit, for example with `--max-old-space-size`, leaving room for memory
+      outside the heap.
+  - title: Shutting down without dropping requests
+    body: |-
+      When a Pod is deleted, during a rollout or a scale-down, two things start at the same
+      time. The kubelet runs the `preStop` hook and then sends `SIGTERM` to the container.
+      And the Pod is removed from the Service's endpoints, which takes a moment to reach
+      every node's proxy. If the app exits at once, requests routed in that moment fail.
+
+      The fix has two parts. The `preStop` sleep in the manifest holds `SIGTERM` back for a
+      few seconds while routing catches up. It needs a `sleep` binary in the image, so
+      minimal images may need another approach. Then the app handles `SIGTERM` by draining:
+
+      ```js
+      import http from 'node:http';
+
+      let shuttingDown = false;
+
+      const server = http.createServer((req, res) => {
+        if (req.url === '/live') return res.end('ok');
+        if (req.url === '/ready') {
+          res.statusCode = shuttingDown ? 503 : 200;
+          return res.end(shuttingDown ? 'draining' : 'ok');
+        }
+        res.end('hello');
+      });
+
+      server.listen(8080);
+
+      process.on('SIGTERM', () => {
+        shuttingDown = true; // readiness now fails, so no new traffic is sent here
+        server.close(() => process.exit(0)); // finish requests in flight, then exit
+        setTimeout(() => process.exit(1), 25_000).unref(); // give up before the grace period ends
+      });
+      ```
+
+      Tested in Node 24: after `SIGTERM` the process exited with code 0. If the process is
+      still running when `terminationGracePeriodSeconds` runs out, the kubelet sends
+      `SIGKILL`, so the safety timer exits first and the grace period covers the `preStop`
+      sleep plus the longest request you expect.
+
+      One detail: the app must receive the signal. If a shell script starts Node without
+      `exec`, the shell gets `SIGTERM` and Node never does. Start the process directly in the
+      Dockerfile's `CMD` in exec form.
+  - title: Configuration, outside traffic and autoscaling
+    body: |-
+      A few more objects complete a typical service.
+
+      - **ConfigMap** holds non-secret settings, injected as environment variables or files.
+        Changing it doesn't restart Pods by itself; environment variables are read at start,
+        so roll the Deployment to pick changes up.
+      - **Secret** holds credentials. Its values are base64-encoded, which is an encoding, not
+        encryption. Turn on encryption at rest for etcd, limit who can read Secrets with
+        RBAC, and consider syncing them from a cloud secret manager.
+      - **Ingress** or the newer **Gateway API** route outside HTTP traffic to Services by
+        host and path, with TLS. A controller does the actual work, and it must be installed
+        separately.
+      - **HorizontalPodAutoscaler** changes a Deployment's replica count to keep a metric,
+        such as average CPU against requests, near a target, within a minimum and maximum.
+      - **PodDisruptionBudget** limits how many Pods of a service may be down at once during
+        voluntary disruptions, such as a node being drained for an upgrade.
+
+      Each is a small YAML object, and each is one more thing to learn, secure and upgrade.
+      That's the honest cost behind the lesson's advice: a cluster suits organisations with
+      many services and a team to run it, and a managed container platform suits most
+      others.
+pitfalls:
+  - '**Liveness probes that check dependencies.** A database blip then restarts every Pod at once. Liveness checks only that the process responds; dependencies belong in readiness, or nowhere.'
+  - '**No readiness probe.** Pods get traffic before they can serve it, and a broken release goes straight to users. Always define readiness, and keep it honest.'
+  - '**Missing or guessed resource requests.** Pods get packed onto busy nodes or never fit. Measure under load and set requests from real usage, with a memory limit above the peak.'
+  - '**Using `latest` as the image tag.** You can''t tell what''s running or roll back to a known version. Tag images with a version or commit, or pin by digest.'
+  - '**Exiting at once on `SIGTERM`.** Requests still routed to the Pod fail during every rollout. Add a short `preStop` delay, fail readiness, drain and then exit.'
+  - '**Treating Secrets as encrypted.** Base64 is readable by anyone who can read the object. Enable encryption at rest and restrict access with RBAC.'
+  - '**Running a cluster for a three-person team.** Upgrades, networking and security become a second job. Use a managed container platform until scale or team size justifies a cluster.'
+interview:
+  - question: Explain what happens when you run `kubectl apply` on a Deployment.
+    answer: >-
+      The API server validates the object and stores it in etcd, and then a chain of
+      controllers reconciles it. The Deployment controller creates a ReplicaSet for the Pod
+      template. The ReplicaSet controller creates Pod objects to reach the replica count. The
+      scheduler assigns each Pod to a node whose free capacity fits its requests. The kubelet
+      on that node pulls the image, starts the containers and runs the probes. Once readiness
+      passes, the Pod's address is added to the Service's endpoints and it gets traffic. No
+      component calls another; each watches the API server and closes a gap, which is why the
+      system heals. On an image change, a new ReplicaSet scales up while the old scales down.
+  - question: What is the difference between liveness, readiness and startup probes?
+    answer: >-
+      Readiness controls traffic, liveness controls restarts, and startup delays both. A
+      failing readiness probe removes the Pod from its Service, which protects users during
+      start-up, overload or a bad release, and holds a rollout. A failing liveness probe
+      restarts the container, which only helps if the process itself is stuck, such as a
+      deadlock. A startup probe gives slow starters time before liveness can kill them. The
+      classic mistake is a liveness probe that checks the database: when the database blips,
+      every Pod restarts at once, adding a restart storm to the outage. I'd keep liveness to
+      "does this process answer", and put dependency checks in readiness only when shedding
+      traffic helps.
+  - question: How do resource requests and limits work, and how would you set them?
+    answer: >-
+      Requests are reservations the scheduler uses for placement; limits are ceilings the
+      node enforces. Over the memory limit, the container is OOM-killed; over the CPU limit,
+      it's throttled, which shows as latency. Their combination sets the QoS class, which
+      decides eviction order when a node runs short. I'd set them from measurements: load
+      test, watch real usage, request slightly above the typical level, and set the memory
+      limit comfortably above the peak, aligning Node's heap limit with it. Many teams skip
+      CPU limits so Pods can use idle CPU, keeping the CPU request for fair scheduling. The
+      trade-off is density against safety: tight requests pack more Pods per node, but risk
+      noisy neighbours.
+  - question: How do you get a zero-downtime rolling update on Kubernetes?
+    answer: >-
+      Four things together. A rolling strategy with `maxUnavailable: 0` and a small
+      `maxSurge`, so capacity never drops. An honest readiness probe, so new Pods get traffic
+      only when they can serve it and a broken release stalls instead of spreading. Graceful
+      shutdown: a short `preStop` delay while endpoint removal reaches every node, then the
+      app fails readiness, finishes requests in flight on `SIGTERM` and exits within the
+      grace period. And backward-compatible changes, because old and new Pods serve traffic
+      side by side, so database migrations follow expand and contract. A PodDisruptionBudget
+      covers node drains too. The trade-off is a slower rollout, which is the price of never
+      dropping a request.

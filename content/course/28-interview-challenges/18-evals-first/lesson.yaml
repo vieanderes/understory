@@ -1,0 +1,303 @@
+id: interview.evals-first
+title: "Evals first"
+objective: "Start an AI build with a small golden set, measure retrieval and answers separately, and gate changes on the results."
+level: advanced
+minutes: 10
+concepts: [interview.golden-set, interview.retrieval-metrics]
+prerequisites: [ai.evals]
+opening:
+  text: >-
+    You'll start an AI build the way reviewers hope to see: with a small set of real questions
+    and a script that scores them. It turns "it looks fine" into numbers you can defend.
+
+steps:
+  - type: prose
+    id: name-golden-set
+    body: >-
+      What you need: **RAG**, retrieval-augmented generation. Your code finds the **chunks**
+      (short passages) of your documents that best match a question. The model answers
+      from those.
+
+
+      Before any of that code, write 10 to 30 real questions. For each, note the chunk ids
+      that answer it and the facts a good answer must contain. Add a few the documents
+      can't answer. That's a **golden set**.
+
+  - type: multiple-choice
+    id: pick-first-thing
+    concept: interview.golden-set
+    difficulty: 1
+    question: A four-hour take-home asks for a chatbot over some manuals. What do you write first?
+    choices:
+      - text: Ten real questions with expected answers
+        correct: true
+        feedback: >-
+          Right. They define done, and every later change is measured against them.
+      - text: The vector database setup
+        feedback: >-
+          Infrastructure feels like progress. Without questions to test, you can't tell if
+          retrieval works.
+      - text: The chat interface
+        feedback: >-
+          A UI shows that it runs, not that it's right. Questions with answers show that.
+      - text: The system prompt
+        feedback: >-
+          Tuning a prompt with nothing to test it on is guessing. Write the checks first.
+
+  - type: prose
+    id: name-retrieval-metrics
+    body: >-
+      Score retrieval with two numbers per question. **Recall at k**: of the chunks that
+      answer it, what share made the top k? **Reciprocal rank**: 1 over the position of the
+      first right chunk, so first place scores 1 and second scores a half.
+
+
+      Average them over the golden set. The mean reciprocal rank is called MRR.
+
+  - type: fill-blank
+    id: fill-retrieval-scores
+    concept: interview.retrieval-metrics
+    difficulty: 2
+    prompt: Complete the two retrieval scores for one golden-set question.
+    language: ts
+    template: |
+      function scoreRetrieval(relevant: string[], retrieved: string[], k: number) {
+        const top = retrieved.slice(0, {{1}});
+        const found = relevant.filter((id) => top.{{2}}(id)).length;
+        const recall = found / relevant.length;
+        const first = top.findIndex((id) => relevant.includes(id));
+        const reciprocalRank = first === -1 ? 0 : 1 / ({{3}});
+        return { recall, reciprocalRank };
+      }
+    blanks:
+      - key: '1'
+        answer: k
+      - key: '2'
+        answer: includes
+      - key: '3'
+        answer: first + 1
+    bank: [k, retrieved.length, includes, push, first + 1, first, first - 1]
+
+  - type: multiple-choice
+    id: pick-where-to-look
+    concept: interview.retrieval-metrics
+    difficulty: 3
+    question: Recall at 5 is 0.95, yet answers often miss the key fact. Where do you look first?
+    choices:
+      - text: The prompt and how chunks are used
+        correct: true
+        feedback: >-
+          Right. The chunks arrive, and the answer step drops them. Fix generation.
+      - text: The embedding model
+        feedback: >-
+          Retrieval already finds the right chunk 95% of the time. New embeddings won't fix
+          the answers.
+      - text: The chunk size
+        feedback: >-
+          Chunking shapes what's retrieved, and retrieval scores well. The loss happens after
+          that.
+      - text: Raise k to 20
+        feedback: >-
+          More chunks means more noise in the prompt. The right one is already there.
+
+  - type: prose
+    id: answer-checks
+    body: >-
+      Score answers apart from retrieval: the key facts are there, a citation is present,
+      and it refuses when it should. When a score drops, you know which half to fix.
+
+
+      Facts and citations are string checks. For fuzzier qualities, an **LLM judge**, a
+      model asked to grade, scales better. But judges tend to favour whichever answer they
+      read first. That's **position bias**.
+
+  - type: ai-review
+    id: review-judge-order
+    concept: interview.golden-set
+    difficulty: 3
+    language: ts
+    request: Ask a judge model whether the new prompt's answer beats the current one.
+    flawClass: logic
+    code: |
+      async function prefer(question: string, current: string, candidate: string) {
+        const verdict = await judge(
+          `Question: ${question}\nAnswer A: ${candidate}\nAnswer B: ${current}\nReply A or B.`,
+        );
+        return verdict.trim() === 'A' ? 'candidate' : 'current';
+      }
+    prompt: >-
+      An assistant wrote this. The new prompt wins 70% of comparisons. Swap A and B by hand
+      and it wins 45%. Tap the line at fault.
+    lines: [3]
+    reasons:
+      - text: The candidate always sits in the favoured first slot
+        correct: true
+        feedback: >-
+          Yes. Judge both orders and keep only verdicts that agree.
+      - text: The judge should reply with a score, not a letter
+        feedback: >-
+          Scores drift too. The bias comes from which answer is read first.
+      - text: '`trim` hides the judge''s reasoning'
+        feedback: >-
+          It only removes spaces round the letter. The order is what tilts the result.
+    fix: |
+      const asA = await judge(ask(question, candidate, current)); // candidate first
+      const asB = await judge(ask(question, current, candidate)); // candidate second
+      if (asA.trim() === 'A' && asB.trim() === 'B') return 'candidate';
+      if (asA.trim() === 'B' && asB.trim() === 'A') return 'current';
+      return 'tie';
+
+  - type: ai-review
+    id: review-averaged-gate
+    concept: interview.retrieval-metrics
+    difficulty: 4
+    language: ts
+    request: Fail the build when a change makes the evals worse than on main.
+    flawClass: logic
+    code: |
+      type Metrics = { recallAtK: number; mrr: number; refusalAccuracy: number };
+
+      // true means the change may merge
+      function gate(baseline: Metrics, current: Metrics, tolerance = 0.02): boolean {
+        const score = (m: Metrics) => (m.recallAtK + m.mrr + m.refusalAccuracy) / 3;
+        return score(baseline) - score(current) <= tolerance;
+      }
+    prompt: >-
+      An assistant wrote this. In tests every metric fell together, and the gate failed. Then
+      a prompt change cut refusal accuracy from 0.9 to 0.65, and it passed. Tap the line at
+      fault.
+    lines: [5]
+    reasons:
+      - text: One metric's gain hides another's drop
+        correct: true
+        feedback: >-
+          Yes. Retrieval rose while refusals fell, so the average went up. Gate each metric.
+      - text: The tolerance should be 0
+        feedback: >-
+          Zero fails on noise. And here the average rose, so no tolerance would catch it.
+      - text: It should compare with `<`, not `<=`
+        feedback: >-
+          That only moves the exact boundary. The 0.25 drop is hidden inside an average.
+    fix: |
+      function gate(baseline: Metrics, current: Metrics, tolerance = 0.02): boolean {
+        const keys = ['recallAtK', 'mrr', 'refusalAccuracy'] as const;
+        return keys.every((key) => baseline[key] - current[key] <= tolerance);
+      }
+
+  - type: code-challenge
+    id: write-run-evals
+    concept: interview.retrieval-metrics
+    difficulty: 4
+    language: ts
+    prompt: >-
+      Write `runEvals(cases, system, k)`. The tests pass a fake system that returns scripted
+      outputs.
+
+
+      Run the system on every case. Over the cases with `relevant` ids, average recall at `k`
+      and reciprocal rank within the top `k`. With no such cases, both are 0.
+
+
+      `refusalAccuracy` is the share of all cases where the trimmed answer is `REFUSAL`
+      exactly when `relevant` is empty.
+
+
+      Then list each case's first failing answer check, in this order: `should refuse`,
+      `should answer`, `missing: <fact>` (ignoring case), `no citation`.
+    hints:
+      - Collect every output with `Promise.all`, then walk the cases and outputs together.
+      - Put the answer checks in a helper that returns the first failing reason, or `null`.
+      - Reciprocal rank is `1 / (index + 1)` for the first relevant id in the top k, or 0.
+
+  - type: explain-back
+    id: explain-evals-first
+    concept: interview.golden-set
+    difficulty: 4
+    prompt: Why write the golden set before you build, rather than once it works?
+    rubric:
+      - Written afterwards, the questions drift towards what the system already handles.
+      - It defines what done means, so scope and trade-offs have a target.
+      - Every change is measured from the start, so a regression shows up as a number.
+    modelAnswer: >-
+      Questions written after the build tend to be ones it already handles, so they prove
+      little. Written first, they say what done means and guide what to build. And every change
+      from then on is measured. A prompt tweak that breaks refusals shows up as a number, not
+      as a surprise in the demo.
+
+recap:
+  - Write a golden set of real questions, including ones to refuse, before building.
+  - Measure retrieval with recall at k and MRR, apart from answer checks.
+  - Gate every metric on its own, and check an LLM judge against people.
+recall:
+  - id: card-golden-case
+    concept: interview.golden-set
+    front: What does one case in a RAG golden set record?
+    back: >-
+      The question, the chunk ids that answer it, the facts a good answer must contain, and
+      whether it should be refused.
+  - id: card-recall-vs-mrr
+    concept: interview.retrieval-metrics
+    front: What does recall at k measure that reciprocal rank doesn't?
+    back: >-
+      How many of the right chunks made the top k. Reciprocal rank only looks at how high the
+      first right one sits.
+  - id: card-keep-apart
+    concept: interview.retrieval-metrics
+    front: Why score retrieval apart from the answers?
+    back: >-
+      So a drop points at one half. Good retrieval with bad answers means fix generation, and
+      the reverse means fix search.
+  - id: card-judge-caveats
+    concept: interview.golden-set
+    front: Name two checks before you trust an LLM judge.
+    back: >-
+      Swap the order of the answers to cancel position bias, and compare its verdicts with
+      human labels on a sample.
+
+references:
+  - kind: paper
+    title: Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena
+    authors: Zheng, Chiang, Sheng et al.
+    year: 2023
+    venue: NeurIPS 2023 Datasets and Benchmarks
+    url: https://arxiv.org/abs/2306.05685
+    note: Position, verbosity and self-enhancement bias in LLM judges, and how to reduce them.
+    primary: true
+    verified: true
+  - kind: book
+    title: Evaluation in information retrieval
+    authors: Manning, Raghavan and Schütze
+    year: 2008
+    venue: Introduction to Information Retrieval, chapter 8, Cambridge University Press
+    url: https://nlp.stanford.edu/IR-book/html/htmledition/evaluation-in-information-retrieval-1.html
+    note: Recall, precision and ranked retrieval metrics, defined carefully.
+    primary: true
+    verified: true
+  - kind: essay
+    title: Your AI Product Needs Evals
+    authors: Hamel Husain
+    year: 2024
+    url: https://hamel.dev/blog/posts/evals/
+    note: Why evals come first, and how to grow them from real failures.
+    verified: true
+
+deepDive: >-
+  One AI start-up says it plainly: it's a red flag if a candidate doesn't start with evals.
+  In a take-home, a small golden set and a script that prints the numbers take half an hour.
+  They also give your presentation its evidence slide.
+
+
+  How big? Ten questions is enough to start. Thirty covers the main paths and a few nasty
+  ones. Use real questions where you can get them. Synthetic ones drift towards phrasing the
+  documents already use, so they flatter retrieval.
+
+
+  Answer checks come in layers. Exact facts and citation checks are cheap and certain. For
+  faithfulness and relevance, an LLM judge scales where string matching can't. But judges
+  prefer the first answer shown, longer answers, and output from their own model family.
+  Swap orders, and measure agreement with a person on a sample before you trust the score.
+
+
+  The gate. Save the metrics from main. On every change, fail if any metric falls by more
+  than a small tolerance. With only 20 cases, one case is 5%, so keep the tolerance honest
+  about that noise.

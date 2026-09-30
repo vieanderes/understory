@@ -1,0 +1,284 @@
+id: aisys.agent-harness
+title: The agent harness
+objective: Keep control flow in code, cap steps and spend, detect loops, and prefer a fixed workflow when the path is known.
+level: advanced
+minutes: 10
+concepts: [aisys.workflows-vs-agents, aisys.step-budgets, aisys.loop-detection, aisys.harness-state]
+prerequisites: [ai.agents, aisys.classifiers-at-the-fork]
+opening:
+  text: >-
+    You'll wrap a model in code that decides when it stops and what it may spend. That code
+    is what makes an agent safe to ship.
+
+steps:
+  - type: prose
+    id: name-workflows-and-agents
+    body: |-
+      A **workflow** runs model calls along paths fixed in code: extract, then match, then
+      decide. An **agent** lets the model choose its next step each turn, as in chapter 20's
+      loop.
+
+      Pick the workflow whenever you can. It's cheaper, faster and testable. When you do need
+      an agent, the loop is still yours. That code around the model is the **harness**.
+    figure:
+      id: agent-loop
+      caption: Everything outside the model's turn is harness code, and it decides when the loop ends.
+
+  - type: multiple-choice
+    id: pick-workflow
+    concept: aisys.workflows-vs-agents
+    difficulty: 1
+    question: 'An invoice arrives: read its fields, match it to an order, then pay or flag it. What fits?'
+    choices:
+      - text: A workflow with fixed steps in code
+        correct: true
+        feedback: >-
+          Yes. The path is known, so code can hold it.
+      - text: An agent that picks its own steps
+        feedback: >-
+          An agent earns its cost when the steps can't be known ahead. Here they can.
+      - text: One big prompt that does everything
+        feedback: >-
+          One call can't match the invoice against your orders, and you can't check each part.
+
+  - type: prose
+    id: name-budgets-and-state
+    body: |-
+      Each turn resends the whole history, so each costs more than the last. A **step
+      budget** caps turns, tokens, time and money for one run. Hitting a cap stops the run
+      with a clear status, never silently.
+
+      The harness also owns the **state**: the task, the step count and every message so
+      far. Save it after each step, and a run can be inspected, resumed or replayed.
+
+  - type: ai-review
+    id: review-step-only-on-success
+    concept: aisys.step-budgets
+    difficulty: 3
+    language: python
+    request: Add a step cap to the agent harness.
+    flawClass: edge-case
+    code: |
+      MAX_STEPS = 12
+      step = 0
+      while step < MAX_STEPS:
+          reply = client.messages.create(**request, tools=TOOLS, messages=state["messages"])
+          state["messages"].append({"role": "assistant", "content": reply.content})
+          if reply.stop_reason != "tool_use":   # it answered, so the run is done
+              break
+          results = run_tools(reply.content)
+          state["messages"].append({"role": "user", "content": results})
+          if not any(r.get("is_error") for r in results):
+              step += 1
+          save_state(state)
+    prompt: >-
+      An assistant wrote this. In tests every tool succeeded, so runs stopped at 12 steps.
+      Then the flights API went down for an hour, and one run made 900 calls. Tap the lines
+      at fault.
+    lines: [10, 11]
+    reasons:
+      - text: Failed turns never count toward the cap
+        correct: true
+        feedback: >-
+          Yes. With the API down, every turn fails, and the loop never ends.
+      - text: State should be saved before the model call
+        feedback: >-
+          Saving after each completed turn is right. It's the counting that goes wrong.
+      - text: The loop should stop on any tool error
+        feedback: >-
+          The model can often recover from one error. Every turn must still cost a step.
+    fix: |
+      for step in range(MAX_STEPS):   # every turn counts, whatever happened
+          reply = client.messages.create(**request, tools=TOOLS, messages=state["messages"])
+          state["messages"].append({"role": "assistant", "content": reply.content})
+          if reply.stop_reason != "tool_use":
+              break
+          state["messages"].append({"role": "user", "content": run_tools(reply.content)})
+          save_state(state)
+
+  - type: multiple-choice
+    id: pick-resume
+    concept: aisys.harness-state
+    difficulty: 2
+    question: A server restarts during step 9 of a 12-step run. What lets the run carry on?
+    choices:
+      - text: State the harness saved after each step
+        correct: true
+        feedback: >-
+          Right. Load it, and step 9 starts again with everything before it.
+      - text: The model remembers where it was
+        feedback: >-
+          The model keeps nothing between calls. Only what your code saved survives.
+      - text: The provider replays the conversation
+        feedback: >-
+          Each request stands alone. The history is yours to store and resend.
+
+  - type: prose
+    id: name-loop-detection
+    body: |-
+      Agents get stuck in cycles. A real history from a flight agent:
+
+      ```text
+      search("flights LIS") → open(1) → search("flights LIS") → open(1) → search(...
+      ```
+
+      **Loop detection** watches the history for one call or a pair repeating, and for
+      results that stop changing. A classifier from lesson 3 can also answer "is this agent
+      stuck?" after each turn.
+
+  - type: bug-hunt
+    id: hunt-naive-loop-check
+    concept: aisys.loop-detection
+    difficulty: 2
+    language: python
+    code: |
+      def is_stuck(calls):
+          return len(calls) >= 2 and calls[-1] == calls[-2]
+
+      # after every turn:
+      if is_stuck(state["calls"]):
+          return stop(state, "loop")
+    prompt: >-
+      The flight agent above alternated search and open for 40 turns, and `is_stuck` never
+      fired. Tap the line to fix.
+    lines: [2]
+    reasons:
+      - text: It only catches one call repeating, not a pair
+        correct: true
+        feedback: >-
+          Right. Search then open, then search again: the last two always differ.
+      - text: Comparing calls with `==` is unreliable
+        feedback: >-
+          Two identical call strings compare equal. The check looks too narrowly.
+      - text: The check should run before each turn
+        feedback: >-
+          Before or after, it still compares only the last two calls.
+    fix: |
+      def is_stuck(calls):
+          one = len(calls) >= 3 and calls[-1] == calls[-2] == calls[-3]
+          two = len(calls) >= 4 and calls[-2:] == calls[-4:-2]
+          return one or two
+
+  - type: code-challenge
+    id: write-detect-loop
+    concept: aisys.loop-detection
+    difficulty: 3
+    language: python
+    starter: loop.starter.py
+    solution: loop.solution.py
+    tests: loop.tests.py
+    prompt: >-
+      Write `detect_loop(calls, repeats)`. `calls` is the history, each call written as a
+      string. Return `True` when it ends with one call repeated `repeats` times, or with a
+      pair of calls repeated `repeats` times.
+
+
+      So `[a, b, a, b, a, b]` with `repeats` 3 is `True`, and `[a, b, a, b]` is `False`.
+      Raise `ValueError` if `repeats` is below 2.
+    hints:
+      - Check two cycle lengths, 1 and 2. For each, look only at the last `cycle * repeats` calls.
+      - In a repeating tail, every call equals the one `cycle` places before it.
+      - '`all(tail[i] == tail[i - cycle] for i in range(cycle, len(tail)))` checks that in one line.'
+
+  - type: explain-back
+    id: explain-invoice-agent
+    concept: aisys.workflows-vs-agents
+    difficulty: 3
+    prompt: >-
+      A team rebuilt their invoice process as an agent. It's slower and costlier, and now and
+      then it skips the order check. Why, and what would you build?
+    rubric:
+      - The steps are known in advance, so a workflow in code fits.
+      - An agent lets the model choose steps, so it can skip one, and each choice is a paid call.
+      - A workflow runs the check in code every time and uses the model only where language is needed.
+    modelAnswer: >-
+      The path never changes: read, match, decide. An agent re-decides that path with a
+      model call every turn. That costs time and money, and sometimes it skips the check.
+      I'd write it as a workflow. Code runs each step in order, so the check always happens.
+      The model is only called to read the invoice's fields.
+
+recap:
+  - Use a workflow when the path is known, and an agent only when it isn't.
+  - Cap steps, tokens, time and money, and count every turn.
+  - Save state after each step, and detect loops of one call or a pair repeating.
+
+recall:
+  - id: card-workflow-agent
+    concept: aisys.workflows-vs-agents
+    front: What is the difference between a workflow and an agent?
+    back: >-
+      A workflow follows paths fixed in code. An agent lets the model choose its next step
+      each turn.
+  - id: card-budgets
+    concept: aisys.step-budgets
+    front: Why does each turn of an agent loop usually cost more than the last?
+    back: >-
+      Every call resends the whole history, and the history grows with each tool call and
+      result.
+  - id: card-loop-shapes
+    concept: aisys.loop-detection
+    front: Why isn't comparing the last two tool calls enough to spot a stuck agent?
+    back: >-
+      Agents often cycle through two calls, like search then open. The last two differ, yet
+      the pair keeps repeating.
+  - id: card-harness-state
+    concept: aisys.harness-state
+    front: What should the harness save after each step, and why?
+    back: >-
+      The task, the step count and the history. Then a run can be resumed after a crash,
+      inspected or replayed.
+
+references:
+  - kind: essay
+    title: Building effective agents
+    authors: Erik Schluntz and Barry Zhang
+    year: 2024
+    venue: Anthropic Engineering
+    url: https://www.anthropic.com/engineering/building-effective-agents
+    note: Workflows against agents, common workflow patterns, and stopping conditions.
+    primary: true
+    verified: true
+  - kind: essay
+    title: Effective harnesses for long-running agents
+    authors: Justin Young
+    year: 2025
+    venue: Anthropic Engineering
+    url: https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents
+    note: Keeping progress in a file and in git so work survives across sessions.
+    verified: true
+  - kind: docs
+    title: Stop reasons and fallback
+    authors: Anthropic
+    venue: Claude Platform Docs
+    url: https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons
+    note: Every stop reason a harness has to handle, not just the happy one.
+    primary: true
+    verified: true
+  - kind: docs
+    title: "Agent Development Kit: technical overview"
+    authors: Google
+    url: https://google.github.io/adk-docs/get-started/about/
+    note: LLM agents, workflow agents, tools, sessions and memory, as one framework composes them.
+    verified: false
+
+deepDive: >-
+  No model was called. The harness snippets and the loop check ran in Python 3.12 on
+  made-up histories.
+
+
+  **Named workflow shapes.** Prompt chaining runs calls in sequence. Routing classifies an
+  input and sends it down one branch. Parallelisation runs calls at once and combines them.
+  Orchestrator and workers lets one call split a task for others. Most production systems
+  are these, with an agent loop only in the one step that needs open-ended exploration.
+
+
+  **Hard caps and soft budgets.** `max_tokens` caps one reply, not a run, so the harness
+  counts tokens and money across turns itself. Some APIs also accept an advisory task
+  budget the model can see, which helps it pace itself and finish tidily. Your code still
+  enforces the hard cap.
+
+
+  **A second loop signal.** Hash each tool result. When the last few hashes repeat, no new
+  information is arriving, whatever the calls look like. For long tasks, write progress to
+  a file and commit it, so a fresh context window can pick up where the last one stopped.
+  The harness decides when to start that window, not the model.

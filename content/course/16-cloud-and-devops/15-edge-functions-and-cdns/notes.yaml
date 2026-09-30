@@ -1,0 +1,242 @@
+summary: >-
+  A CDN puts copies of your responses in hundreds of places near users, so most requests
+  never cross an ocean or reach your servers. Edge functions go one step further: your code
+  runs in those places too, in a small web-standard runtime, and can answer, redirect or
+  rewrite a request before the origin sees it.
+
+
+  The edge is fast for anything that needs only the request itself or a cached response.
+  It's slow for anything that talks to a database many times, because the distance to the
+  user moves to the distance to the data, once per query. So the design question is always
+  where each piece of work sits relative to its data.
+
+
+  These notes cover the headers that tell a CDN what to keep and for how long, how cache
+  keys and variants go wrong, a complete edge function for a sticky experiment, how to
+  check a session at the edge without a database, and the options when you want data
+  close to far-away users too.
+remember:
+  - Code belongs near its data, because a handler talks to the database many times and to the user once.
+  - A CDN keeps what `Cache-Control` allows, where `s-maxage` sets the shared-cache lifetime and `private` or `no-store` keeps a response out.
+  - Everything that changes a response must be in the cache key, or one visitor's variant is served to the next.
+  - Fingerprinted asset names with `max-age=31536000, immutable` let you cache forever and release by changing the name.
+  - Edge functions suit small decisions from the request alone, such as redirects, headers, rewrites and signature checks.
+  - An edge runtime offers web APIs such as `fetch`, `Request`, `Response` and `crypto.subtle`, not Node modules, with tight CPU limits.
+  - Data copied near users is fast to read and can be stale, and writes still travel to one primary.
+sections:
+  - title: Telling the CDN what to keep
+    body: |-
+      A CDN is a shared cache, so it follows the HTTP caching rules of RFC 9111. Your origin
+      decides, response by response, with headers.
+
+      ```http
+      HTTP/1.1 200 OK
+      Content-Type: text/html
+      Cache-Control: public, max-age=60, s-maxage=600, stale-while-revalidate=30
+      ```
+
+      `max-age=60` lets the browser keep it for a minute. `s-maxage=600` overrides that for
+      shared caches, so the CDN keeps it for ten. `stale-while-revalidate=30` lets a cache
+      serve the stale copy for up to 30 seconds past expiry while it fetches a fresh one in
+      the background, so no visitor waits for the origin at the moment of expiry.
+
+      Some responses must never be shared. A page with a user's name uses `private`, which
+      allows the browser's cache and forbids the CDN's. Account data and anything with a
+      secret uses `no-store`. The danger runs one way: a personal page marked `public` is a
+      data leak, served to strangers from the edge.
+
+      Static assets work best with fingerprinted names such as `app.3f9c1a.js`:
+
+      ```http
+      Cache-Control: public, max-age=31536000, immutable
+      ```
+
+      The file at that name never changes, so it can be cached for a year and `immutable`
+      tells the browser not to revalidate on reload. A release ships new names, and the old
+      files expire unused. HTML, which points at those names, keeps a short lifetime.
+
+      For fresh content before expiry, CDNs offer purges by URL or by tag. Purge is a repair
+      tool; versioned names and short lifetimes on HTML are the normal path. When the CDN
+      needs different rules from browsers, the `CDN-Cache-Control` header from RFC 9213 is
+      read by CDNs that support it and ignored by browsers.
+  - title: Cache keys and variants
+    body: |-
+      The **cache key** is what a CDN uses to decide two requests want the same response.
+      By default it's roughly the method, host, path and query string. Anything else that
+      changes the response must be added, or visitors get each other's versions.
+
+      The standard tool is the `Vary` response header. `Vary: Accept-Encoding` keeps gzip and
+      Brotli copies apart, and every CDN handles it well. `Vary: Accept-Language` is riskier:
+      browsers send many slightly different values, so one page splits into hundreds of
+      cache entries and the hit rate collapses. `Vary: Cookie` is worse, since nearly every
+      visitor's cookie header is unique.
+
+      The fix is to normalise at the edge. Turn the messy input into a small set of values,
+      and put that value in the path:
+
+      ```text
+      Accept-Language: de-AT,de;q=0.9,en;q=0.8   ->  /de/pricing
+      cookie bucket=b                            ->  /variants/b/pricing
+      country header from the CDN = FR           ->  /fr/pricing
+      ```
+
+      Now the cache key has three or four variants per page instead of thousands, and each
+      one is cached normally.
+
+      Watch query strings too. Tracking parameters such as `utm_source` create a separate
+      entry per campaign for identical content. Most CDNs can drop or sort named parameters
+      from the key; use that, and make sure the origin ignores them as well.
+  - title: A sticky experiment at the edge, complete
+    body: |-
+      The lesson's review step fixed the random draw. Here is the whole handler, with the
+      cookie parsed properly and set on first visit. It uses only web-standard APIs, so it
+      also runs in Node 24.
+
+      ```js
+      function readCookie(request, name) {
+        const header = request.headers.get('cookie') ?? '';
+        for (const part of header.split(';')) {
+          const [key, ...rest] = part.trim().split('=');
+          if (key === name) return rest.join('=');
+        }
+        return undefined;
+      }
+
+      export default async function handler(request) {
+        const existing = readCookie(request, 'bucket');
+        const bucket =
+          existing === 'a' || existing === 'b' ? existing : Math.random() < 0.5 ? 'a' : 'b';
+
+        const url = new URL(request.url);
+        url.pathname = `/variants/${bucket}${url.pathname}`;
+        const upstream = await fetch(new Request(url, request));
+
+        if (existing === bucket) return upstream;
+        const response = new Response(upstream.body, upstream);
+        response.headers.append(
+          'set-cookie',
+          `bucket=${bucket}; Path=/; Max-Age=2592000; Secure; HttpOnly; SameSite=Lax`,
+        );
+        return response;
+      }
+      ```
+
+      Three details matter. Matching the cookie name exactly avoids `mybucket=b` counting as
+      `bucket=b`, a bug the lesson's `includes` check has. Unknown values are treated as no
+      cookie, so a tampered cookie can't steer the rewrite to an arbitrary path. And the rewrite puts
+      the bucket in the path, so the CDN caches each variant separately.
+
+      Responses from `fetch` have immutable headers, which is why the code copies the
+      response before appending `set-cookie`.
+  - title: Checking a session without a database
+    body: |-
+      The lesson's parsons step turned away requests without a `session=` cookie. That
+      checks presence, not validity: anyone can send `session=x`. A real edge check verifies
+      a signature, which needs a secret and some arithmetic but no database.
+
+      ```js
+      const encoder = new TextEncoder();
+
+      async function hmacKey(secret) {
+        return crypto.subtle.importKey(
+          'raw', encoder.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify'],
+        );
+      }
+
+      function fromBase64Url(text) {
+        const base64 = text.replaceAll('-', '+').replaceAll('_', '/');
+        return Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
+      }
+
+      // cookie value: "<userId>.<expiresAtSeconds>.<signature>"
+      export async function verify(cookieValue, secret, nowSeconds) {
+        const parts = cookieValue.split('.');
+        if (parts.length !== 3) return null;
+        const [userId, expiresAt, signature] = parts;
+        if (Number(expiresAt) < nowSeconds) return null;
+        const key = await hmacKey(secret);
+        const valid = await crypto.subtle.verify(
+          'HMAC', key, fromBase64Url(signature), encoder.encode(`${userId}.${expiresAt}`),
+        );
+        return valid ? userId : null;
+      }
+      ```
+
+      Tested in Node 24: a signed cookie returns its user id, and a changed user id or an
+      expired time returns `null`. Let `crypto.subtle.verify` do the comparison: signing again
+      and comparing strings with `===` can leak, through timing, how much of a forgery matched.
+
+      The trade-off is revocation. A signed cookie is valid until it expires, even after
+      the user logs out or is banned, because the edge never asks the database. Keep the
+      lifetime short, have the origin re-check sessions on sensitive actions, and treat the
+      edge check as a fast first filter, not the final word.
+  - title: Bringing data closer
+    body: |-
+      When far-away users need fast pages that do need data, there are three families of
+      answer, each with a price.
+
+      - **Put the function in the database's region.** Most platforms let you pin server
+        code to a region. The user pays one long trip, the queries pay short ones. This is
+        the default fix and costs nothing but a setting.
+      - **Read replicas near users.** Reads go to a nearby copy, writes to the primary. A
+        replica lags behind, so a user who saves a change and reloads can see the old value.
+        Route that user's reads to the primary for a few seconds after a write, which is
+        called read-your-writes.
+      - **Edge key-value stores and caches.** Small, read-heavy data such as feature flags,
+        redirects or configuration can live at every location. These stores are usually
+        eventually consistent: a write can take seconds to reach every edge.
+
+      A useful rule: first cut the number of sequential queries, then move code next to the
+      data, and only then copy data towards users. A handler that makes one query instead of
+      three is faster everywhere, and it keeps the consistency model simple.
+pitfalls:
+  - '**Marking personal pages `public`.** The CDN then serves one user''s page to strangers. Use `private` or `no-store` for anything tied to a session.'
+  - '**Moving data-heavy handlers to the edge.** Every query crosses the distance to the database. Keep them in the database''s region and give the edge only request-level decisions.'
+  - '**Varying on raw headers or cookies.** `Vary: Cookie` or raw `Accept-Language` shatters the cache. Normalise to a few values at the edge and put them in the path.'
+  - '**Checking that a cookie exists instead of that it''s valid.** Anyone can send `session=x`. Verify a signature and an expiry, and re-check on the origin for sensitive actions.'
+  - '**Relying on purges to publish.** Purges take time to reach every location and get forgotten. Fingerprint asset names and keep HTML lifetimes short.'
+  - '**Designing around one provider''s limits from memory.** CPU and memory caps differ by provider and plan and change over time. Read the current limits page before you build on a number.'
+interview:
+  - question: When would you run code in an edge function, and when in a regional server?
+    answer: >-
+      At the edge when the work needs only the request or cached data; in the region when it
+      talks to the database. Redirects by country, header and cookie rewrites, A/B bucketing,
+      bot filtering and checking a signed token are all request-level, so running them a few
+      milliseconds from the user saves a long round trip. A handler that makes several
+      queries should run beside the database, because from the edge every query pays the
+      long distance, and three queries turn one slow trip into three. Edge runtimes are also
+      restricted, with web APIs only and tight CPU limits, so heavy work like PDFs or image
+      processing doesn't fit. The trade-off is that splitting logic between edge and origin
+      adds a second deployment target to test.
+  - question: How do you design caching headers for a site with public pages, logged-in pages and static assets?
+    answer: >-
+      Three policies. Static assets get fingerprinted names and `public, max-age=31536000,
+      immutable`, so they're cached for a year and a release ships new names. Public HTML
+      gets a short browser lifetime and a longer CDN one, for example `max-age=60,
+      s-maxage=600, stale-while-revalidate=30`, so the CDN absorbs traffic and nobody waits
+      at expiry. Logged-in pages get `private` or `no-store`, so no shared cache ever holds
+      them. I'd also check the cache key: anything that changes a public response, such as
+      language or country, is normalised and put in the path rather than varied on raw
+      headers. The trade-off is freshness: a ten-minute CDN lifetime means content updates
+      take up to ten minutes unless you purge.
+  - question: Users in Australia say your app is slow. The servers and database are in Frankfurt. What do you do?
+    answer: >-
+      Measure where the time goes first, then fix the cheapest part. Static assets and public
+      pages should come from a CDN, which removes most long trips at once. For dynamic
+      requests I'd count sequential round trips: a page that makes several API calls, each
+      making several queries, suffers most, so batching those calls helps everywhere. Moving
+      request-level logic, such as redirects and auth checks, to the edge saves more. If data
+      reads are still the bottleneck, a read replica in Australia with read-your-writes
+      routing helps, at the cost of replication lag and another database to run. I wouldn't
+      move data-heavy handlers to the edge while the database stays in Frankfurt; that makes
+      it slower.
+  - question: What can go wrong when an edge function personalises a cached page?
+    answer: >-
+      The cache can serve one visitor's version to another. If the function picks a variant
+      by cookie, country or experiment bucket but the cache key doesn't include that choice,
+      the first response is cached and everyone gets it. That's a correctness bug for an
+      experiment and a data leak for anything personal. The fix is to reduce the choice to a
+      small set of values and put it in the cache key, usually by rewriting the path, and to
+      keep truly personal responses `private`. Varying on raw cookies works in theory but
+      destroys the hit rate. The other trap is a random choice per request, which flips
+      users between variants; draw once and store it in a cookie.

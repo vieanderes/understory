@@ -1,0 +1,240 @@
+summary: >-
+  Taking a card payment means moving money you can't see, through a bank you don't control,
+  for a buyer who may close the tab at any moment. A payment provider such as Stripe does the
+  moving. Your job is narrower, and full of traps: create the payment for the right
+  amount, never touch card numbers, and decide exactly when an order counts as paid.
+
+
+  The lesson's rule is the heart of it. An order is paid when a verified webhook says so,
+  for the amount you expected, and never because a browser reached your thanks page. Hosted
+  Checkout keeps card numbers off your servers, which moves most of the PCI DSS burden to
+  Stripe. Strong Customer Authentication adds a step where the bank asks the buyer to
+  approve, so a payment can sit in `requires_action` for minutes and then fail.
+
+
+  These notes add the parts that break real shops: money as integers without floating-point
+  errors, the full set of states a payment and a session move through, fulfilment that
+  happens once even when webhooks repeat, idempotency keys on your own calls to Stripe, and
+  refunds and disputes as money moving back.
+remember:
+  - Mark an order paid only from a verified `checkout.session.completed` webhook whose `payment_status` is `paid` and whose `amount_total` matches the order.
+  - Amounts are integers in the smallest currency unit, so £12.50 is `1250`, and zero-decimal currencies such as yen have no minor unit.
+  - Never compute money with floating-point numbers; `19.99 * 100` is `1998.9999999999998` in JavaScript.
+  - A PaymentIntent in `requires_action` is waiting for the buyer's bank, usually 3D Secure, and no money has moved.
+  - Some payment methods settle later, so a completed session can be `unpaid` until `checkout.session.async_payment_succeeded` arrives.
+  - Pass an idempotency key on every create call you might retry, so a retry returns the first result instead of charging twice.
+  - A refund is its own object with its own status, and the order changes when a webhook reports the outcome.
+  - Hosted Checkout keeps card numbers off your servers, which keeps most of PCI DSS off your plate.
+sections:
+  - title: Money as integers, all the way through
+    body: |-
+      Floating-point numbers can't represent most decimal fractions exactly. `0.1 + 0.2` is
+      `0.30000000000000004`, and `19.99 * 100` is `1998.9999999999998`. Round that the
+      wrong way and a customer is charged a penny less, a thousand times a day. So money is
+      stored, sent and summed as integers of the smallest unit: pence, cents.
+
+      Convert at the edge, from the text a person typed or a price list holds, without ever
+      putting the amount in a float:
+
+      ```ts
+      // Currencies with no minor unit, a subset: check the provider's list for the full one.
+      const ZERO_DECIMAL = new Set(['JPY', 'KRW', 'VND']);
+
+      export function toMinorUnits(amount: string, currency: string): number {
+        const decimals = ZERO_DECIMAL.has(currency.toUpperCase()) ? 0 : 2;
+        const match = /^(\d+)(?:\.(\d+))?$/.exec(amount.trim());
+        if (!match) throw new Error(`Not an amount: ${amount}`);
+        const [, whole, fraction = ''] = match;
+        if (fraction.length > decimals) throw new Error(`Too many decimals for ${currency}`);
+        return Number(whole + fraction.padEnd(decimals, '0'));
+      }
+      ```
+
+      `toMinorUnits('19.99', 'gbp')` gives `1999`, `'12.5'` gives `1250`, `'1200'` in yen
+      gives `1200`, and `'12.50'` in yen throws rather than guessing. In the database, use an
+      `integer` or `bigint` column for minor units, or `numeric` if you store decimals; never
+      `real` or `double precision`. Store the currency beside every amount, because `1250`
+      means nothing alone.
+
+      Taxes and discounts need a rounding rule written down, such as rounding each line or
+      rounding the total, because the two can differ by a penny. Decide it once, in one
+      function, and test it.
+  - title: The states a payment moves through
+    body: |-
+      A Checkout Session and the PaymentIntent behind it each have a status, and several
+      webhooks report the changes. Knowing them is what lets you say "pending" rather than
+      "paid" or "failed" at the right time.
+
+      ```text
+      Checkout Session
+        status:         open -> complete, or open -> expired
+        payment_status: paid | unpaid | no_payment_required
+
+      PaymentIntent status
+        requires_payment_method   no card yet, or the last one was declined
+        requires_confirmation     details present, not yet confirmed
+        requires_action           buyer must approve, usually 3D Secure
+        processing                submitted, result not known yet
+        requires_capture          authorised, waiting for you to capture
+        succeeded                 money moved
+        canceled                  abandoned or cancelled
+
+      Webhooks worth handling
+        checkout.session.completed             paid now, or unpaid for delayed methods
+        checkout.session.async_payment_succeeded
+        checkout.session.async_payment_failed
+        checkout.session.expired               buyer never finished
+      ```
+
+      A card payment usually arrives as `checkout.session.completed` with `payment_status`
+      of `paid`. A bank debit arrives as `completed` but `unpaid`, then days later as
+      `async_payment_succeeded` or `async_payment_failed`. Fulfil on either `completed` with
+      `paid` or `async_payment_succeeded`, through the same function, which is idempotent.
+
+      `requires_capture` appears when you create a payment with manual capture: the bank
+      reserves the money and you take it later, for example when an item ships. An
+      authorisation doesn't last for ever, typically about a week for online card payments,
+      so capture or release it in time.
+  - title: Fulfilling once, even when events repeat
+    body: |-
+      Stripe may send `checkout.session.completed` more than once, and a buyer's thanks-page
+      request can race it. Fulfilment must happen exactly once. The database does the hard
+      part if claim and update share a transaction and the update states its own
+      conditions.
+
+      ```ts
+      type Tx = { query(sql: string, params: unknown[]): Promise<{ rows: unknown[] }> };
+
+      export async function fulfil(tx: Tx, eventId: string, orderId: string, amount: number) {
+        const claimed = await tx.query(
+          `insert into processed_events (event_id) values ($1)
+           on conflict do nothing returning event_id`,
+          [eventId],
+        );
+        if (claimed.rows.length === 0) return 'duplicate';
+        const paid = await tx.query(
+          `update orders set status = 'paid'
+           where id = $1 and status = 'pending' and total_pence = $2
+           returning id`,
+          [orderId, amount],
+        );
+        return paid.rows.length === 1 ? 'paid' : 'check by hand';
+      }
+      ```
+
+      Run inside a transaction on PostgreSQL, the first delivery returns `'paid'`, a repeat
+      of the same event returns `'duplicate'`, and a different event for an already-paid
+      order returns `'check by hand'`. That last case matters: an amount mismatch or a second
+      payment for one order is money you must look at, so log it and alert, rather than
+      silently ignoring it.
+
+      Put `client_reference_id` or `metadata` with your order id on the session when you
+      create it, so the webhook can find the order. Never look the order up by amount or by
+      the buyer's email.
+  - title: Idempotency keys on your own calls
+    body: |-
+      Your server calls Stripe too, and networks drop responses. If a create call times out,
+      you don't know whether the charge or refund happened. Retrying blindly can do it twice.
+
+      Stripe accepts an `Idempotency-Key` header on `POST` requests. The first request with a
+      key is processed and its result saved. A repeat with the same key returns that saved
+      result, same status and body, instead of acting again. The official Node library
+      takes it as an option on each call, `{ idempotencyKey: '...' }`, beside the
+      parameters.
+
+      ```http
+      POST /v1/refunds HTTP/1.1
+      Host: api.stripe.com
+      Authorization: Bearer sk_test_...
+      Idempotency-Key: refund-ord_1-2026-09-25
+      Content-Type: application/x-www-form-urlencoded
+
+      payment_intent=pi_123&amount=1500
+      ```
+
+      Derive the key from your own intent, such as the order id plus the action, so every
+      retry of the same intent reuses it and a genuinely new action gets a new one. A random
+      key generated inside the retry loop defeats the purpose. Stripe may discard keys once
+      they are at least 24 hours old, so a key protects a burst of retries, not a replay next
+      week.
+
+      For local work, the Stripe CLI forwards test webhooks to your machine with
+      `stripe listen --forward-to localhost:3000/webhooks/stripe` and prints the signing
+      secret to use.
+  - title: Refunds, disputes and what the order shows
+    body: |-
+      Money flows back in two ways. A **refund** is one you start. A **dispute**, or
+      chargeback, is one the buyer's bank starts, and you respond with evidence.
+
+      A refund moves through its own statuses: `pending`, then `succeeded` or `failed`, and
+      occasionally `requires_action` or `canceled`. Creating it only starts the process, so
+      the order changes when the webhook reports the outcome. Partial refunds are common;
+      store each refund as a row with its amount, rather than a single "refunded" flag, so
+      the order knows how much has gone back and how much can still be refunded.
+
+      ```sql
+      create table refunds (
+        id           text primary key,
+        order_id     text not null references orders (id),
+        amount_pence integer not null check (amount_pence > 0),
+        status       text not null
+      );
+      ```
+
+      A dispute arrives as `charge.dispute.created`. The money is usually withdrawn from your
+      balance straight away, with a fee, and you have a deadline to submit evidence. Treat it
+      as an alert to a person, not something code resolves.
+
+      One more rule keeps accounts straight: record what Stripe says happened, keyed by
+      Stripe's ids, and reconcile your orders against Stripe's records every day. Webhooks
+      can be missed during an outage, and a daily comparison finds the gaps.
+pitfalls:
+  - '**Marking paid on the thanks page.** Anyone can type the URL, and a buyer can close the tab before it loads. Fulfil only from a verified webhook.'
+  - '**Sending pounds instead of pence.** `unit_amount: 40` charges forty pence and nothing warns you. Convert once, in one tested function.'
+  - '**Doing money sums in floats.** `19.99 * 100` isn''t `1999`. Keep integers of the minor unit from input to database.'
+  - '**Ignoring `payment_status`.** A completed session can still be `unpaid` for delayed methods. Check it, and handle `async_payment_succeeded`.'
+  - '**Trusting the event without checking the amount.** A session for the wrong amount, or a second payment, should be flagged. Compare `amount_total` with the order.'
+  - '**Retrying create calls without an idempotency key.** A timeout followed by a retry can charge or refund twice. Pass a key derived from the order and the action.'
+  - '**One "refunded" flag per order.** It can''t express partial refunds. Store each refund with its amount and status.'
+interview:
+  - question: Walk me through taking a payment with Stripe Checkout, end to end.
+    answer: >-
+      Create a session on the server, redirect to Stripe, and fulfil from the webhook. The
+      server creates a Checkout Session with line items in minor units and the order id in
+      `client_reference_id`, then redirects the buyer to its URL. Card details go straight
+      to Stripe, which handles 3D Secure. When payment completes, Stripe sends
+      `checkout.session.completed`. My endpoint verifies the signature on the raw body,
+      claims the event id, checks `payment_status` is `paid` and the amount matches, and
+      marks the order paid in one transaction. The thanks page only displays status. The
+      trade-off of hosted Checkout is less control over the page, in exchange for far less
+      PCI scope and SCA handled for you.
+  - question: Why shouldn't the success redirect mark the order as paid?
+    answer: >-
+      Because a redirect proves only that a browser loaded a URL. Anyone can type
+      `/thanks?orderId=7`, so trusting it ships goods for free. It's also unreliable in the
+      honest case: buyers close the tab, lose signal or never get redirected, and delayed
+      payment methods reach the success page before any money has moved. The webhook is
+      signed by Stripe and retried until you acknowledge it, so it's both authentic and
+      reliable. The success page can still show a real status by fetching the session from
+      Stripe on the server using the session id, but the state change belongs to the
+      webhook handler.
+  - question: How do you avoid charging a customer twice?
+    answer: >-
+      Idempotency on every layer that can repeat. On the client, disable the pay button
+      after the first click and create one session per order. On my calls to Stripe, pass an
+      `Idempotency-Key` derived from the order and action, so a retry after a timeout returns
+      the first result instead of charging again. On webhooks, claim the event id with a
+      unique constraint and update with a condition such as `status = 'pending'`, so repeat
+      deliveries do nothing. And I'd reconcile daily against Stripe to catch anything that
+      slipped through. The subtle part is key choice: a random key per attempt protects
+      nothing, it has to identify the intent.
+  - question: How would you store money in your database?
+    answer: >-
+      As an integer count of the smallest unit, with the currency beside it. So an `integer`
+      or `bigint` of pence plus a three-letter currency code, never a floating-point column,
+      because binary floats can't represent most decimal fractions and sums drift by
+      fractions of a penny. PostgreSQL's `numeric` is exact and fine if you need more
+      precision, such as unit prices to four decimals, but then you must still round to the
+      minor unit with a documented rule before charging. The currency matters because
+      `1250` is £12.50 but ¥1,250, and zero-decimal currencies break any code that assumes
+      two decimals.

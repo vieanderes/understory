@@ -1,0 +1,317 @@
+summary: >-
+  An agent is a loop: call the model, run the tools it asks for, feed the results back, and
+  repeat until it gives a final answer. The loop is a dozen lines. What a take-home grades is
+  everything that stops it going wrong: a step cap, an allowlist, approval before any write,
+  tool errors returned as results, a timeout per call, validated final output, and tool text
+  kept as data so a fetched page cannot give orders.
+
+
+  Every guard exists because of a specific failure. Models ask for tools that do not exist,
+  repeat the same call forever, hang on a slow API, return JSON in the wrong shape, and
+  follow instructions they find in documents. Each guard turns one of those into a handled,
+  testable case. A scripted fake model makes each case repeatable, so every guard gets its
+  own test.
+
+
+  Reach for an agent when the steps depend on what earlier steps return and cannot be fixed
+  in advance. When the steps are known, a fixed workflow of model calls is cheaper, faster
+  and easier to test. Saying that out loud is part of a senior answer.
+remember:
+  - An agent loop stops for exactly three reasons, a valid final answer, the step cap, or a guard such as a repeated call, and every one returns a result instead of throwing.
+  - Tools run only if their name is on an allowlist, checked as an own property so names like `toString` cannot reach the prototype.
+  - Approval for write tools lives in code and is checked on every call, because a prompt rule can be ignored or overridden by injected text.
+  - A failing or timed-out tool returns its error as a tool result, so the model can retry, choose another tool or explain, instead of the run crashing.
+  - Tool output goes back as a tool message, as data; it is never appended to the system prompt, where a fetched page could give orders.
+  - Validate the final output against a schema, send the specific error back, cap the retries, then return a safe fallback.
+  - Model-written tool arguments are untrusted input, so validate them like a request body before acting.
+  - Write tools should be idempotent or take an idempotency key, because a retried call can run twice.
+sections:
+  - title: The production loop, with timeouts and a stuck detector
+    body: |-
+      The challenge's `runAgent` has the four core guards. Two more come up in every
+      follow-up: a timeout per tool call, and spotting a loop that repeats itself. A trace
+      of every call makes a failed run replayable.
+
+      ```ts
+      type ToolCall = { id: string; name: string; input: unknown };
+      type ModelReply = { type: 'tool_calls'; calls: ToolCall[] } | { type: 'final'; text: string };
+      type Message =
+        | { role: 'user'; content: string }
+        | { role: 'assistant'; reply: ModelReply }
+        | { role: 'tool'; callId: string; content: string; isError: boolean };
+      type Model = (messages: Message[]) => Promise<ModelReply>;
+      type Tool = { run: (input: unknown, signal: AbortSignal) => Promise<string>; write?: boolean; timeoutMs?: number };
+
+      // Rejects after `ms`, and aborts the tool's signal so it can stop its own work.
+      async function withTimeout(tool: Tool, input: unknown, ms: number): Promise<string> {
+        const controller = new AbortController();
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const timeout = new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            controller.abort();
+            reject(new Error(`timed out after ${ms} ms`));
+          }, ms);
+        });
+        try {
+          return await Promise.race([tool.run(input, controller.signal), timeout]);
+        } finally {
+          clearTimeout(timer);
+        }
+      }
+
+      type Trace = { step: number; call: string; ms: number; isError: boolean };
+
+      export async function runLoop(
+        model: Model,
+        tools: Record<string, Tool>,
+        task: string,
+        approve: (call: ToolCall) => Promise<boolean>,
+        limits = { maxSteps: 8, maxRepeats: 2, defaultTimeoutMs: 5000 },
+      ) {
+        const messages: Message[] = [{ role: 'user', content: task }];
+        const seen = new Map<string, number>();
+        const trace: Trace[] = [];
+        for (let step = 1; step <= limits.maxSteps; step++) {
+          const reply = await model(messages);
+          messages.push({ role: 'assistant', reply });
+          if (reply.type === 'final') return { status: 'done' as const, text: reply.text, trace };
+          for (const call of reply.calls) {
+            // The same call with the same input, again and again, means the loop is stuck.
+            const key = `${call.name}:${JSON.stringify(call.input)}`;
+            const count = (seen.get(key) ?? 0) + 1;
+            seen.set(key, count);
+            if (count > limits.maxRepeats) return { status: 'stuck' as const, text: `Repeated ${call.name}`, trace };
+
+            const started = Date.now();
+            let content: string;
+            let isError = true;
+            const tool = Object.hasOwn(tools, call.name) ? tools[call.name] : undefined;
+            if (!tool) content = `Unknown tool: ${call.name}`;
+            else if (tool.write && !(await approve(call))) content = 'Not approved by the user';
+            else {
+              try {
+                content = await withTimeout(tool, call.input, tool.timeoutMs ?? limits.defaultTimeoutMs);
+                isError = false;
+              } catch (error) {
+                content = `Error: ${error instanceof Error ? error.message : String(error)}`;
+              }
+            }
+            trace.push({ step, call: call.name, ms: Date.now() - started, isError });
+            messages.push({ role: 'tool', callId: call.id, content, isError });
+          }
+        }
+        return { status: 'stopped' as const, text: 'Step limit reached', trace };
+      }
+      ```
+
+      Against a scripted model, a tool that took a second with a 50 ms limit came back as
+      `Error: timed out after 50 ms`, and the run carried on to a final answer. A model that
+      asked for the same `rooms` call every step was stopped as `stuck` on the third
+      request. `finally` clears the timer on both paths, so a fast tool leaves no pending
+      timeout behind. `Promise.race` alone cannot stop the losing promise, which is why the
+      tool receives a signal: a real tool passes it to `fetch` so the request is cancelled.
+      A token or cost budget works the same way as the step cap: count, and stop cleanly.
+  - title: Designing the tools themselves
+    body: |-
+      Guards around the loop matter less if the tools are unsafe. Four rules for tool design.
+
+      Least privilege. Give the agent only the tools the task needs, with the narrowest
+      scope: `searchRooms` and `bookRoom`, not `runSql`. A summariser needs no email tool.
+
+      Validate arguments. The model writes the input, so it is untrusted, exactly like a
+      request body. Check every field and throw a clear message; the loop turns the throw
+      into an error result the model can act on.
+
+      Make writes idempotent. A timed-out call may have succeeded on the server. If the
+      loop retries it, the booking must not happen twice. Key the write by the tool call's
+      id, which a retry of the same call keeps.
+
+      ```ts
+      type BookInput = { room: string; start: string; minutes: number };
+
+      function parseBookInput(input: unknown): BookInput | string {
+        if (typeof input !== 'object' || input === null) return 'expected an object';
+        const { room, start, minutes } = input as Record<string, unknown>;
+        if (typeof room !== 'string' || !/^R\d{1,3}$/.test(room)) return 'room must look like R4';
+        if (typeof start !== 'string' || Number.isNaN(Date.parse(start))) return 'start must be an ISO date-time';
+        if (typeof minutes !== 'number' || !Number.isInteger(minutes) || minutes < 15 || minutes > 240) {
+          return 'minutes must be a whole number from 15 to 240';
+        }
+        return { room, start, minutes };
+      }
+
+      const done = new Map<string, string>();
+
+      export async function bookRoom(input: unknown, key: string): Promise<string> {
+        const parsed = parseBookInput(input);
+        if (typeof parsed === 'string') throw new Error(parsed);
+        const earlier = done.get(key);
+        if (earlier !== undefined) return earlier;
+        const result = `Booked ${parsed.room} at ${parsed.start} for ${parsed.minutes} minutes`;
+        done.set(key, result);
+        return result;
+      }
+      ```
+
+      Describe tools for the model. A clear name, a one-line description of when to use it,
+      and a parameter schema with units ("minutes", "ISO date-time") prevent more bad calls
+      than any guard catches afterwards. In production the idempotency record lives in the
+      database, next to the booking, not in memory.
+  - title: Approval that means something
+    body: |-
+      "Approval before writes" is quick to say and often done wrong. A few details make it
+      real.
+
+      Approve the exact call, not the tool. The person sees the tool name and the
+      arguments, "Book R4 on 1 October at 10:00 for 60 minutes", and approves that. A
+      standing "allow bookings" permission lets an injected instruction book anything.
+
+      Decide the boundary by effect, not by name. A write is anything that changes state
+      outside the conversation or cannot be undone: sending, paying, deleting, booking,
+      posting. Reads that leak data to a third party, such as fetching a URL built from
+      private context, deserve the same care.
+
+      Refusal is information. When the person declines, the loop returns "Not approved by
+      the user" as an error result. The model can then ask a question or propose another
+      option, instead of retrying the same write.
+
+      Asynchronous approval changes the shape. In a web app the person may answer minutes
+      later. The loop then saves its messages, returns a "waiting for approval" state, and
+      resumes with the answer as the tool result. That is also why each step should be
+      logged with inputs and outputs: a paused run must be resumable and a failed run
+      replayable.
+  - title: Agent or workflow, and how to test either
+    body: |-
+      A **workflow** is a fixed sequence of model calls: classify, then retrieve, then
+      answer. An **agent** chooses its next step from what it has seen. Agents handle open
+      tasks where the path depends on results, such as "find a free room near the team and
+      book it". They cost more calls, vary between runs, and are harder to test. If you can
+      draw the flowchart in advance, build the workflow.
+
+      Testing follows from the loop's shape. A scripted fake model returns a fixed list of
+      replies, so each guard gets a deterministic test:
+
+      - an unknown tool name gives an error result and the run goes on;
+      - a refused write never calls `run`, and the tool message says so;
+      - a throwing or slow tool becomes an error result;
+      - a model that never finishes stops at the cap with the fallback;
+      - invalid output is retried with the error in a user message, then falls back;
+      - a tool whose output says "ignore your rules" leaves the system prompt unchanged.
+
+      These test your code, not the model. For the model's behaviour, keep a small eval set
+      of tasks with the expected tool sequence or final answer, and run it when you change
+      the prompt, the tools or the model.
+pitfalls:
+  - >-
+    **Throwing on an unknown tool.** It ends the run and wastes every step so far. Return
+    `Unknown tool: name` as an error result; told the name was wrong, the model usually
+    picks a real one.
+  - >-
+    **Asking for approval and ignoring the answer.** `await approve(call)` without checking
+    the result still runs the write. Branch on it and return a refusal result.
+  - >-
+    **Appending tool output to the system prompt.** It promotes a fetched page to
+    instructions, which is how indirect prompt injection works. Keep it in a tool message.
+  - >-
+    **No cap, or only a cap.** Without a step cap a confused model loops forever and bills
+    you; with only a cap it burns every step repeating one call. Add repeat detection and a
+    token or cost budget.
+  - >-
+    **`Promise.race` without cancelling.** The timed-out tool keeps running and may still
+    write. Pass an `AbortSignal` and clear the timer in `finally`.
+  - >-
+    **Trusting tool arguments.** The model can pass the wrong type, a huge number or a path
+    outside the allowed folder. Validate every field before acting.
+  - >-
+    **Checking the allowlist with `in` or plain indexing.** `tools['constructor']` exists on
+    every object. Use `Object.hasOwn` or a `Map`.
+interview:
+  - question: How do you stop an agent loop that never ends?
+    answer: >-
+      With several independent limits, because each catches a different failure. A hard
+      step cap bounds model calls whatever the model asks. A token or cost budget bounds
+      spend, since one step with huge context can cost more than ten small ones. Repeat
+      detection stops the run when the same tool is called with the same input several
+      times, which is the common stuck pattern. Each tool call has its own timeout, so one
+      hanging API cannot stall the loop. Every limit ends the run with a clear status and a
+      fallback answer rather than an exception, and the trace shows which limit fired. The
+      trade-off is tuning: caps that are too tight cut off legitimate long tasks, so I set
+      them from observed runs on the eval set.
+  - question: Where do you draw the line between read and write tools, and who approves?
+    answer: >-
+      By effect. Anything that changes state outside the conversation or cannot be undone,
+      sending, paying, deleting, booking, is a write and needs approval of the exact call,
+      with its arguments shown to the person. Reads run freely, with one exception: a read
+      that sends private data outward, such as fetching a URL assembled from user context,
+      is treated like a write. Approval is enforced in the loop, per call, never by a prompt
+      instruction, because injected text can override a prompt. A refusal goes back to the
+      model as an error result so it can ask or adapt. For low-risk writes that can be
+      reversed, I might allow undo instead of approval, which is a product decision worth
+      naming.
+  - question: A tool times out mid-run. What should happen?
+    answer: >-
+      The loop returns the timeout as an error result for that call and carries on. The
+      model sees "Error: timed out after 5000 ms" and can retry, try another tool or explain
+      the failure, which is usually better than a crash that discards the work so far. The
+      timeout also aborts a signal passed to the tool, so its HTTP request is cancelled
+      rather than left running. If the tool writes, it must be idempotent, keyed by the call
+      id, because the first attempt may have succeeded on the server before the timeout
+      fired. The step cap still applies, so repeated retries cannot loop forever.
+  - question: How do you get reliable structured output from the final step?
+    answer: >-
+      Two layers. Where the model API offers schema-constrained output, I use it, since it
+      removes most format errors. I still validate on my side, because a schema guarantees
+      shape, not sense: a string array of sources can still name files that do not exist.
+      If validation fails, I send the specific error back, such as "sources must be an
+      array of strings", and ask again, since the error is new information and the same
+      prompt tends to repeat the same mistake. Retries are capped, then the run returns a
+      typed fallback rather than throwing, so callers always get the promised shape. I log
+      every failure, because a rising retry rate is an early signal that a prompt or model
+      change hurt.
+  - question: When would you not build an agent?
+    answer: >-
+      When the steps are known in advance. If the task is always classify, retrieve, then
+      answer, a fixed workflow of model calls is cheaper, faster, easier to test and behaves
+      the same on every run. An agent earns its cost when the next step genuinely depends on
+      what earlier steps returned, such as searching, comparing results and then choosing
+      what to book. Even then I keep the tool set small and the loop bounded. In a
+      take-home I would say this explicitly, because reviewers value the judgement to pick
+      the simpler design as much as the ability to build the complex one.
+  - question: How do you evaluate an agent?
+    answer: >-
+      With tasks whose end state a program can check, not by reading a few chats. Each case
+      gives the agent a task and a starting state, and a checker looks at the result: the
+      booking exists with the right dates, the file compiles, the refund was not issued. I
+      track the success rate, and beside it the steps taken, the cost and the time per task,
+      because an agent that succeeds in 40 steps is a different product from one that takes
+      four. Then I read the full traces of the failures, which usually show a tool
+      description the model misreads or a loop the guards should have caught. I run the set
+      on every prompt, tool or model change, like any other eval. The trade-off is effort:
+      a checkable end state takes longer to build than a rubric, but it doesn't drift.
+
+terms:
+  - term: Tool call
+    say: The model runs a function.
+    means: The model outputs a structured request naming a tool and its arguments. Your code
+      decides whether to run it and sends back the result.
+  - term: Allowlist
+    say: Listing the tools in the prompt.
+    means: A check in code that the requested tool name is an own property of a known map of
+      tools. Anything else is refused.
+  - term: Step cap
+    say: A safety net you rarely hit.
+    means: A hard limit on model calls per run. When it is reached the loop returns a result
+      saying so, rather than throwing.
+  - term: Indirect prompt injection
+    say: A user typing "ignore previous instructions".
+    means: Instructions hidden in text the model reads, such as a fetched page or a tool result.
+      That is why tool output goes back as a tool message, as data.
+  - term: Structured output
+    say: Asking the model for JSON.
+    means: A final answer checked against a schema in code. On failure the specific error goes
+      back to the model, with a capped number of retries and then a safe fallback.
+  - term: Workflow
+    say: Any multi-step LLM app is an agent.
+    means: Plain code that fixes the steps in advance and calls a model inside some of them. Use
+      one when the steps are known; an agent only when the next step depends on the last
+      result.

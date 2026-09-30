@@ -1,0 +1,233 @@
+summary: >-
+  An eval is a repeatable measurement of whether an AI system does its job. In an AI build,
+  "it looks fine" after trying three questions is the default, and it hides most failures.
+  Starting with a small golden set, ten to thirty real questions with the chunks that answer
+  them and the facts a good answer must contain, turns quality into numbers you can track
+  and defend.
+
+
+  The key structural idea is to measure the pipeline in halves. Retrieval metrics, recall
+  at k and mean reciprocal rank, say whether the right passages were found. Answer checks
+  say whether the model used them: the facts are there, a citation is present, and it
+  refuses when it should. When a number drops, you know which half to open.
+
+
+  Evals then become a gate. Save the metrics from the main branch, and fail any change that
+  lowers any metric beyond a small tolerance. Fuzzy qualities can be scored by an LLM judge,
+  but only after you have cancelled its known biases and checked it against human labels.
+  Reviewers of AI take-homes look for exactly this; some say outright that not starting with
+  evals is a red flag.
+remember:
+  - Write the golden set before building, so it defines done and measures every change from the first commit.
+  - A golden case records the question, the relevant chunk ids, the facts the answer must contain, and whether it should be refused.
+  - Recall at k is the share of relevant chunks in the top k; reciprocal rank is 1 over the position of the first relevant chunk, and MRR is its mean.
+  - Score retrieval and answers separately, so a drop points at search or at generation, not at "the AI".
+  - Gate each metric on its own against a saved baseline; an average lets one metric's gain hide another's fall.
+  - Include questions the documents cannot answer, or you will never measure whether the system refuses.
+  - LLM judges favour the first answer shown, longer answers and their own model family, so swap orders and check agreement with people before trusting them.
+  - With twenty cases one case is five points, so set gate tolerances with that noise in mind.
+sections:
+  - title: What a golden set looks like, and how to write one in thirty minutes
+    body: |-
+      A golden set is a file checked into the repository, next to a script that runs it.
+      Keep it boring and explicit:
+
+      ```json
+      [
+        {
+          "id": "refund-window",
+          "question": "How long do I have to return an item?",
+          "relevant": ["returns#0", "returns#1"],
+          "mustInclude": ["30 days"]
+        },
+        {
+          "id": "refund-method",
+          "question": "Do refunds go back to my card?",
+          "relevant": ["returns#2"],
+          "mustInclude": ["original payment method"]
+        },
+        {
+          "id": "not-covered",
+          "question": "What is the chief executive's salary?",
+          "relevant": [],
+          "mustInclude": []
+        }
+      ]
+      ```
+
+      Thirty minutes is enough if you follow a recipe. Skim the documents and write one
+      question per important fact, in the words a user would use, not the document's
+      wording. Add two or three questions whose answer spans two chunks, since those test
+      recall rather than luck. Add three to five questions the documents cannot answer,
+      some of them close to real topics, because a refusal set of only absurd questions is
+      too lenient a test. Then run your chunker once and record the chunk ids by hand.
+
+      Real user questions beat synthetic ones when you can get them. Questions generated
+      from the documents tend to reuse the documents' phrasing, which flatters embedding
+      search. If you do generate some, rewrite them in plain words and mark them, so you
+      can see whether the real ones score differently.
+  - title: Reading the retrieval numbers
+    body: |-
+      A worked case makes the two metrics concrete. Suppose a question has relevant chunks
+      `a` and `b`, and retrieval returns `[x, a, y, b, z]`.
+
+      - Recall at 3: the top three are `x, a, y`. One of two relevant chunks is there, so
+        recall is 0.5.
+      - Recall at 5: both are there, so recall is 1.
+      - Reciprocal rank: the first relevant chunk is at position 2, so it scores 1/2.
+
+      The two answer different questions. Recall at k asks whether the answer's material
+      reached the prompt at all, which matters most when you pass all k chunks to the
+      model. Reciprocal rank asks how high the first useful chunk sits, which matters when
+      you pass only one or two, or when the model pays most attention to the top. Precision
+      at k, the share of the top k that is relevant, tells you how much noise you add to
+      the prompt; it rises as k falls, while recall rises as k grows.
+
+      Use the numbers to decide where to work. High recall with weak answers means the
+      model is not using what it gets: look at the prompt, the order of chunks and the
+      refusal threshold. Low recall means the search is the problem: look at chunk size,
+      overlap, the embedding model or adding keyword search. Changing k is a tuning knob,
+      not a fix: raising it buys recall with noise.
+  - title: A gate that fails the right changes
+    body: |-
+      A gate compares a change with a saved baseline and blocks the merge if any metric
+      falls too far. Printing every metric, not only the verdict, makes the failure
+      readable in CI.
+
+      ```ts
+      type Metrics = { recallAtK: number; mrr: number; refusalAccuracy: number; answerPass: number };
+      type Verdict = { ok: boolean; lines: string[] };
+
+      export function gate(baseline: Metrics, current: Metrics, tolerance: number): Verdict {
+        const lines: string[] = [];
+        let ok = true;
+        for (const key of Object.keys(baseline) as (keyof Metrics)[]) {
+          const drop = baseline[key] - current[key];
+          const failed = drop > tolerance;
+          if (failed) ok = false;
+          lines.push(`${failed ? 'FAIL' : 'ok  '} ${key}: ${baseline[key].toFixed(2)} -> ${current[key].toFixed(2)}`);
+        }
+        return { ok, lines };
+      }
+      ```
+
+      With a baseline of recall 0.85, MRR 0.70, refusals 0.90 and answers 0.80, a change
+      that lifts retrieval to 0.95 and 0.80 but drops refusals to 0.65 prints three `ok`
+      lines and one `FAIL`, and it is blocked. An averaged score would have gone up.
+
+      Tolerance is about noise. With twenty cases, one case moves a rate by 0.05, and the
+      standard error of a rate of 0.8 is about 0.09. A tolerance of zero fails on noise; a
+      tolerance of 0.2 lets real regressions through. For a small set, a practical rule is
+      to allow one case of movement and to review any case that flips from pass to fail,
+      whatever the average does. Save the baseline file from main after each merge, so the
+      gate always compares with what is live.
+  - title: Using an LLM judge without fooling yourself
+    body: |-
+      String checks cover facts and citations. For qualities like faithfulness ("is every
+      claim supported by the chunks?") or relevance, an LLM judge scales where string
+      matching cannot. Its known biases are position (preferring the first answer),
+      verbosity (preferring longer answers) and self-preference (preferring its own model
+      family). Two habits remove most of the damage.
+
+      Ask for pairwise verdicts in both orders and keep only the ones that agree:
+
+      ```ts
+      type Judge = (prompt: string) => Promise<string>;
+      const ask = (q: string, a: string, b: string) =>
+        `Question: ${q}\nAnswer A: ${a}\nAnswer B: ${b}\nWhich answer is more correct and complete? Reply A or B.`;
+
+      export async function compare(judge: Judge, q: string, candidate: string, current: string) {
+        const [first, second] = await Promise.all([judge(ask(q, candidate, current)), judge(ask(q, current, candidate))]);
+        const a = first.trim();
+        const b = second.trim();
+        if (a === 'A' && b === 'B') return 'candidate';
+        if (a === 'B' && b === 'A') return 'current';
+        return 'tie';
+      }
+      ```
+
+      A judge that always says "A" now returns `tie` every time instead of crowning
+      whichever answer sat first.
+
+      Then measure the judge against people on a sample. Raw agreement flatters: if 80% of
+      answers are good, a judge that passes everything agrees 80% of the time. Cohen's
+      kappa corrects for chance:
+
+      ```ts
+      export function agreement(judge: boolean[], human: boolean[]) {
+        const n = judge.length;
+        const observed = judge.filter((j, i) => j === human[i]).length / n;
+        const pj = judge.filter(Boolean).length / n;
+        const ph = human.filter(Boolean).length / n;
+        const chance = pj * ph + (1 - pj) * (1 - ph);
+        const kappa = chance === 1 ? 1 : (observed - chance) / (1 - chance);
+        return { observed, kappa };
+      }
+      ```
+
+      For that pass-everything judge on ten labels with eight good answers, `observed` is
+      0.8 and `kappa` is 0: it knows nothing. Prefer binary pass or fail questions with a
+      short rubric over 1 to 10 scores, which drift and cluster.
+pitfalls:
+  - >-
+    **Writing the evals after the build.** The questions drift towards what already works,
+    so the numbers flatter the system. Write them first, including ones you expect to fail.
+  - >-
+    **One blended score.** An average of retrieval and answer metrics hides which half
+    broke, and lets a gain in one hide a loss in another. Report and gate each metric.
+  - >-
+    **No refusal cases.** Without questions the documents cannot answer, a system that
+    always answers looks perfect. Add a few, some close to real topics.
+  - >-
+    **Trusting a judge unchecked.** Position and length bias can decide the result. Swap
+    the order, keep a rubric short and binary, and measure agreement with people.
+  - >-
+    **A tolerance that ignores sample size.** Twenty cases cannot detect a two-point change.
+    Size the tolerance to one or two cases, and read the flipped cases by hand.
+  - >-
+    **Tuning on the whole set.** Adjusting prompts until every golden case passes overfits
+    to those questions. Keep a few cases aside that you look at only before a release.
+  - >-
+    **Synthetic questions only.** Generated questions reuse the documents' wording and
+    make retrieval look better than it is. Use real questions where you can.
+interview:
+  - question: You have four hours to build a RAG chatbot. Why spend the first half hour on evals?
+    answer: >-
+      Because without them I cannot tell whether any later change helped. Ten to thirty
+      real questions with the chunk ids that answer them, the facts the answer needs, and a
+      few questions to refuse take about thirty minutes and a small script. From then on,
+      every choice, chunk size, k, the threshold, the prompt, is measured instead of
+      eyeballed, and a regression shows up as a number rather than in the demo. It also
+      gives my presentation its evidence slide. The trade-off is half an hour less for
+      features, which is worth it because reviewers grade evidence and judgement more than
+      extra features.
+  - question: Recall at 5 is high but the answers are poor. What do you do?
+    answer: >-
+      I look at generation, not search. High recall means the right chunks reach the
+      prompt, so the loss happens after retrieval. I read a few failing cases with their
+      prompts: is the relevant chunk buried among four noisy ones, is the instruction to
+      use only the context and cite it missing, is the refusal threshold rejecting good
+      matches? Fixes might be passing fewer chunks, reranking so the best one comes first,
+      or tightening the prompt. What I would not do is change the embedding model or raise
+      k, because retrieval is already doing its job and more chunks add noise. Separate
+      metrics are what make this diagnosis quick.
+  - question: How would you use an LLM as a judge, and how do you know it is reliable?
+    answer: >-
+      For qualities strings cannot check, like faithfulness to the retrieved chunks, with
+      guards. I ask narrow, binary questions with a short rubric rather than 1 to 10 scores.
+      For comparisons I judge both orders and count only agreeing verdicts, which cancels
+      position bias, and I use a different model family from the one being judged where I
+      can. Then I label thirty to fifty cases myself and measure agreement with a
+      chance-corrected statistic such as Cohen's kappa, since raw agreement flatters a judge
+      that passes everything. If agreement is poor I fix the rubric before trusting any
+      score. The cost is extra calls and a little labelling time.
+  - question: How do you stop a prompt change from quietly breaking the system?
+    answer: >-
+      A regression gate in CI. The eval script runs on every change, writes the metrics,
+      and compares each one with a baseline saved from main: recall at k, MRR, refusal
+      accuracy and the answer checks. If any single metric falls by more than the tolerance,
+      the build fails and prints which one. Gating per metric matters, because a prompt
+      that improves answers can break refusals and still raise an average. I size the
+      tolerance to the set, about one case, and review cases that flip from pass to fail.
+      The limit is coverage: the gate only protects what the golden set asks, so I add a
+      case for every production failure.

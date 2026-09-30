@@ -1,0 +1,199 @@
+summary: >-
+  Aggregates turn many rows into one number: how many tickets are open, the total revenue,
+  the latest login. `GROUP BY` does it once per group, so you get one number per agent, per
+  day or per product. `HAVING` then filters those groups. This is how every dashboard,
+  report and "top ten" list gets its figures.
+
+
+  The database should do this work, not your code. Counting in Postgres moves one row per
+  group over the network instead of every row, and it can use indexes to do it. Fetching a
+  table to count it in JavaScript is the aggregate version of filtering in code.
+
+
+  The mental model that makes it all click is the order a query runs in. Rows are found
+  and filtered first, then grouped, then groups are filtered, and only then are the output
+  columns computed. Most errors and most wrong numbers in grouped queries come from
+  forgetting that order, or from aggregating over a join that repeated rows.
+remember:
+  - A query runs as `FROM`, `WHERE`, `GROUP BY`, `HAVING`, window functions, `SELECT`, `DISTINCT`, `ORDER BY`, then `LIMIT`.
+  - "`WHERE` filters rows before grouping, and `HAVING` filters groups after aggregates are computed."
+  - "`count(*)` counts rows, `count(col)` counts non-NULL values, and `count(DISTINCT col)` counts different non-NULL values."
+  - With a left join, count a column from the right table, because `count(*)` counts an unmatched row as one.
+  - "`sum`, `avg`, `min` and `max` return NULL over zero rows, so wrap totals in `coalesce(..., 0)`."
+  - Integer divided by integer truncates in Postgres, so multiply by `100.0` or cast to `numeric` before dividing for a percentage.
+  - Window functions such as `row_number() OVER (PARTITION BY ...)` compute per-group values without collapsing rows, which solves top-N-per-group.
+  - Grouping by a table's primary key lets you select that table's other columns without listing them in `GROUP BY`.
+sections:
+  - title: Counting parents with a left join
+    body: |-
+      "Every customer with their number of orders" needs a left join, so customers with no
+      orders appear, and a careful count:
+
+      ```sql
+      CREATE TABLE customers (id integer PRIMARY KEY, name text NOT NULL);
+      CREATE TABLE orders (id integer PRIMARY KEY, customer_id integer NOT NULL REFERENCES customers(id), total_pence integer NOT NULL);
+      INSERT INTO customers VALUES (1, 'Ana'), (2, 'Ben'), (3, 'Cara');
+      INSERT INTO orders VALUES (10, 1, 1200), (11, 1, 800), (12, 2, 500);
+      SELECT c.id, c.name, count(*) AS wrong, count(o.id) AS orders,
+             coalesce(sum(o.total_pence), 0) AS spent_pence
+      FROM customers c
+      LEFT JOIN orders o ON o.customer_id = c.id
+      GROUP BY c.id
+      ORDER BY c.id;
+      ```
+
+      Cara has no orders, yet `count(*)` gives her 1: the left join produced one row for
+      her, with NULLs on the order side, and `count(*)` counts rows. `count(o.id)` skips the
+      NULL and gives 0. Her `sum` is NULL, hence the `coalesce`.
+
+      Notice the `GROUP BY c.id` with `c.name` in the select list. The SQL standard lets you
+      skip grouping by a column that is **functionally dependent** on the grouped key, and
+      Postgres recognises this when you group by a table's primary key. Every `c.id` has
+      exactly one `c.name`, so there's nothing ambiguous. Grouping by a non-key column
+      such as `c.name` alone doesn't grant this, and two customers called Sam would merge.
+  - title: The full order of evaluation
+    body: |-
+      The lesson's pipeline has a few more stages at the end:
+
+      ```text
+      FROM and JOIN -> WHERE -> GROUP BY -> HAVING -> window functions -> SELECT -> DISTINCT -> ORDER BY -> LIMIT and OFFSET
+      ```
+
+      The rules that follow from it:
+
+      - `WHERE` can't contain an aggregate or a window function; neither exists yet.
+      - `HAVING` can't use an alias from `SELECT` in Postgres, so repeat the expression:
+        `HAVING count(*) > 2`, not `HAVING open_tickets > 2`.
+      - `ORDER BY` can use aliases, because it runs after `SELECT`.
+      - Window functions see the rows left after `WHERE`, `GROUP BY` and `HAVING`. To
+        filter on a window result you need an outer query.
+      - `LIMIT` comes last, so `ORDER BY ... LIMIT 10` sorts everything first. With an
+        index matching the sort, Postgres can stop early instead.
+
+      This is a logical order that defines what the answer is. The planner may execute in a
+      different physical order, for example pushing a condition down into a join, as long
+      as the result is the same.
+
+      As a convenience, Postgres also lets `GROUP BY` name an output column alias or its
+      position, `GROUP BY 1`. Positions break silently when someone reorders the select
+      list, so name columns instead.
+  - title: Window functions and top N per group
+    body: |-
+      An aggregate collapses a group to one row. A **window function** computes across a
+      group but keeps every row, adding the result as a column. `OVER (PARTITION BY ...
+      ORDER BY ...)` defines the group and its order.
+
+      The classic use is "the latest ticket for each agent" or "the top three products per
+      category", which `GROUP BY` alone can't answer, since it can't return the other
+      columns of the winning row:
+
+      ```sql
+      CREATE TABLE tickets (id integer PRIMARY KEY, agent text NOT NULL, subject text NOT NULL, opened_at timestamptz NOT NULL);
+      INSERT INTO tickets VALUES
+        (1, 'ana', 'Refund', '2026-09-20 09:00+00'),
+        (2, 'ana', 'Login', '2026-09-21 10:00+00'),
+        (3, 'kofi', 'Invoice', '2026-09-19 12:00+00'),
+        (4, 'kofi', 'Password', '2026-09-22 08:00+00'),
+        (5, 'kofi', 'Upgrade', '2026-09-18 15:00+00');
+      SELECT agent, id, subject
+      FROM (
+        SELECT agent, id, subject,
+               row_number() OVER (PARTITION BY agent ORDER BY opened_at DESC, id DESC) AS rn
+        FROM tickets
+      ) ranked
+      WHERE rn = 1
+      ORDER BY agent;
+      SELECT DISTINCT ON (agent) agent, id, subject
+      FROM tickets
+      ORDER BY agent, opened_at DESC, id DESC;
+      SELECT id, agent, count(*) OVER (PARTITION BY agent) AS agent_total
+      FROM tickets ORDER BY id;
+      ```
+
+      Both of the first two queries return Ana's ticket 2 and Kofi's ticket 4. The
+      subquery is needed because `WHERE` runs before window functions. Change `rn = 1` to
+      `rn <= 3` for top three. `DISTINCT ON` is a Postgres extension that keeps the first
+      row per group in the `ORDER BY` order; it's shorter but only does top one. The last
+      query shows the defining trait: all five rows stay, each carrying its agent's total.
+
+      `rank()` gives tied rows the same number and leaves gaps; `row_number()` never ties.
+      Pick by whether ties should all win.
+  - title: Numbers that come out wrong
+    body: |-
+      Three arithmetic traps catch reports.
+
+      **Integer division truncates.** `count(*)` returns `bigint`, and dividing two integers
+      discards the fraction. `avg` of integers is safe: it returns `numeric`.
+
+      **Dividing by a count that can be zero** raises an error. `nullif(x, 0)` turns a zero
+      divisor into NULL, so the result is NULL instead of a crash.
+
+      **Several counts in one pass** are cleaner with `FILTER` than with several queries or
+      `CASE` inside `sum`:
+
+      ```sql
+      CREATE TABLE tickets (id integer PRIMARY KEY, agent text, closed_at timestamptz);
+      INSERT INTO tickets VALUES (1, 'ana', now()), (2, 'ana', NULL), (3, 'kofi', NULL), (4, NULL, NULL);
+      SELECT count(*) FILTER (WHERE closed_at IS NOT NULL) / count(*) AS truncated,
+             round(100.0 * count(*) FILTER (WHERE closed_at IS NOT NULL) / count(*), 1) AS pct_closed
+      FROM tickets;
+      SELECT agent,
+             count(*) FILTER (WHERE closed_at IS NULL) AS open,
+             round(100.0 * count(*) FILTER (WHERE closed_at IS NOT NULL)
+                   / nullif(count(*), 0), 1) AS pct_closed
+      FROM tickets
+      GROUP BY agent
+      ORDER BY agent NULLS LAST;
+      ```
+
+      The first query shows `truncated` as 0 and `pct_closed` as 25.0. The second gives one
+      row per agent, plus a row for the unassigned ticket, because `GROUP BY` puts all NULLs
+      in one group.
+
+      For totals by several levels at once, such as per agent and overall, `GROUP BY
+      ROLLUP (agent)` adds a grand-total row, which saves a second query.
+pitfalls:
+  - '**An aggregate in `WHERE`.** Groups don''t exist yet, so Postgres refuses. Move the test to `HAVING`.'
+  - '**`count(*)` after a left join.** Unmatched parents count as 1. Count a non-NULL column from the joined table, such as its id.'
+  - '**`count(col)` when you mean rows.** It skips NULLs, so `count(closed_at)` counts closed tickets. Use `count(*)` with a `WHERE`, or `FILTER`.'
+  - '**Summing parent values across a join to children.** Each parent value repeats per child. Aggregate the children first or drop the join.'
+  - '**Integer division in percentages.** `open / total` is 0 for any fraction below one. Multiply by `100.0` first.'
+  - '**Trusting `sum` on a quiet day.** Over no rows it returns NULL, which a chart may show as blank or crash on. Use `coalesce(sum(x), 0)`.'
+  - '**Grouping by a name instead of a key.** Two customers with the same name merge into one group. Group by the id.'
+interview:
+  - question: What's the difference between WHERE and HAVING?
+    answer: >-
+      `WHERE` filters rows before grouping; `HAVING` filters groups after aggregation. The
+      logical order is `FROM`, `WHERE`, `GROUP BY`, `HAVING`, then `SELECT`, so `WHERE` can't
+      see a `count(*)` because no groups exist yet. Row conditions, such as `closed_at IS
+      NULL`, belong in `WHERE` even in a grouped query, because filtering early means fewer
+      rows to group and lets an index help. Only conditions on aggregates, such as `count(*)
+      > 5`, belong in `HAVING`. Putting a plain row condition in `HAVING` is legal when it's
+      on a grouped column, but wasteful.
+  - question: How do you get the most recent order for each customer?
+    answer: >-
+      With a window function: `row_number() OVER (PARTITION BY customer_id ORDER BY
+      created_at DESC, id DESC)` in a subquery, keeping `rn = 1`. It returns the whole
+      winning row, which `GROUP BY` with `max(created_at)` can't do without joining back.
+      In Postgres, `DISTINCT ON (customer_id) ... ORDER BY customer_id, created_at DESC` is
+      shorter for top one. With a small set of customers and an index on `(customer_id,
+      created_at DESC)`, a `LATERAL` subquery with `LIMIT 1` per customer is often fastest,
+      since each lookup is one index probe. The id tie-breaker keeps results deterministic.
+  - question: What's the difference between count(*), count(column) and count(DISTINCT column)?
+    answer: >-
+      `count(*)` counts rows; `count(column)` counts rows where that column isn't NULL;
+      `count(DISTINCT column)` counts different non-NULL values. So on tickets,
+      `count(*)` is all tickets, `count(agent)` is assigned tickets, and `count(DISTINCT
+      agent)` is how many agents have tickets. The difference bites after a left join:
+      `count(*)` counts an unmatched parent as 1, while `count(child.id)` correctly gives 0.
+      `count(DISTINCT ...)` needs a sort or hash of the values, so it's heavier on large
+      tables, and approximate counts are sometimes acceptable there.
+  - question: A revenue report sums order totals after joining order lines, and the figure is too high. Explain and fix it.
+    answer: >-
+      The join repeats each order once per line, so each total is added as many times as
+      the order has lines, and bigger baskets inflate it more. If the report needs only
+      order totals, drop the join and sum `orders.total_pence` directly. If it needs line
+      data too, aggregate the lines to one row per order in a subquery, then join that. The
+      general rule: never aggregate a parent's column across a one-to-many join. I'd also
+      reconcile the report against a known figure, such as payments received, because
+      fan-out bugs produce believable numbers.

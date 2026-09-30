@@ -1,0 +1,211 @@
+summary: >-
+  The relational model is the idea that data lives in tables, each row is identified by a
+  key, and tables relate by storing each other's keys. A primary key names one row for
+  good. A foreign key says "this value must be a key over there". Together they let the
+  database itself refuse duplicates and orphans, whatever code, script or person writes to
+  it.
+
+
+  Normalisation is the design habit that goes with it: store each fact once and point at
+  it. A name held in one row can't disagree with itself; a name copied onto a thousand
+  orders will, sooner or later. The schema then carries the rules of the business, and
+  bugs of the kind "an order with no customer" become impossible rather than unlikely.
+
+
+  Reach for this by default when you design tables. Break it on purpose, and only with a
+  plan to keep copies in step, when a measured read path is too slow: a cached count on a
+  busy page, or a snapshot that must not change, such as the price on an invoice.
+remember:
+  - A primary key is unique and never NULL, and every table should have one.
+  - A foreign key refuses a child row that points at a missing parent and, by default, refuses deleting a parent that still has children.
+  - Postgres indexes primary keys and unique columns automatically but does not index the referencing side of a foreign key, so add that index yourself.
+  - One-to-many puts the foreign key on the many side, and many-to-many needs a junction table with a key made of both foreign keys.
+  - Keep a unique constraint on the natural identifier, such as an email, even when the primary key is a surrogate id.
+  - Store each fact once and point at it by key, so an update can never leave two versions of it.
+  - Copy a value on purpose when it is a snapshot that must not change, such as the price paid on an order line.
+  - Choose `ON DELETE CASCADE`, `SET NULL` or the default refusal per relationship, based on whether the child can exist without its parent.
+sections:
+  - title: Choosing a primary key
+    body: |-
+      A **natural key** is a value from the real world, such as an email or an ISBN. A
+      **surrogate key** is an id the database invents. Most schemas use surrogate keys,
+      because real-world values change: people change email, and ISBNs get reissued. A key
+      that changes forces an update to every row pointing at it.
+
+      Keep the natural value unique anyway. A surrogate id alone would happily store the
+      same email twice:
+
+      ```sql
+      CREATE TABLE users (
+        id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        email text NOT NULL UNIQUE
+      );
+      INSERT INTO users (email) VALUES ('ana@example.com');
+      INSERT INTO users (email) VALUES ('ana@example.com');
+      ```
+
+      The second insert fails with `duplicate key value violates unique constraint
+      "users_email_key"`.
+
+      For the id itself, the choice is usually `bigint` identity or UUID. A `bigint` is small
+      and fast, but sequential ids leak how many rows you have and can be guessed in URLs.
+      A UUID can be generated anywhere, even on a phone offline, and reveals nothing. Random
+      UUIDs, version 4, scatter inserts across the whole index, which hurts write speed on
+      big tables. Version 7 UUIDs start with a timestamp, so new ones sort together.
+      Postgres 18 generates both:
+
+      ```sql
+      SELECT uuidv7() AS time_ordered, gen_random_uuid() AS random_v4;
+      ```
+
+      Whatever the key, never expose a guessable id as the only protection on a resource.
+      Authorisation checks belong in the query, not in the id being hard to guess.
+  - title: The three shapes of relationship
+    body: |-
+      Every relationship is one of three shapes, and each has a standard table layout.
+
+      - **One-to-many**: a customer has many orders. The foreign key goes on the many side,
+        `orders.customer_id`.
+      - **One-to-one**: a user has one profile. A foreign key that is also unique, often the
+        profile's primary key itself.
+      - **Many-to-many**: a book has many authors and an author writes many books. Neither
+        table can hold the link, so a **junction table** holds one row per pair.
+
+      ```sql
+      CREATE TABLE books (id integer PRIMARY KEY, title text NOT NULL);
+      CREATE TABLE authors (id integer PRIMARY KEY, name text NOT NULL);
+      CREATE TABLE book_authors (
+        book_id integer NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+        author_id integer NOT NULL REFERENCES authors(id),
+        position integer NOT NULL,
+        PRIMARY KEY (book_id, author_id)
+      );
+      CREATE INDEX book_authors_author_id_idx ON book_authors (author_id);
+      INSERT INTO books VALUES (1, 'Good Omens');
+      INSERT INTO authors VALUES (1, 'Terry Pratchett'), (2, 'Neil Gaiman');
+      INSERT INTO book_authors VALUES (1, 1, 1), (1, 2, 2);
+      INSERT INTO book_authors VALUES (1, 2, 3);
+      ```
+
+      The composite primary key stops the same author being linked twice, so the last
+      insert fails. It also indexes lookups by `book_id`, because that column comes first.
+      Lookups by author need the second index. The junction table is also the right home
+      for facts about the pair, such as the order the authors are credited in.
+
+      A column holding a list, such as `authors = 'Pratchett, Gaiman'`, looks simpler and
+      loses everything: no foreign key, no index per author, and every query splits strings.
+  - title: What happens when a parent is deleted
+    body: |-
+      A foreign key's `ON DELETE` rule decides what a delete of the parent does to the
+      children:
+
+      - `NO ACTION`, the default: refuse if children exist, checked at the end of the
+        statement, or at commit if the constraint is deferred.
+      - `RESTRICT`: refuse, checked at once and never deferred.
+      - `CASCADE`: delete the children too.
+      - `SET NULL` or `SET DEFAULT`: keep the children and clear the pointer.
+
+      Pick by asking whether the child means anything without its parent. Order lines
+      without their order mean nothing, so cascade. An order without its customer is still
+      a financial record, so refuse, and anonymise the customer instead of deleting them.
+      A support ticket whose agent leaves can keep existing with `SET NULL`.
+
+      Postgres checks the child table on every parent delete and on every update of the
+      parent's key. It **does not create an index** on the referencing column, so without
+      one each check scans the child table:
+
+      ```sql
+      CREATE TABLE customers (id integer PRIMARY KEY);
+      CREATE TABLE orders (id integer PRIMARY KEY, customer_id integer NOT NULL REFERENCES customers(id));
+      SELECT indexname FROM pg_indexes WHERE tablename = 'orders';
+      CREATE INDEX orders_customer_id_idx ON orders (customer_id);
+      SELECT indexname FROM pg_indexes WHERE tablename = 'orders';
+      ```
+
+      The first check lists only `orders_pkey`. Index foreign keys by default: you'll join
+      on them constantly, and a cascading delete on a big unindexed child table is slow.
+  - title: Normal forms, in working terms
+    body: |-
+      The normal forms are a checklist for "each fact once". Three cover almost all real
+      design.
+
+      - **First normal form**: one value per cell. No comma-separated lists, no `phone1`,
+        `phone2`, `phone3` columns. Repeating things become rows in another table.
+      - **Second normal form**: with a composite key, every column depends on the whole
+        key. In `book_authors (book_id, author_id, author_name)`, the name depends only on
+        `author_id`, so it belongs in `authors`.
+      - **Third normal form**: no column depends on another non-key column. In
+        `orders (id, postcode, city)`, the city follows from the postcode, so a typo can
+        put one postcode in two cities.
+
+      Knowing when to stop matters as much. Some copies are correct because the fact is
+      different. The price on an order line is the price **at the time of purchase**, a
+      separate fact from today's catalogue price, so copying it is right:
+
+      ```sql
+      CREATE TABLE products (id integer PRIMARY KEY, name text NOT NULL, price_pence integer NOT NULL);
+      CREATE TABLE order_lines (
+        order_id integer NOT NULL,
+        product_id integer NOT NULL REFERENCES products(id),
+        unit_price_pence integer NOT NULL,
+        qty integer NOT NULL CHECK (qty > 0),
+        PRIMARY KEY (order_id, product_id)
+      );
+      ```
+
+      Postgres also offers `jsonb` and arrays. They suit data read and written as a whole
+      that you never join on, such as a user's display settings. Once you filter, join or
+      enforce rules on the parts, they want their own table.
+pitfalls:
+  - '**Leaving foreign key columns unindexed.** Postgres doesn''t index them for you, so joins and parent deletes scan the child table. Add an index on every foreign key column.'
+  - '**A surrogate id with no unique constraint on the natural value.** The same email or ISBN gets stored twice. Add `UNIQUE` to the value that identifies things in the real world.'
+  - '**Lists inside one column.** Comma-separated tags can''t be indexed, constrained or joined. Use a junction table.'
+  - '**`ON DELETE CASCADE` everywhere.** One delete of a customer silently removes years of orders. Cascade only where the child means nothing without its parent.'
+  - '**Enforcing relationships only in application code.** A script, a second service or a race gets past it. Declare the foreign key.'
+  - '**Normalising a snapshot.** Pointing an order line at today''s product price rewrites history when the price changes. Copy values that record a moment.'
+interview:
+  - question: Surrogate or natural primary keys?
+    answer: >-
+      Surrogate keys for the primary key, with a unique constraint on the natural value.
+      Natural values change: emails, usernames, even codes that looked permanent. A changing
+      primary key must cascade into every referencing row and every URL or cache holding it.
+      A surrogate id never changes. The unique constraint still guarantees one row per real
+      thing, and gives an index for lookups by that value. The exception is small reference
+      tables with truly stable codes, such as ISO currency codes, where the natural key reads
+      better in queries and saves a join.
+  - question: bigint identity or UUID for ids?
+    answer: >-
+      It depends on who creates ids and what they reveal. `bigint` identity is compact and
+      inserts append to the index, so it's the fastest. But ids are sequential, which leaks
+      volume and invites guessing in public URLs. UUIDs can be generated by clients or
+      separate services without coordination and reveal nothing. Random v4 UUIDs spread
+      inserts across the index and hurt write performance at scale; v7 UUIDs, which
+      Postgres 18 generates with `uuidv7()`, are time-ordered and avoid most of that, though
+      they reveal creation time. I'd pick `bigint` inside a single database and UUIDv7 for
+      distributed or client-generated ids.
+  - question: How do you model a many-to-many relationship, say students and courses?
+    answer: >-
+      With a junction table, `enrolments (student_id, course_id)`, one row per pair, each
+      column a foreign key and the pair the primary key. The composite key stops duplicate
+      enrolments and indexes lookups by the first column; I'd add an index on `course_id`
+      for the reverse lookup. The junction table is also where facts about the pair live,
+      such as the enrolment date or a grade. Arrays of ids on either side look simpler but
+      lose foreign key checks and make the reverse query awkward.
+  - question: Does Postgres index foreign keys automatically?
+    answer: >-
+      No. It indexes the referenced side, because a foreign key must point at a primary key
+      or unique constraint, which already has an index. The referencing column,
+      `orders.customer_id`, gets no index unless you create one. Without it, every join on
+      that column and every delete or key update of a customer scans `orders` to check for
+      children, which gets slow and holds locks longer. I index foreign key columns by
+      default. The rare exception is a small child table that is never joined from the
+      parent side, where the index costs writes for no benefit.
+  - question: When would you denormalise?
+    answer: >-
+      When a read path is measurably too slow and the copy can be kept correct, or when the
+      copy is a different fact, such as a price at purchase time. A classic case is storing
+      `comment_count` on posts so a feed doesn't count comments for every post. The cost is
+      that every write must update the copy in the same transaction, or a trigger must, and
+      a missed path gives wrong numbers. Before that, I'd try an index or a materialised view,
+      which keeps the source of truth single. For snapshots, copying isn't denormalisation
+      at all; it's recording what was true at the time.

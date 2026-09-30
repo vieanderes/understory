@@ -1,0 +1,200 @@
+summary: >-
+  Replication keeps copies of the same data on several machines. It buys three things: more
+  read capacity, survival when a machine dies, and data closer to users. It costs one thing
+  everywhere: copies disagree for a while, and the design has to say what readers may see
+  in that gap.
+
+
+  The lesson covers the leader-follower model, replica lag, read-your-writes and split
+  brain. These notes go into the knobs that trade speed for safety in Postgres, better ways
+  to route a read after a write, what a failover does step by step, and the leaderless
+  alternative with quorums.
+
+
+  In a design, replication answers two different requirements, and you should say which
+  one you're addressing. Replicas for read scale can lag and nobody minds much. Replicas
+  for durability must be synchronous or you accept losing the last moments of writes.
+remember:
+  - One leader takes every write and streams changes to followers, which serve reads and stand ready to take over.
+  - Asynchronous replication confirms a commit before any follower has it, so a failover can lose writes users were told were saved.
+  - Synchronous replication waits for a follower to confirm, so commits survive losing the leader and each commit pays a round trip.
+  - Replica lag is usually milliseconds and can reach seconds or more under load, so read-your-writes sends a user's reads to the leader, or to a replica that has caught up, after they write.
+  - Split brain is two nodes accepting writes after a failover, and fencing makes the old leader unable to write.
+  - RPO is how much recent data a failure may lose and RTO is how long recovery may take, and both are requirements you state as numbers.
+  - "Leaderless stores use quorums: with N copies, writing to W and reading from R, reads overlap the latest write when W + R is greater than N."
+sections:
+  - title: Synchronous, asynchronous and the middle ground in Postgres
+    body: |-
+      Postgres lets you pick how long a commit waits, per server or per transaction, with
+      `synchronous_commit`. It only waits for standbys named in
+      `synchronous_standby_names`.
+
+      ```text
+      off           don't wait for the local disk flush (a crash can lose recent commits)
+      local         wait for the local disk only
+      remote_write  wait until the standby has received the change and written it to
+                    its operating system
+      on            wait until the standby has flushed it to disk
+      remote_apply  wait until the standby has applied it, so reads there see it
+      ```
+
+      With `remote_apply`, a read on that standby right after the commit sees the row.
+      That's read-your-writes by construction, at the price of the slowest wait.
+
+      Waiting for one named standby has a trap: if that standby dies, commits stop. A quorum
+      setting avoids it: `synchronous_standby_names = 'ANY 1 (replica_a, replica_b)'`
+      waits for whichever of two answers first, so one can fail without stopping writes.
+
+      You can also mix. Name the standbys, set the default to `synchronous_commit = local`
+      for speed, and run the few transactions that must survive a failover, such as
+      payments, with `SET LOCAL synchronous_commit = on` inside the transaction. Speed where losses are tolerable, safety where they aren't.
+
+      The cost of synchronous commits is the round trip to the standby. In the same region
+      that's around a millisecond. Across regions it's tens of milliseconds on every commit,
+      which is why cross-region replicas are almost always asynchronous.
+  - title: Read-your-writes without guessing the lag
+    body: |-
+      The lesson's approach, sending a user to the leader for a fixed time after a write,
+      is simple and usually enough. It guesses the lag, though. Postgres lets you check
+      instead, using the position in the write-ahead log, the **LSN**.
+
+      After a write, record the leader's current position in the user's session:
+
+      ```sql
+      SELECT pg_current_wal_lsn()::text AS lsn;
+      ```
+
+      Before a read on a replica, ask whether it has replayed that far:
+
+      ```sql
+      SELECT pg_last_wal_replay_lsn() >= $1::pg_lsn AS caught_up;
+      ```
+
+      If `caught_up` is true, read from the replica. Otherwise try another replica or the
+      leader. The check costs one tiny query, and it's exact: no reads go to the leader
+      longer than needed.
+
+      Two related guarantees are worth naming in an interview.
+
+      - **Monotonic reads**: a user never sees data go backwards. Without it, two reads that
+        land on replicas with different lag can show a comment, then hide it. Pin each user
+        to one replica, for example by hashing the user id.
+      - **Consistent prefix**: readers see writes in the order they happened, so an answer
+        never appears before its question. Partitioned systems can break this when related
+        writes land on different partitions.
+  - title: What a failover does, step by step
+    body: |-
+      Failover is a sequence, and each step has a way to go wrong.
+
+      1. **Detect.** Health checks miss several beats. Too sensitive, and a network blip
+         triggers a needless failover. Too slow, and writes are down longer. Detection
+         usually takes seconds to tens of seconds.
+      2. **Choose.** Promote the follower with the most recent data, to lose the least.
+      3. **Fence.** Make sure the old leader can't accept writes: cut its network, shut it
+         down, or have storage refuse its writes.
+      4. **Redirect.** Move the DNS name, virtual IP or proxy target to the new leader, so
+         clients follow.
+      5. **Rebuild.** Turn the old leader into a follower of the new one, discarding any
+         writes it took that never replicated.
+
+      Fencing with a term number is the pattern behind step 3. Each new leader gets a
+      higher term from the coordinator, and storage refuses anything older.
+
+      ```ts
+      class FencedStore {
+        private highestTerm = 0;
+        readonly rows: string[] = [];
+        write(term: number, row: string): void {
+          if (term < this.highestTerm) {
+            throw new Error(`stale leader: term ${term}, current ${this.highestTerm}`);
+          }
+          this.highestTerm = term;
+          this.rows.push(row);
+        }
+      }
+      ```
+
+      An old leader returning from a long pause with term 33 is refused once the new leader
+      has written with term 34.
+
+      Put numbers on the result: **RPO**, recovery point objective, is how much recent data
+      you may lose, and **RTO**, recovery time objective, how long you may be down.
+      Asynchronous replication with automatic failover might give an RPO of seconds and an
+      RTO of under a minute. Synchronous replication brings RPO to zero for committed
+      transactions.
+  - title: Leaderless replication and quorums
+    body: |-
+      Some stores, in the style of the Dynamo paper, have no leader. Any replica accepts
+      writes, and the client or a coordinator writes to several at once.
+
+      With N copies, a write succeeds when W replicas confirm, and a read asks R replicas and
+      takes the newest answer. If W + R is greater than N, the replicas read and the replicas
+      written must share at least one, so the read sees the latest successful write.
+
+      ```text
+      N = 3, W = 2, R = 2   overlap guaranteed, survives one replica down
+      N = 3, W = 1, R = 1   fast, reads can be stale
+      N = 5, W = 3, R = 3   survives two replicas down
+      ```
+
+      The appeal is availability: no failover, because there's no leader to lose. The edge
+      cases are real, and an interviewer may probe them.
+
+      - **Concurrent writes** to the same key need a rule. Last-write-wins by timestamp is
+        simple and drops one write silently, and clocks drift. Version vectors detect the
+        conflict so the application can merge.
+      - **Sloppy quorums** accept writes on stand-in nodes during a partition, which keeps
+        writes available and weakens the overlap guarantee until the data is handed back.
+      - **Repair**: replicas that missed writes are fixed on read, or by a background
+        process comparing data.
+
+      For most product data, a leader-follower relational database is simpler to reason
+      about. Leaderless stores fit high write volumes where availability matters more than
+      strict ordering.
+pitfalls:
+  - "**Reading your own write from a lagging replica.** A user saves, the page reloads from a replica, and the old value appears. Route that user's reads to the leader, or check the replica's replay position, after a write."
+  - "**Assuming replicas are backups.** A replica copies a mistaken `DELETE` within milliseconds. Keep point-in-time backups as well."
+  - "**One synchronous standby with no spare.** If it dies, every commit waits. Use a quorum such as `ANY 1` of two standbys."
+  - "**Hard-coding the leader's address.** After failover, writes go to the old machine. Connect through a name or proxy that follows the current leader, and fence the old one."
+  - "**Failover without fencing.** Two leaders accept writes, and the histories can't be merged automatically. Fence before you redirect traffic."
+  - "**Sending analytical queries to the leader.** Long reports compete with writes. Run them on a replica, accepting it may lag."
+interview:
+  - question: A user updates their profile and the page shows the old name. What's going on and how do you fix it?
+    answer: >-
+      Replica lag: the write went to the leader and the reload read from a replica that
+      hadn't applied it yet. The quick fix is read-your-writes routing: for a few seconds
+      after a user writes, send their reads to the leader. A more exact version stores the
+      leader's WAL position after the write and reads from a replica only once
+      `pg_last_wal_replay_lsn()` has passed it. For a single critical read, the leader is
+      always correct. The trade-off is load: the more reads you send to the leader, the less
+      the replicas help, so I'd scope it to the user who wrote and to a short window.
+  - question: Synchronous or asynchronous replication for an orders database?
+    answer: >-
+      Synchronous for the commits that must never be lost, with a quorum so one standby's
+      failure doesn't stop writes. An asynchronous leader confirms an order before any
+      standby has it, so a crash in that gap loses an order the customer was told was saved.
+      In Postgres I'd use `synchronous_standby_names = 'ANY 1 (a, b)'` with two standbys in
+      the same region, costing around a millisecond per commit. Cross-region replicas stay
+      asynchronous, because tens of milliseconds on every commit is too slow, and I'd state
+      the resulting RPO for a whole-region loss. For less critical data on the same server,
+      I can relax it per transaction.
+  - question: What is split brain and how do real systems prevent it?
+    answer: >-
+      Split brain is two nodes both acting as leader and accepting writes, so the data
+      diverges with no automatic way to merge. It happens when the old leader wasn't dead,
+      only unreachable or paused, and comes back after a follower was promoted. Prevention
+      is fencing: before the new leader takes traffic, make the old one unable to write,
+      by cutting it off, shutting it down, or giving each leader a rising term number that
+      storage checks. A coordinator that needs a majority to elect a leader also helps,
+      because a node cut off from the majority knows it can't lead. The cost is that a
+      failover takes a few seconds longer to be safe.
+  - question: Explain quorums in a leaderless database.
+    answer: >-
+      With N copies, a write waits for W acknowledgements and a read asks R replicas, and if
+      W plus R exceeds N the two sets overlap, so a read sees the latest successful write.
+      Three copies with W and R both 2 is common: it tolerates one replica down for reads and
+      writes. Lower values trade consistency for latency and availability. The guarantee has
+      holes: concurrent writes to one key need version vectors or they're resolved by
+      last-write-wins, which loses data silently; sloppy quorums during partitions break the
+      overlap temporarily. So I'd choose it for high-volume data where availability matters
+      more than strict ordering, not for money.

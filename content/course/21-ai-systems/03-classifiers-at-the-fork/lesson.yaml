@@ -1,0 +1,295 @@
+id: aisys.classifiers-at-the-fork
+title: Classifiers at the fork
+objective: Say what a classifier is and how to get one, then answer the fuzzy question at each branch with a label and a probability, and keep the large model for writing.
+level: advanced
+minutes: 10
+concepts: [aisys.classifiers, aisys.decision-points, aisys.classifier-outputs, aisys.classifier-routing]
+prerequisites: [aisys.demo-to-system, ai.structured-output-and-tools]
+opening:
+  text: >-
+    You'll replace "ask the big model what to do" with small, fast questions whose answers
+    your code can compare. It's faster, cheaper, and each branch becomes testable.
+
+steps:
+  - type: prose
+    id: what-a-classifier-is
+    body: |-
+      A **classifier** is a model that picks one label from a fixed list. It also says how
+      sure it is, as a probability from 0 to 1. Spam or not. Refund, complaint or question.
+
+      The demo's `if "refund" in text` was a classifier too: a bad one, with no probability.
+      A real one returns a number per label that your code can weigh: refund 0.94,
+      complaint 0.04, question 0.02.
+
+  - type: prose
+    id: three-ways
+    body: >-
+      There are three common ways to get one. **Prompt an LLM** to answer with one label
+      from the list. It works on day one, with no training data, but it's the slowest and
+      gives no real probability.
+
+
+      **Train a small model on embeddings**, such as logistic regression, from a few hundred
+      labelled examples. Or **fine-tune a small model** on thousands. Both answer in
+      milliseconds, with a probability per label.
+
+  - type: multiple-choice
+    id: pick-classifier-source
+    concept: aisys.classifiers
+    difficulty: 1
+    question: Launch is Monday, and you have no labelled tickets yet. Which classifier do you start with?
+    choices:
+      - text: A prompted LLM limited to the labels
+        correct: true
+        feedback: >-
+          Right. No training data needed. Log its labels, and they become your training set.
+      - text: A fine-tuned small model
+        feedback: >-
+          That needs thousands of labelled tickets. You have none yet.
+      - text: Logistic regression on embeddings
+        feedback: >-
+          Cheap and fast, but it learns from labelled examples. Those come later.
+
+  - type: fill-blank
+    id: fill-label-enum
+    concept: aisys.classifiers
+    difficulty: 2
+    language: python
+    prompt: >-
+      Make a small model answer with exactly one of `LABELS`, as JSON. Structured output
+      holds it to the schema.
+    template: |
+      LABELS = ["refund", "complaint", "question", "spam"]
+
+      reply = client.messages.create(
+          model="claude-haiku-4-5", max_tokens=64,
+          system="Label the support ticket.",
+          output_config={"format": {"type": "json_schema", "schema": {
+              "type": "object",
+              "properties": {"label": {"type": "string", "{{1}}": {{2}}}},
+              "required": ["label"], "additionalProperties": False}}},
+          messages=[{"role": "user", "content": ticket_text}],
+      )
+    blanks:
+      - key: '1'
+        answer: enum
+      - key: '2'
+        answer: LABELS
+    bank: [enum, LABELS, items, ticket_text, pattern]
+
+  - type: prose
+    id: name-decision-points
+    body: |-
+      Most of a pipeline is forks: which category, how urgent, is the task done? Each is a
+      **decision point**, one fuzzy question with a few answers. One classifier call can
+      answer several, in three shapes:
+
+      ```python
+      triage = {
+          "category": {"refund": 0.94, "complaint": 0.04, "question": 0.02},  # a choice
+          "urgency": 4,                                                        # a score, 1 to 5
+          "needs_human": 0.12,                                                 # a yes-or-no
+      }
+      ```
+
+      Your code compares each with a threshold and takes the branch.
+
+  - type: ai-review
+    id: review-argmax-without-confidence
+    concept: aisys.classifier-routing
+    difficulty: 2
+    language: python
+    request: Route incoming tickets with the triage classifier.
+    flawClass: logic
+    code: |
+      def handle(ticket):
+          t = triage(ticket.text)   # one call answers all four questions
+          if t["legal_threat"] > 0.5:
+              return escalate(ticket)
+          label = max(t["category"], key=t["category"].get)   # the most likely label
+          if label == "refund":
+              return auto_refund(ticket)
+          if t["needs_human"] > 0.5:
+              return queue_for_human(ticket)
+          return draft_reply(ticket)
+    prompt: >-
+      An assistant wrote this. Every refund in the test set scored above 0.9. Then "my parcel
+      arrived damaged, what can I do?" scored refund 0.41 and got refunded. Tap the line at
+      fault.
+    lines: [6]
+    reasons:
+      - text: It acts on the top label, whatever its probability
+        correct: true
+        feedback: >-
+          Yes. A top of 0.41 isn't confidence. An irreversible action needs a high bar.
+      - text: The legal check should come last
+        feedback: >-
+          First is right. A legal threat escalates whatever the other answers say.
+      - text: It should call the classifier once per question
+        feedback: >-
+          One call for all four is faster and cheaper. The answers aren't the problem.
+    fix: |
+      label = max(t["category"], key=t["category"].get)
+      p = t["category"][label]
+      if label == "refund" and p >= 0.9:
+          return auto_refund(ticket)
+      if t["needs_human"] > 0.5 or p < 0.6:
+          return queue_for_human(ticket)
+
+  - type: multiple-choice
+    id: pick-uncertain-branch
+    concept: aisys.classifier-outputs
+    difficulty: 2
+    language: json
+    code: |
+      { "next_action": { "call_search": 0.45, "answer_user": 0.48, "ask_user": 0.04, "stop": 0.03 } }
+    question: An agent's classifier returns this after a tool result. What should the harness do?
+    choices:
+      - text: Let the large model decide this turn
+        correct: true
+        feedback: >-
+          Yes. Confident forks go to code. A near tie goes to the model that reasons.
+      - text: Answer the user, the top label
+        feedback: >-
+          It wins by 0.03. Acting on a near tie as if it were sure is how bad branches happen.
+      - text: Stop the run
+        feedback: >-
+          Stop has only 0.03. Nothing here says the run should end.
+
+  - type: code-challenge
+    id: write-route-ticket
+    concept: aisys.classifier-routing
+    difficulty: 3
+    language: python
+    starter: route.starter.py
+    solution: route.solution.py
+    tests: route.tests.py
+    prompt: >-
+      Write `route_ticket(t)`. `t` is a dict like the triage above, plus `legal_threat`.
+      Apply these rules in order:
+
+
+      1. `legal_threat` above 0.5 gives `"escalate-legal"`.
+
+      2. Top label `spam` at 0.95 or more gives `"discard"`.
+
+      3. Top label `refund` at 0.9 or more gives `"auto-refund"`.
+
+      4. `needs_human` at 0.5 or more, or a top probability under 0.6, gives `"human-queue"`.
+
+      5. `urgency` of 4 or more gives `"draft-reply-urgent"`, otherwise `"draft-reply"`.
+
+
+      Raise `ValueError` if `category` is empty.
+    hints:
+      - The rules are ordered on purpose. Return as soon as one matches.
+      - You need the top label and its probability before rules 2 to 4.
+      - '`max(t["category"], key=t["category"].get)` gives the top label. Look up its probability next.'
+
+  - type: explain-back
+    id: explain-why-classifier
+    concept: aisys.decision-points
+    difficulty: 3
+    prompt: >-
+      A teammate asks the large model "what should we do with this ticket?" in one call. Why
+      split the job into classifier forks instead?
+    rubric:
+      - Code owns the flow, so the branches and their order are explicit and testable.
+      - Each fork returns a probability you can compare with a threshold, not free text to parse.
+      - A small classifier is far faster and cheaper, so the large model runs only to write text.
+    modelAnswer: >-
+      One big call hides every decision inside free text. With forks, each question gets its
+      own answer and probability, and my code picks the branch. I can test each fork, see
+      which one went wrong, and set how sure it must be before acting. Classifier calls are
+      quick and cheap, so the expensive model only runs to write the reply.
+
+recap:
+  - Say what a classifier is, and pick a prompted, trained or fine-tuned one.
+  - Read a choice, a score or a yes-or-no, each as a number to compare.
+  - Let code take the branch, and call the large model only to write.
+
+recall:
+  - id: card-decision-point
+    concept: aisys.decision-points
+    front: What is a decision point in an AI pipeline?
+    back: >-
+      A fork where one fuzzy question with a few possible answers decides the next branch.
+  - id: card-three-shapes
+    concept: aisys.classifier-outputs
+    front: What three shapes can a classifier's answer take?
+    back: >-
+      A choice with a probability per label, a score on a scale, or a yes-or-no with the
+      probability of yes.
+  - id: card-near-tie
+    concept: aisys.classifier-routing
+    front: The top two labels are 0.48 and 0.45. What should your code do?
+    back: >-
+      Treat it as uncertain. Send that case to a person or the large model, never straight
+      down the top branch.
+  - id: card-three-ways
+    concept: aisys.classifiers
+    front: What are three ways to get a classifier, and when does each fit?
+    back: >-
+      A prompted LLM limited to the labels, on day one with no data. Embeddings plus a small
+      trained model, from hundreds of labels. A fine-tuned small model, from thousands.
+
+references:
+  - kind: essay
+    title: Building effective agents
+    authors: Erik Schluntz and Barry Zhang
+    year: 2024
+    venue: Anthropic Engineering
+    url: https://www.anthropic.com/engineering/building-effective-agents
+    note: Routing as a workflow, where one classification step picks the next path.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Ticket routing
+    authors: Anthropic
+    venue: Claude Platform Docs
+    url: https://platform.claude.com/docs/en/about-claude/use-case-guides/ticket-routing
+    note: A worked guide to classifying support tickets, with evaluation.
+    verified: true
+  - kind: paper
+    title: 'FrugalGPT: How to Use Large Language Models While Reducing Cost and Improving Performance'
+    authors: Lingjiao Chen, Matei Zaharia and James Zou
+    year: 2023
+    venue: arXiv
+    url: https://arxiv.org/abs/2305.05176
+    note: Cascades that send a request to a larger model only when a cheaper answer is unsure.
+    primary: true
+    verified: true
+  - kind: paper
+    title: 'RouteLLM: Learning to Route LLMs with Preference Data'
+    authors: Isaac Ong and others
+    year: 2024
+    venue: arXiv
+    url: https://arxiv.org/abs/2406.18665
+    note: Training a router to decide which model a query needs.
+    verified: true
+
+deepDive: >-
+  No model was called. The triage results are made up, and the routing code ran in Python
+  3.12. The latencies are illustrative. A small trained classifier typically answers in
+  milliseconds, and a small prompted model in a few hundred. A large model writing a
+  paragraph takes seconds. Measure your own.
+
+
+  **Where the probability comes from.** A trained classifier ends with one score per label.
+  A function called softmax turns those scores into probabilities that add up to 1.
+  A prompted LLM gives you a label, not a calibrated number. Some teams sample it a few
+  times and use the share of agreeing answers. Many log its labels, have people correct a
+  sample, and train a small model on the result. That's often the cheapest route to fast,
+  well-behaved probabilities.
+
+
+  **Where it pays.** Route a scanned invoice or contract to the right parser before paying
+  for expensive processing. Decide inside a real-time loop, where seconds of generation are
+  useless. In an agent loop, one call after every tool result can answer "which action
+  next?", "is the task complete?" and "is it stuck?". The large model then runs only when
+  the chosen action is to write something.
+
+
+  **Several questions, one call.** Asking about the same input once, rather than four
+  times, reads it once. That matters for cost and latency, and it keeps the answers
+  consistent with each other.

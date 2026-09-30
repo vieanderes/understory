@@ -1,0 +1,420 @@
+summary: >-
+  Production Python is Python a team can change safely for years. Working code is only
+  the start. What makes it production grade is everything around it: one `pyproject.toml` that
+  declares the project, a lockfile so every machine installs the same versions, a src
+  layout so tests run against the installed package, a type checker and a linter that fail
+  the build, tests with fixtures, a small exception hierarchy, and logs a machine can search.
+
+
+  The lesson sets up the src layout with `uv`, turns on strict mypy and writes a JSON log
+  formatter. These notes fill in the rest of a real service: how `uv`, the virtual
+  environment and `uv.lock` fit together, what strict typing catches in practice, how to
+  design exceptions callers can handle, how pytest fixtures and `parametrize` keep tests
+  short, how to configure logging once with a request id on every line, and the asyncio
+  basics you need for an AI service that calls several APIs at once.
+
+
+  None of this is ceremony for its own sake. Each piece moves a class of problem from
+  production, or from a reviewer's attention, to a machine that checks it on every commit.
+remember:
+  - '`pyproject.toml` declares the project, its dependencies and its tool settings, and `uv.lock` pins the exact versions so every machine and CI install the same thing.'
+  - CI runs `uv sync --locked`, which fails if the lockfile is out of date instead of quietly changing it.
+  - Strict mypy refuses untyped functions and forces you to handle `X | None`, which catches the "it was None in production" class of bug before merge.
+  - Give a package one base exception, such as `BookingError`, with specific subclasses, so callers can catch everything from you or one precise case.
+  - Configure logging once, at the entry point; modules only call `logging.getLogger(__name__)`, and a library never configures handlers.
+  - Use `logger.exception(...)` inside an `except` block, so the traceback goes into the log record.
+  - A pytest fixture builds what a test needs and is requested by naming it as a parameter, and `@pytest.mark.parametrize` runs one test body over many cases.
+  - '`await` runs one call at a time, while `asyncio.TaskGroup` runs several concurrently, and a blocking call such as `time.sleep` inside a coroutine freezes every task.'
+sections:
+  - title: The project file, the lockfile and the environment
+    body: |-
+      A **virtual environment** is a folder with its own Python and its own installed
+      packages, so each project's dependencies stay separate. `uv` creates it as `.venv`,
+      installs into it, and runs commands inside it with `uv run`. You rarely activate it
+      by hand.
+
+      `uv init --package booking-api` writes this `pyproject.toml`:
+
+      ```text
+      [project]
+      name = "booking-api"
+      version = "0.1.0"
+      requires-python = ">=3.13"
+      dependencies = []
+
+      [project.scripts]
+      booking-api = "booking_api:main"
+
+      [build-system]
+      requires = ["uv_build>=0.9.15,<0.10.0"]
+      build-backend = "uv_build"
+      ```
+
+      `uv add httpx` puts a range such as `httpx>=0.28` in `dependencies` and records the
+      exact resolved version, with hashes, in `uv.lock`. `uv add --dev pytest mypy ruff`
+      puts tools in a `[dependency-groups]` table instead, so they never ship to users. Commit
+      `uv.lock` for applications. Anyone who clones the repository and runs `uv sync` gets the
+      same versions you tested. In CI, `uv sync --locked` fails with "The lockfile at
+      `uv.lock` needs to be updated" if someone edited `pyproject.toml` without relocking.
+
+      `[project.scripts]` creates a command. After `uv sync`, `uv run booking-api` calls
+      `main()` in `booking_api/__init__.py`. That's the production way to give a package an
+      entry point.
+
+      Inside a single script, the same idea is `if __name__ == "__main__":`. Python sets
+      `__name__` to `"__main__"` for the file you run and to the module's name for a file you
+      import. So the guarded block runs when you execute the file and not when a test imports
+      it:
+
+      ```python
+      def main() -> None:
+          print("Starting the booking import")
+
+      if __name__ == "__main__":
+          main()
+      ```
+
+      Keep the guarded block to one call. Everything worth testing lives in functions above
+      it.
+  - title: What strict typing and ruff catch
+    body: |-
+      Type hints do nothing at runtime. A **type checker** such as mypy or pyright reads them
+      and reports contradictions before the code runs. The configuration lives in
+      `pyproject.toml`, so every developer and CI share it:
+
+      ```text
+      [tool.mypy]
+      strict = true
+
+      [tool.ruff.lint]
+      select = ["E", "F", "I", "B", "UP", "SIM"]
+      ```
+
+      Here is the bug strict mode is best at. `dict.get` returns `int | None`, and the code
+      forgets the `None`:
+
+      ```python
+      def find_room(rooms: dict[str, int], name: str) -> int | None:
+          return rooms.get(name)
+
+      def describe(capacity: int) -> str:
+          return f"sleeps {capacity}"
+
+      capacity = find_room({"Room 1": 2}, "Room 1")
+      print(describe(capacity))
+      ```
+
+      It prints `sleeps 2` today. mypy refuses it: `Argument 1 to "describe" has
+      incompatible type "int | None"; expected "int"  [arg-type]`. The day the room is
+      missing, the untyped version prints `sleeps None`. The fix is an explicit branch, such
+      as `if capacity is None: raise NotFoundError(...)`, after which mypy narrows the type
+      to `int`.
+
+      For dependencies you swap in tests, type against a `Protocol`: a class listing the
+      methods you need. Any class with a matching `send(self, to: str, text: str) -> None`
+      satisfies a `Notifier` protocol without inheriting from it. That's structural typing,
+      the same idea as TypeScript interfaces.
+
+      **ruff** is the linter and formatter. `ruff check` finds likely bugs, such as `B006`
+      for a mutable default argument, sorts imports with `I` and modernises syntax with
+      `UP`. `ruff format` is a drop-in replacement for Black. Both run in well under a second on most projects,
+      which is why teams can afford to run them in a pre-commit hook and in CI. Adopting
+      strict typing on an old codebase works best one module at a time, with per-module
+      overrides in the mypy config. One more detail: a package that other code type-checks
+      against ships an empty `py.typed` file beside its `__init__.py`. Without it, mypy
+      skips the package's hints with `module is installed, but missing library stubs or
+      py.typed marker`.
+  - title: An exception hierarchy callers can use
+    body: |-
+      Raising bare `Exception` or `ValueError` everywhere leaves callers two bad choices:
+      catch everything, or parse error messages. A package does better with one base class
+      and a few specific subclasses that carry data.
+
+      ```python
+      class BookingError(Exception):
+          """Base class for every error this package raises on purpose."""
+
+
+      class NotFoundError(BookingError):
+          def __init__(self, booking_id: int) -> None:
+              super().__init__(f"booking {booking_id} not found")
+              self.booking_id = booking_id
+
+
+      class RoomUnavailableError(BookingError):
+          pass
+
+
+      def get(bookings: dict[int, str], booking_id: int) -> str:
+          try:
+              return bookings[booking_id]
+          except KeyError:
+              raise NotFoundError(booking_id) from None
+
+
+      try:
+          get({1: "Room 1"}, 99)
+      except BookingError as err:
+          print(type(err).__name__, err)  # NotFoundError booking 99 not found
+      ```
+
+      A web layer can now map errors in one place: `NotFoundError` to 404,
+      `RoomUnavailableError` to 409, any other `BookingError` to 400, and anything else to
+      500 with a logged traceback. Code that doesn't care about the detail catches
+      `BookingError`.
+
+      `from None` hides the internal `KeyError`, because the caller doesn't need to know a
+      dict was involved. Use `from err` instead when the original error helps debugging,
+      such as a database driver's message. Keep programmer errors separate: passing
+      `nights=0` is a bug in the caller and can stay a plain `ValueError`. Name exceptions
+      with an `Error` suffix, as PEP 8 recommends, and resist making a class per message.
+      Three to six subclasses cover most packages.
+  - title: Pytest fixtures and parametrize
+    body: |-
+      A **fixture** is a function that builds something a test needs. A test asks for it by
+      naming it as a parameter, and fixtures can ask for other fixtures. Each test gets a
+      fresh one by default, so tests can't leak state into each other.
+
+      ```python
+      from datetime import date
+
+      import pytest
+
+      from booking_api.errors import RoomUnavailableError
+      from booking_api.service import BookingService
+
+
+      @pytest.fixture
+      def service() -> BookingService:
+          return BookingService()
+
+
+      @pytest.fixture
+      def booked(service: BookingService) -> BookingService:
+          service.book("Room 1", date(2026, 10, 1), nights=2)
+          return service
+
+
+      @pytest.mark.parametrize("nights", [0, -1])
+      def test_rejects_fewer_than_one_night(service: BookingService, nights: int) -> None:
+          with pytest.raises(ValueError):
+              service.book("Room 2", date(2026, 10, 1), nights)
+
+
+      @pytest.mark.parametrize(
+          ("room", "check_in", "allowed"),
+          [
+              ("Room 1", date(2026, 10, 1), False),
+              ("Room 1", date(2026, 10, 2), True),
+              ("Room 2", date(2026, 10, 1), True),
+          ],
+          ids=["same room and night", "next night", "other room"],
+      )
+      def test_availability(booked: BookingService, room: str, check_in: date, allowed: bool) -> None:
+          try:
+              booked.book(room, check_in, nights=1)
+          except RoomUnavailableError:
+              assert not allowed
+          else:
+              assert allowed
+      ```
+
+      `pytest -v` reports each case by its id, such as `test_availability[next night]
+      PASSED`, so a failure names the case. A fixture that `yield`s instead of returning runs
+      the code after `yield` as tear-down, the same shape as a context manager. Fixtures
+      shared across files go in `tests/conftest.py`, which pytest loads without an import.
+
+      pytest ships useful fixtures: `tmp_path` gives a fresh temporary directory as a `Path`,
+      `monkeypatch` sets environment variables and attributes and undoes them afterwards, and
+      `caplog` captures log records so you can assert on them. `pytest.raises(..., match=...)`
+      also checks the message, as a regular expression.
+  - title: Logging configured once, with a request id on every line
+    body: |-
+      The lesson's formatter needs `extra=` on every call. In a web service you'd rather set
+      the request id once per request and have every log line carry it. A `ContextVar` holds
+      a value per request, even across `await`, and a `Filter` copies it onto each record.
+
+      ```python
+      import json
+      import logging
+      import logging.config
+      from contextvars import ContextVar
+
+      request_id: ContextVar[str | None] = ContextVar("request_id", default=None)
+
+
+      class RequestIdFilter(logging.Filter):
+          def filter(self, record: logging.LogRecord) -> bool:
+              record.request_id = request_id.get()
+              return True
+
+
+      class JsonFormatter(logging.Formatter):
+          def format(self, record: logging.LogRecord) -> str:
+              entry = {
+                  "level": record.levelname,
+                  "logger": record.name,
+                  "message": record.getMessage(),
+                  "request_id": getattr(record, "request_id", None),
+              }
+              if record.exc_info:
+                  entry["exception"] = self.formatException(record.exc_info)
+              return json.dumps(entry)
+
+
+      LOGGING = {
+          "version": 1,
+          "disable_existing_loggers": False,
+          "filters": {"request_id": {"()": RequestIdFilter}},
+          "formatters": {"json": {"()": JsonFormatter}},
+          "handlers": {
+              "stdout": {
+                  "class": "logging.StreamHandler",
+                  "stream": "ext://sys.stdout",
+                  "filters": ["request_id"],
+                  "formatter": "json",
+              }
+          },
+          "root": {"level": "INFO", "handlers": ["stdout"]},
+      }
+
+      logger = logging.getLogger("booking_api.checkout")
+
+      if __name__ == "__main__":
+          logging.config.dictConfig(LOGGING)
+          token = request_id.set("r-42")
+          try:
+              logger.info("Checkout started with %d items", 2)
+              try:
+                  1 / 0
+              except ZeroDivisionError:
+                  logger.exception("Payment failed")
+          finally:
+              request_id.reset(token)
+      ```
+
+      Both lines come out as JSON with `"request_id": "r-42"`, and the second has an
+      `exception` field holding the traceback. In a real app, middleware sets and resets the
+      variable around each request.
+
+      Three rules hold this together. `dictConfig` runs once, at the entry point. Setting
+      `disable_existing_loggers` to `False` keeps loggers that modules created at import
+      time working. And a library never adds handlers: it only calls `getLogger(__name__)`,
+      so the application decides where logs go. Write to standard output and let the
+      platform ship the lines to your log store.
+  - title: Asyncio basics for services that wait
+    body: |-
+      An AI service spends most of its time waiting on the network: a model call, a vector
+      search, a payment API. **asyncio** lets one thread start several waits and handle
+      whichever finishes. A coroutine, defined with `async def`, pauses at each `await` so
+      the event loop can run something else.
+
+      ```python
+      import asyncio
+      import time
+
+
+      async def fetch_price(room: str, delay: float) -> int:
+          await asyncio.sleep(delay)  # stands in for an HTTP call
+          return {"Room 1": 90, "Room 2": 120}[room]
+
+
+      async def main() -> None:
+          start = time.perf_counter()
+          one = await fetch_price("Room 1", 0.2)
+          two = await fetch_price("Room 2", 0.2)
+          print("in turn:", one, two, round(time.perf_counter() - start, 1))  # 0.4
+
+          start = time.perf_counter()
+          async with asyncio.TaskGroup() as tg:
+              t1 = tg.create_task(fetch_price("Room 1", 0.2))
+              t2 = tg.create_task(fetch_price("Room 2", 0.2))
+          print("together:", t1.result(), t2.result(), round(time.perf_counter() - start, 1))  # 0.2
+
+          try:
+              async with asyncio.timeout(0.1):
+                  await fetch_price("Room 1", 1)
+          except TimeoutError:
+              print("timed out")
+
+          await asyncio.to_thread(time.sleep, 0.2)  # a blocking call, moved off the loop
+
+
+      asyncio.run(main())
+      ```
+
+      Two `await`s in a row run one after the other. `TaskGroup`, added in Python 3.11, runs
+      tasks concurrently and waits for all of them. If one fails, it cancels the rest and
+      raises an `ExceptionGroup`, which you catch with `except*`. `asyncio.gather` is the
+      older way and doesn't cancel siblings by default. `asyncio.timeout` cancels a slow
+      await and raises `TimeoutError`.
+
+      The rule that bites: never call blocking code inside a coroutine. `time.sleep(0.2)`,
+      `requests.get` or a synchronous database driver freezes the whole loop, so two
+      "concurrent" blocking calls take 0.4 seconds. Use async libraries such as httpx, or
+      push blocking work to a thread with `asyncio.to_thread`. asyncio helps with waiting,
+      not with heavy computation, which still needs processes.
+pitfalls:
+  - "**Not committing `uv.lock`.** Each machine resolves its own versions, so CI tests something different from your laptop and a new release breaks a deploy. Commit it, and run `uv sync --locked` in CI."
+  - "**Configuring logging at import time.** A `basicConfig` call inside a module fights the application's setup and runs in tests. Call `dictConfig` or `basicConfig` once, in the entry point."
+  - "**Logging an error without the traceback.** `logger.error(f\"failed: {err}\")` keeps the message and loses where it happened. Use `logger.exception(\"Payment failed\")` inside the `except` block."
+  - "**Silencing mypy with `Any` and `# type: ignore`.** Each one switches the checker off exactly where it was needed. Narrow with `if x is None`, or use a `Protocol`, and leave a reason on any ignore you keep."
+  - "**Sharing state between tests through module globals.** Tests then pass alone and fail together, or depend on order. Build state in fixtures, which run fresh for each test."
+  - "**Calling blocking code inside `async def`.** `requests.get` or `time.sleep` freezes the event loop for every request. Use an async client such as httpx, or `asyncio.to_thread`."
+  - "**Catching `Exception` at every layer.** Errors get logged three times or swallowed. Catch specific errors where you can act on them, and let one boundary, such as the web framework's error handler, log the rest."
+interview:
+  - question: How do you set up a new Python service so a team can work on it safely?
+    answer: >-
+      I start with `uv init --package`, which gives a src layout, a `pyproject.toml` and an
+      entry point. Dependencies go in with `uv add`, tools with `uv add --dev`, and `uv.lock`
+      is committed so every machine installs the same versions. The same file configures
+      strict mypy, ruff with a chosen rule set and pytest. CI runs `uv sync --locked`, then
+      `ruff check`, `ruff format --check`, `mypy` and `pytest`, and a pre-commit hook runs
+      the fast ones locally. The src layout makes tests import the installed package, so a
+      packaging mistake fails in CI rather than for users. The trade-off is set-up time and
+      some friction for quick experiments, which I handle with per-module mypy overrides for
+      prototype code rather than turning strict mode off.
+  - question: How do you design exceptions for a Python library?
+    answer: >-
+      One base exception per package, a few specific subclasses that carry useful data, and
+      standard exceptions for programmer errors. For a booking library that's `BookingError`
+      with `NotFoundError(booking_id)` and `RoomUnavailableError`. Callers catch the base
+      class when they want "anything from this library" and a subclass when they can act on
+      the case, and a web layer maps each subclass to an HTTP status in one place. I wrap
+      low-level errors with `raise ... from err` when the cause helps debugging, or `from
+      None` when it leaks internals. A bad argument like `nights=0` stays a `ValueError`,
+      because that's a bug to fix, not a condition to handle. The risk is over-design: a class
+      per message makes the hierarchy noise.
+  - question: What do pytest fixtures give you over setUp methods?
+    answer: >-
+      Fixtures are explicit, composable dependencies. A test names what it needs as
+      parameters, `def test_x(booked, tmp_path)`, so you can read its setup from its
+      signature. Fixtures can depend on other fixtures, so `booked` builds on `service`
+      without inheritance. Scope is configurable: function by default, or module and session
+      for expensive things like a database container. A `yield` fixture puts set-up and
+      tear-down in one function, and tear-down runs even when the test fails. Combined with
+      `parametrize`, one test body covers a table of cases, each reported by its own id. The
+      cost is indirection: fixtures in a distant `conftest.py` can feel like magic, so I keep
+      them close to their tests unless several files share them.
+  - question: When does asyncio help, and when doesn't it?
+    answer: >-
+      It helps when a program spends its time waiting on I/O and can do several waits at
+      once. An endpoint that calls a model API, a vector store and a user service can run
+      them concurrently with `asyncio.TaskGroup` and take as long as the slowest call rather
+      than their sum, on one thread with little memory per task. It doesn't help with
+      CPU-bound work such as parsing a huge file or running a model locally, because
+      coroutines share one thread; that needs processes, or a library that releases the GIL.
+      The main hazard is a blocking call inside a coroutine, like `requests.get` or a sync
+      database driver, which stalls every request on the loop. So async means async
+      libraries end to end, or `asyncio.to_thread` for the odd blocking call.
+  - question: How do you make logs useful in production?
+    answer: >-
+      Structured, correlated and configured once. Each line is JSON with a level, a logger
+      name, a message and fields such as a request id, so the log store can filter and group.
+      I set the request id per request in a `ContextVar` from middleware, and a logging
+      filter copies it onto every record, so no call site has to remember `extra=`. Messages
+      use `%s` arguments rather than f-strings, so identical events share a template. Errors
+      use `logger.exception` to include the traceback. Configuration happens once at the
+      entry point, logs go to standard output, and libraries never add handlers. And
+      secrets, tokens and personal data stay out, because logs are copied widely and kept for
+      a long time. The trade-off is volume and cost, so debug stays off by default.

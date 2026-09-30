@@ -1,0 +1,248 @@
+summary: >-
+  Server code talks to Postgres through a driver, and every query it sends is a string of SQL
+  plus some values. How those values travel decides whether your app is safe. Glue them into
+  the SQL text and a user can rewrite the query: that is SQL injection, still one of the most
+  common and most damaging web vulnerabilities. Send them as parameters (`$1`, `$2`) and the
+  database receives the SQL and the values separately, so a value can never become code.
+
+
+  The second thing that goes wrong is the number of round trips. Each query waits on the
+  network, so a query inside a loop (the N+1 pattern) turns one page into dozens or hundreds of
+  trips. It's invisible with ten rows on a laptop and slow with real data in production. One
+  join, one `= ANY($1)` lookup, or a batching loader fixes it.
+
+
+  These notes cover what parameters are at the protocol level, how to build dynamic queries
+  (optional filters, sorting, search) without reopening injection, how Postgres types arrive
+  in JavaScript, and the ways to remove N+1 queries.
+remember:
+  - Send every value as a parameter (`$1`, `$2`) so the database gets SQL and data separately and data can never change the query.
+  - Parameters cover values only, so table names, column names and sort directions come from a fixed allowlist in code.
+  - A query with a loop around it is N+1; fetch the whole set with a join or `WHERE id = ANY($1)` in one round trip.
+  - Escaping quotes by hand is not a defence, because one missed path or character set reopens the hole.
+  - In a `LIKE` search, a parameter stops injection but not wildcards, so escape `%`, `_` and backslash in the user's text.
+  - ORMs and query builders parameterise for you, and their raw SQL escape hatches bring the risk back.
+  - "`node-postgres` returns `bigint` and `numeric` as strings to keep them exact, and `timestamptz` as a JavaScript `Date`."
+  - Connect with a database role that has only the rights the app needs, so a bug that slips through does limited damage.
+sections:
+  - title: What a parameter is on the wire
+    body: |-
+      Postgres speaks two protocols. The **simple query** protocol sends one string that may
+      hold several statements. The **extended query** protocol splits a query into steps:
+      *Parse* sends the SQL text with `$1` placeholders, *Bind* sends the values, and
+      *Execute* runs it. `node-postgres` uses the extended protocol whenever you pass values.
+
+      The value never passes through the SQL parser, which is why no quoting trick can turn
+      it into code. The type is decided by the statement, not by the value: in `WHERE id =
+      $1`, the parameter is an integer, and the text `'1 OR 1=1'` fails to convert instead of
+      widening the query.
+
+      The extended protocol has a second guard. A prepared statement may contain only one
+      command:
+
+      ```sql
+      -- sent through the extended protocol, with or without values
+      SELECT 1; DROP TABLE books;
+      -- ERROR: cannot insert multiple commands into a prepared statement
+      ```
+
+      So a parameterised query also blocks the "stacked" injection that appends a second
+      statement. A query sent without values through the simple protocol doesn't get that
+      protection, which is one more reason never to build SQL from input.
+
+      `node-postgres` can also keep a statement prepared on the connection: pass `{ name:
+      'find-user', text, values }` and it parses the SQL once per connection and reuses the
+      plan. That saves parsing on hot queries. Unnamed parameterised queries are already safe,
+      so naming is a performance choice, not a security one.
+  - title: Dynamic queries without injection
+    body: |-
+      Real endpoints have optional filters and a sort chosen in the URL. Build the SQL from
+      fixed fragments you wrote, number the parameters as you go, and map the sort to a
+      column through an allowlist.
+
+      ```ts
+      type Filters = { status?: string; customerId?: number; placedAfter?: string };
+
+      const SORTABLE: Record<string, string> = { placed: 'placed_at', total: 'total_pence' };
+
+      function ordersQuery(filters: Filters, sort: string, descending: boolean) {
+        const where: string[] = [];
+        const values: unknown[] = [];
+        const add = (sql: string, value: unknown) => {
+          values.push(value);
+          where.push(sql.replace('?', `$${values.length}`));
+        };
+        if (filters.status !== undefined) add('status = ?', filters.status);
+        if (filters.customerId !== undefined) add('customer_id = ?', filters.customerId);
+        if (filters.placedAfter !== undefined) add('placed_at > ?', filters.placedAfter);
+        // Object.hasOwn, so "constructor" or "toString" from the URL can't match.
+        const column = Object.hasOwn(SORTABLE, sort) ? SORTABLE[sort] : 'placed_at';
+        const text =
+          'SELECT id, status, total_pence FROM orders' +
+          (where.length ? ` WHERE ${where.join(' AND ')}` : '') +
+          ` ORDER BY ${column} ${descending ? 'DESC' : 'ASC'} LIMIT 50`;
+        return { text, values };
+      }
+
+      ordersQuery({ status: 'paid', customerId: 7 }, 'total', true);
+      // { text: '... WHERE status = $1 AND customer_id = $2 ORDER BY total_pence DESC LIMIT 50',
+      //   values: [ 'paid', 7 ] }
+      ```
+
+      Every character of `text` comes from the code. User input only reaches `values`, or
+      selects between strings you wrote. A sort of `id; DROP TABLE orders` falls back to
+      `placed_at`.
+
+      Search needs one more step. A parameter keeps the text as data, but inside `LIKE` the
+      characters `%` and `_` are still wildcards. Searching for `100%` would match `1000
+      Knots`, and `my_first` would match `myXfirst`. Escape them before adding your own
+      wildcards; backslash is the default `LIKE` escape character in Postgres:
+
+      ```ts
+      function likePattern(input: string): string {
+        return '%' + input.replace(/[\\%_]/g, (c) => '\\' + c) + '%';
+      }
+
+      await pool.query('SELECT id, title FROM books WHERE title ILIKE $1', [likePattern(q)]);
+      ```
+  - title: Three ways to remove an N+1
+    body: |-
+      Which fix fits depends on the shape of the data and where the ids come from.
+
+      A **join** is best when you need one parent per row, such as each post with its author.
+      For one-to-many, a plain join repeats the parent on every child row. Postgres can build
+      the nested shape itself with `json_agg`:
+
+      ```sql
+      SELECT posts.id, posts.title,
+             coalesce(json_agg(json_build_object('id', comments.id, 'body', comments.body)
+                      ORDER BY comments.id) FILTER (WHERE comments.id IS NOT NULL),
+                      '[]') AS comments
+      FROM posts
+      LEFT JOIN comments ON comments.post_id = posts.id
+      GROUP BY posts.id
+      ORDER BY posts.id;
+      -- 1 | Sourdough   | [{"id":1,"body":"Tried it"},{"id":2,"body":"Too sour"}]
+      -- 2 | Bike chains | [{"id":3,"body":"Thanks"}]
+      -- 3 | Lunches     | []
+      ```
+
+      A **batched lookup** with `WHERE id = ANY($1)` fits when the ids come from somewhere
+      else, such as another service or a cache. `node-postgres` sends a JavaScript array as a
+      Postgres array, so two queries replace N+1 whatever N is.
+
+      A **loader** batches lookups that are scattered through code, which is what GraphQL
+      resolvers need. Each call asks for one key, and the loader collects every key requested
+      in the same tick into one query:
+
+      ```ts
+      function createLoader<K, V>(loadMany: (keys: K[]) => Promise<Map<K, V>>) {
+        type Waiting = { key: K; resolve: (value: V | undefined) => void; reject: (error: unknown) => void };
+        let waiting: Waiting[] = [];
+        return (key: K) =>
+          new Promise<V | undefined>((resolve, reject) => {
+            waiting.push({ key, resolve, reject });
+            if (waiting.length > 1) return;
+            // Wait until the current code has asked for every key, then fetch them together.
+            queueMicrotask(async () => {
+              const batch = waiting;
+              waiting = [];
+              try {
+                const found = await loadMany([...new Set(batch.map((w) => w.key))]);
+                for (const w of batch) w.resolve(found.get(w.key));
+              } catch (error) {
+                for (const w of batch) w.reject(error);
+              }
+            });
+          });
+      }
+
+      const authorById = createLoader(async (ids: number[]) => {
+        const { rows } = await pool.query('SELECT id, name FROM authors WHERE id = ANY($1)', [ids]);
+        return new Map(rows.map((a) => [a.id, a]));
+      });
+      ```
+
+      Run over three posts with `Promise.all`, this sends two queries in total: the list and
+      one batched author lookup. Create a loader per request, so one user's cached results
+      never leak into another's.
+
+      To catch N+1 before users do, count queries per request in development, and in
+      production look for a cheap query with an enormous `calls` count in
+      `pg_stat_statements`.
+  - title: How Postgres types arrive in JavaScript
+    body: |-
+      A driver has to turn every column into a JavaScript value, and some types don't fit.
+      `node-postgres` makes these choices by default:
+
+      - `integer`, `smallint`, `real` and `double precision` become `number`.
+      - `bigint` and `numeric` become **strings**, because a `number` can't hold every value
+        of either exactly. `count(*)` returns a `bigint`, so it arrives as `'42'`.
+      - `timestamptz` and `date` become a `Date`. A plain `timestamp` is read as local time on
+        the server running Node, one more reason to use `timestamptz`.
+      - `json` and `jsonb` are parsed into objects, arrays become JavaScript arrays, `bytea`
+        becomes a `Buffer`, and SQL NULL becomes `null`.
+
+      You can override a parser per type OID, for example turning `bigint` (OID 20) into
+      `BigInt`:
+
+      ```ts
+      import pg from 'pg';
+
+      pg.types.setTypeParser(20, (value) => BigInt(value));
+      ```
+
+      Do that once at start-up and deliberately. Turning `numeric` into a float with
+      `parseFloat` gives up the exactness you chose `numeric` for. A cleaner fix for counts is
+      in SQL: `count(*)::int` when the count can't pass 2,147,483,647.
+
+      Types are also where TypeScript lies to you. `pool.query` returns rows typed as `any`
+      unless you give a type, and a type argument is a promise you make, not a check. Validate
+      rows at the boundary (for example with a schema library) or use a query builder that
+      derives types from the schema.
+pitfalls:
+  - "**Parameterising some values and gluing in one more.** One `$1` doesn't protect the string beside it. Every value that isn't a constant in your code goes in the values array."
+  - "**Passing a column or table name as `$1`.** Parameters are values, so `ORDER BY $1` sorts by a constant and does nothing. Choose identifiers from an allowlist."
+  - "**Looking up an allowlist with `obj[key]`.** Keys such as `constructor` exist on every object. Use `Object.hasOwn` or a `Map`."
+  - "**Forgetting `LIKE` wildcards in search.** A user who types `%` matches everything, and a leading wildcard forces a full scan. Escape `%`, `_` and backslash."
+  - "**Awaiting a query inside a `for` loop over rows.** It's N+1, and it also runs the queries one after another. Fetch the set with a join or `= ANY($1)`."
+  - "**Reaching for the ORM's raw SQL helper and interpolating.** `sql.raw` or `$queryRawUnsafe` style functions don't parameterise. Use their tagged-template forms, which do."
+  - "**Connecting as the database owner.** Then a single injection can drop tables. Give the app a role with only the grants it needs."
+interview:
+  - question: How do you prevent SQL injection?
+    answer: >-
+      With parameterised queries for every value, so the SQL and the data travel separately
+      and data is never parsed as SQL. In Postgres that's the extended protocol: the statement
+      with `$1` is parsed first, the values are bound afterwards, and a prepared statement
+      can't contain a second command, so stacked queries fail too. Identifiers such as sort
+      columns can't be parameters, so I pick them from an allowlist. I'd add defence in depth:
+      the app connects as a role without DDL rights, and code review watches ORM raw-SQL
+      helpers, which is where injection returns. Escaping by hand isn't a defence I'd rely on,
+      because it fails the first time someone forgets it.
+  - question: What's an N+1 query problem and how do you fix it?
+    answer: >-
+      It's one query for a list and then one more per item, usually a query inside a loop or
+      an ORM loading a relation lazily. Fifty posts become 51 round trips, each paying network
+      latency, so the page gets slower as data grows while tests with ten rows stay fast. I fix
+      it by fetching the related rows as a set: a join when I need one parent per row, `WHERE
+      id = ANY($1)` when the ids come from elsewhere, or a per-request data loader when lookups
+      are scattered through resolvers. The trade-off is that a join can return wide, repeated
+      rows for one-to-many, where two queries or `json_agg` are cheaper.
+  - question: A user can choose the sort column and direction on a list endpoint. How do you build that query safely?
+    answer: >-
+      I map the user's choice through an allowlist to column names I wrote, and choose the
+      direction with a boolean, never from the raw string. Parameters can't help here: `ORDER
+      BY $1` binds a value, so it sorts by a constant. The lookup uses `Object.hasOwn` or a
+      `Map`, because a plain object also answers to keys like `constructor`. Filters still go
+      through numbered parameters, built from fixed SQL fragments as I add each one. I'd also
+      add a stable tiebreaker such as `id` to the sort, so pagination doesn't skip or repeat
+      rows that share a value.
+  - question: Why does `count(*)` come back as a string in Node, and what do you do about it?
+    answer: >-
+      Because `count(*)` returns a Postgres `bigint`, and `node-postgres` returns `bigint` as a
+      string by default. A JavaScript `number` is exact only up to 2^53 minus 1, and a `bigint`
+      goes far beyond that, so the driver won't silently round. If the count can't exceed the
+      `integer` range, I cast in SQL with `count(*)::int`. For real 64-bit ids I either keep
+      them as strings, which is fine for ids you never do arithmetic on, or register a type
+      parser that turns them into `BigInt`. The same caution applies to `numeric` money
+      values: never `parseFloat` them.

@@ -1,0 +1,341 @@
+summary: >-
+  A model feature has two budgets that a demo never meets: money and time. Money follows
+  tokens, split into fresh input, cached input and output, each at its own rate. Time splits
+  into the wait for the first token, which users feel, and the total, which matters when
+  nobody sees a stream. At scale, a feature that costs a cent per request and takes three
+  seconds is a finance problem and a product problem at once.
+
+
+  The tools are few and each has a catch. Caching makes a long, stable prefix cheap, but only
+  if the prefix really is identical from the first byte. Batching halves the price of work
+  nobody waits for. Routing sends simple requests to a small model, but it can cost more per
+  finished task if the small model fails and escalates. Fallbacks and circuit breakers keep
+  the feature up when a provider is not, but a fallback that catches the wrong errors turns
+  your own bugs into silent apologies.
+
+
+  Reach for these once real traffic shows where the money and the milliseconds go, measured
+  per finished task and per step. Don't route or cache on a guess, and don't add a fallback
+  model you haven't run your evals on.
+remember:
+  - Measure cost per finished task, not per call, because retries and escalations add calls that a per-call price hides.
+  - A prompt cache matches from the very first token, so put stable content first and anything per user or per request after the cache breakpoint.
+  - Users feel time to first token most, so every step before generation shares one first-token budget and independent steps run in parallel.
+  - Work nobody waits for goes through a batch API at about half price, and anything a user waits for stays synchronous.
+  - Route a request to a smaller model only where evals show it passes, and remember each model keeps its own cache.
+  - Fall back only on errors another model or a later try can fix, such as 429, overload, 5xx and timeouts, and let 400 and 401 raise and page someone.
+  - A circuit breaker stops calling a dependency that keeps failing, so calls fail fast instead of piling up behind timeouts.
+sections:
+  - title: The arithmetic of cost per finished task
+    body: |-
+      A token price is a rate. What finance sees is the bill per thing users got done. Three
+      effects separate the two: retries multiply calls, escalation adds a second model's call,
+      and caching discounts repeated input. The prices below are illustrative, not any
+      provider's list.
+
+      ```python
+      # Illustrative rates in dollars per million tokens. Check your provider's price list.
+      RATES = {
+          "small": {"input": 1.0, "output": 5.0},
+          "large": {"input": 5.0, "output": 25.0},
+      }
+      CACHE_WRITE, CACHE_READ = 1.25, 0.10  # multipliers on the input rate, five-minute cache
+
+
+      def call_cost(model, fresh_in, out, cache_write=0, cache_read=0):
+          r = RATES[model]
+          input_cost = (fresh_in + cache_write * CACHE_WRITE + cache_read * CACHE_READ) * r["input"]
+          return (input_cost + out * r["output"]) / 1_000_000
+
+
+      def cost_per_task(cost_per_try, success_rate):
+          # Trying until it works takes 1 / p attempts on average.
+          return cost_per_try / success_rate
+
+
+      small = call_cost("small", 3_000, 400)
+      large = call_cost("large", 3_000, 400)
+      print(f"per call:  small {small:.4f}  large {large:.4f}")
+
+      # Simple tasks: the small model works 80% of the time, and a retry is cheap.
+      print(f"simple task, small with retries: {cost_per_task(small, 0.8):.4f}")
+
+      # Hard tasks: the small model passes 10%, and every failure escalates to the large one.
+      p = 0.10
+      routed = small + (1 - p) * large
+      print(f"hard task: routed {routed:.4f}  large only {large:.4f}")
+
+      # A 20,000-token manual as a cached prefix, one write then reads within five minutes.
+      manual = 20_000
+      uncached = call_cost("large", manual + 500, 300)
+      first = call_cost("large", 500, 300, cache_write=manual)
+      repeat = call_cost("large", 500, 300, cache_read=manual)
+      print(f"uncached {uncached:.4f}  first {first:.4f}  repeat {repeat:.4f}")
+      ```
+
+      Three lessons fall out of the output. On simple tasks the small model wins even with
+      retries. On hard tasks, routing to it first costs more than going straight to the large
+      model, because nearly every request pays twice. And with a five-minute cache, the first
+      call costs a little more than no cache at all, while every repeat costs under a fifth.
+      One cache hit pays for the write.
+
+      Output tokens are usually priced several times higher than input. That makes a
+      shorter answer format, or a lower output limit, one of the cheapest savings available,
+      and a verbose reasoning setting one of the most expensive defaults.
+  - title: Keeping the cached prefix stable
+    body: |-
+      The cache is keyed on the exact prefix, so anything that varies early in the prompt
+      breaks it for everything after. The lesson showed the obvious case, a customer's name
+      before the manual. The subtle cases do the same damage.
+
+      - A timestamp or request id in the system prompt, added for "context".
+      - Tool definitions built from a dict whose order changes between deploys, or a tool list
+        filtered per user. Tools come first in the prefix, so they break everything.
+      - Retrieved documents placed before the fixed instructions.
+      - Conversation history trimmed from the front, which shifts every later token. Trim in
+        whole turns and accept a cache miss when you do, or summarise old turns into a stable
+        block.
+
+      Put the order as the provider evaluates it: tools, then system instructions, then
+      examples and reference documents, then the conversation, then the new message. Mark the
+      breakpoint after the last stable block.
+
+      Check it in production, not by reading the code. The response usage reports cached input
+      separately from fresh input. Chart the share of input tokens read from cache per feature.
+      A share that drops to zero after a deploy means something now varies early in the
+      prompt. Also know the minimum: prefixes below a model-dependent length aren't cached,
+      so a short system prompt gains nothing.
+
+      Cache lifetime shapes the design too. The default entry lives minutes and refreshes on
+      each hit, so steady traffic keeps it warm while a feature used once an hour pays the
+      write every time. A longer-lived entry costs more to write and pays off only with enough
+      reads inside its window.
+  - title: Spending a latency budget
+    body: |-
+      A latency budget is a sum on the critical path. Parallel steps cost the slowest of them,
+      sequential steps cost their total, and a step that blows its share should degrade rather
+      than block. The example gives reranking a 300 ms share and falls back to first-stage
+      order when it's late.
+
+      ```python
+      import asyncio
+      import time
+
+
+      async def classify(q):
+          await asyncio.sleep(0.06)
+          return "billing"
+
+
+      async def retrieve(q):
+          await asyncio.sleep(0.40)
+          return ["doc-3", "doc-1", "doc-7", "doc-2"]
+
+
+      async def rerank(q, docs):
+          await asyncio.sleep(0.90)  # too slow today
+          return sorted(docs)
+
+
+      async def with_budget(coro, seconds, fallback):
+          # Each step gets its share of the budget; a late step degrades instead of blocking.
+          try:
+              async with asyncio.timeout(seconds):
+                  return await coro
+          except TimeoutError:
+              return fallback
+
+
+      async def prepare(q):
+          start = time.perf_counter()
+          # Independent steps run side by side: the wait is the slower one, not the sum.
+          label, docs = await asyncio.gather(classify(q), retrieve(q))
+          top = await with_budget(rerank(q, docs), 0.30, fallback=docs[:3])
+          ms = round((time.perf_counter() - start) * 1000, -2)
+          return label, top, ms
+
+
+      print(asyncio.run(prepare("Why was I charged twice?")))
+      ```
+
+      It prints `('billing', ['doc-3', 'doc-1', 'doc-7'], 700.0)`: 400 ms for the parallel
+      pair, 300 ms before rerank gave up. `asyncio.timeout` needs Python 3.11 or later, and it
+      cancels the late task, so nothing keeps running and billing in the background.
+
+      Budget for the tail, not the average. Users remember the slow request, so set shares
+      against p95 or p99 per step, from traces. Other levers, in rough order of payoff: fewer
+      rerank candidates, a smaller model for classification, a shorter prompt (input is
+      processed before the first token, so a long prompt delays it), a cache hit, which also
+      speeds up processing of the prefix, and streaming so the user reads while the rest
+      arrives. For a structured result that code parses, streaming helps less, since nothing
+      can use half an object.
+  - title: Retries, fallbacks and the circuit breaker together
+    body: |-
+      Three mechanisms stack, from the inside out. **Retries** handle a blip: the same call
+      again after a short wait. **Fallbacks** handle a provider that stays unhealthy: another
+      model or a degraded answer. **Circuit breakers** stop the retries themselves from making
+      things worse when a dependency is down.
+
+      Retries need backoff with jitter, or every client retries in lockstep and hits the
+      recovering service at once. When the server sends a `retry-after` header, honour it.
+
+      ```python
+      import random
+
+
+      def backoff(attempt, base=0.5, cap=20.0, retry_after=None):
+          """Seconds to wait before retry number `attempt` (0, 1, 2, ...)."""
+          if retry_after is not None:
+              return retry_after  # the server said when; believe it
+          # Full jitter: a random wait up to the exponential ceiling spreads clients apart.
+          return random.uniform(0, min(cap, base * 2 ** attempt))
+
+
+      random.seed(1)
+      print([round(backoff(n), 2) for n in range(6)])
+      print(backoff(3, retry_after=7))
+      ```
+
+      The lesson's breaker lets every caller through once the cool-down ends. Under load that
+      is a stampede: a hundred waiting requests all become trial calls. A production breaker
+      has a **half-open** state that admits one trial and keeps failing fast for everyone
+      else until it reports.
+
+      ```python
+      class Breaker:
+          """Closed, open, then half-open with exactly one trial in flight."""
+
+          def __init__(self, threshold, cooldown):
+              self.threshold, self.cooldown = threshold, cooldown
+              self.failures, self.opened_at, self.trial = 0, None, False
+
+          def allow(self, now):
+              if self.opened_at is None:
+                  return True
+              if now - self.opened_at < self.cooldown or self.trial:
+                  return False
+              self.trial = True  # this caller tests the dependency; others still fail fast
+              return True
+
+          def record(self, ok, now):
+              self.trial = False
+              if ok:
+                  self.failures, self.opened_at = 0, None
+                  return
+              self.failures += 1
+              if self.opened_at is not None or self.failures >= self.threshold:
+                  self.opened_at = now
+
+
+      b = Breaker(threshold=3, cooldown=30)
+      for _ in range(3):
+          b.record(False, now=0)
+      print(b.allow(10))                 # False: open
+      print(b.allow(30), b.allow(30))    # True False: one trial, the second caller waits
+      b.record(True, now=31)
+      print(b.allow(31))                 # True: closed again
+      ```
+
+      In a service with several processes, each keeps its own breaker unless you share state,
+      which is usually fine: each process learns about the outage within a few calls. Count
+      only the errors that mean the dependency is unhealthy. A 400 caused by your request says
+      nothing about the provider and must not open the breaker.
+
+      Finally, every fallback is a product decision. A second provider's model answers
+      differently and needs its own eval run and its own prompt tuning. A degraded answer,
+      such as "here are the three most relevant help articles", is often safer than a
+      different model, and it's always cheaper.
+pitfalls:
+  - "**Pricing per call.** A small model at a fifth of the price that fails half the time and escalates can cost more than the large model alone. Report cost per completed task, per slice, before and after any routing change."
+  - "**Anything variable at the top of the prompt.** A date, a user's name, a shuffled tool list or retrieved text before the instructions makes every request a new prefix. Stable content first, variable content after the breakpoint, and watch the cached share of input tokens."
+  - "**Falling back on every exception.** Catching the base API error hides your own 400s and 401s behind an apology for days. Catch rate limits, overload, server errors and timeouts only, and let the rest raise and alert."
+  - "**Retrying without jitter or a cap.** Fixed-interval retries from many clients arrive together and keep the provider overloaded. Use exponential backoff with full jitter, honour `retry-after`, cap attempts, and count retries in the cost."
+  - "**Letting every waiting call through after the cool-down.** A breaker without a half-open state turns recovery into a stampede. Admit one trial, and fail fast for the rest until it reports."
+  - "**An untested fallback model.** The day the primary fails is the first day real users see the fallback's answers. Run the eval suite on every fallback, and tune its prompt, before it's in the chain."
+  - "**Optimising the longest step instead of the one before the first token.** A streamed generation phase is long but already visible to the user. Cut the waits that come before the first word."
+  - "**A semantic cache on answers that depend on the user.** A near-duplicate question from another person gets the first person's answer, sometimes with their data in it. Cache only answers that fit everyone, tune the similarity threshold on labelled pairs, and log hits so wrong reuse is visible."
+interview:
+  - question: Your AI feature's bill tripled last month. How do you find out why and bring it down?
+    answer: >-
+      I'd break cost down per feature and per finished task from traces, then attack the
+      biggest term. Each span records model, fresh input, cached input and output tokens, so I
+      can see whether traffic grew, prompts got longer, the cache share fell, or retries and
+      escalations rose. A falling cache share after a deploy usually means something variable
+      moved to the front of the prompt. Then the levers: fix the prefix order, trim history and
+      retrieved context, cap output length, move non-interactive work to the batch API, and
+      route simple requests to a smaller model where evals show it passes. Each change runs
+      through the eval gate, because the cheapest version that answers badly isn't a saving.
+      The trade-off is that aggressive trimming can cut quality in rare slices, which only
+      per-slice evals will show.
+  - question: How would you design fallbacks for an LLM provider outage?
+    answer: >-
+      Retry blips, fail over on sustained unhealthiness, and break the circuit so retries
+      don't pile up. The SDK retries 429s, overload and 5xx a few times with backoff and
+      jitter, honouring `retry-after`. If those still fail, a circuit breaker per dependency
+      opens and calls fail fast. Behind it sits a planned fallback: a second model that has
+      passed our eval suite with its own tuned prompt, or a degraded answer such as relevant
+      help articles, or a queued reply by email. I'd only fall back on errors another model
+      can fix. A 400 or 401 is our bug and must raise and page. The trade-offs are quality and
+      cost: the fallback answers differently and starts with a cold cache, so I'd monitor its
+      scores separately and switch back once the breaker closes.
+  - question: How do you reduce time to first token in a RAG chat feature?
+    answer: >-
+      I'd trace the steps before generation and cut the biggest waits on the critical path.
+      Classification and retrieval usually don't depend on each other, so they run in
+      parallel. Reranking is often the largest single wait, so I'd rerank fewer candidates or
+      give it a timeout that falls back to first-stage order. A shorter prompt helps, because
+      the model processes all input before the first token, and a cache hit on a long stable
+      prefix speeds that up too. Streaming makes the remaining generation visible. I'd set
+      each step's share against p95 from traces, not the average. The trade-off is quality:
+      fewer candidates or a skipped rerank lowers retrieval precision, so the eval suite has
+      to confirm the faster version still answers well.
+  - question: When is model routing worth it, and when does it backfire?
+    answer: >-
+      It's worth it when a large share of traffic is simple and a small model passes those
+      cases in evals. Then a rule or a cheap classifier sends them to the small model and cost
+      and latency fall together. It backfires when the small model fails often enough that
+      users retry or requests escalate, because those tasks pay for two models. It also splits
+      traffic across two caches, so each gets fewer hits. I'd first try the large model at a
+      lower effort setting, which keeps one prompt and one cache. If I route, I'd judge it by
+      cost per completed task and eval score per slice, measured on real traffic before and
+      after. The classifier itself also needs a threshold, so uncertain requests go to the
+      large model by default.
+  - question: Would you add a semantic cache in front of the model? How would you set it up?
+    answer: >-
+      Start with the difference from an exact cache. An exact cache reuses an answer only
+      for the identical prompt. A semantic cache embeds the question and reuses a stored
+      answer when a past question is close enough, for example cosine similarity above
+      0.95. Recommend it only where many users ask the same thing in different words and
+      one answer fits all of them, such as help-centre questions. Then name when it's wrong:
+      "cancel my order" and "don't cancel my order" can score as near neighbours, and any
+      answer that depends on the user, their data, the date or the conversation so far must
+      never be shared. Tune the threshold on a labelled set of question pairs, key entries
+      by model and prompt version, add a time to live, and log every hit so wrong reuse
+      shows up in evals. The trade-off is a cheaper, faster answer against the risk of a
+      confident, wrong one.
+terms:
+  - term: Cost per finished task
+    say: The price per call.
+    means: The total spend to complete one task, including retries, escalations and extra calls.
+      A cheaper model can cost more per task if it needs more of them.
+  - term: Cache breakpoint
+    say: Where the cache stores the answer.
+    means: The point in a prompt up to which the prefix is cached. Stable content goes before
+      it; anything per user or per request goes after it.
+  - term: Batch API
+    say: A way to send many prompts at once.
+    means: An asynchronous endpoint that runs requests within a window, typically up to 24
+      hours, at about half price. Use it only for work nobody waits for.
+  - term: Semantic cache
+    say: The same as prompt caching.
+    means: Returning a stored answer when a new question's embedding is close to an earlier one.
+      It skips the model, and risks answering a subtly different question wrongly.
+  - term: Fallback
+    say: Retry on another provider for any error.
+    means: Moving to another model or a later try only for errors another model or a later try
+      can fix, such as `429`, overload, `5xx` and timeouts. A `400` or `401` should raise
+      and page someone.
+  - term: Circuit breaker
+    say: A longer timeout.
+    means: Stops calling a dependency that keeps failing, so calls fail fast instead of piling
+      up. After a cool-off it goes half-open and lets a trial call through.

@@ -1,0 +1,283 @@
+summary: >-
+  A migration is a versioned, ordered change to a database schema, kept in files beside the
+  code and applied the same way to every copy of the database. It solves two problems: every
+  environment ends up with the same schema, and every change is reviewed, repeatable and
+  recorded.
+
+
+  The hard part isn't writing `ALTER TABLE`. It's running it against a table that live
+  traffic is reading and writing, while two versions of the app run side by side during a
+  deploy. Many schema changes take a lock that blocks every query on the table, and some
+  rewrite or scan the whole table while they hold it. The lesson teaches the defaults,
+  `lock_timeout`, expand and contract, and `CREATE INDEX CONCURRENTLY`.
+
+
+  These notes go underneath: what a migration runner does, which changes are instant and
+  which rewrite the table, how to add a constraint without a long lock, how to backfill in
+  batches, and how to order migrations and deploys so neither version of the app ever
+  breaks. On a small table none of this matters. On a table with fifty million rows and
+  steady writes, it's the difference between a quiet deploy and an outage.
+remember:
+  - Every migration must work with both the code that is running now and the code about to be deployed, because both run at once during a deploy.
+  - Most `ALTER TABLE` forms take an `ACCESS EXCLUSIVE` lock, and while one waits for it every new query on that table queues behind it, so set `lock_timeout` and retry later.
+  - '`ADD COLUMN` with no default or a constant default is instant since Postgres 11, but a volatile default such as `gen_random_uuid()` or a type change such as `integer` to `bigint` rewrites the whole table.'
+  - '`CREATE INDEX CONCURRENTLY` builds an index without blocking writes, can''t run inside a transaction, and leaves an invalid index behind if it fails.'
+  - Add constraints in two steps, `NOT VALID` then `VALIDATE CONSTRAINT`, so the long check runs under a lock that lets reads and writes continue.
+  - 'Rename or retype a column by expand and contract: add the new one, write both, backfill in batches, switch reads, then drop the old one in a later release.'
+  - Postgres runs DDL inside transactions, so a failed migration in a transaction leaves no half-applied schema behind.
+  - Keep migrations forward-only in production and fix a bad one with a new migration, since data rarely goes back cleanly.
+sections:
+  - title: What a migration runner does
+    body: |-
+      Prisma Migrate, Drizzle Kit, node-pg-migrate and the rest share one core loop. They
+      keep a table of applied migrations, take a lock so two deploys can't run at once, and
+      apply each missing file in order, recording it in the same transaction as the change.
+      Here is that loop, runnable against Postgres or PGlite:
+
+      ```ts
+      interface Migration {
+        id: string;
+        sql: string;
+        transactional?: boolean; // false for CREATE INDEX CONCURRENTLY
+      }
+
+      interface Db {
+        query<R>(sql: string, params?: unknown[]): Promise<{ rows: R[] }>;
+        exec(sql: string): Promise<unknown>;
+      }
+
+      const LOCK_KEY = 72001; // any fixed number every deploy agrees on
+
+      export async function migrate(db: Db, migrations: Migration[]): Promise<string[]> {
+        await db.exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
+          id text PRIMARY KEY,
+          applied_at timestamptz NOT NULL DEFAULT now()
+        )`);
+        // Two deploys starting at once must not both run the same file.
+        await db.query('SELECT pg_advisory_lock($1)', [LOCK_KEY]);
+        try {
+          const { rows } = await db.query<{ id: string }>('SELECT id FROM schema_migrations');
+          const done = new Set(rows.map((r) => r.id));
+          const applied: string[] = [];
+          for (const m of [...migrations].sort((a, b) => a.id.localeCompare(b.id))) {
+            if (done.has(m.id)) continue;
+            if (m.transactional === false) {
+              await db.exec(m.sql);
+              await db.query('INSERT INTO schema_migrations (id) VALUES ($1)', [m.id]);
+            } else {
+              await db.exec('BEGIN');
+              try {
+                await db.exec("SET LOCAL lock_timeout = '5s'");
+                await db.exec(m.sql);
+                await db.query('INSERT INTO schema_migrations (id) VALUES ($1)', [m.id]);
+                await db.exec('COMMIT');
+              } catch (err) {
+                await db.exec('ROLLBACK'); // the schema change and its record vanish together
+                throw err;
+              }
+            }
+            applied.push(m.id);
+          }
+          return applied;
+        } finally {
+          await db.query('SELECT pg_advisory_unlock($1)', [LOCK_KEY]);
+        }
+      }
+      ```
+
+      Run on an empty database with three files, it applies all three; run again, it applies
+      none. A file that creates a table and then fails on a second statement leaves no table
+      behind, because Postgres DDL is transactional.
+
+      An **advisory lock** is a lock on a number that means whatever your app decides. It
+      protects nothing by itself; it works because every runner asks for the same one. Note
+      the gap in the non-transactional path: if the process dies between the index build and
+      the insert, the next run tries again, so write such files with `IF NOT EXISTS`.
+  - title: Which changes are instant, which scan, which rewrite
+    body: |-
+      Nearly every `ALTER TABLE` takes `ACCESS EXCLUSIVE`, the lock that blocks reads too. The
+      question is how long it's held. Three cases:
+
+      - **Metadata only, held for milliseconds.** `ADD COLUMN` that is nullable or has a
+        constant default. `DROP COLUMN` (the space is reclaimed later as rows are rewritten).
+        Widening `varchar(10)` to `varchar(50)` or to `text`. Renames.
+      - **Full scan while locked.** `SET NOT NULL`, and adding a `CHECK` or foreign key
+        without `NOT VALID`. Postgres reads every row to prove the rule.
+      - **Full rewrite while locked.** Changing a column type that needs conversion, such
+        as `integer` to `bigint`, and `ADD COLUMN` with a volatile default like
+        `gen_random_uuid()`. The table and all its indexes are rebuilt.
+
+      You can see a rewrite happen: `pg_relation_filenode('orders')` returns a new number
+      after one. On a test table it stayed the same after widening `varchar` and dropping a
+      column, and changed after `integer` to `bigint` and after adding a column with
+      `DEFAULT gen_random_uuid()`.
+
+      Plain `CREATE INDEX` is a separate case: it takes a `SHARE` lock, so reads continue but
+      writes wait for the whole build.
+
+      The danger is the lock **queue**. A waiting `ACCESS EXCLUSIVE` request blocks every
+      query that arrives after it, even ones that would have been compatible with the query
+      it's waiting for. So every migration session starts with a timeout:
+
+      ```sql
+      SET lock_timeout = '5s';
+      SET statement_timeout = '15min';
+      ```
+
+      If the lock isn't granted in five seconds, the statement fails and the queue drains.
+      The runner or the person deploying retries a little later.
+  - title: Constraints and NOT NULL without a long lock
+    body: |-
+      Adding a rule to a big table is a two-phase job. `NOT VALID` adds the constraint
+      without checking existing rows; it's enforced for new writes at once.
+      `VALIDATE CONSTRAINT` then checks the old rows under a weaker lock that lets reads and
+      writes continue.
+
+      ```sql
+      CREATE TABLE users (id integer PRIMARY KEY, name text NOT NULL, full_name text);
+      INSERT INTO users SELECT n, 'User ' || n, NULL FROM generate_series(1, 2500) AS n;
+
+      ALTER TABLE users
+        ADD CONSTRAINT full_name_present CHECK (full_name IS NOT NULL) NOT VALID;
+
+      INSERT INTO users (id, name) VALUES (9999, 'No full name');
+      -- ERROR: new row for relation "users" violates check constraint "full_name_present"
+
+      UPDATE users SET full_name = name WHERE full_name IS NULL;   -- batch this in real life
+      ALTER TABLE users VALIDATE CONSTRAINT full_name_present;
+      ALTER TABLE users ALTER COLUMN full_name SET NOT NULL;       -- uses the check, skips the scan
+      ALTER TABLE users DROP CONSTRAINT full_name_present;
+      ```
+
+      Since Postgres 12, `SET NOT NULL` skips its scan when a valid `CHECK (col IS NOT
+      NULL)` already proves the rule. Foreign keys work the same way: `ADD CONSTRAINT ...
+      FOREIGN KEY ... NOT VALID`, then `VALIDATE CONSTRAINT`.
+
+      Unique constraints need an index first. Build it without blocking writes, then attach
+      it:
+
+      ```sql
+      CREATE UNIQUE INDEX CONCURRENTLY users_email_key ON users (email);
+      ALTER TABLE users ADD CONSTRAINT users_email_unique UNIQUE USING INDEX users_email_key;
+      ```
+
+      Each `CONCURRENTLY` statement must be sent on its own. Sent in a multi-statement string
+      it fails with `cannot run inside a transaction block`, because Postgres wraps a
+      multi-statement query in one implicit transaction.
+  - title: Concurrent index builds and backfills in practice
+    body: |-
+      `CREATE INDEX CONCURRENTLY` scans the table twice and waits for transactions that
+      started before it, so a long-running transaction elsewhere makes it wait. If it fails,
+      for example on a duplicate while building a unique index, it leaves an **invalid**
+      index. Postgres keeps updating it on every write but never uses it for reads. Find and
+      replace them:
+
+      ```sql
+      SELECT indexrelid::regclass AS index, indrelid::regclass AS table
+      FROM pg_index
+      WHERE NOT indisvalid;
+      ```
+
+      Drop it with `DROP INDEX CONCURRENTLY` and build it again. `REINDEX INDEX CONCURRENTLY`
+      rebuilds a bloated index without blocking writes.
+
+      A backfill is a data change, not a schema change, and one giant `UPDATE` is the wrong
+      shape: it holds row locks on every row it touches until it ends, and replicas fall
+      behind while they replay it. Loop in batches, each its own short transaction:
+
+      ```ts
+      interface Db {
+        query(sql: string, params?: unknown[]): Promise<{ rowCount: number | null }>;
+      }
+
+      // Each batch is its own short transaction, so row locks last moments, not minutes.
+      export async function backfillFullName(db: Db, batchSize = 1000): Promise<number> {
+        let total = 0;
+        for (;;) {
+          const { rowCount } = await db.query(
+            `UPDATE users SET full_name = name
+             WHERE id IN (
+               SELECT id FROM users WHERE full_name IS NULL ORDER BY id LIMIT $1
+             )`,
+            [batchSize],
+          );
+          if (!rowCount) return total;
+          total += rowCount;
+          await new Promise((resolve) => setTimeout(resolve, 50)); // give replicas and vacuum room
+        }
+      }
+      ```
+
+      On 2,500 rows it ran three batches and left no NULLs. Give it an index that finds the
+      remaining rows quickly on a big table, or walk by id ranges instead. Run backfills from
+      a job or script, not from the migration runner, so a slow backfill doesn't hold up a
+      deploy.
+  - title: Ordering migrations and deploys
+    body: |-
+      A deploy replaces old app servers with new ones gradually, so for a while both run
+      against the same database. Every migration must suit both. That gives two rules.
+
+      **Additive changes go before the code that uses them.** Add the column, table or index
+      first; old code ignores it. Then deploy code that writes it.
+
+      **Removals go after the code that stopped using them.** Deploy code that no longer
+      reads or writes the column, wait until no old server is left, then drop it in a later
+      migration. Dropping first makes every old server's queries fail.
+
+      Expand and contract applies both rules to a rename, as the lesson showed. The same
+      shape handles a type change (add `id_new bigint`, write both, backfill, switch, drop)
+      and splitting a table in two.
+
+      A few more habits help. Keep each migration small and single-purpose, so a failure is
+      quick to diagnose. Run migrations as a step before the new code starts, not from each
+      app instance on boot, where ten instances race for the lock. Keep migrations
+      **forward-only**: a "down" script that drops a column deletes the data written since, so
+      the fix for a bad migration is a new one. And test migrations against a copy of
+      production-sized data, since a step that takes one second on staging can take an hour
+      on the real table.
+pitfalls:
+  - '**No `lock_timeout` on a migration.** It waits behind one slow query, every new query queues behind it, and the site stalls. Set a short `lock_timeout` and retry.'
+  - '**Renaming or dropping a column that running code still uses.** Old servers fail the moment it lands. Expand and contract, and drop only after the last old server is gone.'
+  - '**Changing `integer` to `bigint` in place on a big table.** It rewrites the table under an exclusive lock. Add a new column, backfill in batches, and switch over.'
+  - '**`CREATE INDEX CONCURRENTLY` inside a transaction.** It fails, and some tools wrap every file in one. Mark the file as non-transactional and send the statement on its own.'
+  - '**Forgetting a failed concurrent index.** The invalid index slows every write and helps no read. Check `pg_index.indisvalid` after a failure and drop it.'
+  - '**One huge backfill `UPDATE`.** It holds locks for its whole run and leaves replicas behind. Update in batches of a few thousand rows, each in its own transaction.'
+  - '**Editing a migration that already ran somewhere.** The runner skips it by id, so environments quietly differ. Never change an applied file; add a new one.'
+interview:
+  - question: How do you deploy a schema change to a large, busy Postgres table without downtime?
+    answer: >-
+      Make every step compatible with both app versions and keep every exclusive lock short.
+      I set `lock_timeout` so a migration can't queue the whole table behind it. I prefer
+      changes that are metadata-only, such as adding a nullable column or one with a constant
+      default. Indexes go in with `CREATE INDEX CONCURRENTLY`, constraints with `NOT VALID`
+      then `VALIDATE`, and `SET NOT NULL` after a validated check. Anything that would rewrite
+      the table, like `integer` to `bigint`, becomes expand and contract with a batched
+      backfill. Removals come last, after no running code uses the column. The cost is more
+      steps and releases per change, which is worth it for tables that serve traffic.
+  - question: Walk me through renaming a column safely.
+    answer: >-
+      Expand and contract across several deploys. First a migration adds the new column.
+      Then I deploy code that writes both columns and still reads the old one. A batched
+      backfill copies the old values into the new column. Then I deploy code that reads the
+      new column, still writing both, so a rollback of that deploy is safe. Once no running
+      code touches the old column, a final migration drops it. A single `RENAME` would break
+      every old server still running during the deploy. For a small internal table with a
+      maintenance window I might rename in place, but not for a table live traffic uses.
+  - question: Why can an ALTER TABLE that should take milliseconds take the site down?
+    answer: >-
+      Because of the lock queue, not the work. The `ALTER` needs an `ACCESS EXCLUSIVE` lock,
+      so it waits for every running query on the table, say a five-minute report. While it
+      waits, every new query on that table, even plain reads, queues behind it, so traffic
+      piles up for five minutes. The fix is `SET lock_timeout = '5s'`: the migration fails
+      fast, the queue drains, and it retries later. It also helps to cap long queries with
+      `statement_timeout` and to run migrations at quiet times.
+  - question: Do you write down migrations? How do you roll back a bad schema change?
+    answer: >-
+      In production I keep migrations forward-only and roll forward. A down migration that
+      drops a column also drops whatever users wrote to it since, and one that restores a
+      column can't restore its data, so it's rarely safe to run under pressure. The
+      protection comes earlier: each migration is small, backwards compatible with the
+      running code and tested on production-sized data, so the code can be rolled back
+      without touching the schema. If a migration is wrong, I write a new one that corrects
+      it. Down scripts are still handy locally, for iterating on a migration before it
+      merges.

@@ -1,0 +1,240 @@
+summary: >-
+  Every program starts with three open channels: standard input to read from, standard output
+  for results and standard error for complaints. Redirection (`>`, `>>`, `<`, `2>`) and pipes
+  (`|`) are the shell rewiring those channels before the program starts. The program itself
+  doesn't know or care whether it's writing to your screen, a file or another program.
+
+
+  That design is what lets small tools combine. `grep` doesn't need a counting feature
+  because `wc -l` exists, and neither needs to know about files because the shell can connect
+  them. The separate error channel is what keeps error messages out of your data when you save
+  or pipe it.
+
+
+  Exit codes are the other half. Every program ends with a number, and `0` is the only one
+  that means success. `&&`, `||`, `if` and a script's `set -e` all read that number, so it's
+  how commands, scripts and CI pipelines decide whether to carry on. The traps are the places
+  where a failure's number gets lost: inside a pipeline, and in the corners where `set -e`
+  quietly doesn't apply.
+remember:
+  - Every process starts with file descriptor 0 for standard input, 1 for standard output and 2 for standard error.
+  - The shell sets up every redirection before the program starts, which is why `> file` empties the file even if the program then fails.
+  - '`>` and `|` only carry standard output, so error messages still reach the screen unless you redirect `2>` as well.'
+  - Redirections are applied left to right, so `> out.txt 2>&1` sends both streams to the file while `2>&1 > out.txt` does not.
+  - An exit code of `0` means success, anything from 1 to 255 means failure, and 128 plus a number means the process was killed by that signal.
+  - A pipeline's exit code is its last command's unless `set -o pipefail` is on.
+  - '`set -e` stops a script on a failing command, but not inside an `if` condition or any part of an `&&` or `||` list except the last command.'
+  - To filter a file in place, write to a temporary file and then `mv` it over the original.
+sections:
+  - title: File descriptors, the numbers behind the arrows
+    body: |-
+      A running program refers to each open file, pipe or terminal by a small number, a **file
+      descriptor**. Three are open from the start: 0 is standard input, 1 is standard output
+      and 2 is standard error. `console.log` in Node writes to 1, `console.error` writes to 2.
+
+      Redirection is the shell pointing one of those numbers somewhere else before it starts
+      the program. `>` is short for `1>`. `2>` points descriptor 2. `2>&1` means "make 2 point
+      wherever 1 points right now".
+
+      ```text
+      $ echo "buy milk" > todo.txt
+      $ cat todo.txt missing.txt > out.txt 2> err.txt
+      $ cat out.txt
+      buy milk
+      $ cat err.txt
+      cat: missing.txt: No such file or directory
+      $ cat todo.txt missing.txt > both.txt 2>&1
+      $ cat both.txt
+      buy milk
+      cat: missing.txt: No such file or directory
+      $ cat todo.txt missing.txt 2>&1 > only-out.txt
+      cat: missing.txt: No such file or directory
+      ```
+
+      The last line surprises most people. The shell reads redirections left to right. First
+      `2>&1` copies where 1 points at that moment, the terminal. Then `> only-out.txt` moves 1
+      to the file. Descriptor 2 still points at the terminal.
+
+      Other forms you'll meet:
+
+      - `2>/dev/null` throws errors away. `/dev/null` is a file that swallows everything.
+      - `< todo.txt` feeds a file into standard input, so `wc -l < todo.txt` prints a count
+        with no file name after it.
+      - `>&2` in a script sends a message to standard error: `echo "config missing" >&2`.
+      - `&> file` sends both streams in bash and zsh, but it isn't POSIX, so portable scripts
+        write `> file 2>&1`.
+  - title: What a pipe really is
+    body: |-
+      `a | b` starts both programs at the same time. The shell creates a **pipe**, a small
+      buffer inside the operating system, points `a`'s descriptor 1 at its writing end and
+      `b`'s descriptor 0 at its reading end. `b` reads lines as `a` produces them, so a
+      pipeline can process a file far bigger than memory.
+
+      Because only descriptor 1 goes into the pipe, errors skip it:
+
+      ```text
+      $ cat missing.txt | grep -c "No such"
+      cat: missing.txt: No such file or directory
+      0
+      $ cat missing.txt 2>&1 | grep -c "No such"
+      1
+      ```
+
+      The first `grep` read nothing: the message went straight to the screen. Adding `2>&1`
+      before the pipe merges the error into the stream.
+
+      When the reader stops early, the writer is told to stop. `head -n 1` exits after one
+      line. The next time the writer writes, the system sends it the signal **SIGPIPE** and it
+      ends. That's normal and usually invisible, but it shows up in exit codes. In bash,
+      `PIPESTATUS` lists the code of every command in the last pipeline:
+
+      ```text
+      $ seq 1 100000 | head -n 1; echo "${PIPESTATUS[*]}"
+      1
+      141 0
+      ```
+
+      141 is 128 plus 13, the number of SIGPIPE. Keep it in mind for the next section:
+      `pipefail` treats that 141 as a failure.
+  - title: Exit codes and what the numbers mean
+    body: |-
+      An exit code is a number from 0 to 255. Only `0` means success. Beyond that, a few
+      ranges are conventions every shell follows:
+
+      - `1` is a general failure. Many programs use `2` for wrong usage, and `grep` uses `1`
+        for "no match" and `2` for a real error.
+      - `126` means the file was found but isn't executable, and `127` means the command
+        wasn't found at all.
+      - `128 + n` means the process was killed by signal `n`. Ctrl-C sends signal 2, so an
+        interrupted command gives 130. `kill` sends signal 15, giving 143.
+      - Values wrap around at 256, so `exit 300` reports 44. Stay between 0 and 125 for your
+        own codes.
+
+      Node follows the same rules. An uncaught error ends the process with 1, and
+      `process.exitCode = 2` sets the code the process reports when it finishes.
+
+      ```text
+      $ node -e 'process.exit(3)'; echo $?
+      3
+      $ node -e 'throw new Error("save failed")' 2>/dev/null; echo $?
+      1
+      ```
+
+      You combine codes with three operators. `a && b` runs `b` only if `a` succeeded.
+      `a || b` runs `b` only if `a` failed, which gives fallbacks such as
+      `mkdir -p logs || exit 1`. A leading `!` inverts a command's result, so `! grep -q TODO app.js` succeeds
+      when there's no TODO. CI systems, Git hooks and `npm test` all decide pass or fail from
+      nothing but this number.
+  - title: 'Strict mode: set -euo pipefail and its gaps'
+    body: |-
+      A plain script carries on after a failed command. Three options change that, and most
+      careful scripts start with them:
+
+      - `set -e` exits the script when a command fails.
+      - `set -u` treats an unset variable as an error instead of an empty string.
+      - `set -o pipefail` makes a pipeline fail if any command in it failed, not only the last.
+
+      ```bash
+      #!/bin/bash
+      set -euo pipefail
+
+      out="${BUILD_DIR:-dist}"
+      rm -rf "./$out"
+      mkdir "$out"
+      # grep exits 1 when it counts zero matches, which is fine here
+      grep -c "TODO" src/app.js > "$out/todo-count.txt" || true
+      cat src/*.js | wc -l > "$out/lines.txt"
+      echo "built into $out, TODOs: $(cat "$out/todo-count.txt")"
+      ```
+
+      `${BUILD_DIR:-dist}` uses `dist` when the variable is unset or empty, which keeps `set -u`
+      happy. Without `set -u`, a typo like `rm -rf "./$ot"` would expand to `rm -rf "./"`.
+      Remove the `|| true` and the script stops at the `grep` line with exit code 1 and no
+      message, because a zero count is a "failure" to `grep`.
+
+      The gaps are where people get hurt. `set -e` is ignored for a command in an `if` or
+      `while` condition, for any command in an `&&` or `||` list except the last, and for a
+      command after `!`. That rule also applies to everything inside a function called in
+      those places:
+
+      ```bash
+      set -e
+      save() { false; echo "still inside save"; }
+      save || echo "save failed"
+      # prints "still inside save", and never "save failed"
+      ```
+
+      And `pipefail` counts SIGPIPE, so `yes | head -n 1` fails with 141 under it. Strict mode
+      is a safety net, not a replacement for checking the results that matter.
+  - title: Changing a file in place, safely
+    body: |-
+      The lesson showed that `grep " 404" access.log > access.log` empties the log, because
+      the shell truncates the file before `grep` opens it. The same happens with `sort` or
+      `sed` and `>`. The fix is always the same shape: write somewhere new, then replace.
+
+      ```bash
+      grep " 404" access.log > access.log.tmp && mv access.log.tmp access.log
+      ```
+
+      The `&&` matters. If `grep` fails, the original stays untouched. `mv` within one disk
+      renames the file in a single step, so another program never sees a half-written log.
+
+      Two more tools help here:
+
+      - `tee` copies its input to a file and to standard output, so
+        `npm test 2>&1 | tee test.log` shows the run and saves it.
+      - `set -o noclobber` makes `>` refuse to overwrite an existing file. Bash says
+        `cannot overwrite existing file`. `>|` overrides it when you mean to.
+
+      For edits by pattern, `sed -i` edits in place, but its flag differs between macOS and
+      Linux: macOS needs `sed -i ''`, Linux takes `sed -i`. The temporary file pattern works
+      everywhere.
+pitfalls:
+  - '**Putting `2>&1` before the `>`.** `cmd 2>&1 > log.txt` still prints errors on screen, because 2 copied where 1 pointed before 1 moved. Write `cmd > log.txt 2>&1`.'
+  - '**Reading and writing the same file in one command.** The shell empties the target before the command reads it, so `sort names.txt > names.txt` leaves an empty file. Write to a temporary file and `mv` it back.'
+  - '**Trusting a pipeline''s exit code.** `npm test | tee test.log` reports `tee`''s success even when the tests fail. Turn on `set -o pipefail` in scripts and CI, or check `PIPESTATUS` in bash.'
+  - '**Relying on `set -e` inside functions.** A function called as `deploy || echo failed` runs with `set -e` switched off, so it carries on after its own errors. Check critical steps explicitly with `|| return 1`.'
+  - '**Treating every non-zero code as a crash.** `grep`, `diff` and `test` use 1 as an ordinary answer, such as "no match". Handle the expected code with `|| true` or an `if`, and test for `0` rather than a particular failure number.'
+  - '**Swallowing errors with `2>/dev/null` by habit.** It hides the one line that explains a failure. Redirect errors to a log file instead when the output is noisy.'
+interview:
+  - question: What's the difference between `cmd > out.txt 2>&1` and `cmd 2>&1 > out.txt`?
+    answer: >-
+      The first sends both output and errors to the file, the second sends only output there.
+      The shell applies redirections left to right, and `2>&1` means "point descriptor 2 at
+      whatever descriptor 1 points to now". In the first form, 1 already points at
+      `out.txt`, so 2 follows it. In the second, 2 copies the terminal first, and only then
+      does 1 move to the file. It's a common bug in cron jobs and CI scripts, where errors
+      vanish from the log file that's meant to catch them. If portability doesn't matter,
+      bash's `&> out.txt` sidesteps the ordering, but it isn't POSIX, so `sh` scripts should
+      keep the explicit form.
+  - question: Why do programs have a separate standard error stream?
+    answer: >-
+      So diagnostics don't corrupt the data flowing through a pipe or into a file. If
+      `sort data.csv > sorted.csv` hits a problem, the message goes to the screen and
+      `sorted.csv` stays clean. In a pipeline, only standard output flows to the next
+      program, so a warning from the first command can't be mistaken for input by the
+      second. It also lets you treat them differently: keep results with `>`, log errors
+      with `2> errors.log`, or merge them with `2>&1` when you want everything in one place,
+      such as a CI log. The cost is that you have to remember `>` alone doesn't capture
+      errors, which surprises people when a "silent" redirected command still prints.
+  - question: What does `set -euo pipefail` do, and what doesn't it protect you from?
+    answer: >-
+      It makes a bash script stop on the first failed command, on any unset variable and on a
+      failure anywhere in a pipeline. Without it a script carries on after errors, and
+      `rm -rf "$DIR/"` with a mistyped variable becomes `rm -rf "/"`. The gaps matter as much.
+      `set -e` is suspended in `if` and `while` conditions, in every part of an `&&` or `||`
+      list except the last, and inside any function called from those places, so a helper
+      can fail halfway and keep going. `pipefail` also treats SIGPIPE as failure, so
+      `producer | head -n 1` can exit with 141. And commands like `grep` fail on "no match",
+      which needs an explicit `|| true`. So I use it as a default net and still check the
+      steps that matter.
+  - question: How is the exit code of a pipeline determined?
+    answer: >-
+      By default it's the exit code of the last command, and the others are ignored. So
+      `cat missing.txt | wc -l` succeeds, because `wc` counted zero lines without trouble.
+      That hides real failures, for example `npm test | tee log.txt` passing a broken build
+      in CI. `set -o pipefail` changes the rule: the pipeline returns the last non-zero code
+      of any command, or 0 if all succeeded. Bash also keeps every code in the `PIPESTATUS`
+      array, which helps when you need to know which stage failed. The trade-off with
+      `pipefail` is SIGPIPE: when a reader like `head` exits early, the writer can end with
+      141 and the pipeline counts as failed even though you got what you wanted.

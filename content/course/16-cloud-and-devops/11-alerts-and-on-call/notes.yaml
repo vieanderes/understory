@@ -1,0 +1,237 @@
+summary: >-
+  Alerting decides when a person is interrupted. Get it wrong one way and outages go
+  unnoticed until customers complain. Get it wrong the other way and people are woken for
+  nothing until they stop trusting the pager, and then outages go unnoticed anyway.
+
+
+  The way out is to define "working" from the user's side first. A service level indicator
+  counts good events out of all events, a service level objective sets a target for it, and
+  the error budget is the failure the target allows. Alerts then fire on how fast that
+  budget is burning, which is something users feel, rather than on causes such as CPU that
+  they don't.
+
+
+  When a page is real, the order is fixed: stop the harm, then find the cause, then learn
+  from it without blame. These notes add the arithmetic of budgets and burn rates, what
+  separates a good page from noise, how an incident is run with more than one person, and
+  what a useful review contains.
+remember:
+  - An SLI is the share of good events out of all events, and an SLO is a target for it over a window, such as 99.9% over 30 days.
+  - The error budget is what the SLO allows to fail; 99.9% over 30 days is 43.2 minutes of total outage, or one request in a thousand.
+  - Page only when users are hurting now and a person can act; everything else becomes a ticket or a dashboard.
+  - A burn rate of 1 spends the budget exactly over the SLO window, and paging on a fast burn over both a long and a short window catches real outages without flapping.
+  - Rate-based alerts need a minimum of traffic, and quiet services need a synthetic probe so a total outage at night still pages.
+  - In an incident, mitigate first, usually by rolling back, turning off a flag or failing over, and diagnose once users are safe.
+  - Every page links to a runbook, and a page nobody could act on is itself a bug to fix.
+  - A blameless review asks what let the failure through, and every action item has an owner and a date.
+sections:
+  - title: The error budget in numbers
+    body: |-
+      The budget is the SLO turned into something you can spend. For a time-based view,
+      multiply the allowed failure by the window.
+
+      ```text
+      99%    over 30 days   0.01  × 43,200 min  = 432 min, about 7.2 hours
+      99.9%  over 30 days   0.001 × 43,200 min  = 43.2 min
+      99.95% over 30 days   0.0005 × 43,200 min = 21.6 min
+      99.5%  over 28 days   0.005 × 40,320 min  = 201.6 min, about 3.4 hours
+      ```
+
+      For a request-based SLI, the budget is a count: at 99.9%, a service handling ten
+      million requests a month may fail ten thousand of them. Request-based budgets are
+      fairer, because an outage at 3 a.m. with little traffic costs less than one at noon.
+
+      Each extra nine divides the budget by ten, and the cost of achieving it rises steeply.
+      A 43-minute budget can't absorb a manual rollback that takes half an hour to notice
+      and fifteen minutes to run. 21 minutes means automatic detection and rollback. Don't
+      promise more nines than your dependencies have: a service that calls a provider with
+      99.9% availability can't offer 99.99% without a fallback.
+
+      The budget is also a policy tool. Agree in advance what happens when it's spent, for
+      example that the team pauses feature releases and works on reliability until the
+      30-day window recovers. That turns "move fast" against "be careful" from an argument
+      into a number both sides accepted. A budget that's never touched is a signal too: the
+      SLO may be stricter than users need, and the team could ship faster.
+
+      Choose the SLI from the user's side. For a booking API: the share of booking requests
+      that succeed within 800 ms, measured at the load balancer, so a crashed app still
+      counts against it.
+  - title: Alerting on burn rate
+    body: |-
+      A plain error-rate threshold is either too jumpy or too slow. **Burn rate** measures
+      how fast you're spending the budget: 1 means the budget runs out exactly at the end of
+      the window, 10 means ten times faster. Pair a long window, which proves the problem is
+      real, with a short one, which proves it's still happening.
+
+      ```ts
+      type Window = { requests: number; errors: number };
+      type Alert = 'page' | 'ticket' | 'none';
+
+      const SLO = 0.999; // 99.9% of requests succeed, over 30 days
+      const BUDGET = 1 - SLO; // 0.1% may fail
+
+      // 1 means failing at exactly the rate that uses the budget up in 30 days.
+      function burnRate(w: Window): number {
+        if (w.requests === 0) return 0;
+        return w.errors / w.requests / BUDGET;
+      }
+
+      // Each rule needs a long window (it's real) and a short one (it's still happening).
+      const RULES: { long: string; short: string; rate: number; action: Alert }[] = [
+        { long: '1h', short: '5m', rate: 14.4, action: 'page' }, // 2% of the budget in an hour
+        { long: '6h', short: '30m', rate: 6, action: 'page' }, // 5% in six hours
+        { long: '3d', short: '6h', rate: 1, action: 'ticket' }, // 10% in three days
+      ];
+
+      export function evaluate(windows: Record<string, Window>): Alert {
+        for (const rule of RULES) {
+          const long = burnRate(windows[rule.long]);
+          const short = burnRate(windows[rule.short]);
+          if (long >= rule.rate && short >= rule.rate) return rule.action;
+        }
+        return 'none';
+      }
+      ```
+
+      With 3% of requests failing in the last five minutes and 2.2% over the hour, it
+      returned `page`. With the same hour but a clean last five minutes, it returned
+      `none`: the spike is over, so nobody is woken for history.
+
+      The thresholds come from the Google SRE workbook. A burn of 14.4 for an hour spends 2%
+      of a 30-day budget, fast enough to wake someone. A slow burn of 1 over three days is a
+      ticket: it will exhaust the budget, but there's time to fix it in working hours. In a
+      real system these rules live in your monitoring tool, not your app.
+  - title: What makes a page worth waking for
+    body: |-
+      A good page passes four tests. It describes a **symptom** users feel, not a cause. It
+      is **urgent**, so it can't wait for morning. It is **actionable**, so there's something
+      the person can do. And it is **new**, not the fifth copy of an alert already being
+      handled.
+
+      Causes still matter, as context. Disk at 90%, CPU high, a queue growing: those belong
+      on the dashboard the page links to, or become tickets. Some causes predict certain
+      harm, such as a disk that will be full in four hours at the current rate. That's worth
+      a page because the symptom is guaranteed and imminent.
+
+      Two gaps catch teams out. **Low traffic**: the lesson's minimum request count stops
+      false pages at night, but it also hides a total outage when there are no requests to
+      fail. A synthetic check, a probe that books and cancels a test room every minute from
+      outside, keeps a signal flowing. **Missing data**: if the service stops reporting
+      metrics, an error-rate alert sees nothing and stays quiet. Alert on the absence of data
+      too.
+
+      Every page links to a **runbook**: what this alert means, the graphs to open, the
+      likely causes, and the levers, such as how to roll back or switch the model provider
+      to a fallback. A runbook turns a 3 a.m. page into steps instead of research.
+
+      Measure the pager itself. Count pages per on-call shift, and how many needed action.
+      A common target is no more than a couple of incidents per shift. An alert that fired
+      and needed nothing gets tuned or deleted in the following week, not tolerated.
+  - title: Running an incident with more than one person
+    body: |-
+      A small incident is one person with a rollback. A large one pulls in several engineers,
+      and without roles they all debug the same thing while nobody updates customers.
+
+      Assign roles as soon as a second person joins. The **incident commander** coordinates:
+      decides what to try next, who does it, and when to escalate. They don't debug. The
+      **operations lead** makes the changes. **Communications** posts updates to the team,
+      support and a status page on a steady rhythm, such as every 30 minutes, even when the
+      update is "no change". A **scribe** keeps a timeline of what was seen and done, with
+      times, which the review will need. On a small team one person holds two roles, but
+      someone always holds command.
+
+      Declare a **severity** early, for example: users can't book at all, users have a
+      degraded experience, or internal only. Severity decides who gets pulled in and how
+      often you update.
+
+      Mitigate before you diagnose. The levers, fastest first:
+
+      - roll back the last deploy or configuration change;
+      - turn off a feature flag, or switch a model call to its fallback;
+      - shed load: rate limit, pause background jobs, serve a cached page;
+      - scale out, or fail over to a replica.
+
+      Keep changes small and one at a time, and say each one out loud in the incident
+      channel, so the timeline shows cause and effect. Two engineers changing things at once
+      can hide which change helped. Close the incident when the SLI is back to normal, not
+      when the fix is merged.
+  - title: A review that changes something
+    body: |-
+      The review exists to make the next incident less likely or less harmful. A short,
+      consistent shape helps.
+
+      ```text
+      Summary       Bookings failed for 23% of users for 41 minutes.
+      Impact        About 1,900 failed bookings; 31% of the monthly error budget.
+      Timeline      14:02 deploy of 4f2a9c1
+                    14:03 error rate rises from 0.1% to 23%
+                    14:09 page fires (burn rate over 14.4 for 5m and 1h)
+                    14:12 on-call acknowledges, links errors to the deploy
+                    14:16 rollback to 9c1e2b7 starts
+                    14:43 error rate back to 0.1%
+      Causes        A migration renamed a column the running version still read.
+      What helped   Rollback was one command; the page linked the right graph.
+      What hurt     Six minutes to page; rollback slowed by an image pull.
+      Actions       Lint migrations for renames and drops    owner A   by 10 Oct
+                    Pre-pull the previous image on servers   owner B   by 3 Oct
+                    Page on a 2m short window for bookings   owner C   by 3 Oct
+      ```
+
+      **Blameless** doesn't mean nobody did anything. It means asking why the action made
+      sense at the time and why the system allowed it. "Engineer shipped a bad migration"
+      leads to "be more careful", which changes nothing. "Nothing checks migrations for
+      renames" leads to a lint rule, which does.
+
+      Look for several contributing factors rather than one root cause. Here, the rename,
+      the slow page and the slow rollback each made the outage longer. Good actions are
+      specific, owned and dated, and they favour automatic guards over training. Track them
+      like any other work, and review open ones at the next incident review.
+pitfalls:
+  - "**Paging on causes.** CPU, memory and queue length wake people for situations users never feel. Page on symptoms from the SLI, and keep causes on dashboards."
+  - "**One short window.** A five-minute error rate flaps on blips and pages for history. Require a long and a short window to agree."
+  - "**No floor for rate alerts, and no probe for quiet hours.** Two requests make a 50% error rate, and zero requests hide a total outage. Add a minimum count and a synthetic check."
+  - "**Alerts without runbooks.** The person paged at 3 a.m. has to research instead of act. Link every page to steps and the relevant graphs."
+  - "**Debugging before mitigating.** Every minute spent understanding the bug is a minute of users failing. Roll back or switch off first."
+  - "**Everyone investigating, nobody coordinating.** Changes overlap and customers hear nothing. Name an incident commander and a communications lead early."
+  - "**Reviews that end in \"be more careful\".** People don't change under a memo. Find what let the mistake through and add a guard, with an owner and a date."
+interview:
+  - question: How would you set up alerting for a new service so the on-call engineer isn't overwhelmed?
+    answer: >-
+      Start from an SLO on what users feel and page on how fast its error budget burns.
+      For a booking API I'd pick "99.9% of booking requests succeed within 800 ms over 30
+      days", measured at the load balancer. Pages fire when the burn rate is high over
+      both a long and a short window, for example above 14.4 over an hour and five minutes,
+      so blips and finished spikes don't wake anyone. Slower burns open tickets. Each page
+      links to a runbook. A synthetic probe and a no-data alert cover quiet periods. Causes
+      like CPU live on dashboards. Then I review every page weekly and tune or delete any
+      that needed no action.
+  - question: What's an error budget, and how does it change how a team works?
+    answer: >-
+      It's the amount of failure the SLO allows: at 99.9% over 30 days, one request in a
+      thousand, or about 43 minutes of full outage. It turns reliability into a shared
+      number instead of an argument. While there's budget left, the team ships features and
+      takes reasonable risks, since that's what the budget is for. When it's spent, the
+      agreed policy kicks in, such as pausing risky releases and working on reliability
+      until the window recovers. It also shows when the target is wrong: an untouched budget
+      suggests the SLO is stricter than users need. The trade-off is that the policy only
+      works if product and engineering agreed to it beforehand.
+  - question: You're paged at 3 a.m. and checkout is failing. Walk me through the first fifteen minutes.
+    answer: >-
+      Acknowledge, assess, mitigate, communicate. I acknowledge so nobody else starts on it,
+      then check the SLI graph for when it began and how bad it is, and what changed around
+      then: a deploy, a config change, a provider status page. If it lines up with our
+      deploy, I roll back to the previous image and watch the error rate fall. If it's a
+      dependency, I use a lever from the runbook, such as a fallback or a feature flag. I
+      post a short update to the team and support within the first few minutes. If it's
+      large, I call in help and take the commander role. Diagnosis waits until users are
+      safe, and I note times for the review as I go.
+  - question: What makes a post-incident review blameless, and why does it matter?
+    answer: >-
+      It treats the people involved as having acted reasonably with what they knew, and asks
+      what in the system allowed the failure. It matters because blame makes people hide
+      mistakes and details, and without honest details the review can't find the real
+      causes. Instead of "who deployed the broken migration", it asks why nothing caught a
+      rename, why the page took six minutes, and why rollback was slow. That produces
+      guards, such as a migration lint, rather than warnings. Blameless isn't the same as
+      without accountability: the actions still have named owners and dates, and someone
+      checks they were done.

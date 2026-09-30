@@ -1,0 +1,318 @@
+summary: >-
+  Pydantic turns type hints into checks that run. You describe the data you expect as a
+  class, and every time data comes in, Pydantic parses it, converts what it safely can and
+  raises one `ValidationError` listing every field that's wrong. After that line, the rest
+  of your code can trust the types.
+
+
+  It exists because the data that breaks programs comes from outside: request bodies,
+  config, files and, in AI work, a model's reply. A model is a very fluent source of almost
+  right data: `"Refund"` for `"refund"`, `"false"` in quotes, a missing field, a note
+  wrapped around the JSON. Type hints alone check none of this at run time. Pydantic
+  checks all of it, at the boundary where the data arrives.
+
+
+  Reach for it wherever outside data enters: API payloads (FastAPI is built on it),
+  settings, and every structured reply from a model. Its schema also travels the other
+  way, as JSON Schema that tells a model what shape to write. Inside your own code, between
+  functions that already trust each other, plain classes or dataclasses are enough.
+  Validating the same data again and again costs time and says nothing new.
+remember:
+  - Validate once, at the boundary where outside data enters, so everything after it can trust the types.
+  - By default Pydantic is lax and converts where nothing is lost, such as `"3"` to `3` and `"false"` to `False`, and `strict=True` refuses every conversion.
+  - Pydantic 2 does not turn a number into a string, so `123` for a `str` field fails with `string_type`.
+  - '`ValidationError.errors()` gives one dict per problem with `type`, `loc`, `msg` and `input`, and `loc` is a path such as `(''lines'', 1, ''qty'')`.'
+  - '`Field` constraints such as `ge`, `le`, `min_length` and `pattern` check single values, `field_validator` runs your own code on one field, and `model_validator` checks fields against each other.'
+  - Unknown keys are ignored by default, and `ConfigDict(extra="forbid")` turns them into errors.
+  - '`model_dump()` gives a dict, `model_dump_json()` gives a string, and `model_json_schema()` gives the JSON Schema an SDK sends to a model.'
+  - Pydantic is lax by default where zod is strict by default, so a zod `z.number()` rejects `"3"` while a Pydantic `int` accepts it.
+sections:
+  - title: What lax mode converts, and what it refuses
+    body: |-
+      Lax mode follows one rule: convert when the value means the same thing, refuse when
+      data would be lost or the meaning is a guess. Knowing the edges saves surprises.
+
+      ```python
+      from pydantic import BaseModel, ConfigDict, ValidationError
+
+
+      class Item(BaseModel):
+          qty: int
+          name: str
+          gift: bool
+
+
+      def check(model, data):
+          try:
+              print(model.model_validate(data))
+          except ValidationError as error:
+              print([e["type"] for e in error.errors()])
+
+
+      check(Item, {"qty": "3", "name": "Mug", "gift": "false"})  # qty=3 name='Mug' gift=False
+      check(Item, {"qty": 3.0, "name": "Mug", "gift": "yes"})    # qty=3 name='Mug' gift=True
+      check(Item, {"qty": 2.5, "name": "Mug", "gift": 0})        # ['int_from_float']
+      check(Item, {"qty": 1, "name": 123, "gift": 1})            # ['string_type']
+      check(Item, {"qty": 1, "name": "Mug", "gift": 2})          # ['bool_parsing']
+
+
+      class StrictItem(Item):
+          model_config = ConfigDict(strict=True)
+
+
+      check(StrictItem, {"qty": "3", "name": "Mug", "gift": False})  # ['int_type']
+      ```
+
+      For a `bool`, lax mode accepts `true`, `false`, `1`, `0` and words such as `"yes"`,
+      `"no"`, `"on"` and `"off"`. Anything else fails, so `2` is an error, not a truthy
+      value. That's the difference from Python's `if value:`, which treats every non-empty
+      string as true.
+
+      Strict mode suits internal APIs where the sender is your own typed code and a string
+      where a number belongs means a bug. Lax mode suits model replies and HTML forms,
+      where `"3"` is a formatting slip, not a wrong answer. You can mix them: keep the model
+      lax and mark one field strict with `Annotated[int, Strict()]`, importing `Strict` from
+      `pydantic`. One detail: in strict mode, `model_validate_json` still accepts a date
+      written as `"2026-10-01"`, because JSON has no date type, while `model_validate`
+      given the same Python string refuses it.
+  - title: Constraints and validators
+    body: |-
+      A type says what kind of value. Constraints say which values. `Field` handles single
+      values; validators handle the rest.
+
+      ```python
+      from datetime import date
+      from typing import Annotated, Literal
+
+      from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
+
+
+      class Booking(BaseModel):
+          room: str = Field(min_length=1)
+          guests: Annotated[int, Field(ge=1, le=6)]
+          check_in: date
+          check_out: date
+          channel: Literal["web", "phone", "desk"]
+
+          @field_validator("channel", mode="before")
+          @classmethod
+          def lower_channel(cls, value):
+              # "Web" is a slip in case, not a wrong answer.
+              return value.lower() if isinstance(value, str) else value
+
+          @model_validator(mode="after")
+          def dates_in_order(self):
+              if self.check_out <= self.check_in:
+                  raise ValueError("check_out must be after check_in")
+              return self
+
+
+      ok = Booking.model_validate({"room": "Maple", "guests": "2", "check_in": "2026-10-01",
+                                   "check_out": "2026-10-03", "channel": "Web"})
+      print(ok.guests, ok.check_in, ok.channel)  # 2 2026-10-01 web
+
+      for guests in (9, 2):
+          try:
+              Booking.model_validate({"room": "Maple", "guests": guests, "check_in": "2026-10-03",
+                                      "check_out": "2026-10-01", "channel": "web"})
+          except ValidationError as error:
+              print([(e["type"], e["loc"]) for e in error.errors()])
+      # [('less_than_equal', ('guests',))]
+      # [('value_error', ())]
+      ```
+
+      A `mode="before"` validator sees the raw input, before type checks, so it must cope
+      with any type. A `mode="after"` validator, the default, sees a value that's already
+      the right type. A `model_validator(mode="after")` runs only when every field passed:
+      that's why the first booking reports only `guests` and never mentions its dates.
+      Raise `ValueError` inside a validator, and Pydantic folds it into the
+      `ValidationError`, with `type` set to `value_error`.
+
+      Normalising in a before validator is a judgement call. Lower-casing a category helps.
+      Guessing that `"refnd"` meant `"refund"` hides a prompt that needs fixing.
+  - title: Errors a program can read, and the repair loop
+    body: |-
+      `error.errors()` is built for code. Each entry has a `type` code, a `loc` path into
+      nested data, a human `msg` and the `input` that failed. Nested lists give integer
+      positions in the path.
+
+      ```python
+      from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
+
+      class Line(BaseModel):
+          sku: str
+          qty: int = Field(gt=0)
+
+
+      class Order(BaseModel):
+          model_config = ConfigDict(extra="forbid")
+          lines: list[Line]
+
+
+      reply = '{"lines": [{"sku": "A1", "qty": 2}, {"sku": "B7", "qty": 0}], "gift": true}'
+      try:
+          Order.model_validate_json(reply)
+      except ValidationError as error:
+          for e in error.errors(include_url=False):
+              print(e["loc"], e["type"], repr(e["input"]))
+      # ('gift',) extra_forbidden True
+      # ('lines', 1, 'qty') greater_than 0
+      ```
+
+      A common production pattern sends these errors back to the model. When a structured
+      reply fails, you add the bad reply and a short list of the problems to the
+      conversation and ask once more.
+
+      ```python
+      from pydantic import BaseModel, ValidationError
+
+
+      class Triage(BaseModel):
+          urgent: bool
+
+
+      def problems(error):
+          return "; ".join(f"{'.'.join(map(str, e['loc']))}: {e['msg']}" for e in error.errors())
+
+
+      def triage(ask, email, tries=2):
+          prompt = f"Reply with JSON containing an urgent boolean. Email: {email}"
+          for _ in range(tries):
+              reply = ask(prompt)
+              try:
+                  return Triage.model_validate_json(reply)
+              except ValidationError as error:
+                  prompt += f"\nYour last reply was {reply!r}. Fix: {problems(error)}"
+          return None
+
+
+      replies = iter(['{"urgency": "high"}', '{"urgent": true}'])
+      print(triage(lambda prompt: next(replies), "The till is on fire."))  # urgent=True
+      ```
+
+      Cap the retries and log every failure. A reply that fails twice usually means the
+      prompt or schema is wrong, and another attempt only adds cost.
+  - title: Going out again, dumps and schemas
+    body: |-
+      Validation brings data in. Three methods take it back out.
+
+      ```python
+      import json
+
+      from pydantic import BaseModel, Field, TypeAdapter
+
+
+      class Line(BaseModel):
+          sku: str
+          qty: int = Field(gt=0)
+          note: str | None = None
+
+
+      line = Line.model_validate({"sku": "A1", "qty": "2"})
+      print(line.model_dump())                   # {'sku': 'A1', 'qty': 2, 'note': None}
+      print(line.model_dump(exclude_none=True))  # {'sku': 'A1', 'qty': 2}
+      print(line.model_dump_json())              # {"sku":"A1","qty":2,"note":null}
+
+      schema = Line.model_json_schema()
+      print(schema["required"], schema["properties"]["qty"])
+      # ['sku', 'qty'] {'exclusiveMinimum': 0, 'title': 'Qty', 'type': 'integer'}
+
+      lines = TypeAdapter(list[Line]).validate_json('[{"sku": "A1", "qty": 1}, {"sku": "C3", "qty": 4}]')
+      print(lines[1])  # sku='C3' qty=4 note=None
+      ```
+
+      `model_dump()` keeps Python types, such as a `date` object. `model_dump(mode="json")`
+      converts them to JSON-safe values, which matters before you put the dict into a JSON
+      column or a log line.
+
+      `model_json_schema()` is how structured output works: the SDK turns your class into
+      JSON Schema, sends it with the request, and validates the reply with the same class.
+      Constraints such as `gt=0` appear in the schema, which helps the model, but check
+      your provider's documentation for which keywords it enforces.
+
+      `TypeAdapter` validates any type, not only a `BaseModel`: a list of lines, a union,
+      a `TypedDict`. Build it once at module level and reuse it, because building one
+      compiles a validator.
+  - title: Pydantic next to zod
+    body: |-
+      If you know zod, most of Pydantic maps across.
+
+      ```ts
+      import { z } from 'zod';
+
+      const Ticket = z.object({
+        category: z.enum(['refund', 'delivery', 'other']),
+        urgent: z.boolean(),
+      });
+      type Ticket = z.infer<typeof Ticket>;
+
+      const result = Ticket.safeParse(JSON.parse(replyText));
+      if (!result.success) console.log(result.error.issues);
+      ```
+
+      A `BaseModel` class is the schema and the type at once, so there's no `z.infer` step.
+      `model_validate` is `parse`, and `ValidationError.errors()` plays the role of
+      `error.issues`. There's no `safeParse`: Python code uses `try` and `except
+      ValidationError`, as the lesson's challenge does.
+
+      The defaults differ in one important way. zod refuses `"true"` for `z.boolean()` and
+      `"3"` for `z.number()` unless you opt in with `z.coerce`. Pydantic converts both
+      unless you opt out with strict mode. Both drop unknown keys by default: zod has
+      `z.strictObject` to refuse them, and Pydantic has `extra="forbid"`.
+
+      One more difference catches people. Pydantic doesn't validate assignments by default:
+      `line.qty = "lots"` succeeds silently. Set `ConfigDict(validate_assignment=True)` if
+      your code changes models after creating them, or make them immutable with
+      `frozen=True`.
+pitfalls:
+  - '**Catching `Exception` around validation.** It hides bugs in your own code, such as a typo in a validator. Catch `ValidationError`, log `error.errors()`, and let everything else crash.'
+  - '**Using Pydantic 1 names.** `parse_raw`, `parse_obj`, `.dict()` and `@validator` still appear in old code and assistant output, and they warn or break. Use `model_validate_json`, `model_validate`, `model_dump` and `@field_validator`.'
+  - '**Calling `json.loads` and trusting the result.** Parsing only checks the syntax. `{"urgent": "false"}` parses into a truthy string. Validate with a model instead.'
+  - '**Expecting a number to become a string.** Pydantic 2 refuses `123` for a `str` field. Send strings, or accept a union such as `str | int` and convert yourself.'
+  - '**Forgetting `@classmethod` under `@field_validator`.** Field validators are class methods, and the order matters: `@field_validator` goes on top, `@classmethod` below it.'
+  - '**Assuming assignment is checked.** Setting `model.field = bad_value` isn''t validated by default. Turn on `validate_assignment`, or freeze the model.'
+  - '**A before validator that assumes a type.** It sees raw input, so `value.lower()` crashes on a number. Check the type first, as the booking example does.'
+interview:
+  - question: How do you get reliable structured data out of an LLM?
+    answer: >-
+      Define the shape once as a Pydantic model, have the model write to that schema, and
+      validate every reply at the boundary. I pass the class to the SDK's structured output
+      feature, which sends its JSON Schema with the request and parses the reply. I still
+      validate, because business rules such as "check-out after check-in" live in
+      validators the schema can't express. On failure I log `error.errors()` and retry
+      once with those errors fed back to the model. If it fails again, I fall back: a
+      default, a human queue or a clear error. I check `stop_reason` too, because a
+      truncated reply is the commonest cause of broken JSON. The trade-off is a retry's
+      latency and cost against silently acting on wrong data.
+  - question: What's the difference between type hints and Pydantic?
+    answer: >-
+      Type hints are checked by tools before the code runs; Pydantic checks real values at
+      run time. Python ignores hints when it runs, so `guests: int` holding `"3"` is
+      caught only by mypy or Pyright, and only in code they can see. Data from a request
+      or a model's reply is invisible to them. Pydantic reads the same hints and enforces
+      them on the actual data, converting safe cases such as `"3"` to `3` and raising a
+      `ValidationError` for the rest. So I use both: static checking for my own code, and
+      Pydantic at the edges. I wouldn't use Pydantic for every internal object, because
+      validation costs time and adds nothing once data is trusted.
+  - question: When would you use strict mode in Pydantic?
+    answer: >-
+      When a type mismatch means a bug, not a formatting slip. Strict mode refuses every
+      conversion, so `"3"` for an `int` fails. That suits internal service-to-service
+      messages, where the sender is typed code and a string means someone broke the
+      contract. Lax mode, the default, suits model replies, form data and query strings,
+      where numbers and booleans often arrive as text and converting them loses nothing.
+      Pydantic lets you mix the two: a lax model with one strict field through
+      `Annotated[int, Strict()]`. The trade-off is catching contract bugs early against
+      rejecting data that's fine in meaning.
+  - question: How would you validate that one field depends on another, like a date range?
+    answer: >-
+      With a `model_validator(mode="after")`, which runs once every field has passed and
+      sees the whole model. Inside it I compare the fields, raise `ValueError` with a clear
+      message if they conflict, and return `self`. Pydantic wraps that into the
+      `ValidationError` with the type `value_error`. It doesn't run if a field already
+      failed, so the error list shows the field problems first, which is usually what
+      you want. For single-field rules I'd use `Field` constraints such as `ge` and
+      `pattern`, because they also appear in the JSON Schema, and a model writing to that
+      schema can see them. A cross-field rule can't be expressed in the schema, which is
+      another reason to validate after a structured output call.

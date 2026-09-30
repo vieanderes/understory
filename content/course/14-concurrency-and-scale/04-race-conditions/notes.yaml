@@ -1,0 +1,305 @@
+summary: >-
+  A race condition is a bug whose result depends on the timing of concurrent operations,
+  where some orders are wrong. The classic shape is **check-then-act**: read a value, make a
+  decision, and write based on that decision, with a gap in between where someone else can
+  change the value. In async JavaScript the gap is an `await`. Across server copies the gap
+  is the time between a `SELECT` and the `UPDATE` that trusts it.
+
+
+  Races are expensive because tests rarely catch them. A function called once at a time
+  is correct, so the suite passes, and production finds the rare order: two shoppers
+  redeem the last coupon use, two copies send the same email, a stock count goes negative.
+  These notes add how to find the gaps, how to close one inside a process with a lock per
+  key, how to hand the whole problem to the database, how to write a test that fails every
+  time, and why races are also security bugs.
+
+
+  The fix always has the same idea: make the check and the write one indivisible step.
+  Inside one process, that means no `await` between them, or a lock. Across copies, it
+  means one SQL statement that checks and writes together, a constraint, or a transaction
+  that locks or detects the conflict.
+remember:
+  - A race condition is a bug whose result depends on the order of concurrent operations, and some orders give a wrong answer.
+  - Check-then-act is the common race, where a decision based on a read is written after a gap in which the value can change.
+  - In one Node process, synchronous code runs to completion, so a check and a write with no `await` between them can't be interleaved.
+  - Every `await` is a yield point, even `await` on a value that's already there.
+  - Across server copies, close the gap in the database with a conditional `UPDATE`, a constraint, or a transaction that locks or detects the conflict.
+  - A unique constraint turns "check if it exists, then insert" into one atomic step, with `ON CONFLICT` deciding what happens on a clash.
+  - Single-flight shares one in-flight promise among callers, which stops a stampede of identical fetches.
+  - To test a race, control the slow step with a promise the test resolves, so the unlucky order happens on every run.
+sections:
+  - title: Where the gaps are
+    body: |-
+      Inside one Node process, a stretch of synchronous code runs from start to finish
+      before anything else touches memory. That's **run-to-completion**, and it's why
+      `count = count + 1` is safe in plain JavaScript. The thread can only switch to another
+      request at a yield point, and in async code every `await` is one. That includes an
+      `await` on something that isn't slow at all:
+
+      ```js
+      const stock = { left: 1 };
+
+      async function reserve() {
+        const seen = stock.left;       // read
+        await null;                    // nothing slow here, and it still yields
+        if (seen > 0) {
+          stock.left = seen - 1;       // write based on the old read
+          return "reserved";
+        }
+        return "sold out";
+      }
+
+      console.log(await Promise.all([reserve(), reserve()]), stock.left);
+      // [ 'reserved', 'reserved' ] 0   (two sales, one item, and the count even looks right)
+      ```
+
+      The final count of 0 hides the bug: one item was sold twice. That's the danger of
+      races on derived values. The state looks valid, and only the history is wrong.
+
+      When you review code for races, look for these shapes:
+
+      - An `if` on shared state, an `await`, then a write that trusts the `if`.
+      - A read into a local variable, an `await`, then a write computed from the local.
+      - "Does it exist?" followed by "create it", for users, bookings, slugs or files.
+      - A cache or lazy value checked for `null` and filled after an `await`.
+      - Any of the above where the shared state is a database row and the code runs on
+        more than one copy, where even a gap with no `await` in it is open.
+
+      Moving the write before the `await` closes the gap in one process, as the lesson
+      showed. It changes the failure mode, though: if the slow step fails, you've already
+      written, so you need to undo. Sometimes that's the right trade, and sometimes a lock
+      is cleaner.
+  - title: A lock per key, inside one process
+    body: |-
+      Sometimes the slow step has to sit between the check and the write, such as a card
+      charge that decides whether the write happens at all. Then you can serialise the
+      callers: make each wait until the previous one for the same key has finished. A
+      **mutex** keyed by id does it, using a chain of promises.
+
+      ```js
+      // One lock per key: calls for the same key run one after another, other keys don't wait.
+      function keyedLock() {
+        const tails = new Map();
+        return async function withLock(key, task) {
+          const previous = tails.get(key) ?? Promise.resolve();
+          let release;
+          const current = new Promise((resolve) => (release = resolve));
+          const tail = previous.then(() => current);
+          tails.set(key, tail);
+          await previous;
+          try {
+            return await task();
+          } finally {
+            release();
+            if (tails.get(key) === tail) tails.delete(key); // nobody queued behind us
+          }
+        };
+      }
+
+      const withLock = keyedLock();
+      const coupons = new Map([["SPRING10", { usesLeft: 1 }]]);
+      const chargeCard = () => new Promise((done) => setTimeout(done, 20));
+
+      async function redeem(code) {
+        return withLock(code, async () => {
+          const coupon = coupons.get(code);
+          if (coupon.usesLeft <= 0) return "refused";
+          await chargeCard(); // the gap is still here, but the lock keeps others out of it
+          coupon.usesLeft -= 1;
+          return "redeemed";
+        });
+      }
+
+      console.log(await Promise.all([redeem("SPRING10"), redeem("SPRING10"), redeem("SPRING10")]));
+      // [ 'redeemed', 'refused', 'refused' ]
+      ```
+
+      The lock is released in `finally`, so a failed task doesn't block the key for good,
+      and the map entry is removed once nobody waits, so it doesn't grow without end.
+
+      Know its limits before you reach for it. It only protects one process: with four
+      copies there are four independent locks, and the database needs its own protection.
+      It makes every call for that key wait, so a slow task behind a popular key becomes a
+      queue. And nesting two locks in different orders in two places can deadlock, with
+      each waiting on the other for ever. In most server code a lock in memory is a
+      stopgap, and the real fix belongs in the shared store.
+  - title: Let the database close the gap
+    body: |-
+      Across copies, the only place that sees every write is the database, so the check has
+      to happen there, in the same step as the write. Three tools cover most cases.
+
+      A **conditional update** puts the check in the `WHERE` clause and reports whether it
+      matched:
+
+      ```sql
+      CREATE TABLE coupons (
+        code text PRIMARY KEY,
+        uses_left integer NOT NULL CHECK (uses_left >= 0)
+      );
+      INSERT INTO coupons VALUES ('SPRING10', 1);
+
+      UPDATE coupons SET uses_left = uses_left - 1
+      WHERE code = 'SPRING10' AND uses_left > 0
+      RETURNING uses_left;
+      -- first call: one row, uses_left 0. Second call: no rows, so refuse.
+      ```
+
+      Under PostgreSQL's default isolation, Read Committed, a second concurrent `UPDATE` on
+      the same row waits for the first to commit, then re-evaluates its `WHERE` against the
+      new row. So the second redeem sees `uses_left = 0` and matches nothing. The `CHECK`
+      constraint is a backstop: any code path that tries to go below zero gets an error
+      instead of bad data.
+
+      A **unique constraint** makes "if it doesn't exist, create it" atomic:
+
+      ```sql
+      CREATE TABLE seat_bookings (
+        show_id integer NOT NULL,
+        seat text NOT NULL,
+        user_id integer NOT NULL,
+        PRIMARY KEY (show_id, seat)
+      );
+
+      INSERT INTO seat_bookings VALUES (42, 'C7', 1)
+      ON CONFLICT (show_id, seat) DO NOTHING
+      RETURNING user_id;
+      -- first booking: returns user 1. A second booking of C7: returns no rows.
+      ```
+
+      We ran both on PostgreSQL 18 with the results shown. The third tool is a
+      **transaction** that either locks or detects. `SELECT ... FOR UPDATE` locks the rows it
+      reads until commit, so a read-then-write in application code becomes safe. Higher
+      isolation levels detect the conflict instead and fail one transaction with SQLSTATE
+      `40001`, which your code must catch and retry. Repeatable Read catches two
+      transactions updating the same row; Serializable also catches write skew, where each
+      reads what the other changes. The next lesson compares
+      locking with detecting in depth.
+  - title: Making a race fail every time in a test
+    body: |-
+      A race test that runs the code twice and hopes the timing lines up passes most of the
+      time and proves nothing. The trick is to control the slow step. Pass it in as a
+      dependency, and in the test hand over a promise that only resolves when the test
+      says so. Then you can open the gap, run the second call inside it, and close it.
+
+      ```js
+      import assert from "node:assert/strict";
+
+      // A promise the test resolves when it chooses, to force the unlucky order every time.
+      function deferred() {
+        let resolve;
+        const promise = new Promise((r) => (resolve = r));
+        return { promise, resolve };
+      }
+
+      // The code under test takes its slow step as a parameter, so the test can hold it open.
+      function makeBooking(chargeCard) {
+        const desk = { bookedBy: null };
+        async function book(user) {
+          if (desk.bookedBy !== null) return "taken";
+          await chargeCard(user);
+          desk.bookedBy = user;
+          return "booked";
+        }
+        return { book, desk };
+      }
+
+      const firstCharge = deferred();
+      const { book } = makeBooking((user) => (user === "ana" ? firstCharge.promise : Promise.resolve()));
+
+      const ana = book("ana");   // passes the check, then waits on her charge
+      const ben = book("ben");   // runs inside Ana's gap
+      firstCharge.resolve();
+
+      assert.deepEqual(await Promise.all([ana, ben]), ["booked", "taken"]);
+      // AssertionError: actual [ 'booked', 'booked' ]. The race fails the test on every run.
+      ```
+
+      This test is red on every run until the code is fixed, and green on every run after.
+      `Promise.withResolvers()` returns the same `{ promise, resolve, reject }` trio in
+      Node 22 and later, if you'd rather not write `deferred`.
+
+      For the database version, the test needs two real connections. Open two
+      transactions, run the first one's read, run the second one's whole write, then finish
+      the first, and assert on the final row. It's slower than a unit test and worth having
+      for the few places where money or stock is at stake.
+  - title: Races as security bugs
+    body: |-
+      A race that an honest user hits once a month, an attacker can hit on purpose. Anything
+      that enforces a limit with check-then-act can be overrun by sending many identical
+      requests at the same moment, so they all pass the check before any of them writes.
+      Security testers call this a **limit overrun**, and MITRE files the general shape as
+      CWE-367, time-of-check to time-of-use.
+
+      Typical targets are rules that are checked in code and then counted:
+
+      - A coupon or gift card that should be used once, redeemed several times.
+      - A withdrawal that checks the balance, then subtracts, taking the balance negative.
+      - A per-account limit, such as three free exports, exceeded by parallel requests.
+      - A one-time token, such as a password reset or invite link, accepted twice.
+      - A rate limit that reads a counter and writes it back, instead of incrementing it
+        atomically.
+
+      Defending against it is the same work as fixing any race, applied where the stakes
+      are high. Enforce the rule in the database: a conditional `UPDATE` that returns zero
+      rows when the limit is reached, a `CHECK` constraint so a balance can't go below zero,
+      a unique constraint on "token used", or `INSERT ... ON CONFLICT` for one-per-user
+      actions. Consume one-time tokens with a single `UPDATE ... WHERE used_at IS NULL` and
+      check the row count, rather than reading then marking.
+
+      To test your own system, write an automated test that fires the same request many
+      times at once with `Promise.all` against a test environment, then asserts on the
+      outcome: exactly one redemption, a balance that never went negative. Run it in CI for
+      every endpoint that spends something. The deterministic test from the previous
+      section proves the logic; the parallel test proves the deployed stack, including the
+      database, enforces it.
+pitfalls:
+  - '**Believing JavaScript can''t have races because it''s single-threaded.** One thread runs code without interruption only between yield points. Every `await` is a gap, and server copies run truly in parallel.'
+  - '**Testing concurrency by calling twice in a row.** Sequential calls never land in the gap, so the test passes while production double-books. Control the slow step with a deferred promise, or fire parallel requests at a real database.'
+  - '**Checking with a `SELECT`, then writing with an `UPDATE`.** Another copy can change the row between the two. Put the condition in the `UPDATE`''s `WHERE` and check the row count, or lock with `FOR UPDATE`.'
+  - '**Guarding with an in-memory flag or lock on a multi-copy service.** Each copy has its own, so the others never see it. Use a database constraint, a conditional update or a row lock.'
+  - '**Caching the result instead of the promise.** The value is only set after the `await`, so every caller in the meantime starts its own fetch. Store the promise at once and share it.'
+  - '**Moving the write before the `await` and forgetting the undo.** If the slow step fails, the early write stays. Roll it back in a `catch`, or use a hold that expires.'
+interview:
+  - question: What is a race condition? Give an example from web development.
+    answer: >-
+      A race condition is when the correctness of a result depends on the relative timing
+      of concurrent operations. The common web example is check-then-act across a gap:
+      booking code reads that a seat is free, awaits a payment, then writes the booking.
+      Two requests for the same seat both see it free during each other's wait, and both
+      book it. It happens inside one Node process at every `await`, and across server copies
+      even without one, because each copy reads the database independently. Tests miss it
+      because they call one at a time. The fix is to make check and write one atomic step,
+      for example a unique constraint on show and seat, so the database refuses the second
+      booking.
+  - question: How do you prevent two server instances from both redeeming the same single-use coupon?
+    answer: >-
+      Make the database do the check and the decrement in one statement:
+      `UPDATE coupons SET uses_left = uses_left - 1 WHERE code = $1 AND uses_left > 0
+      RETURNING uses_left`. If it returns no row, refuse. Under Read Committed, a concurrent
+      second update waits for the first, then re-checks the `WHERE` against the committed
+      row and matches nothing. I'd add `CHECK (uses_left >= 0)` as a backstop. For
+      per-user single use, a unique constraint on coupon and user with `ON CONFLICT DO
+      NOTHING` does the same job. What doesn't work is a `SELECT` followed by an `UPDATE`
+      in application code, or any lock held in one instance's memory. If the redemption
+      spans several statements, I'd use `SELECT ... FOR UPDATE` in a transaction.
+  - question: Node is single-threaded. Why do you still get race conditions?
+    answer: >-
+      Because single-threaded means no two lines run at the same instant, not that a
+      function runs uninterrupted. Synchronous code runs to completion, but every `await`
+      hands the thread to other callbacks, so another request can change shared state
+      between your check and your write. On top of that, production runs several processes
+      or containers, which are truly parallel and share a database. So inside a process I
+      keep checks and dependent writes free of `await`, or share one promise for a fetch,
+      and for shared data I push the invariant into the database: atomic updates,
+      constraints, row locks or version checks.
+  - question: How would you test code for race conditions?
+    answer: >-
+      By forcing the bad interleaving instead of hoping for it. I inject the slow dependency,
+      such as the payment call, and in the test give it a promise I resolve myself. I start
+      the first call, which passes its check and blocks, then run the second call entirely
+      inside the gap, then release the first, and assert only one succeeded. That fails
+      deterministically before the fix and passes after. For database races, I open two
+      real connections and interleave their statements by hand. For endpoints that spend
+      money or stock, I'd also keep an integration test that fires many identical requests
+      in parallel and asserts the limit held. Code review is the other half: look for an
+      `await` or a round trip between a read and the write that depends on it.

@@ -1,0 +1,348 @@
+summary: >-
+  A promise is an object that stands for a result you don't have yet. It starts pending and
+  settles exactly once: fulfilled with a value or rejected with a reason. Code that needs the
+  result registers a callback with `then`, or pauses an `async` function with `await`. Either
+  way, JavaScript keeps running other work while the slow part happens elsewhere: a network
+  request, a timer, a file read.
+
+
+  `async` and `await` are a nicer way to write promise chains, not a different mechanism. An
+  `async` function always returns a promise. `await` unwraps one, and a rejection becomes a
+  thrown error that `try`/`catch` can handle. Under the hood, the code after each `await` runs
+  later as a microtask, which is why the next lesson on the event loop matters.
+
+
+  The skill that separates working code from fast, correct code is knowing **when work starts**.
+  Calling an async function starts it. `await` only waits. So you start independent jobs first
+  and wait once, pick the right combinator for how failure should behave, and make sure every
+  promise ends up awaited or caught, so no error goes missing.
+remember:
+  - A promise settles once, as fulfilled with a value or rejected with a reason, and never changes after that.
+  - Calling an async function starts the work, and `await` only waits for it, so start independent calls first and await them together.
+  - "`then` always returns a new promise that resolves to whatever its callback returns, so a missing `return` passes `undefined` down the chain."
+  - A rejection skips every `then` until it reaches a `catch`, and a `catch` that returns a value puts the chain back on the success path.
+  - "`Promise.all` rejects on the first failure, `allSettled` never rejects, `race` settles like the first to settle, and `any` fulfils with the first success."
+  - "`forEach` ignores the promises its callback returns, so use `for...of` for one at a time, or `map` plus `Promise.all` for all at once."
+  - "`try`/`catch` only catches a rejection you `await` inside the `try`, which is why `return await` matters there."
+  - An unhandled rejection crashes a Node process by default and logs "Uncaught (in promise)" in a browser.
+sections:
+  - title: What a promise is underneath
+    body: |-
+      A promise is a small state machine with three states: pending, fulfilled and rejected.
+      Once it leaves pending, it's **settled**, and its state and value are frozen. Calling
+      `resolve` a second time does nothing.
+
+      The function you pass to `new Promise` is the **executor**. It runs straight away,
+      during the constructor call, not later. If it throws, the promise rejects.
+
+      ```js
+      const p = new Promise((resolve) => {
+        console.log("executor runs now");
+        resolve("first");
+        resolve("second"); // ignored: a promise settles once
+      });
+      console.log("after constructor");
+      console.log(await p);
+
+      const q = new Promise(() => {
+        throw new Error("boom");
+      });
+      q.catch((e) => console.log("executor throw rejects:", e.message));
+
+      // executor runs now
+      // after constructor
+      // first
+      // executor throw rejects: boom
+      ```
+
+      Two more rules explain most surprises. First, a `then` callback **never runs
+      synchronously**, even when the promise is already fulfilled. It's queued as a microtask
+      and runs once the current code finishes. That guarantee keeps ordering predictable.
+
+      Second, if you resolve a promise with another promise (or any object with a `then`
+      method, called a **thenable**), it adopts that promise's fate. That's why returning a
+      promise from a `then` callback makes the chain wait for it, and why `await` works on
+      values from libraries that wrote their own promise classes.
+
+      You rarely need `new Promise` in application code. Use it to wrap a callback API, such
+      as a timer or an event that fires once. If you already have a promise, chain from it
+      instead of wrapping it: wrapping adds code and often drops the rejection.
+  - title: Chains, and how errors travel through them
+    body: |-
+      Every `then`, `catch` and `finally` returns a new promise. The value the callback
+      returns becomes the next promise's value. A thrown error, or a returned rejected promise,
+      becomes the next promise's rejection. A rejection then skips every `then` success
+      callback until something handles it, much like an exception skipping lines until a
+      `catch`.
+
+      ```js
+      function loadUser(id) {
+        return new Promise((resolve, reject) => {
+          setTimeout(() => {
+            if (id > 0) resolve({ id, name: "Ada" });
+            else reject(new Error("no such user"));
+          }, 10);
+        });
+      }
+
+      await loadUser(1)
+        .then((user) => user.name)
+        .then((name) => name.toUpperCase())
+        .then((shout) => console.log("got", shout))
+        .catch((error) => console.log("caught", error.message))
+        .finally(() => console.log("done"));
+
+      await loadUser(0)
+        .then((user) => user.name) // skipped
+        .catch((error) => {
+          console.log("caught", error.message);
+          return "Guest"; // back on the success path
+        })
+        .then((name) => console.log("recovered as", name));
+
+      await Promise.resolve(2)
+        .then((n) => { n * 10; }) // braces, no return
+        .then((value) => console.log("braces without return:", value));
+
+      // got ADA
+      // done
+      // caught no such user
+      // recovered as Guest
+      // braces without return: undefined
+      ```
+
+      `finally` runs on both paths and passes the original result through, so it suits
+      cleanup such as hiding a spinner. A `catch` in the middle of a chain recovers; if you
+      only want to log and keep failing, rethrow inside it. `then(onSuccess, onFailure)` with
+      two arguments differs from `then(onSuccess).catch(onFailure)`: the second form also
+      catches an error thrown by `onSuccess` itself.
+  - title: 'The four combinators, and what "fails" means for each'
+    body: |-
+      All four take an iterable of promises (plain values count as fulfilled) and return one
+      promise. They differ in what they wait for and what they do with a rejection.
+
+      ```js
+      const wait = (ms, value, fail = false) =>
+        new Promise((resolve, reject) =>
+          setTimeout(() => (fail ? reject(new Error(value)) : resolve(value)), ms),
+        );
+      const fast = () => wait(10, "fast");
+      const slow = () => wait(30, "slow");
+      const broken = () => wait(20, "broken", true);
+
+      console.log(await Promise.all([fast(), slow()])); // [ 'fast', 'slow' ]
+      await Promise.all([fast(), broken(), slow()]).catch((e) => console.log("all:", e.message));
+      // all: broken
+
+      const settled = await Promise.allSettled([fast(), broken()]);
+      console.log(settled.map((r) => r.status)); // [ 'fulfilled', 'rejected' ]
+      console.log(settled[1].reason.message); // broken
+
+      console.log(await Promise.race([slow(), fast()])); // fast
+      await Promise.race([slow(), broken()]).catch((e) => console.log("race:", e.message));
+      // race: broken
+
+      console.log(await Promise.any([broken(), slow()])); // slow
+      await Promise.any([broken(), broken()]).catch((e) => console.log(e.name, e.errors.length));
+      // AggregateError 2
+
+      console.log(await Promise.all([])); // []
+      ```
+
+      Choose by the question you're asking. "I need every result, or none" is `all`: a
+      checkout that needs the cart, the prices and the delivery slots. "Show what loaded" is
+      `allSettled`: a dashboard of independent widgets. "Whichever answers first, good or bad"
+      is `race`: a request against a timeout. "The first one that works" is `any`: the same
+      file from several mirrors.
+
+      None of them cancels anything. When `all` rejects or `race` settles, the other promises
+      keep running and their results are thrown away. If the losers are network requests,
+      pass them an `AbortSignal` so you can stop them (lesson 18).
+  - title: Sequential, parallel and the forEach trap
+    body: |-
+      Where you put `await` decides how long a batch takes. Awaiting inside a `for...of` loop
+      runs the jobs one after another: the total is the sum of the times. Starting all jobs
+      with `map` and awaiting `Promise.all` overlaps them: the total is roughly the slowest.
+
+      `forEach` is the trap in between. It calls your async callback, gets a promise back and
+      throws it away. So the loop "finishes" at once, the caller carries on, and any rejection
+      is unhandled.
+
+      ```js
+      const save = (item) => new Promise((resolve) => setTimeout(() => resolve(item), 10));
+
+      async function saveAllWrong(items) {
+        items.forEach(async (item) => {
+          await save(item);
+          console.log("saved", item);
+        });
+        console.log("forEach returned");
+      }
+
+      async function saveAllInOrder(items) {
+        for (const item of items) {
+          await save(item);
+          console.log("saved", item);
+        }
+        console.log("loop finished");
+      }
+
+      async function saveAllAtOnce(items) {
+        await Promise.all(items.map((item) => save(item)));
+        console.log("all saved");
+      }
+
+      await saveAllWrong(["a", "b"]);
+      console.log("after saveAllWrong");
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      await saveAllInOrder(["c", "d"]);
+      await saveAllAtOnce(["e", "f"]);
+
+      // forEach returned
+      // after saveAllWrong
+      // saved a
+      // saved b
+      // saved c
+      // saved d
+      // loop finished
+      // all saved
+      ```
+
+      Sequential is sometimes right. Use it when each step needs the previous result, when
+      order of side effects matters (apply database migrations in order), or when the other
+      side limits how many calls you may make. For large batches, the middle ground is a pool
+      with a fixed number of calls in flight, as in the lesson's `mapWithLimit`. The same
+      trap applies to `filter`, `some` and `reduce` with async callbacks: they all get
+      promises back, and a promise is always truthy.
+  - title: Errors that go missing
+    body: |-
+      A promise that nobody awaits and nobody catches is a **floating promise**. If it
+      rejects, there's no handler. Node's default is to treat an unhandled rejection like an
+      uncaught exception: it prints the error and exits with code 1. Browsers log "Uncaught
+      (in promise)" and fire an `unhandledrejection` event on `window`, which error-reporting
+      tools listen for.
+
+      ```js
+      process.on("exit", (code) => console.log("exit code", code));
+      async function charge() {
+        throw new Error("card declined");
+      }
+      charge(); // nobody awaits or catches this
+      setTimeout(() => console.log("this never logs"), 100);
+
+      // exit code 1
+      // Error: card declined (on stderr, with its stack trace)
+      ```
+
+      The subtler case is `return` inside `try`. Returning a promise hands it to the caller
+      before it rejects, so your `catch` never sees the failure. `return await` makes the
+      rejection happen inside the `try`.
+
+      ```js
+      async function fetchPrice() {
+        throw new Error("price service down");
+      }
+      async function withoutAwait() {
+        try {
+          return fetchPrice(); // leaves the try before it rejects
+        } catch {
+          return "fallback";
+        }
+      }
+      async function withAwait() {
+        try {
+          return await fetchPrice(); // the rejection is thrown here, inside the try
+        } catch {
+          return "fallback";
+        }
+      }
+
+      console.log(await withAwait()); // fallback
+      await withoutAwait().catch((e) => console.log("escaped:", e.message));
+      // escaped: price service down
+      ```
+
+      In production, turn on a lint rule for floating promises (typescript-eslint's
+      `no-floating-promises`) and add a global handler that reports unhandled rejections. If
+      you mean to fire and forget, say so in code: attach a `.catch` that logs.
+pitfalls:
+  - "**Using `forEach` with an async callback.** `forEach` discards the returned promises, so nothing waits and rejections go unhandled. Use `for...of` with `await` for order, or `await Promise.all(items.map(fn))` for speed."
+  - "**Awaiting in a loop when the calls are independent.** Each call starts only after the last one ends, so ten 200 ms calls take two seconds. Start them all with `map`, then await `Promise.all` once."
+  - "**Calling without `await` inside `try`.** The `try` finishes before the promise rejects, so `catch` never runs and the error surfaces as unhandled. Await the call, and write `return await` when you return it from inside a `try`."
+  - "**Forgetting `return` in a `then` callback with braces.** `.then((x) => { x * 2; })` passes `undefined` on. Return the value, or drop the braces so the arrow returns it."
+  - "**Reaching for `Promise.all` when partial results are fine.** One failed widget blanks the whole page. Use `Promise.allSettled` and render each result by its `status`."
+  - "**Wrapping an existing promise in `new Promise`.** It adds code and, if you forget to wire `reject`, swallows failures and leaves the outer promise pending forever. Return or chain the promise you already have."
+interview:
+  - question: What is a promise, and what does `then` return?
+    answer: >-
+      A promise is an object representing a result that isn't ready yet. It starts pending
+      and settles once, either fulfilled with a value or rejected with a reason, and then
+      it's immutable. `then` registers callbacks and always returns a new promise. That new
+      promise resolves with whatever the callback returns; if the callback returns a promise,
+      it waits for it; if the callback throws, it rejects. That's what makes chaining work,
+      and why a rejection flows past success handlers to the nearest `catch`. Callbacks
+      always run asynchronously as microtasks, even on an already settled promise, which
+      keeps ordering predictable. `async`/`await` is syntax over the same machinery: an async
+      function returns a promise, and `await` suspends until one settles.
+  - question: Compare `Promise.all`, `Promise.allSettled`, `Promise.race` and `Promise.any`.
+    answer: >-
+      They differ in what they wait for and how they treat failure. `all` fulfils with every
+      value in input order, and rejects as soon as any input rejects. `allSettled` waits for
+      everything and never rejects; you get objects with `status` and a `value` or `reason`.
+      `race` settles like whichever input settles first, success or failure, so it's the
+      classic timeout pattern. `any` fulfils with the first success and only rejects, with an
+      `AggregateError`, if every input rejects. I pick `all` when results are all-or-nothing,
+      `allSettled` for independent parts of a page, `any` for redundant sources. The
+      trade-off to mention: none of them cancels the losers. They keep running unless I pass
+      an `AbortSignal`.
+  - question: This code saves ten items with `forEach` and an async callback. What's wrong, and how do you fix it?
+    answer: >-
+      `forEach` ignores return values, so the ten promises are dropped. The function carries
+      on immediately, the caller thinks the saves are done, and a failure becomes an
+      unhandled rejection. The fix depends on what I need. If order matters or each save
+      depends on the last, I use `for...of` with `await`, which is sequential. If they're
+      independent, I use `await Promise.all(items.map(save))`, which runs them concurrently
+      and takes about as long as the slowest. For hundreds of items against a rate-limited
+      API, I'd cap concurrency with a small worker pool, which keeps most of the speed
+      without flooding the server.
+  - question: Why might a `try`/`catch` around an async call not catch its error?
+    answer: >-
+      Because `try` only catches what's thrown while it runs, and a promise rejects later. If
+      I call an async function without `await`, the `try` block finishes first and the
+      rejection has nowhere to go. The same happens with `return somePromise()` inside `try`:
+      the promise is handed to the caller before it settles. Writing `await`, or `return
+      await`, makes the rejection throw at that line, inside the `try`. The general fix is to
+      never leave a promise floating: await it, return it to a caller who handles it, or
+      attach a `.catch`. I'd back that with a lint rule for floating promises, because the
+      bug is invisible in review.
+  - question: Implement `Promise.all`.
+    answer: >-
+      Return a new promise, and keep a results array plus a counter of how many are still
+      pending. For each input, wrap it with `Promise.resolve` so plain values work, and in
+      its `then` store the value at its own index, not by push, so order matches the input.
+      Decrement the counter and resolve when it hits zero. Pass `reject` as the failure
+      handler, so the first rejection rejects the whole thing; later calls to `reject` are
+      ignored because a promise settles once. Handle the empty input by resolving with `[]`
+      straight away, or the counter never reaches zero from above. Copying the iterable into
+      an array first means any iterable works, as with the built-in.
+terms:
+  - term: Promise
+    say: An async function.
+    means: An object that stands for a result you don't have yet. It starts pending and settles once,
+      fulfilled with a value or rejected with a reason.
+  - term: "`async`/`await`"
+    say: It makes asynchronous code run synchronously.
+    means: An `async` function always returns a promise, and `await` pauses only that function, resuming
+      it later as a microtask. Everything else keeps running meanwhile.
+  - term: Resolved
+    say: Resolved means it succeeded.
+    means: Resolved means its outcome is locked in, possibly by following another promise that later
+      rejects. The word for succeeded is fulfilled.
+  - term: "`Promise.all`"
+    say: It runs the promises in parallel.
+    means: "It runs nothing: the work started when the promises were created. It waits for all of them
+      and rejects on the first rejection, without cancelling the rest."
+  - term: Unhandled rejection
+    say: An error that nobody noticed.
+    means: A rejected promise with no handler attached in time. Node crashes the process on it by
+      default, and a browser logs `Uncaught (in promise)`.

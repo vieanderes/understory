@@ -1,0 +1,290 @@
+summary: >-
+  Professional SQL is SQL a colleague can read once and trust. It names its columns, reads
+  top to bottom, describes the rows it wants as a set rather than looping over them, and
+  treats `NULL` as "unknown", not as a value. It sends user input as parameters, never as
+  glued strings, and it lets the schema refuse bad data instead of hoping the application
+  catches it.
+
+
+  The lesson covers explicit columns, set-based updates, CTEs and the `NOT IN` trap. These
+  notes add the rest of what a senior reviewer checks: how three-valued logic changes
+  `COUNT`, `<>` and `SUM`; window functions for "latest per group" and running totals; the
+  join fan-out that silently doubles totals; keyset pagination and why `OFFSET` slows down
+  page by page; constraints that make bad rows impossible; and reading `EXPLAIN ANALYZE`.
+
+
+  Reach for these habits in every query that lives in application code or a migration. A
+  throwaway query in a console can be rough. A query that runs a thousand times a day, or
+  that someone will edit next year, cannot.
+remember:
+  - Any comparison with `NULL` gives unknown, and `WHERE` keeps only rows where the condition is true, so unknown rows vanish.
+  - '`COUNT(*)` counts rows, while `COUNT(column)` counts non-null values in that column, and `SUM` of no rows is `NULL`, not 0.'
+  - Use `IS DISTINCT FROM` when either side may be `NULL` and you want `NULL` treated as a value, and `NOT EXISTS` instead of `NOT IN` for anti-joins.
+  - User input goes in as a parameter such as `$1`, never glued into the SQL text, because a parameter can only ever be data.
+  - Joining one parent to two separate one-to-many children multiplies rows, so aggregate each child in its own CTE before joining.
+  - A window function such as `ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...)` adds a value to every row without collapsing them like `GROUP BY` does.
+  - Keyset pagination with `WHERE (created_at, id) < ($1, $2)` stays fast on every page, while `OFFSET n` reads and throws away n rows first.
+  - Put rules in the schema with `NOT NULL`, `CHECK`, `UNIQUE` and foreign keys, so bad data fails at the door whichever code writes it.
+sections:
+  - title: NULL is unknown, and every operator knows it
+    body: |-
+      SQL uses **three-valued logic**: true, false and unknown. Any ordinary comparison with
+      `NULL` is unknown, including `NULL = NULL`. `WHERE` keeps only true rows. That one rule
+      explains most `NULL` surprises.
+
+      ```sql
+      CREATE TABLE members (
+        id integer PRIMARY KEY,
+        name text NOT NULL,
+        referred_by integer
+      );
+      INSERT INTO members (id, name, referred_by) VALUES
+        (1, 'Ada', NULL),
+        (2, 'Ben', 1),
+        (3, 'Cy', NULL),
+        (4, 'Dee', 2);
+
+      SELECT name FROM members WHERE referred_by = NULL;              -- no rows
+      SELECT name FROM members WHERE referred_by <> 1;                -- Dee only
+      SELECT name FROM members WHERE referred_by IS DISTINCT FROM 1;  -- Ada, Cy, Dee
+
+      SELECT
+        COUNT(*) AS all_rows,                                  -- 4
+        COUNT(referred_by) AS referred,                        -- 2
+        COUNT(*) FILTER (WHERE referred_by IS NULL) AS organic -- 2
+      FROM members;
+      ```
+
+      The `<> 1` query surprises people most. Ada and Cy were not referred by member 1, but
+      `NULL <> 1` is unknown, so they drop out. `IS DISTINCT FROM` treats `NULL` as a
+      comparable value: `NULL IS NOT DISTINCT FROM NULL` is true. It's the right tool for
+      "did this value change?" checks on nullable columns.
+
+      Aggregates skip `NULL`s. `AVG(referred_by)` here is 1.5, the average of 1 and 2, not of
+      four rows. And an aggregate over zero rows returns `NULL`, except `COUNT`, which returns
+      0. So a report that sums fines for a member with no loans gets `NULL`, and the
+      application prints nothing or crashes. Wrap it: `COALESCE(SUM(fine_pence), 0)`.
+
+      Logic operators follow the same idea. `NULL OR true` is true, because the answer is
+      true whatever the unknown is. `NULL AND false` is false for the same reason. Anything
+      else with `NULL` stays unknown.
+  - title: Window functions and the join fan-out
+    body: |-
+      "Each member's latest loan" is a classic. `GROUP BY` can't do it directly, because it
+      collapses rows and you lose the title. A **window function** computes a value over a
+      group of rows but keeps every row.
+
+      ```sql
+      WITH ranked AS (
+        SELECT
+          member_id,
+          title,
+          borrowed_on,
+          ROW_NUMBER() OVER (
+            PARTITION BY member_id
+            ORDER BY borrowed_on DESC, id DESC
+          ) AS rn
+        FROM loans
+      )
+      SELECT member_id, title, borrowed_on
+      FROM ranked
+      WHERE rn = 1
+      ORDER BY member_id;
+      ```
+
+      You can't filter on `rn` in the same `SELECT`, because `WHERE` runs before window
+      functions. That's why the CTE is there. The `id DESC` tie-breaker makes the pick
+      deterministic when two loans share a date. PostgreSQL also offers
+      `SELECT DISTINCT ON (member_id) ... ORDER BY member_id, borrowed_on DESC, id DESC`,
+      which is shorter but not portable.
+
+      The same `OVER` clause gives running totals and comparisons with the previous row:
+      `SUM(fine_pence) OVER (PARTITION BY member_id ORDER BY borrowed_on)` is each member's
+      fines so far, and `LAG(borrowed_on) OVER (...)` is the date of their previous loan.
+
+      The **fan-out** bug is the reason to aggregate before joining. An order with two items
+      and two payments, joined in one query, gives four rows, so both sums double:
+
+      ```sql
+      -- Wrong: items_total 1600 and paid 1600 for 800 of items and 800 paid
+      SELECT o.id, SUM(i.price_pence) AS items_total, SUM(p.amount_pence) AS paid
+      FROM orders AS o
+      JOIN order_items AS i ON i.order_id = o.id
+      JOIN payments AS p ON p.order_id = o.id
+      GROUP BY o.id;
+
+      -- Right: one row per order from each child before the join
+      WITH item_totals AS (
+        SELECT order_id, SUM(price_pence) AS items_total
+        FROM order_items
+        GROUP BY order_id
+      ),
+      payment_totals AS (
+        SELECT order_id, SUM(amount_pence) AS paid
+        FROM payments
+        GROUP BY order_id
+      )
+      SELECT o.id, it.items_total, pt.paid
+      FROM orders AS o
+      LEFT JOIN item_totals AS it ON it.order_id = o.id
+      LEFT JOIN payment_totals AS pt ON pt.order_id = o.id;
+      ```
+
+      A `DISTINCT` inside the sums is not a fix. It would merge two different payments of
+      the same amount.
+  - title: Keyset pagination, and what EXPLAIN shows
+    body: |-
+      `LIMIT 20 OFFSET 150000` looks cheap, but the database must produce 150,020 rows and
+      throw 150,000 away. Page 7,500 is far slower than page 1. Rows inserted while someone
+      pages also shift everything, so they see duplicates or miss rows.
+
+      **Keyset pagination**, also called cursor pagination, remembers where the last page
+      ended and asks for rows after it. The sort must be unique, so add the primary key as a
+      tie-breaker, and back it with a matching index.
+
+      ```sql
+      CREATE INDEX bookings_created_at_id_idx ON bookings (created_at DESC, id DESC);
+
+      -- First page
+      SELECT id, created_at, guest
+      FROM bookings
+      ORDER BY created_at DESC, id DESC
+      LIMIT 20;
+
+      -- Next page: $1 and $2 are created_at and id of the last row shown
+      SELECT id, created_at, guest
+      FROM bookings
+      WHERE (created_at, id) < ($1, $2)
+      ORDER BY created_at DESC, id DESC
+      LIMIT 20;
+      ```
+
+      The row comparison `(created_at, id) < ($1, $2)` means "earlier time, or the same time
+      and a smaller id". Filtering on `created_at < $1` alone skips every row that shares the
+      last row's timestamp. Running both plans on 200,000 rows with `EXPLAIN ANALYZE` makes
+      the difference plain:
+
+      ```text
+      OFFSET 150000:
+        Index Scan using bookings_created_at_id_idx (actual ... rows=150020.00 loops=1)
+        Execution Time: 1900.649 ms
+      Keyset:
+        Index Scan using bookings_created_at_id_idx (actual ... rows=20.00 loops=1)
+          Index Cond: (ROW(created_at, id) < ROW(...))
+        Execution Time: 2.160 ms
+      ```
+
+      Read a plan from the innermost node out. `EXPLAIN` alone shows estimates. `ANALYZE`
+      runs the query and adds actual rows and times, so never use it on a `DELETE` you don't
+      mean, unless it's inside a transaction you roll back. Look for a `Seq Scan` on a big
+      table under a selective filter, and for estimated rows far from actual rows, which
+      means stale statistics. The trade-off of keysets: no "jump to page 40", only next and
+      previous. That suits feeds and infinite scroll. Numbered pages over small, filtered
+      results can keep `OFFSET`.
+  - title: Parameters and constraints, the two safety nets
+    body: |-
+      A **parameterised query** sends the SQL text and the values separately. The database
+      parses the text first, so a value can never become code. In node-postgres that's
+      `pool.query('SELECT id, guest FROM bookings WHERE guest = $1', [guest])`. You can see
+      the same thing in plain SQL with a prepared statement:
+
+      ```sql
+      PREPARE find_guest (text) AS
+        SELECT id, guest FROM bookings WHERE guest = $1;
+
+      EXECUTE find_guest ('Bo'' OR ''1''=''1');  -- no rows: it's one odd name
+      EXECUTE find_guest ('Bo');                 -- Bo's booking
+      ```
+
+      Parameters hold values only. A table name, a column name or `ASC` and `DESC` can't be a
+      parameter, so a sortable list checks the requested column against an allow-list in
+      code and only then puts it in the SQL.
+
+      **Constraints** are the second net. Application checks cover one code path. A
+      constraint covers every path: the admin script, the migration, the new service.
+
+      ```sql
+      CREATE TABLE loans (
+        id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        copy_id integer NOT NULL,
+        member_id integer NOT NULL,
+        borrowed_on date NOT NULL DEFAULT current_date,
+        due_on date NOT NULL,
+        returned_on date,
+        CHECK (due_on > borrowed_on),
+        CHECK (returned_on IS NULL OR returned_on >= borrowed_on)
+      );
+
+      -- A copy can have only one open loan at a time
+      CREATE UNIQUE INDEX loans_one_open_per_copy
+        ON loans (copy_id)
+        WHERE returned_on IS NULL;
+      ```
+
+      The partial unique index is the interesting one. It lets a copy have many returned
+      loans but refuses a second open one with `duplicate key value violates unique
+      constraint "loans_one_open_per_copy"`. An application check of "is it already on loan?"
+      followed by an insert has a race: two requests both see "free" and both insert. The
+      index closes that race inside the database, and the application turns the error into a
+      friendly message.
+pitfalls:
+  - "**Writing `WHERE col = NULL`.** It is never true, so it returns no rows without an error. Use `IS NULL`, or `IS NOT DISTINCT FROM` when comparing two columns that may both be `NULL`."
+  - "**Filtering with `<>` on a nullable column.** `referred_by <> 1` drops every row where `referred_by` is `NULL`. Use `referred_by IS DISTINCT FROM 1` if those rows belong in the result."
+  - "**Using `COUNT(col)` to count rows.** It skips `NULL`s, so a count of loans by `returned_on` counts only returned ones. Use `COUNT(*)` for rows and `COUNT(col)` only when you mean non-null values."
+  - "**Summing across two one-to-many joins.** Items times payments rows makes every total too big, and tests with one item per order never notice. Aggregate each child in a CTE, then join the totals."
+  - "**Building SQL with template strings.** `` `WHERE email = '${email}'` `` lets input rewrite the query. Pass values as parameters, and check identifiers such as sort columns against an allow-list."
+  - "**Paginating with a non-unique sort.** `ORDER BY created_at` with ties returns rows in any order among equals, so pages overlap or skip. Add the primary key as the last sort column, in the index too."
+  - "**Running `EXPLAIN ANALYZE` on a write in production.** It executes the statement. Wrap it in `BEGIN` and `ROLLBACK`, or use plain `EXPLAIN` for the estimate."
+interview:
+  - question: Why can `NOT IN` return no rows, and what do you use instead?
+    answer: >-
+      Because one `NULL` in the list makes every `NOT IN` test unknown, so I use `NOT EXISTS`.
+      `x NOT IN (1, NULL)` expands to `x <> 1 AND x <> NULL`. The second part is unknown, so
+      the whole thing is never true, and `WHERE` drops every row. It passes tests and fails
+      the day a nullable foreign key gets its first `NULL`. `NOT EXISTS (SELECT 1 FROM loans
+      WHERE loans.member_id = members.id)` asks whether a matching row exists, and a `NULL`
+      never matches anything. The planner turns it into an anti-join, so it's usually as fast
+      or faster. `NOT IN` is safe over a literal list with no `NULL` or a `NOT NULL` column, but I'd
+      still default to `NOT EXISTS` so the next schema change can't break it.
+  - question: How would you paginate an API endpoint over a large table?
+    answer: >-
+      With keyset pagination on a unique sort, not `OFFSET`. I order by something like
+      `created_at DESC, id DESC`, add a composite index in the same order, and return an
+      opaque cursor holding the last row's `created_at` and `id`. The next page is `WHERE
+      (created_at, id) < ($1, $2) ORDER BY created_at DESC, id DESC LIMIT 20`. The index
+      seeks straight to the cursor, so every page costs the same. `OFFSET 100000` makes the
+      database read and discard 100,000 rows, and concurrent inserts shift pages so users see
+      duplicates. The id tie-breaker matters because a cursor on the timestamp alone skips
+      rows that share it. The trade-off is no random access to page 40, which is fine for
+      feeds and exports but not for a small admin table with numbered pages.
+  - question: What's the difference between `COUNT(*)`, `COUNT(col)` and `COUNT(DISTINCT col)`?
+    answer: >-
+      `COUNT(*)` counts rows, `COUNT(col)` counts rows where `col` is not `NULL`, and
+      `COUNT(DISTINCT col)` counts distinct non-null values. On a members table with four
+      rows where two have a `referred_by`, they return 4, 2 and the number of different
+      referrers. The difference bites in outer joins: after `members LEFT JOIN loans`, a
+      member with no loans still produces one row, so `COUNT(*)` says 1 while
+      `COUNT(loans.id)` correctly says 0. For conditional counts in one pass I use `COUNT(*)
+      FILTER (WHERE ...)`. `COUNT(*)` is not slower than `COUNT(1)` in PostgreSQL, so that
+      old argument isn't a reason to pick one.
+  - question: When do you use a window function instead of `GROUP BY`?
+    answer: >-
+      When I need a per-group value but still want every row, or one whole row per group.
+      `GROUP BY` collapses each group to one row of aggregates, so "latest loan per member
+      with its title" can't come out of it without a second join. `ROW_NUMBER() OVER
+      (PARTITION BY member_id ORDER BY borrowed_on DESC, id DESC)` numbers each member's
+      loans, and a CTE keeps `rn = 1`. The same pattern gives top three per category, running
+      totals with `SUM(...) OVER (ORDER BY ...)` and gaps between events with `LAG`. The
+      filter must go in an outer query, because window functions run after `WHERE`. For one
+      row per group in PostgreSQL, `DISTINCT ON` is shorter, at the cost of portability.
+  - question: Should data rules live in the application or in the database?
+    answer: >-
+      Both, with the database as the last word for anything that must never be false. The
+      application validates early to give a helpful message. The schema enforces the
+      invariant with `NOT NULL`, `CHECK`, `UNIQUE` and foreign keys, because it sees every
+      writer: scripts, migrations, other services and concurrent requests. Uniqueness is the
+      clearest case. "Check it's free, then insert" races, since two requests can both pass
+      the check. A unique index, or a partial one such as one open loan per book copy, makes
+      the second insert fail atomically, and the app maps that error to a 409. The cost is
+      that rules live in migrations, so changing them needs a deploy and sometimes a
+      backfill, and very complex business rules still belong in code.

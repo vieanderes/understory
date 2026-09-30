@@ -1,0 +1,291 @@
+id: backend.payments
+title: Payments with Stripe
+objective: Take a card payment with Stripe Checkout, mark an order paid only from a verified webhook, and refund it.
+level: essential
+minutes: 10
+concepts: [backend.stripe-checkout, backend.payment-intents, backend.sca, backend.refunds]
+prerequisites: [backend.webhooks, backend.calling-other-apis]
+opening:
+  text: >-
+    You'll take a card payment without a single card number touching your server. And you'll
+    know the one moment it's safe to say an order is paid.
+
+steps:
+  - type: prose
+    id: the-flow
+    body: |-
+      **Stripe** is a company that moves card payments for you, through its API and your
+      secret key. A payment takes four steps:
+
+      1. Your server creates a **Checkout Session** with the order's items and total.
+      2. You redirect the buyer to its URL, a payment page Stripe hosts.
+      3. The buyer pays there, and Stripe sends them back to your site.
+      4. Stripe sends a `checkout.session.completed` webhook to your server.
+
+  - type: prose
+    id: hosted-checkout
+    body: >-
+      That hosted page is **Stripe Checkout**. Card numbers go straight to Stripe and never
+      pass through your server. **PCI DSS** is the card industry's security rules for anyone
+      who handles card numbers. Most of it becomes Stripe's job, not yours.
+
+
+      One rule catches everyone: amounts are whole numbers in the smallest unit. £12.50 is
+      `1250` pence.
+
+  - type: predict-output
+    id: predict-amount-units
+    concept: backend.stripe-checkout
+    difficulty: 1
+    language: js
+    code: |
+      // A jacket costs £40.
+      const session = await stripe.checkout.sessions.create({
+        mode: "payment",
+        line_items: [{
+          price_data: { currency: "gbp", product_data: { name: "Jacket" }, unit_amount: 40 },
+          quantity: 1,
+        }],
+        success_url: "https://shop.example/thanks",
+      });
+    question: The buyer pays on the Checkout page. How much are they charged?
+    choices:
+      - text: 40 pence
+        correct: true
+        feedback: >-
+          Right. `unit_amount` is in pence, so £40 is `4000`. Nothing warns you.
+      - text: '£40, as intended'
+        feedback: >-
+          Stripe never reads pounds. The field is pence, so `40` means forty pence.
+      - text: An error, since 40 is below the minimum charge
+        feedback: >-
+          The minimum for pounds is 30 pence, so 40 goes through. That silence makes the bug costly.
+
+  - type: fill-blank
+    id: fill-checkout-session
+    concept: backend.stripe-checkout
+    difficulty: 2
+    language: js
+    prompt: >-
+      Create a Session for one jacket at £12.50. Tie it to your order, so the webhook can
+      find it, then send the buyer to Stripe. Fill the gaps.
+    template: |
+      const session = await stripe.checkout.sessions.create({
+        mode: "payment",
+        line_items: [{
+          price_data: { currency: "gbp", product_data: { name: "Jacket" }, unit_amount: {{1}} },
+          quantity: 1,
+        }],
+        client_reference_id: {{2}},
+        success_url: "https://shop.example/thanks",
+      });
+      return Response.redirect(session.{{3}}, 303);
+    blanks:
+      - key: '1'
+        answer: '1250'
+      - key: '2'
+        answer: order.id
+      - key: '3'
+        answer: url
+    bank: ['1250', '12.50', order.id, order.total, url, id]
+
+  - type: ai-review
+    id: review-paid-on-redirect
+    concept: backend.payment-intents
+    difficulty: 3
+    language: js
+    request: Mark the order paid when the buyer comes back from Checkout.
+    flawClass: security
+    code: |
+      // GET /thanks?orderId=...
+      const orderId = new URL(request.url).searchParams.get("orderId");
+      const order = orders.get(orderId);
+      order.status = "paid";
+      return new Response(renderThanks(order), {
+        headers: { "Content-Type": "text/html" },
+      });
+    prompt: >-
+      An assistant wrote this. It works in testing, and the test passes. Then orders ship that
+      Stripe never charged. Tap the line at fault.
+    lines: [4]
+    reasons:
+      - text: Reaching the thanks page doesn't prove anyone paid
+        correct: true
+        feedback: >-
+          Yes. Anyone can type `/thanks?orderId=7`. Only the verified webhook marks it paid.
+      - text: '`searchParams.get` should be `searchParams.getAll`'
+        feedback: >-
+          There's one order id, so `get` is right. The trouble is trusting the visit at all.
+      - text: The status should be `"complete"`
+        feedback: >-
+          The name doesn't matter. Setting any paid state on a page visit is the bug.
+    fix: |
+      // GET /thanks?orderId=...  Show the order. The verified
+      // checkout.session.completed webhook is what marks it paid.
+      const orderId = new URL(request.url).searchParams.get("orderId");
+      const order = orders.get(orderId);
+      return new Response(renderThanks(order), {
+        headers: { "Content-Type": "text/html" },
+      });
+
+  - type: prose
+    id: sca-and-status
+    body: >-
+      In the UK and Europe, **Strong Customer Authentication** (SCA) applies to many card
+      payments. The buyer gives two proofs, such as the card and a tap in the bank's app.
+      That check is **3D Secure**, and Checkout shows it for you.
+
+
+      Behind the session, a **PaymentIntent** tracks the payment's state. `requires_action`
+      means the buyer still has to approve. Only `succeeded` means the money moved.
+
+  - type: multiple-choice
+    id: predict-requires-action
+    concept: backend.sca
+    difficulty: 2
+    question: The buyer is looking at their bank's 3D Secure screen. What should your order say?
+    choices:
+      - text: Pending, until a paid event arrives
+        correct: true
+        feedback: >-
+          Right. The PaymentIntent is `requires_action`, so no money has moved yet.
+      - text: Paid, since the card was accepted
+        feedback: >-
+          Not yet. The bank is still asking for approval, and the buyer may never give it.
+      - text: Failed, since the bank asked a question
+        feedback: >-
+          Nothing failed. A 3D Secure check is a normal step, and most buyers pass it.
+
+  - type: prose
+    id: refunds
+    body: |-
+      To give money back, create a **refund** against the original payment:
+
+      ```js
+      await stripe.refunds.create({ payment_intent: session.payment_intent, amount: 1500 });
+      ```
+
+      Leave out `amount` to refund it all. A refund is its own object with its own status,
+      and it can take days to settle. Stripe sends a webhook such as `refund.updated` when
+      its status changes.
+
+  - type: code-challenge
+    id: write-mark-paid
+    concept: backend.payment-intents
+    difficulty: 3
+    language: ts
+    editable: '26-27'
+    prompt: >-
+      `markPaid(event, orders)` runs after the webhook's signature passed. It marks any order
+      paid. Make it strict.
+
+
+      Return `'ignored'` unless the type is `checkout.session.completed` and `payment_status`
+      is `'paid'`. A paid order returns `'already paid'`. An `amount_total` that isn't the
+      order's `totalPence` returns `'wrong amount'`. Otherwise mark it paid.
+    hints:
+      - Add the checks between finding the order and changing its status.
+      - The event type sits on `event`, the payment status and amount on `session`.
+      - "Start with `if (event.type !== 'checkout.session.completed' || session.payment_status !== 'paid')`."
+
+  - type: explain-back
+    id: explain-when-paid
+    concept: backend.refunds
+    difficulty: 3
+    prompt: >-
+      A buyer paid £40, and you refund £15. Describe what you ask Stripe for, and when your
+      order should show the refund.
+    rubric:
+      - You create a refund against the original payment, for 1500 pence.
+      - The create call starts the refund; it doesn't prove the money went back.
+      - The order changes when a verified webhook says the refund succeeded.
+    modelAnswer: >-
+      I call `stripe.refunds.create` with the payment's PaymentIntent and an `amount` of
+      `1500`, since Stripe counts in pence. That makes a refund object, but it can still be
+      pending or fail. So I don't change the order yet. When Stripe sends a verified
+      webhook saying the refund succeeded, my handler updates the order. It's the same rule
+      as taking the payment.
+
+recap:
+  - Send every amount as a whole number of pence, so £12.50 is `1250`.
+  - Take payment on Stripe Checkout, so no card number reaches your server.
+  - Mark an order paid, or refunded, only from a verified webhook, never from a page visit.
+
+recall:
+  - id: card-smallest-unit
+    concept: backend.stripe-checkout
+    front: How do you send £12.50 to Stripe?
+    back: >-
+      As `1250`. Amounts are whole numbers in the smallest unit, pence for pounds.
+  - id: card-checkout
+    concept: backend.stripe-checkout
+    front: What does hosted Checkout keep off your servers?
+    back: >-
+      Card numbers. They go straight to Stripe's page, so most of PCI DSS is Stripe's job.
+  - id: card-paid-when
+    concept: backend.payment-intents
+    front: When is it safe to mark an order paid?
+    back: >-
+      When a verified `checkout.session.completed` webhook says the session is paid, for the
+      right amount.
+  - id: card-sca-status
+    concept: backend.sca
+    front: What does a `requires_action` PaymentIntent mean?
+    back: >-
+      The bank wants the buyer to approve, usually with 3D Secure. No money has moved yet.
+  - id: card-refund-object
+    concept: backend.refunds
+    front: When you refund part of a payment, what is created and how do you learn the result?
+    back: >-
+      A refund object against the original payment. Its outcome arrives as a webhook event.
+
+references:
+  - kind: docs
+    title: Fulfill orders
+    authors: Stripe
+    venue: Stripe documentation
+    url: https://docs.stripe.com/checkout/fulfillment
+    note: Why fulfilment needs webhooks, `checkout.session.completed`, `payment_status`, and fulfilling once.
+    primary: true
+    verified: true
+  - kind: docs
+    title: The Payment Intents API
+    authors: Stripe
+    venue: Stripe documentation
+    url: https://docs.stripe.com/payments/payment-intents
+    note: The PaymentIntent lifecycle and its statuses, from creation to success.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Strong Customer Authentication readiness
+    authors: Stripe
+    venue: Stripe documentation
+    url: https://docs.stripe.com/strong-customer-authentication
+    note: The SCA rule, and how 3D Secure meets it through `requires_action`.
+    verified: true
+  - kind: docs
+    title: Refund and cancel payments
+    authors: Stripe
+    venue: Stripe documentation
+    url: https://docs.stripe.com/refunds
+    note: Partial refunds, the refund object, and its statuses.
+    verified: true
+
+deepDive: >-
+  A few currencies have no smaller unit. Yen, won and a handful of others are
+  zero-decimal, so ¥1200 is `1200`, not `120000`. Stripe's docs list them, and a helper
+  that converts prices should know them.
+
+
+  Some payment methods, such as bank debits, settle days later. Then
+  `checkout.session.completed` arrives with `payment_status` of `unpaid`, and
+  `checkout.session.async_payment_succeeded` follows when the money lands.
+
+
+  A retried create call can charge twice. Pass an idempotency key, and Stripe returns the
+  first result for a repeat instead of making a second charge.
+
+
+  The thanks page can show the order straight away. Put `{CHECKOUT_SESSION_ID}` in
+  `success_url`, and fetch that session from Stripe on the server to show its status. It
+  still never trusts a query string it didn't check.

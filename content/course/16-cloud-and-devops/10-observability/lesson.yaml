@@ -1,0 +1,314 @@
+id: cloud.observability
+title: Logs, metrics and traces
+objective: Write structured logs with a request id and no personal data, count requests, latency and model tokens as metrics, and follow one request in a trace.
+level: essential
+minutes: 10
+concepts: [cloud.structured-logs, cloud.metrics, cloud.traces]
+prerequisites: [cloud.releases, security.detection-and-logging, perf.backend-performance]
+opening:
+  text: >-
+    You'll be able to say what a live app is doing, and why one request was slow. You'll also see what each model call costs in tokens and time.
+
+steps:
+  - type: prose
+    id: what-observability-is
+    body: >-
+      On your laptop you can pause code and look inside. In production you can't. Real users
+      are waiting, and the app runs on machines you never touch.
+
+
+      **Observability** means you can answer "what's wrong, and where?" from what the app
+      already sends out. It sends three kinds of signal: logs, metrics and traces. Metrics
+      find the fire, traces find the room, and logs say what was burning.
+
+  - type: prose
+    id: name-structured-logs
+    body: |-
+      A **structured log** writes one JSON object per event, on one line, with named fields:
+
+      ```json
+      {"requestId":"req-50","event":"order.failed","status":500,"ms":44}
+      ```
+
+      A tool can filter that by `status` or `requestId`, like `filter` on an array. A
+      sentence such as "order went wrong again" needs guesswork. Give every request a **request id**,
+      and put it on every line that request writes.
+
+  - type: multiple-choice
+    id: pick-filterable-line
+    concept: cloud.structured-logs
+    difficulty: 1
+    question: One customer's summary failed. Which line lets you find all of that request's lines?
+    choices:
+      - text: '`{"requestId":"req-81","event":"summary.failed"}`'
+        correct: true
+        feedback: >-
+          Right. Filter on `requestId` and every line of that request turns up.
+      - text: '`Summary failed, sorry`'
+        feedback: >-
+          It says something broke, but not for which request. Nothing links it to the others.
+      - text: '`{"event":"summary.failed","status":502}`'
+        feedback: >-
+          It's structured, which helps. Without a request id, though, it can't be joined to its neighbours.
+
+  - type: ai-review
+    id: review-logged-prompt
+    concept: cloud.structured-logs
+    difficulty: 2
+    language: js
+    request: Log each summary request so we can debug slow or failed model calls.
+    flawClass: security
+    code: |
+      export async function POST(request) {
+        const { email, text } = await request.json();
+        const reply = await model.summarise(text);
+        console.log(JSON.stringify({
+          requestId: request.headers.get("x-request-id"),
+          event: "summary.done", email, prompt: text,
+          tokens: reply.tokens,
+        }));
+        return Response.json({ summary: reply.text });
+      }
+    prompt: >-
+      A model-backed endpoint, logging as asked. The lines are structured and carry a request
+      id. Something still has to go. Tap the line at fault.
+    lines: [6]
+    reasons:
+      - text: It logs the user's email and their whole prompt
+        correct: true
+        feedback: >-
+          Yes. Logs are copied widely and kept for months. Personal data stays out.
+      - text: '`event` should be a sentence people can read'
+        feedback: >-
+          A short fixed name like `summary.done` is easier to filter. Sentences vary, names don't.
+      - text: The token count is private and must be dropped
+        feedback: >-
+          Tokens are a number about cost, not about the person. Keep them: you'll want them in a moment.
+    fix: |
+      console.log(JSON.stringify({
+        requestId: request.headers.get("x-request-id"),
+        event: "summary.done", promptChars: text.length,
+        tokens: reply.tokens,
+      }));
+
+  - type: code-challenge
+    id: write-log-line
+    concept: cloud.structured-logs
+    difficulty: 3
+    language: ts
+    prompt: >-
+      Write `logLine(requestId, event, fields)`. It returns one JSON line: `requestId` first,
+      then `event`, then the fields in their order.
+
+
+      A field called `email`, `prompt` or `password` keeps its key, with the value
+      `"[redacted]"`. A field can't overwrite `requestId` or `event`: skip it.
+
+
+      So `logLine('req-7', 'summary.done', { status: 200, email: 'ana@example.com' })` gives
+      `{"requestId":"req-7","event":"summary.done","status":200,"email":"[redacted]"}`.
+    hints:
+      - Build a new object in the right order, then `JSON.stringify` it once at the end.
+      - Put `requestId` and `event` in first. Then loop over `Object.entries(fields)`.
+      - "Inside the loop, `continue` past the two reserved keys, and check `PERSONAL.includes(key)`."
+
+  - type: prose
+    id: name-metrics
+    body: |-
+      **Metrics** are numbers over time. A counter only goes up: requests, errors, tokens. A
+      histogram sorts durations into buckets, so the p95, the time 95 in 100 requests beat,
+      comes cheap. **OpenTelemetry** is the open standard library for all three signals:
+
+      ```js
+      const latency = meter.createHistogram("model.call.duration");
+      const tokens = meter.createCounter("model.tokens");
+      ```
+
+      For a model call, latency and tokens in and out are your speed and your bill.
+
+  - type: fill-blank
+    id: fill-model-metrics
+    concept: cloud.metrics
+    difficulty: 2
+    language: js
+    prompt: >-
+      Record each model call: its duration in the histogram, and its tokens in the counter,
+      split by direction. Fill the gaps.
+    template: |
+      const started = Date.now();
+      const reply = await model.summarise(text);
+
+      latency.{{1}}(Date.now() - started, { model: "small" });
+      tokens.{{2}}(reply.usage.input_tokens, { direction: "input" });
+      tokens.add(reply.usage.output_tokens, { direction: "{{3}}" });
+    blanks:
+      - key: '1'
+        answer: record
+      - key: '2'
+        answer: add
+      - key: '3'
+        answer: output
+    bank: [record, add, set, output, input, total]
+
+  - type: prose
+    id: name-traces
+    body: |-
+      A **trace** follows one request. Each timed step in it is a **span**, and every span
+      shares the request's **trace id**. A span is sent only when its `end()` runs, so here
+      the children printed before their parent:
+
+      ```text
+      name: 'reserve stock'   duration: 20361.75
+      name: 'charge card'     duration: 123579.708
+      name: 'POST /checkout'  duration: 148171.541
+      ```
+
+      Durations are in microseconds. The card charge took most of the time.
+
+  - type: bug-hunt
+    id: hunt-unended-span
+    concept: cloud.traces
+    difficulty: 4
+    language: js
+    code: |
+      async function checkout(cart) {
+        const span = tracer.startSpan("checkout");
+        await charge(cart);
+        span.end();
+        return "paid";
+      }
+    prompt: >-
+      Paid checkouts show up in the tracing tool. Not one failed checkout ever has. `charge`
+      throws on a declined card. Tap the line that never runs.
+    lines: [4]
+    reasons:
+      - text: When `charge` throws, `span.end()` is skipped
+        correct: true
+        feedback: >-
+          Right. A span that never ends is never sent, so every failure vanishes.
+      - text: '`startSpan` needs a parent span first'
+        feedback: >-
+          A span with no parent starts a new trace. That's allowed, and the paid ones arrive fine.
+      - text: '`return "paid"` should come before `span.end()`'
+        feedback: >-
+          Then `end()` would never run at all. The trouble is the path where `charge` throws.
+    fix: |
+      async function checkout(cart) {
+        const span = tracer.startSpan("checkout");
+        try {
+          await charge(cart);
+          return "paid";
+        } catch (error) {
+          span.recordException(error);
+          span.setStatus({ code: SpanStatusCode.ERROR });
+          throw error;
+        } finally {
+          span.end();
+        }
+      }
+
+  - type: explain-back
+    id: explain-three-signals
+    concept: cloud.traces
+    difficulty: 4
+    prompt: >-
+      An alert says checkout's p99 has tripled. You have metrics, logs and traces. Why do you
+      need all three to find the cause?
+    rubric:
+      - Metrics show that something is wrong and when it began, but not which requests or why.
+      - A trace of one slow request shows which service and which span the time went into.
+      - Logs for that request id give the detail, such as the query, the error or the input.
+    modelAnswer: >-
+      Each one answers a different question. The metric told me that the tail got slow, and
+      its graph tells me when. It can't point at a request. So I pick a slow trace from that
+      period. Its spans show where the time went: which service, which call. Then I take that
+      request's id to the logs. There I find what it was doing: the query, the error, the
+      input size. Metrics find the fire, traces find the room, and logs say what was burning.
+
+recap:
+  - Log one JSON line per event with a request id, and keep emails and prompts out.
+  - Count requests, errors, latency and model tokens as metrics, and read a high percentile.
+  - Follow one request in a trace, and end every span, even when the code throws.
+
+recall:
+  - id: card-structured-log
+    concept: cloud.structured-logs
+    front: What makes a log line structured, and which field should every line carry?
+    back: >-
+      It's a record with named fields, usually one JSON object per line, so tools can filter
+      it. Every line carries the request id.
+  - id: card-personal-data
+    concept: cloud.structured-logs
+    front: A model-backed endpoint logs each call. What stays out of the log line?
+    back: >-
+      Personal data: the user's email, the prompt text, passwords and keys. Log the request
+      id, the status, the duration and the token counts instead.
+  - id: card-model-cost
+    concept: cloud.metrics
+    front: Which two metrics tell you what a model call costs you?
+    back: >-
+      A histogram of its duration, for speed, and a counter of tokens in and out, for the
+      bill. Tag both with the model's name.
+  - id: card-trace
+    concept: cloud.traces
+    front: What is a trace, and when is a span sent?
+    back: >-
+      One request's tree of timed spans, all sharing a trace id. A span is sent only when it
+      ends, so end it in `finally`.
+
+references:
+  - kind: docs
+    title: Traces
+    authors: OpenTelemetry Authors
+    venue: OpenTelemetry documentation
+    url: https://opentelemetry.io/docs/concepts/signals/traces/
+    note: Spans, span context, status and events, and how a trace ties them together.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Metrics
+    authors: OpenTelemetry Authors
+    venue: OpenTelemetry documentation
+    url: https://opentelemetry.io/docs/concepts/signals/metrics/
+    note: Counters, histograms and the other instruments, and what each is for.
+    verified: true
+  - kind: book
+    title: 'Site Reliability Engineering, chapter 6: Monitoring Distributed Systems'
+    authors: Rob Ewaschuk
+    year: 2016
+    venue: "O'Reilly, free at sre.google"
+    url: https://sre.google/sre-book/monitoring-distributed-systems/
+    note: The four golden signals, latency, traffic, errors and saturation.
+    primary: true
+    verified: true
+
+deepDive: >-
+  The trace and metric output ran on Node 24.21 with `@opentelemetry/api` 1.9.1 and the
+  2.11.0 SDK packages (`sdk-trace-base`, `sdk-metrics`, `context-async-hooks`), printing to
+  `ConsoleSpanExporter` and `ConsoleMetricExporter`. Nested spans came out as reserve stock,
+  charge card, then POST /checkout, all under one trace id, because a span is exported when
+  it ends.
+
+
+  The unended span was real too. With a declined card, the flawed `checkout` exported
+  nothing at all. The fixed one exported the span with `status: { code: 2 }`, which is
+  `ERROR`, and an `exception` event holding the message and stack. The `with` block in
+  Python and `startActiveSpan` with a callback in JavaScript are other ways to make sure a
+  span ends.
+
+
+  Three model calls recorded 5,200 input and 480 output tokens on the counter, and the
+  histogram placed the durations in its default buckets. Their edges run 0, 5, 10, 25, 50,
+  75, 100, 250, 500, 750, 1000, 2500 and on up to 10000. Bucket edges are fixed up front, so
+  a percentile read from a histogram is an estimate. Choose edges that bracket the times you
+  care about.
+
+
+  Services pass trace context to each other in the W3C `traceparent` header, which holds a
+  version, the trace id, the caller's span id and flags. OpenTelemetry's HTTP instrumentation
+  adds and reads it for you. You rarely touch it by hand.
+
+
+  Logging personal data is covered in depth in the security chapter's detection and logging
+  lesson. The short rule here: log what describes the request, never what describes the
+  person.

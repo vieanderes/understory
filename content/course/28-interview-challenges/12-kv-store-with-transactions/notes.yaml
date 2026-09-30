@@ -1,0 +1,323 @@
+summary: >-
+  An in-memory key-value store with `BEGIN`, `COMMIT` and `ROLLBACK` is one of the most
+  reported live-round tasks. It looks like a database problem and is really a data
+  structure problem: how do you undo a group of changes, including groups nested inside
+  groups, without copying the whole store?
+
+
+  The answer is a **change set**: for each open transaction, a map from every key it touched
+  to the value that key had before the transaction first touched it. Rollback writes those
+  old values back. Nesting needs one change set per open transaction on a stack. An inner
+  rollback pops and restores only its own set. An inner commit cannot throw its set away,
+  because the outer transaction can still roll back, so it folds its entries into the parent,
+  keeping the parent's older value wherever both touched the same key.
+
+
+  The rest is care: `undefined` as the old value of a key that did not exist, a tally so
+  `COUNT` stays O(1), and one private write method so rollback updates the tally too. State
+  the snapshot approach first as the brute force, then improve on it.
+remember:
+  - >-
+    A change set records each key's value from before the transaction first touched it, and
+    only on that first touch.
+  - >-
+    A key that did not exist records `undefined`, so rollback deletes it rather than setting it.
+  - >-
+    Nested transactions use a stack of change sets: `begin` pushes, writes record into the top
+    set, rollback pops and restores.
+  - >-
+    An inner commit folds its entries into the parent's set, skipping keys the parent already
+    recorded, so the outer rollback can still undo everything.
+  - >-
+    The outermost commit discards its change set, because the new values are already in the
+    data.
+  - >-
+    Route every change, including rollback's restores, through one private write method, so
+    derived state such as a value tally never drifts.
+  - >-
+    A snapshot per `BEGIN` is correct but costs O(n) per transaction; a change set costs O(k)
+    for the k keys touched.
+sections:
+  - title: The full command-line version
+    body: |-
+      The task usually arrives as lines of commands and expects printed output. Write the
+      store as a class with no parsing in it, then a thin loop that splits each line and calls
+      it. The class is testable on its own, and the parser stays too small to hide bugs.
+
+      ```ts
+      type Old = string | undefined; // undefined: the key did not exist before
+
+      export class KvStore {
+        #data = new Map<string, string>();
+        #counts = new Map<string, number>();
+        #stack: Map<string, Old>[] = [];
+
+        get(key: string): string | undefined {
+          return this.#data.get(key);
+        }
+
+        set(key: string, value: string): void {
+          this.#record(key);
+          this.#write(key, value);
+        }
+
+        delete(key: string): boolean {
+          if (!this.#data.has(key)) return false;
+          this.#record(key);
+          this.#write(key, undefined);
+          return true;
+        }
+
+        count(value: string): number {
+          return this.#counts.get(value) ?? 0;
+        }
+
+        begin(): void {
+          this.#stack.push(new Map());
+        }
+
+        rollback(): boolean {
+          const changes = this.#stack.pop();
+          if (!changes) return false;
+          for (const [key, old] of changes) this.#write(key, old);
+          return true;
+        }
+
+        // The innermost transaction hands its undo record to the one below it.
+        commit(): boolean {
+          const changes = this.#stack.pop();
+          if (!changes) return false;
+          const parent = this.#stack.at(-1);
+          if (parent) for (const [key, old] of changes) if (!parent.has(key)) parent.set(key, old);
+          return true;
+        }
+
+        // The variant where COMMIT makes everything permanent at once.
+        commitAll(): boolean {
+          if (this.#stack.length === 0) return false;
+          this.#stack = [];
+          return true;
+        }
+
+        #record(key: string): void {
+          const top = this.#stack.at(-1);
+          if (top && !top.has(key)) top.set(key, this.#data.get(key));
+        }
+
+        // The only place that changes #data, so the tally can never drift.
+        #write(key: string, value: Old): void {
+          const before = this.#data.get(key);
+          if (before !== undefined) this.#counts.set(before, this.#counts.get(before)! - 1);
+          if (value === undefined) {
+            this.#data.delete(key);
+          } else {
+            this.#data.set(key, value);
+            this.#counts.set(value, (this.#counts.get(value) ?? 0) + 1);
+          }
+        }
+      }
+
+      // A thin parser: one line in, the printed lines out. All the logic stays in the class.
+      export function runCommands(lines: string[]): string[] {
+        const store = new KvStore();
+        const out: string[] = [];
+        for (const line of lines) {
+          const [command, ...args] = line.trim().split(/\s+/);
+          switch (command.toUpperCase()) {
+            case 'SET': store.set(args[0], args[1]); break;
+            case 'GET': out.push(store.get(args[0]) ?? 'NULL'); break;
+            case 'DELETE': store.delete(args[0]); break;
+            case 'COUNT': out.push(String(store.count(args[0]))); break;
+            case 'BEGIN': store.begin(); break;
+            case 'ROLLBACK': if (!store.rollback()) out.push('NO TRANSACTION'); break;
+            case 'COMMIT': if (!store.commit()) out.push('NO TRANSACTION'); break;
+            default: out.push(`UNKNOWN COMMAND ${command}`);
+          }
+        }
+        return out;
+      }
+
+      console.log(runCommands([
+        'SET seat free',
+        'BEGIN',
+        'SET seat held',
+        'BEGIN',
+        'SET seat sold',
+        'SET row B',
+        'COUNT sold',
+        'COMMIT',
+        'GET row',
+        'ROLLBACK',
+        'GET seat',
+        'GET row',
+        'COUNT sold',
+        'ROLLBACK',
+      ]));
+      // [ '1', 'B', 'free', 'NULL', '0', 'NO TRANSACTION' ]
+      ```
+
+      Walk the example: `seat` starts free. The outer transaction records `seat: free` and sets
+      it held. The inner one records `seat: held`, then `row: undefined`, and sets sold and B.
+      The inner commit folds into the outer: `seat` is already recorded there, so `free`
+      survives, and `row: undefined` is copied across. The rollback then restores `seat` to
+      free and deletes `row`. `COUNT sold` drops back to 0 because the restore went through
+      `#write`.
+  - title: The brute force, and why the change set beats it
+    body: |-
+      Say this version first. It is hard to get wrong, and its cost motivates the real one.
+
+      ```ts
+      // The brute force: copy the whole store on BEGIN. Correct, and O(n) per BEGIN.
+      class SnapshotStore {
+        #data = new Map<string, string>();
+        #snapshots: Map<string, string>[] = [];
+
+        get(key: string) { return this.#data.get(key); }
+        set(key: string, value: string) { this.#data.set(key, value); }
+        begin() { this.#snapshots.push(new Map(this.#data)); }
+        rollback(): boolean {
+          const snapshot = this.#snapshots.pop();
+          if (!snapshot) return false;
+          this.#data = snapshot;
+          return true;
+        }
+        commit(): boolean {
+          return this.#snapshots.pop() !== undefined;
+        }
+      }
+
+      const s = new SnapshotStore();
+      s.set('seat', 'free');
+      s.begin(); s.set('seat', 'held');
+      s.begin(); s.set('seat', 'sold');
+      s.commit(); s.rollback();
+      console.log(s.get('seat')); // free
+      ```
+
+      Each `BEGIN` copies the whole store: O(n) time and memory per transaction, even if the
+      transaction touches one key. A change set costs O(k), where k is the number of distinct
+      keys touched, and an inner commit costs O(k) to fold. With a million keys and small
+      transactions, that is the difference between copying a million entries per `BEGIN` and
+      copying a handful.
+
+      Two more details are worth saying. Commit on the snapshot version is almost free, since
+      the live data is already right; on the change-set version the inner commit does the
+      folding work. And `COUNT` on the snapshot version would need its tally copied too, while
+      the change-set version keeps one tally updated through `#write`.
+  - title: Invariants to state and to test
+    body: |-
+      Saying the invariants aloud is the fastest way to show you understand the design, and
+      each one is a test:
+
+      - **First touch wins.** Setting a key twice in one transaction keeps the original old
+        value. Test: set 4, then 3, roll back, get the value from before both.
+      - **Absent means delete.** A key created inside a transaction is removed by rollback.
+        Test: set a new key, roll back, get `NULL`.
+      - **Deletes are recorded too.** Deleting a key inside a transaction records its old
+        value, so rollback brings it back. Deleting a key that does not exist records nothing.
+      - **Inner rollback is local.** After an inner rollback, the outer transaction's changes
+        are still visible and still undoable.
+      - **Fold keeps the older value.** After an inner commit, an outer rollback returns every
+        key to its value from before the outer `BEGIN`.
+      - **Reads see your own writes.** Inside a transaction, `GET` returns the latest value,
+        since writes go straight to the data.
+      - **The tally matches the data** after every command, including rollbacks. A property
+        test can check `count(v)` against a scan after random commands.
+      - **Nothing open means `NO TRANSACTION`** for both commit and rollback, with no change.
+
+      One question to ask the interviewer: does `COMMIT` close only the innermost transaction,
+      or all of them? Some versions of this task mean all. That variant is `commitAll` above:
+      clear the stack.
+  - title: How real databases do the same thing
+    body: |-
+      PostgreSQL nests with savepoints. `SAVEPOINT` is an inner `BEGIN`,
+      `ROLLBACK TO SAVEPOINT` is an inner rollback, and `RELEASE SAVEPOINT` is an inner commit: its changes
+      become part of the enclosing transaction and can still be rolled back with it.
+
+      ```sql
+      BEGIN;
+      UPDATE seat SET state = 'held' WHERE id = 'A1';
+      SAVEPOINT inner_work;
+      UPDATE seat SET state = 'sold' WHERE id = 'A1';
+      ROLLBACK TO SAVEPOINT inner_work;        -- undoes only 'sold'
+      SELECT state FROM seat WHERE id = 'A1';  -- held
+      SAVEPOINT more_work;
+      UPDATE seat SET state = 'paid' WHERE id = 'A1';
+      RELEASE SAVEPOINT more_work;             -- folds into the outer transaction
+      ROLLBACK;                                -- undoes everything, 'paid' included
+      SELECT state FROM seat WHERE id = 'A1';  -- free
+      ```
+
+      Databases also have to handle what the interview store ignores: other sessions. A
+      change set writes straight into shared data, so another reader would see uncommitted
+      values. PostgreSQL avoids that with multi-version concurrency control: a write creates
+      a new row version, and each transaction sees only the versions committed before its
+      snapshot. If an interviewer asks how to make the store safe for concurrent clients, the
+      honest short answer is either a single lock around each transaction, or per-transaction
+      private write buffers applied at commit.
+
+      Redis is the common confusion. `MULTI` and `EXEC` queue commands and run them together,
+      but Redis has no rollback: a command that fails at run time does not undo the others.
+pitfalls:
+  - >-
+    **Recording the old value on every write.** The second write overwrites the first record, so
+    rollback restores an intermediate value. Record only when the key is not yet in the top set.
+  - >-
+    **Restoring `undefined` with `set`.** The key then exists with an empty value instead of not
+    existing. Delete keys whose recorded old value is `undefined`.
+  - >-
+    **Discarding the inner change set on commit.** The outer rollback then cannot undo the inner
+    writes. Fold the entries into the parent.
+  - >-
+    **Folding with overwrite.** Copying every inner entry replaces the parent's older value with
+    a newer one. Copy only keys the parent has not recorded.
+  - >-
+    **Updating the data outside the write helper.** Rollback that calls `map.set` directly
+    leaves the `COUNT` tally wrong. Send every change through one method.
+  - >-
+    **Putting logic in the parser.** Graders test through the parser, and bugs hide in string
+    handling. Keep the parser a thin switch over a tested class.
+interview:
+  - question: >-
+      How do you support nested transactions in an in-memory key-value store?
+    answer: >-
+      With a stack of change sets. Each `BEGIN` pushes an empty map. Before any write, if the
+      top map has not seen the key, I record the key's current value, with `undefined` if it
+      did not exist. Rollback pops the top map and writes every recorded value back, deleting
+      keys recorded as `undefined`, so only the innermost transaction is undone. Commit pops the
+      top map and, if there is a parent, copies across only the keys the parent has not already
+      recorded, so the parent keeps the oldest value. The outermost commit drops its map. Each operation is O(1) per key touched, and memory is proportional to the keys
+      touched, not the store size.
+  - question: >-
+      Why not copy the whole store on `BEGIN`?
+    answer: >-
+      Because it costs O(n) time and memory for every transaction, even one that touches a
+      single key. I would say it first as the brute force, since it is simple and clearly
+      correct, and it is fine for a small store. The change set costs O(k) for the k keys a
+      transaction touches, so with a large store and small transactions it is dramatically
+      cheaper. The trade-off is more logic: first-touch recording, the fold on inner commit,
+      and care with derived state such as counts. Another middle ground is copy-on-write with
+      persistent maps, which makes snapshots cheap by sharing structure, at the cost of a
+      library or more code.
+  - question: >-
+      How do you keep `COUNT value` fast, and what can go wrong?
+    answer: >-
+      I keep a second map from value to the number of keys holding it, so `COUNT` is O(1)
+      instead of a scan. The risk is drift: every change to the data must update the tally,
+      including deletes and the restores that rollback performs. So I route all changes
+      through one private write method that decrements the old value's count and increments
+      the new one's, and rollback calls that same method. A good test runs random commands,
+      then compares every tally entry against a scan. The trade-off is extra memory and a
+      write path that does two map updates instead of one.
+  - question: >-
+      How would you make this store safe for several clients at once?
+    answer: >-
+      First I would ask what isolation is needed, because that decides the design. The
+      simplest correct answer is a lock per transaction: one client's transaction runs to
+      commit or rollback before another starts, which is serialisable but limits throughput.
+      To let clients work in parallel, each transaction writes into a private buffer and reads
+      its own writes from it, falling back to the shared data. Commit then applies the buffer
+      atomically, after checking for conflicts, which is optimistic concurrency. Databases go
+      further with multi-version concurrency control, keeping several versions of each value so
+      readers never block writers. For an interview I would describe the lock, then the buffer,
+      and name MVCC as what PostgreSQL does.

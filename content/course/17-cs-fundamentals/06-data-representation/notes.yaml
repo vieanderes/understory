@@ -1,0 +1,278 @@
+summary: >-
+  Every value a program touches is a pattern of bits, and the pattern only means something
+  once you agree how to read it. The same 32 bits can be a whole number, a negative number,
+  part of a fraction, four letters of text or a colour. Data representation is the set of
+  agreements. Integers use binary and two's complement, fractions use IEEE 754, text uses
+  Unicode and UTF-8, and anything longer than a byte needs a byte order.
+
+
+  The agreements have limits, and the limits are where bugs live. A fixed number of bits has
+  a top value, so ids overflow. A binary fraction can't hold most decimals, so money drifts
+  by a penny. JavaScript counts text in 16-bit pieces, so an emoji is two characters and a
+  flag is four. None of these throw an error. They quietly give a wrong answer.
+
+
+  You reach for this knowledge whenever data crosses a boundary. Think of a database column
+  type, a JSON id from another service, a price from a form, a name field with a length
+  limit, or a network packet. Knowing the representation tells you which operations are
+  exact, which round, and which cut something in half.
+remember:
+  - A JavaScript number is an IEEE 754 double, with 53 bits of precision, so integers are exact only up to `Number.MAX_SAFE_INTEGER`, 2^53 - 1.
+  - Most decimal fractions, including 0.1, have no exact binary form, so `0.1 + 0.2` is `0.30000000000000004` and money belongs in integer minor units or a decimal type.
+  - Two's complement stores a negative number by giving the top bit a negative weight, so in 8 bits `11111111` is -1 and the range is -128 to 127.
+  - JavaScript strings are sequences of UTF-16 code units, so `length` counts units, `[...text]` counts code points, and only `Intl.Segmenter` counts what a reader sees as characters.
+  - UTF-8 writes each code point as 1 to 4 bytes and matches ASCII for the first 128, which is why files and the network use it.
+  - Integers past 2^53, such as 64-bit database ids, need `BigInt` in code and a string in JSON.
+  - Endianness is the order of a multi-byte number's bytes, and network protocols use big-endian while most CPUs are little-endian.
+sections:
+  - title: Binary, hex and two's complement in JavaScript
+    body: |-
+      Binary is base 2: each place is worth twice the one to its right. Hexadecimal is base
+      16, and one hex digit is exactly four bits, so a byte is always two hex digits. That's
+      why colours, hashes and memory dumps are written in hex.
+
+      ```js
+      console.log((13).toString(2)); // 1101
+      console.log((255).toString(16)); // ff
+      console.log(0b1101, 0xff, parseInt('ff', 16)); // 13 255 255
+      ```
+
+      For negative numbers, almost every CPU uses **two's complement**. The top bit keeps its
+      place value but counts as negative. In 8 bits the top place is worth -128, so
+      `10000000` is -128 and `11111111` is -128 + 127 = -1. To negate a number, flip every
+      bit and add 1. The payoff is that addition works the same for signed and unsigned
+      values, so the hardware needs one adder, and there's only one zero.
+
+      ```js
+      const bits8 = (n) => (n & 0xff).toString(2).padStart(8, '0');
+      console.log(bits8(6), bits8(-6), bits8(-1), bits8(-128));
+      // 00000110 11111010 11111111 10000000
+      console.log(~5); // -6, flipping every bit of 5
+      ```
+
+      JavaScript numbers aren't integers, but the bit operators (`&`, `|`, `^`, `~`, `<<`,
+      `>>`) convert their operands to 32-bit two's complement first. That makes overflow
+      visible. `>>> 0` reads the same bits as unsigned.
+
+      ```js
+      console.log(2147483647 | 0, (2147483647 + 1) | 0); // 2147483647 -2147483648
+      console.log(-1 >>> 0); // 4294967295
+      ```
+
+      Typed arrays wrap in the same way, which is how fixed-width integers behave in C, Rust
+      or a database driver.
+
+      ```js
+      const signed = new Int8Array([127]);
+      signed[0] += 1;
+      console.log(signed[0]); // -128
+      const unsigned = new Uint8Array([255]);
+      unsigned[0] += 1;
+      console.log(unsigned[0]); // 0
+      ```
+
+      PostgreSQL does not wrap: an `integer` past 2,147,483,647 is an error, as the lesson
+      showed. Wrapping silently or failing loudly are both choices a system makes about the
+      same bits.
+  - title: Inside a double, and where exactness ends
+    body: |-
+      An IEEE 754 double is 64 bits in three fields: 1 sign bit, 11 exponent bits and 52
+      fraction bits. The value is `1.fraction × 2^exponent`, with an implied leading 1, so you
+      get 53 significant bits. You can see the fields with a `DataView`.
+
+      ```js
+      function bitsOf(x) {
+        const view = new DataView(new ArrayBuffer(8));
+        view.setFloat64(0, x);
+        const bits = view.getBigUint64(0).toString(2).padStart(64, '0');
+        return `${bits[0]} ${bits.slice(1, 12)} ${bits.slice(12)}`;
+      }
+      console.log(bitsOf(1));
+      // 0 01111111111 0000000000000000000000000000000000000000000000000000
+      console.log(bitsOf(0.1));
+      // 0 01111111011 1001100110011001100110011001100110011001100110011010
+      ```
+
+      The fraction of 0.1 repeats `1001` for ever, and the last bits were rounded up. That
+      rounding is the whole story of `0.1 + 0.2`.
+
+      With 53 bits, every integer up to 2^53 fits exactly. Past it, the gap between neighbouring
+      doubles becomes 2, then 4, and whole numbers start to vanish.
+
+      ```js
+      console.log(Number.MAX_SAFE_INTEGER === 2 ** 53 - 1); // true
+      console.log(2 ** 53 === 2 ** 53 + 1); // true
+      console.log(JSON.parse('{"id": 9007199254740993}').id); // 9007199254740992
+      ```
+
+      That last line is a real bug: a 64-bit id from another service changes by one when
+      `JSON.parse` reads it. APIs that use such ids send them as strings.
+
+      For large exact integers there's `BigInt`. It has its own type and never mixes with
+      numbers by accident.
+
+      ```js
+      console.log(2n ** 64n); // 18446744073709551616n
+      console.log(7n / 2n); // 3n, integer division
+      try {
+        1n + 1;
+      } catch (error) {
+        console.log(error.message); // Cannot mix BigInt and other types, use explicit conversions
+      }
+      ```
+
+      `JSON.stringify` throws on a `BigInt`, so convert it to a string yourself. Doubles also
+      have special values: `NaN` isn't equal to itself, `-0` exists, and `1e308 * 10` is
+      `Infinity`. Rounding for display has traps too: `(1.005).toFixed(2)` is `"1.00"`,
+      because the stored value is `1.00499999999999989...`.
+  - title: Code units, code points and graphemes
+    body: |-
+      Unicode gives each character a number, a **code point**, from 0 to 0x10FFFF. An encoding
+      turns code points into bytes. UTF-8 uses 1 to 4 bytes. UTF-16, which JavaScript strings
+      use inside, uses one 16-bit **code unit** for code points up to 0xFFFF and two, a
+      **surrogate pair**, for the rest.
+
+      What a reader calls one character is a **grapheme cluster**, and it can be several code
+      points. Examples are a letter plus a combining accent, a flag made of two regional
+      indicators, and a family emoji made of people joined by zero-width joiners. The four ways to count text
+      give four answers.
+
+      ```js
+      const encoder = new TextEncoder();
+      const segmenter = new Intl.Segmenter('en', { granularity: 'grapheme' });
+      function measure(text) {
+        return {
+          units: text.length,
+          codePoints: [...text].length,
+          graphemes: [...segmenter.segment(text)].length,
+          utf8Bytes: encoder.encode(text).length,
+        };
+      }
+      console.log(measure('é'));
+      // { units: 1, codePoints: 1, graphemes: 1, utf8Bytes: 2 }
+      console.log(measure('😀'));
+      // { units: 2, codePoints: 1, graphemes: 1, utf8Bytes: 4 }
+      console.log(measure('🇬🇧'));
+      // { units: 4, codePoints: 2, graphemes: 1, utf8Bytes: 8 }
+      console.log(measure('👨‍👩‍👧'));
+      // { units: 8, codePoints: 5, graphemes: 1, utf8Bytes: 18 }
+      ```
+
+      Pick the count by purpose. A database column limit or a request body limit is about
+      bytes. A limit a person sees, such as "30 characters", is about graphemes. `length` is
+      right only for indexing into the string itself.
+
+      ```js
+      const graphemes = new Intl.Segmenter('en', { granularity: 'grapheme' });
+      function truncate(text, max) {
+        const parts = [...graphemes.segment(text)].map((s) => s.segment);
+        return parts.length <= max ? text : parts.slice(0, max).join('');
+      }
+      console.log(truncate('Rosie 👨‍👩‍👧 Lee', 7)); // Rosie 👨‍👩‍👧
+      ```
+
+      A lone half of a surrogate pair is broken text. When it's encoded as UTF-8 it becomes
+      the replacement character `�`, the bytes `ef bf bd`. `isWellFormed()` detects it and
+      `toWellFormed()` replaces it. Two strings that look alike can differ too: `'é'`
+      and `'é'` are both "é", and they're only `===` after `normalize('NFC')`. Normalise
+      before you compare or store usernames.
+  - title: UTF-8 bytes and byte order
+    body: |-
+      UTF-8's design is visible in its bytes. A code point below 128 is one byte starting
+      with `0`, the same as ASCII. Longer code points start with a lead byte that says how
+      many bytes follow (`110`, `1110` or `11110`), and every continuation byte starts with
+      `10`. So a decoder can find the start of a character from any position, and no ASCII
+      byte ever appears inside a multi-byte character.
+
+      ```js
+      const bytes = [...new TextEncoder().encode('😀')];
+      console.log(bytes.map((b) => b.toString(2).padStart(8, '0')).join(' '));
+      // 11110000 10011111 10011000 10000000
+      ```
+
+      UTF-8 has no byte-order problem because its unit is one byte. Anything wider does.
+      **Endianness** is the order in which a multi-byte number's bytes sit in memory or on
+      the wire. Big-endian puts the most significant byte first, the way we write numbers.
+      Little-endian puts it last. x86 and the ARM chips in phones and laptops run
+      little-endian, and network protocols such as IP and TCP headers use big-endian, called
+      network byte order.
+
+      ```js
+      const buffer = new ArrayBuffer(4);
+      const view = new DataView(buffer);
+      view.setUint32(0, 0x12345678); // DataView defaults to big-endian
+      console.log(new Uint8Array(buffer)); // Uint8Array(4) [ 18, 52, 86, 120 ]
+      view.setUint32(0, 0x12345678, true); // little-endian
+      console.log(new Uint8Array(buffer)); // Uint8Array(4) [ 120, 86, 52, 18 ]
+      ```
+
+      Typed arrays such as `Uint32Array` use the machine's own order. So code that reads a
+      file format or a network packet should name the order, with `DataView` or with Node's
+      `Buffer` methods such as `readUInt32BE` and `readUInt32LE`. Reading the right bytes in
+      the wrong order gives a plausible but wrong number.
+
+      ```js
+      const packet = Buffer.from([0x00, 0x00, 0x01, 0xbb]);
+      console.log(packet.readUInt32BE(0), packet.readUInt32LE(0)); // 443 3137404928
+      ```
+pitfalls:
+  - '**Comparing floats with `===`.** Results of arithmetic carry rounding error, so `0.1 + 0.2 === 0.3` is `false`. Compare with a tolerance scaled to the values, or keep the quantity in integers so equality is exact.'
+  - '**Parsing 64-bit ids as numbers.** `JSON.parse` turns any number into a double, and ids past 2^53 change silently. Send large ids as strings and keep them as strings, or convert to `BigInt` where you need arithmetic.'
+  - '**Using `length` as a character limit.** It counts UTF-16 code units, so emoji and flags count double or more and `slice` can cut a pair in half. Count graphemes with `Intl.Segmenter` for anything a person sees, and bytes for storage limits.'
+  - '**Rounding money with `toFixed` for anything but display.** `(1.005).toFixed(2)` gives `"1.00"` because the stored value sits below 1.005. Do the arithmetic in integer pence and format only at the edge.'
+  - '**Comparing strings that are not normalised.** A precomposed "é" and "e" plus a combining accent look identical but differ in code points, so a username can be registered twice. Call `normalize(''NFC'')` before comparing or storing.'
+  - '**Reading binary data with a typed array.** `Uint32Array` uses the machine''s byte order, which is little-endian almost everywhere, while file formats and protocols often specify big-endian. Read with `DataView` or `Buffer` and name the order.'
+interview:
+  - question: Why does `0.1 + 0.2` not equal `0.3` in JavaScript, and how would you handle money?
+    answer: >-
+      Because JavaScript numbers are binary IEEE 754 doubles, and 0.1, 0.2 and 0.3 have no
+      exact binary form. A double has 53 significant bits. In binary, 0.1 is a repeating
+      fraction, so it's rounded to the nearest representable value, and the same happens to
+      0.2. Their sum rounds to `0.30000000000000004`, which is a different double from the
+      one nearest 0.3. For money I store integer minor units, such as pence, which are exact
+      up to 2^53. I convert once at the input with rounding, do all arithmetic in integers,
+      and format with `Intl.NumberFormat` at the edge. In the database I use a `numeric`
+      column or an integer. The trade-off is that division needs an explicit rule for the
+      leftover pennies, as in splitting a bill, and currencies with three decimal places
+      need a different scale.
+  - question: What is `Number.MAX_SAFE_INTEGER`, and what goes wrong past it?
+    answer: >-
+      It's 2^53 - 1, the largest integer n for which n and n + 1 are both exactly
+      representable as doubles. A double has 53 bits of precision, so past 2^53 the gap
+      between neighbouring values grows to 2, then 4, and some integers can't be stored at
+      all. `2 ** 53 === 2 ** 53 + 1` is `true`. The practical bug is 64-bit ids: a database
+      `bigint` or a snowflake id parsed by `JSON.parse` can come back off by one with no
+      error. The fix is to send such ids as strings, and to use `BigInt` when you need exact
+      arithmetic on them. `BigInt` is slower than numbers and can't mix with them, and
+      `JSON.stringify` refuses it, so I only use it where the range really needs it.
+  - question: A user's name is limited to 20 characters. How do you measure and truncate it correctly?
+    answer: >-
+      I count grapheme clusters with `Intl.Segmenter`, because that's what a person means by
+      a character. `length` counts UTF-16 code units, so an emoji counts as 2 and a family
+      emoji as 8. Spreading the string counts code points, which is better but still splits
+      a flag or a family into pieces. With a grapheme segmenter I split the name into
+      segments, check the count, and join the first 20 if needed, so nothing is cut in half.
+      I also normalise to NFC before storing, so two names that look the same compare
+      equal. Separately, the database column may have a byte limit, and UTF-8 needs up to 4
+      bytes per code point, so I'd check `TextEncoder` byte length against that limit too.
+  - question: What is two's complement, and why do computers use it?
+    answer: >-
+      It's the standard way to store signed integers: the top bit has a negative place
+      value. In 8 bits the top bit is worth -128, so `11111111` is -1 and the range is -128
+      to 127. You negate a number by flipping every bit and adding 1. Computers use it
+      because addition and subtraction work the same for signed and unsigned values. One
+      adder circuit serves both, and there's a single zero instead of a plus and a minus
+      zero. The cost is an asymmetric range: -128 has no positive partner in 8 bits, so
+      negating it overflows. In JavaScript you see two's complement through the bit
+      operators, which work on 32 bits, so `(2147483647 + 1) | 0` is -2147483648.
+  - question: What is endianness, and when does it matter in a web or Node application?
+    answer: >-
+      Endianness is the order in which a multi-byte number's bytes are stored. Big-endian
+      puts the most significant byte first and little-endian puts it last. Most CPUs today
+      are little-endian, and network protocol headers use big-endian, known as network byte
+      order. In everyday JavaScript you never see it, because numbers and strings hide their
+      bytes. It matters when you parse binary data: a file format, a WebSocket binary frame,
+      a protocol header or a WebAssembly memory. There I read with `DataView` or `Buffer`
+      methods such as `readUInt32BE`, which take an explicit order, rather than a typed array
+      view, which uses the machine's order. UTF-8 text has no byte-order issue, because its
+      unit is a single byte.

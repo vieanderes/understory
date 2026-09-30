@@ -1,0 +1,264 @@
+summary: >-
+  A load test sends traffic to your system on purpose to learn how it behaves under
+  pressure: how many requests a second it completes, how long they take, and where it bends.
+  Every system has a knee, the load where one resource is always busy, throughput stops
+  rising and latency takes the growth instead. A load test finds that knee in a script, so
+  you learn it before launch day does.
+
+
+  k6 runs those scripts. You write a JavaScript function that makes requests, and k6 runs it
+  many times over, following a scenario you describe. The results are percentiles, not
+  averages, because users feel the slow tail: a p95 says what one visitor in twenty waits.
+  Thresholds turn those numbers into a pass or a fail, so a release that makes checkout slow
+  fails its pipeline like a broken unit test.
+
+
+  The subtle part is how you generate load. A closed model, a fixed number of virtual users
+  who each wait for a reply, sends less traffic the slower the server gets, and so hides the
+  very slowness you're looking for. An open model starts requests at a set rate, the way real
+  visitors arrive, and shows the queue growing. These notes cover both, a complete script
+  with checks and thresholds, the kinds of load test, and how to read what comes back.
+remember:
+  - Gate releases on percentiles such as `p(95)<300` and `p(99)<600`, never on the average, because the average hides the slow tail users feel.
+  - Past the knee, throughput stays flat and latency grows with every extra request, because requests queue for the busiest resource.
+  - A closed model, `constant-vus` or `ramping-vus`, slows its own sending when the server slows, so it under-reports latency; this is coordinated omission.
+  - An open model, `constant-arrival-rate` or `ramping-arrival-rate`, starts iterations at a fixed rate whatever the server does, and counts the ones it couldn't start as `dropped_iterations`.
+  - "A `check` records a pass or fail but never fails the run on its own, so pair checks with a threshold such as `checks: ['rate>0.99']`."
+  - Little's law ties the numbers together, requests in flight equal throughput times latency, which is how you size VUs and connection pools.
+  - A failed threshold makes `k6 run` exit with a non-zero code, 99, which is what fails a CI job.
+sections:
+  - title: Open and closed models, and coordinated omission
+    body: |-
+      In a **closed model**, a fixed pool of virtual users each send a request, wait for the
+      reply, and go again. In an **open model**, new requests arrive at a set rate, whether
+      or not earlier ones have finished. Real visitors to a public site behave like the open
+      model: a shopper doesn't wait for someone else's checkout before loading the page.
+
+      The difference shows the moment a server saturates. Both scripts below ran against a
+      Node server with four workers and 100 ms of work per request, so it can finish about
+      40 requests a second.
+
+      ```js
+      // closed.js: eight users, each waiting for its reply
+      import http from 'k6/http';
+
+      export const options = {
+        scenarios: {
+          closed: { executor: 'constant-vus', vus: 8, duration: '15s' },
+        },
+      };
+
+      export default function () {
+        http.get('http://localhost:8090/price');
+      }
+      ```
+
+      ```js
+      // open.js: sixty new requests a second, whatever happens
+      import http from 'k6/http';
+
+      export const options = {
+        scenarios: {
+          open: {
+            executor: 'constant-arrival-rate',
+            rate: 60,
+            timeUnit: '1s',
+            duration: '15s',
+            preAllocatedVUs: 20,
+            maxVUs: 200,
+          },
+        },
+      };
+
+      export default function () {
+        http.get('http://localhost:8090/price');
+      }
+      ```
+
+      ```text
+      closed  http_reqs 39.3/s  p(95)=208.92ms
+      open    http_reqs 39.3/s  p(95)=3.98s   dropped_iterations 146   vus max=164
+      ```
+
+      Same server, same throughput. The closed run reports a comfortable 209 ms, because
+      eight users can only ever have eight requests waiting. The open run shows the truth
+      for a site receiving 60 visitors a second: a queue that grows every second, a p95
+      near four seconds, k6 adding VUs to keep up, and 146 iterations it couldn't start at
+      all.
+
+      That gap has a name: **coordinated omission**. When the server stalls, a closed-model
+      tester stops sending, so the requests that would have arrived during the stall are
+      never measured. The results look better than any real user's experience. Use an
+      arrival-rate executor when you want to know what visitors will feel, and keep an eye
+      on `dropped_iterations`: if it's above zero, the load you asked for never happened.
+      Closed models still suit systems whose clients really do wait, such as a fixed pool of
+      background workers.
+  - title: A complete script with checks and thresholds
+    body: |-
+      A script worth running in CI checks that responses are correct, not only fast, and
+      states its limits as thresholds. This one ran against the same server and passed.
+
+      ```js
+      import http from 'k6/http';
+      import { check, sleep } from 'k6';
+
+      const BASE = __ENV.BASE_URL || 'http://localhost:8090';
+
+      export const options = {
+        scenarios: {
+          browse: {
+            executor: 'ramping-arrival-rate',
+            startRate: 5,
+            timeUnit: '1s',
+            preAllocatedVUs: 20,
+            maxVUs: 100,
+            stages: [
+              { target: 20, duration: '10s' },
+              { target: 20, duration: '10s' },
+              { target: 0, duration: '5s' },
+            ],
+          },
+        },
+        thresholds: {
+          http_req_failed: ['rate<0.01'],
+          http_req_duration: ['p(95)<300', 'p(99)<600'],
+          'http_req_duration{name:price}': [
+            { threshold: 'p(99)<1000', abortOnFail: true, delayAbortEval: '10s' },
+          ],
+          checks: ['rate>0.99'],
+          dropped_iterations: ['count<1'],
+        },
+      };
+
+      export default function () {
+        const res = http.get(`${BASE}/price`, { tags: { name: 'price' } });
+        check(res, {
+          'status is 200': (r) => r.status === 200,
+          'has a price': (r) => r.json('price') !== undefined,
+        });
+        sleep(0.5);
+      }
+      ```
+
+      A few details carry the weight. `http_req_failed` counts responses outside 200 to 399
+      by default, so a server that answers fast with errors fails the run. A `check` only
+      records a pass or a fail; the `checks` threshold is what makes a wrong answer fail the
+      run. The `name` tag groups URLs so each endpoint gets its own threshold, and it keeps
+      URLs with ids in them from becoming thousands of separate series. `abortOnFail` stops
+      a run that's already hopeless, and `delayAbortEval` waits ten seconds first so a slow
+      warm-up doesn't abort it. `__ENV.BASE_URL` comes from `k6 run -e BASE_URL=...`, so the
+      same script runs against staging and a local server.
+
+      `http_req_duration` measures from sending the request to the end of the response, and
+      excludes DNS lookup and connection time, which have their own metrics. The `sleep` is
+      think time. In an arrival-rate scenario it doesn't lower the rate, it only keeps each
+      VU busy longer, so k6 needs more VUs for the same rate.
+  - title: Little's law and reading the results
+    body: |-
+      One equation connects the three numbers a load test reports. **Little's law**: the
+      average number of requests in the system equals the arrival rate times the average
+      time each spends there.
+
+      ```text
+      in flight = throughput × latency
+      8 VUs     = 39.3 per second × 0.203 s
+      ```
+
+      The closed run above fits it exactly: eight requests in flight, 39.3 completed a
+      second, an average of 202.6 ms. Half of that was work and half was waiting for one of
+      the four workers.
+
+      It sizes things too. To serve 200 requests a second at 250 ms each, about 50 requests
+      are in flight at any moment. That's roughly the VUs an arrival-rate scenario needs,
+      and the concurrency your server, its connection pool and its downstream calls must
+      hold. If the database pool has 20 connections and every request holds one for the
+      whole 250 ms, the pool caps you at 80 requests a second, and that's your knee.
+
+      When you read a run, compare throughput with the arrival rate you asked for. If they
+      match, the system kept up. If throughput is flat while the target climbs and latency
+      rises, you've passed the knee. Then find the resource that's pinned: CPU, a pool
+      waiting for connections, a lock, a downstream API's rate limit. Watch the server's own
+      metrics during the run, because k6 sees only the symptoms.
+
+      Two traps spoil results. A load generator on the same machine as the server, or one
+      that runs out of CPU itself, measures its own limits. And percentiles don't combine:
+      you can't average the p95 of two runs or two machines. Compute percentiles from all
+      the samples, which k6 does within a run.
+  - title: Kinds of load test
+    body: |-
+      The same script becomes a different test by changing the scenario. Each answers a
+      different question.
+
+      - **Smoke.** A few VUs for a minute. Does the script work and does the system respond
+        at all? Run it on every merge.
+      - **Average load.** The traffic of a normal busy day, held for a while. Does the system
+        meet its targets under expected load? This is the release gate.
+      - **Stress.** Well above normal, such as a sale or a launch. Where does it degrade, and
+        does it degrade gracefully, with fast errors rather than timeouts everywhere?
+      - **Spike.** A jump from quiet to very busy in seconds. Do autoscaling, caches and
+        connection pools cope with the sudden change?
+      - **Soak.** Normal load for hours. Memory leaks, connection leaks, growing queues, disks
+        filling with logs: problems that only appear with time.
+      - **Breakpoint.** Keep raising the arrival rate until it breaks. Where is the ceiling,
+        and what breaks first?
+
+      For the release gate, thresholds come from your service level objectives: if the
+      promise is that 99% of checkout requests finish in 800 ms, the threshold is
+      `p(99)<800` on the checkout requests. Run against an environment close to production,
+      with realistic data volumes and cache behaviour. A database with a thousand rows or a
+      cache that serves every request makes any system look fast.
+
+      Shared CI runners are noisy, so a tight latency threshold there will flap. Run the
+      heavier tests against a dedicated environment on a schedule or before release, and keep
+      the per-merge run to a smoke test with generous limits.
+pitfalls:
+  - '**Setting thresholds on the average.** One request in twenty can take seconds while the mean looks fine. Use `p(95)` and `p(99)`.'
+  - '**Measuring with a closed model and calling it user experience.** VUs that wait for replies send less when the server slows, which hides the queue. Use an arrival-rate executor for public traffic.'
+  - '**Ignoring `dropped_iterations`.** Above zero, the load you asked for never ran, so the latency figures describe a lighter test. Raise `maxVUs`, or accept that the system is past its knee.'
+  - '**Relying on checks to fail the run.** A failed check is recorded and the run still passes. Add a `checks` threshold, and one on `http_req_failed`.'
+  - '**Testing against tiny or empty data.** Queries on a thousand rows and warm caches make every endpoint fast. Seed realistic volumes and vary the requested ids.'
+  - '**Running the load generator on the server''s machine.** They compete for CPU and you measure both at once. Generate load from a separate machine, and watch its CPU too.'
+  - '**Leaving URLs untagged.** Every `/orders/123` becomes its own series and thresholds per endpoint are impossible. Tag requests with a `name`.'
+interview:
+  - question: How would you load test a new checkout service before launch?
+    answer: >-
+      I'd start from the targets, then build up load in stages. From the expected traffic and
+      the service level objective, say 50 checkouts a second with p99 under 800 ms, I'd write
+      a k6 script that walks the real journey with realistic data and checks each response.
+      I'd use an arrival-rate executor so load arrives like real visitors, with thresholds on
+      p95, p99, error rate and checks, and a zero budget for dropped iterations. Then a smoke
+      run, an average-load run at the expected rate, a stress run at two or three times that,
+      and a soak for a few hours to catch leaks. During each I'd watch the server side, CPU,
+      pool waits and downstream latency, to name the bottleneck at the knee. The trade-off is
+      realism against cost, so the environment and data need to be close to production.
+  - question: What is coordinated omission, and how do you avoid it?
+    answer: >-
+      It's when the load generator backs off exactly when the system is slow, so the slow
+      period is under-measured. In a closed model each virtual user waits for its reply
+      before sending the next, so if the server stalls for two seconds, the requests that
+      would have arrived in that window are never sent and never timed. In a demo, eight
+      users against a saturated server reported a p95 of about 200 ms, while an open model
+      at 60 requests a second against the same server showed about four seconds. To avoid
+      it, use an open model: k6's `constant-arrival-rate` or `ramping-arrival-rate`, which
+      start iterations on schedule, and watch `dropped_iterations`, which tells you when k6
+      itself couldn't keep up.
+  - question: Why do you set latency targets on p95 and p99 rather than the average?
+    answer: >-
+      Because users experience individual requests, and the average hides the bad ones. Ten
+      requests can average 185 ms while one takes 825 ms, and that one person had a slow
+      page. The p95 is the latency 95% of requests stay under, so it speaks for one visitor
+      in twenty. Tails matter more as systems fan out: a page that makes ten backend calls
+      is slow if any one of them is slow, so a backend's p99 becomes a common page
+      experience. So I set thresholds like `p(95)<300` and `p(99)<600` on each key endpoint.
+      The trade-off is that very high percentiles need many samples to be stable, so short
+      runs should gate on p95 and longer runs can add p99.
+  - question: Your throughput plateaus at 400 requests a second while latency keeps rising. What's going on and what do you do?
+    answer: >-
+      The system is past its knee: one resource is fully busy, so extra requests queue and
+      add latency rather than throughput. The job is to find which resource. I'd look at
+      server metrics at the plateau: CPU per instance, event-loop lag in Node, database
+      connection pool waits, lock contention, and downstream calls hitting their own limits.
+      Little's law helps: if each request holds a database connection for 50 ms and the pool
+      has 20 connections, the ceiling is 400 a second, which would match. The fix follows
+      the resource, such as a larger pool if the database can take it, a faster query, a
+      cache or more instances, and then I rerun the same test to see the knee move.

@@ -1,0 +1,304 @@
+summary: >-
+  A model call is a network call to a shared, rate-limited service that is sometimes busy,
+  sometimes slow and sometimes finishes its reply early. Treating it like a local function
+  is how AI features fall over on their first bad afternoon. This lesson sorts the failures
+  into three kinds: transient errors worth retrying, permanent errors that retrying can't
+  fix, and replies that arrive with a success status but aren't a finished answer.
+
+
+  The tools are old ones from distributed systems, applied with care. Retry only transient
+  errors, with exponential backoff and a cap. Honour the server's `retry-after`. Give every
+  call a deadline that fits the person or job waiting for it, and remember that retries
+  multiply it. Check `stop_reason` before trusting the text. When retries run out, fail
+  with a plain message and a request id, or fall back to something smaller that still
+  helps.
+
+
+  The judgement is in the numbers: how long a user will wait, how many attempts that allows,
+  what happens to 50 workers retrying together, and which fallback is worth more than an
+  error. Batch jobs can wait minutes and retry patiently; a chat reply has seconds and
+  should give up early and say so.
+remember:
+  - Retry transient failures, such as `429`, `529`, timeouts and dropped connections, and never retry a `400` or `401`, because the same request fails the same way.
+  - Back off exponentially with random jitter and a cap, so many clients don't retry in step and keep a rate limit from recovering.
+  - When the server sends a `retry-after`, wait that long instead of your own backoff.
+  - The worst-case wait is roughly the timeout times the number of attempts plus the backoff between them, so pick both from the wait you'll accept.
+  - A reply that stopped on `max_tokens` is cut off and a reply that stopped on `refusal` was declined, so check `stop_reason` before parsing or showing the text.
+  - The SDK already retries transient errors with backoff, so a retry loop of your own on top multiplies attempts unless you lower the SDK's count.
+  - Retrying a call with side effects is safe only when the action is idempotent, for example keyed by an idempotency key or checked before it runs again.
+  - When retries run out, show a plain message, log the request id, and fall back to a smaller model or a non-AI answer where one helps.
+sections:
+  - title: Backoff with jitter and a time budget
+    body: |-
+      The lesson's retry doubles its wait: 1, 2, 4 seconds. That's fine for one client. With
+      many workers, all failing at the same moment, they all come back at the same moment
+      too, and the wave hits the limit again. **Jitter** spreads them out. "Full jitter"
+      waits a random time between zero and the capped exponential value.
+
+      The other change for real use is a time budget instead of a fixed number of attempts,
+      because what a caller cares about is how long it waits.
+
+      ```python
+      import random
+
+
+      class RateLimitError(Exception):
+          def __init__(self, retry_after=None):
+              super().__init__("429")
+              self.retry_after = retry_after
+
+
+      class OverloadedError(Exception):
+          pass
+
+
+      class APITimeoutError(Exception):
+          pass
+
+
+      RETRYABLE = (RateLimitError, OverloadedError, APITimeoutError)
+
+
+      def call_with_budget(call, sleep, clock, deadline_s=30, base=1, cap=8, rng=random.random):
+          """Retries transient errors with full jitter until the time budget runs out."""
+          start = clock()
+          attempt = 0
+          while True:
+              try:
+                  return call()
+              except RETRYABLE as error:
+                  server_wait = getattr(error, "retry_after", None)
+                  # Full jitter: a random wait between 0 and the capped exponential.
+                  wait = server_wait if server_wait is not None else rng() * min(cap, base * 2 ** attempt)
+                  if clock() - start + wait > deadline_s:
+                      raise   # waiting would miss the deadline, so fail now
+                  sleep(wait)
+                  attempt += 1
+
+
+      # A fake clock and sleep, so the example runs instantly.
+      now = [0.0]
+      waits = []
+
+      def fake_sleep(seconds):
+          waits.append(round(seconds, 2))
+          now[0] += seconds
+
+      def always_busy():
+          now[0] += 5   # each attempt takes 5 seconds before failing
+          raise OverloadedError()
+
+      random.seed(1)
+      try:
+          call_with_budget(always_busy, fake_sleep, lambda: now[0], deadline_s=30)
+      except OverloadedError:
+          print("gave up after", round(now[0], 2), "seconds, waits:", waits)
+      # gave up after 31.92 seconds, waits: [0.13, 1.69, 3.06, 2.04]
+      ```
+
+      Note the result: about 32 seconds against a 30-second budget. The check covers the
+      waits, but the last attempt started with only a few seconds left and ran for five. In
+      production, give each attempt a timeout no longer than the time remaining, so the
+      budget holds.
+  - title: Reading stop reasons
+    body: |-
+      A `200` response only says the request worked. `stop_reason` says why the model
+      stopped, and only some reasons mean "here is a finished answer". The ones this chapter
+      has met: `end_turn`, the model finished; `tool_use`, it wants a tool run; `max_tokens`,
+      it hit your cap mid-reply; `refusal`, it declined. Treat anything unexpected as an
+      error rather than guessing.
+
+      ```python
+      import json
+
+
+      class ReplyStoppedEarly(Exception):
+          pass
+
+
+      def reply_text(reply):
+          return "".join(b["text"] for b in reply["content"] if b["type"] == "text")
+
+
+      def parse_json_reply(reply):
+          """Trust the text only when the model finished on its own."""
+          reason = reply["stop_reason"]
+          if reason == "end_turn":
+              return json.loads(reply_text(reply))
+          if reason == "max_tokens":
+              raise ReplyStoppedEarly("cut off: raise max_tokens or ask for less")
+          if reason == "refusal":
+              raise ReplyStoppedEarly("declined: show a message, don't retry the same request")
+          raise ReplyStoppedEarly(f"unexpected stop reason: {reason}")
+
+
+      finished = {"stop_reason": "end_turn", "content": [{"type": "text", "text": '{"lines": 3}'}]}
+      cut = {"stop_reason": "max_tokens", "content": [{"type": "text", "text": '{"lines": [{"sku": "A'}]}
+
+      print(parse_json_reply(finished))   # {'lines': 3}
+      try:
+          parse_json_reply(cut)
+      except ReplyStoppedEarly as error:
+          print(error)   # cut off: raise max_tokens or ask for less
+      ```
+
+      A cut-off reply is not a transient error. Sending the same request again produces the
+      same length and the same cut. Raise the cap, ask for less, or split the work into
+      smaller pieces, such as one call per page of a long invoice. A cut-off plain-text reply
+      is sneakier than JSON, because it doesn't fail to parse: it reads as a complete answer
+      that stops mid-thought. Check the reason for text too.
+  - title: Fallbacks and circuit breakers
+    body: |-
+      When a provider is down for minutes, retrying every request wastes each user's full
+      time budget before they see the fallback. A **circuit breaker** notices repeated
+      failures and skips the primary for a cool-off period, so users get the fallback at once.
+      After the cool-off, one request tries the primary again; a success closes the breaker.
+
+      ```python
+      import time
+
+      TRANSIENT = (TimeoutError, ConnectionError)
+
+
+      class CircuitBreaker:
+          """After `limit` transient failures in a row, skip the primary for `cool_off` seconds."""
+
+          def __init__(self, limit=5, cool_off=30, clock=time.monotonic):
+              self.limit, self.cool_off, self.clock = limit, cool_off, clock
+              self.failures, self.opened_at = 0, None
+
+          def call(self, primary, fallback):
+              if self.opened_at is not None and self.clock() - self.opened_at < self.cool_off:
+                  return fallback()           # open: don't even try the primary
+              try:
+                  result = primary()
+              except TRANSIENT:
+                  self.failures += 1
+                  if self.failures >= self.limit:
+                      self.opened_at = self.clock()
+                  return fallback()
+              self.failures, self.opened_at = 0, None   # a success closes it again
+              return result
+
+
+      now = [0.0]
+      breaker = CircuitBreaker(limit=2, cool_off=30, clock=lambda: now[0])
+      tries = []
+
+      def primary():
+          tries.append(now[0])
+          raise TimeoutError()
+
+      def fallback():
+          return "Here are the top help articles instead."
+
+      for t in (0, 1, 2, 3, 40):
+          now[0] = t
+          breaker.call(primary, fallback)
+      print("primary tried at", tries)   # primary tried at [0, 1, 40]
+      ```
+
+      Only transient errors count. A bad request is your bug, and it shouldn't switch every
+      user onto the fallback. Choose fallbacks in order of usefulness: a smaller model from
+      the same or another provider, then a non-AI answer such as search results or a help
+      page, then a clear error. A smaller model should have passed your eval set too, or the
+      fallback is a quiet quality drop. Record which route served each request, so you can
+      see how often users got the lesser answer.
+  - title: Retries and side effects
+    body: |-
+      A timeout doesn't tell you whether the other side did the work. For a model call, a
+      retry after a timeout costs at most a second bill for the same tokens. For an action,
+      it can mean doing the thing twice: two refunds, two emails, two bookings.
+
+      So any operation that an agent or a retry loop might repeat should be **idempotent**:
+      running it twice has the same effect as once. The usual tool is an idempotency key.
+      The caller generates one id per logical action, such as a hash of the conversation id
+      and the tool call id, and the service stores the result under that key. A repeat with
+      the same key returns the stored result instead of acting again. Many payment APIs accept
+      such a key for this reason.
+
+      Two more cases catch people. **Streams that fail midway**: the user has seen half a
+      reply and the connection drops. Retrying from scratch produces a different reply,
+      because sampling varies, so replace the partial text rather than appending to it, and
+      tell the user it restarted. **Layers of retries**: the SDK makes up to 3 attempts, your
+      wrapper calls it up to 4 times, and a queue delivers the job up to 3 times. The
+      attempts multiply to 36 calls, and so does the worst-case wait. Decide which layer owns retries,
+      usually the outermost one that knows the deadline, and set the others to zero.
+pitfalls:
+  - '**Catching every exception and retrying.** A `400` for a prompt that''s too long fails forever, burning time and money. Catch the transient error types only, and cap the attempts.'
+  - '**Retrying at once, in step.** Many workers retrying immediately keep the rate limit saturated. Back off exponentially and add jitter.'
+  - '**Ignoring `retry-after`.** The server knows when the limit resets. Use its wait when it sends one, and your backoff otherwise.'
+  - '**A long timeout with many retries.** Sixty seconds times six attempts is six minutes of spinner. Work backwards from the wait a user accepts, then set the timeout and retry count.'
+  - '**Parsing without checking `stop_reason`.** A reply cut off at `max_tokens` fails to parse as JSON, or worse, reads as a complete sentence in plain text. Check the reason first, and raise the cap or split the work.'
+  - '**Retrying a refusal.** The same request gets the same answer. Show a message or route to a person instead.'
+  - '**Stacking retry layers.** SDK, wrapper and queue retries multiply. Let one layer own retries and turn the others off.'
+  - '**Failing without a trace.** "Something went wrong" helps nobody. Log the request id and the error type, and show the user a plain next step.'
+interview:
+  - question: How do you make calls to an LLM API reliable in production?
+    answer: >-
+      I classify failures and handle each class differently. Transient errors, `429`, `529`,
+      timeouts and dropped connections, get retried with exponential backoff, jitter and a
+      cap, honouring `retry-after` when the server sends it. Permanent ones, `400` and `401`,
+      are bugs: they're logged with the request id and never retried. Every call has a
+      deadline sized to its caller, seconds for chat and minutes for batch, and the retry
+      count is chosen so timeout times attempts fits that deadline. I check `stop_reason`
+      before trusting the text. When retries run out, a circuit breaker routes to a fallback,
+      a smaller model or plain search results, and I track how often that happens. The
+      trade-off is between latency and success rate: more retries recover more requests but
+      make the unlucky users wait longer.
+  - question: Fifty workers in a batch job all hit rate limits. What do you change?
+    answer: >-
+      I'd stop them retrying in lockstep and lower the rate they send at. Immediate or fixed
+      retries mean all fifty come back together and hit the limit again, so the load never
+      drops. Exponential backoff with full jitter spreads the retries out and lets the limit
+      recover, and respecting `retry-after` waits exactly as long as needed. Then I'd fix the
+      cause: a shared limiter, such as a token bucket sized to the provider's requests and
+      tokens per minute, so the workers don't exceed it in the first place. For work nobody
+      is waiting on, a batch API at a lower price is often better still. The cost is
+      throughput: the job takes longer, but it finishes instead of thrashing.
+  - question: A chat feature shows a spinner for minutes before failing. How do you fix it?
+    answer: >-
+      I'd set the timeout and retries from the wait a user will accept, because retries
+      multiply the timeout. A 60-second timeout with five retries allows six attempts, up to
+      six minutes. For chat I'd aim for a total budget of about 30 to 45 seconds, for example
+      a 15-second timeout with two retries, and make the retry loop respect a deadline so a
+      late attempt doesn't overrun it. I'd stream the reply so the first words arrive in
+      about a second, which also shows early whether the provider is responding. If the
+      budget runs out, the user sees a plain message and a retry button, and we log the
+      request id. The trade-off is that a shorter budget fails some requests a longer one
+      would have saved, which matters more for batch work than for chat.
+  - question: Your code parses JSON from a model and occasionally fails on long inputs. Why, and what do you do?
+    answer: >-
+      Most likely the reply was cut off at `max_tokens`, so the JSON ends mid-string. The
+      `stop_reason` in the response confirms it. Retrying won't help, because the same
+      request stops at the same length. I'd check `stop_reason` before parsing and treat
+      anything other than a normal finish as an error with a clear message. Then fix the
+      cause: raise the cap to fit the largest realistic output, ask for a more compact
+      format, or split the input into chunks and merge the results. If the provider offers
+      schema-constrained output, I'd use it too, but it doesn't stop truncation. The trade-off
+      of a higher cap is cost only when the model uses it, so it's usually cheap insurance.
+terms:
+  - term: Transient error
+    say: Any error, worth retrying.
+    means: A failure that can pass on a second try, such as `429`, `529`, a timeout or a dropped
+      connection. A `400` or `401` fails the same way every time.
+  - term: "529"
+    say: The server crashed.
+    means: "Anthropic's overloaded status: the API is briefly overloaded across all users, not
+      by you. Retry with backoff."
+  - term: Exponential backoff with jitter
+    say: Wait a second and try again.
+    means: Waiting longer before each retry, capped, with a random part so many clients don't
+      retry in step and keep a rate limit from recovering.
+  - term: "`max_tokens` stop"
+    say: The model finished its answer.
+    means: The reply hit the output token limit and was cut off mid-way. The status is still
+      success, so check `stop_reason` before parsing.
+  - term: Idempotent
+    say: Safe to call.
+    means: Running the action twice has the same effect as running it once. Only idempotent
+      actions, or actions keyed by an idempotency key, are safe to retry.
+  - term: Circuit breaker
+    say: A retry limit.
+    means: After repeated failures it stops calling a dependency for a cool-off period, so calls
+      fail fast, then lets a trial call through to see if it has recovered.

@@ -1,0 +1,299 @@
+id: scale.failure-handling
+title: Failure handling
+objective: Give calls deadlines, retry with backoff and jitter, and fail fast with breakers and load shedding.
+level: advanced
+minutes: 10
+concepts: [scale.timeouts, scale.retries-with-jitter, scale.circuit-breaker, scale.load-shedding]
+prerequisites: [scale.queues-and-workers, backend.calling-other-apis, backend.rate-limits]
+opening:
+  text: >-
+    You'll keep your app standing when a service it needs, such as a model API, slows down
+    or falls over. Four small habits decide whether one bad service becomes everyone's
+    outage.
+
+steps:
+  - type: prose
+    id: slow-is-worse-than-dead
+    body: >-
+      A dead service fails fast: your call gets an error at once. A slow one is worse. Each
+      request waits, holding a connection and memory. New requests arrive and wait too, until
+      your own server runs out and stops answering.
+
+
+      So every remote call gets a **timeout**, a deadline. You met
+      `AbortSignal.timeout(ms)` in the lesson on calling other APIs.
+
+  - type: bug-hunt
+    id: hunt-no-deadline
+    concept: scale.timeouts
+    difficulty: 1
+    language: js
+    code: |
+      export async function productPage(request) {
+        const product = await db.findProduct(request.params.id);
+        const reply = await fetch(`${RECOMMENDER_URL}/similar/${product.id}`);
+        const similar = reply.ok ? await reply.json() : [];
+        return renderProduct(product, similar);
+      }
+    prompt: >-
+      Incident report: the recommendations service got slow for ten minutes, and the whole
+      shop stopped answering. Tap the line that let it happen.
+    lines: [3]
+    reasons:
+      - text: The call to the slow service has no deadline
+        correct: true
+        feedback: >-
+          Yes. Every page waited as long as the recommender did. Add a timeout.
+      - text: '`reply.ok` hides the error'
+        feedback: >-
+          Showing no recommendations on an error is a sensible fallback. The trouble is the wait.
+      - text: The database call should come second
+        feedback: >-
+          The database was fine. Pages hung on the service with no deadline.
+    fix: |
+      const reply = await fetch(`${RECOMMENDER_URL}/similar/${product.id}`, {
+        signal: AbortSignal.timeout(800),
+      }).catch(() => null);
+      const similar = reply?.ok ? await reply.json() : [];
+
+  - type: prose
+    id: what-to-retry
+    body: >-
+      Some failures may pass on a second try: `429`, any `5xx`, a timeout, a dropped
+      connection. Others never will. A `400`, `401` or `422` says the request itself is
+      wrong, so sending it again changes nothing.
+
+
+      Retry only the first kind, waiting longer each time, the backoff from the rate limits
+      lesson.
+
+  - type: prose
+    id: name-jitter
+    body: >-
+      Backoff has a flaw. A thousand clients that failed at the same second wait the same
+      one, two, four seconds. They come back together, and knock the service over again.
+
+
+      So add **jitter**: a random part in each wait. The simplest, full jitter, waits a
+      random time from zero up to the backoff. The crowd spreads out.
+
+  - type: code-challenge
+    id: write-retry-with-jitter
+    concept: scale.retries-with-jitter
+    difficulty: 3
+    language: ts
+    twin:
+      language: python
+      starter: jitter.starter.py
+      solution: jitter.solution.py
+      tests: jitter.tests.py
+      editable: '22-23'
+    editable: '16-17'
+    prompt: >-
+      Write `retryWithJitter(fn, options)`. Call `fn`, and retry when it throws a retryable
+      error, up to `attempts` calls in all. Retryable means an `HttpError` with status `429`
+      or `500` and up, or an error named `TimeoutError`.
+
+
+      Before retry number n, `sleep` for `random() * baseMs * 2 ** (n - 1)`. Throw any other
+      error at once. When attempts run out, throw the last error.
+    hints:
+      - A `for` loop over attempts, with `try` and `catch` inside, is the usual shape.
+      - In the `catch`, decide whether the error is retryable, and whether attempts remain. If not, `throw error`.
+      - "`error instanceof HttpError` tells you whether `error.status` exists."
+
+  - type: prose
+    id: retries-multiply
+    body: >-
+      Retries stack up. Model SDKs usually retry failed calls themselves, twice by default.
+      If your code loops around the SDK, and the queue retries your job too, each layer
+      multiplies the others.
+
+
+      One user's request can become dozens of calls to a service that's already down. Retry
+      in one layer, and let the others fail.
+
+  - type: ai-review
+    id: review-stacked-retries
+    concept: scale.retries-with-jitter
+    difficulty: 3
+    language: js
+    request: Summaries sometimes fail. Make the summarise job more reliable.
+    flawClass: performance
+    code: |
+      // The SDK retries failed calls twice. The queue retries this job 5 times.
+      const client = new ModelClient({ apiKey: process.env.MODEL_API_KEY });
+
+      export async function summariseJob(job) {
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          try {
+            return await client.summarise(job.text);
+          } catch (error) {
+            if (attempt === 3) throw error;
+          }
+        }
+      }
+    prompt: >-
+      This came from a coding assistant. During a five-minute outage, the model API saw far
+      more calls than you had users. Tap the line at fault.
+    lines: [5]
+    reasons:
+      - text: It adds a third layer of retries
+        correct: true
+        feedback: >-
+          Yes. The SDK and the queue already retry. Remove the loop.
+      - text: It should retry five times, like the queue
+        feedback: >-
+          More tries here would multiply the flood further. The fix is fewer layers, not more tries.
+      - text: The client should be created inside the job
+        feedback: >-
+          One client for the process is the usual pattern. Where it's made doesn't add calls.
+    fix: |
+      // One layer of quick retries in the SDK, and slow retries in the queue.
+      export async function summariseJob(job) {
+        return client.summarise(job.text);
+      }
+
+  - type: prose
+    id: breakers-and-shedding
+    body: >-
+      Two more habits. A **circuit breaker** wraps calls to one service. **Closed**, calls
+      pass. After several failures in a row it goes **open**: calls fail at once, for a
+      cool-down. Then **half-open**: one trial call decides.
+
+
+      **Load shedding** protects you from your callers. Past the requests you can finish in
+      time, refuse early with `503` and `Retry-After`.
+
+  - type: multiple-choice
+    id: pick-open-breaker
+    concept: scale.circuit-breaker
+    difficulty: 2
+    question: The breaker is open, and its cool-down hasn't ended. What happens to a new call?
+    choices:
+      - text: It fails at once, without calling the service
+        correct: true
+        feedback: >-
+          Right. Your user gets a quick error, and the service gets quiet to recover.
+      - text: It waits until the cool-down ends
+        feedback: >-
+          Waiting is what the breaker avoids. An open breaker answers straight away.
+      - text: It goes through as a trial
+        feedback: >-
+          That's half-open, after the cool-down. While open, nothing gets through.
+
+  - type: explain-back
+    id: explain-shed-beats-queue
+    concept: scale.load-shedding
+    difficulty: 4
+    prompt: >-
+      An overloaded service queues every request and answers all of them, eventually. Why
+      does refusing some requests serve its users better?
+    rubric:
+      - Capacity is fixed, so a growing queue only makes every request wait longer.
+      - Callers give up or time out, so work finished late is wasted.
+      - Shedding the excess early keeps accepted requests fast, and a cheap 503 can be retried later.
+    modelAnswer: >-
+      The service can only finish so many requests a second. If more arrive, the queue grows,
+      and every request waits behind it. Soon each one takes longer than any caller will wait.
+      The server still does the work, but nobody is listening for the answer. Refusing the
+      excess costs almost nothing. The accepted requests stay fast, and the rest get a quick
+      `503` saying when to come back.
+
+recap:
+  - Give every remote call a timeout, and retry only failures that may pass next time.
+  - Back off with jitter, and retry in one layer, not three.
+  - Fail fast with a circuit breaker, and shed load you can't finish in time.
+
+recall:
+  - id: card-timeouts
+    concept: scale.timeouts
+    front: Why is a slow dependency worse than a dead one?
+    back: >-
+      A dead one fails fast. A slow one holds every waiting request's connection and memory
+      until your server runs out too.
+  - id: card-what-to-retry
+    concept: scale.retries-with-jitter
+    front: Which failures are worth retrying, and which never are?
+    back: >-
+      Retry `429`, `5xx`, timeouts and dropped connections. Never `400`, `401` or `422`: the
+      request itself is wrong.
+  - id: card-jitter
+    concept: scale.retries-with-jitter
+    front: What does jitter add to exponential backoff?
+    back: >-
+      A random part in each wait, so clients that failed together retry at different moments.
+  - id: card-breaker-states
+    concept: scale.circuit-breaker
+    front: Name a circuit breaker's three states.
+    back: >-
+      Closed passes calls through. Open fails them at once for a cool-down. Half-open lets
+      one trial through to test recovery.
+  - id: card-load-shedding
+    concept: scale.load-shedding
+    front: What does a shedding server answer when it's full?
+    back: >-
+      `503` with a `Retry-After` header, early and cheaply, so the requests it accepted stay
+      fast.
+
+references:
+  - kind: essay
+    title: Exponential Backoff And Jitter
+    authors: Marc Brooker
+    year: 2015
+    venue: AWS Architecture Blog
+    url: https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/
+    note: The simulations behind "full jitter", and why it beats plain backoff.
+    primary: true
+    verified: true
+  - kind: paper
+    title: The Tail at Scale
+    authors: Jeffrey Dean and Luiz André Barroso
+    year: 2013
+    venue: Communications of the ACM 56(2)
+    url: https://doi.org/10.1145/2408776.2408794
+    note: Why slow calls are normal at scale, and the case for deadlines.
+    primary: true
+    verified: true
+  - kind: essay
+    title: Circuit Breaker
+    authors: Martin Fowler
+    year: 2014
+    venue: martinfowler.com
+    url: https://martinfowler.com/bliki/CircuitBreaker.html
+    note: The closed, open and half-open states, with a worked implementation.
+    verified: true
+  - kind: docs
+    title: TypeScript SDK
+    authors: Anthropic
+    venue: Claude Platform documentation
+    url: https://platform.claude.com/docs/en/cli-sdks-libraries/sdks/typescript
+    note: "Its Retries section: connection errors, 408, 409, 429 and 5xx are retried twice by default, set with `maxRetries`."
+    verified: true
+
+deepDive: >-
+  Both Anthropic's and OpenAI's official TypeScript SDKs retry connection errors, `408`,
+  `409`, `429` and `5xx` responses twice by default, with a short backoff. `maxRetries: 0`
+  turns that off, which is right when a queue already retries the job. Three layers that
+  each retry three times turn one failure into 27 calls.
+
+
+  Pick a timeout from the dependency's p99, not from a feeling. Pass the remaining budget
+  down, so an inner call never outlives its caller. A model call that streams can use a
+  short deadline for the first token and a longer one for the whole answer.
+
+
+  Retry only what's safe to repeat. A `POST` that charges a card needs an idempotency key
+  before any retry, as the idempotency lesson showed. And honour `Retry-After` when a server
+  sends it: it knows better than your backoff.
+
+
+  In Brooker's simulation, full jitter cut the total calls and finished the work sooner than
+  plain backoff. Other variants, such as equal jitter and decorrelated jitter, keep a
+  minimum wait.
+
+
+  Backpressure, from "How many at once", is the polite version between parts of your own
+  system. Load shedding is for callers you can't slow down. A breaker is the caller's half of
+  the same deal: stop sending when it clearly isn't working. A kinder form of shedding is a
+  waiting room, where extra visitors get a holding page and a place in line.

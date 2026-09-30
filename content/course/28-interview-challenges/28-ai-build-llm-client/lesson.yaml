@@ -1,0 +1,311 @@
+id: interview.llm-client-build
+title: "AI build: a production LLM client"
+objective: "Wrap a model call with a timeout, retries on retryable errors only, a concurrency cap, a promise cache that shares identical calls, and JSON validated with one re-ask."
+level: advanced
+minutes: 10
+concepts: [interview.timeout-and-retry, interview.in-flight-cache, interview.validate-and-retry]
+prerequisites: [js.promises, scale.failure-handling, interview.agent-build]
+opening:
+  text: >-
+    You'll turn a one-line model call into a client that survives hangs, rate limits and
+    broken JSON. Interviewers ask for exactly this, because every AI feature sits on top of it.
+
+steps:
+  - type: prose
+    id: what-you-need
+    body: >-
+      In a demo, one `fetch` to the model is enough. In production that call hangs, gets
+      rate limited, and returns JSON wrapped in chat.
+
+
+      This build adds five guards. A timeout, and retries on the right errors. A cap on calls
+      in flight, and a cache that shares identical calls. And checked JSON. The model call is
+      passed in as a function, so the tests need no network.
+
+  - type: prose
+    id: name-retryable
+    body: >-
+      Some failures pass on a second try: a timeout, `429 Too Many Requests`, and any `5xx`
+      server error. Others never will. A `400` means your request is wrong, and a `401` means
+      your key is.
+
+
+      Retry only the first kind. Wait longer each time: that's **backoff**. Add a random
+      part, **jitter**, so a thousand clients don't all come back at once.
+
+  - type: multiple-choice
+    id: pick-retryable
+    concept: interview.timeout-and-retry
+    difficulty: 1
+    question: The model API answers with an error. Which one is worth retrying?
+    choices:
+      - text: '`503 Service Unavailable`'
+        correct: true
+        feedback: >-
+          Yes. The server is busy now, and may not be in a second.
+      - text: '`400 Bad Request`'
+        feedback: >-
+          The request itself is wrong. Sending it again gets the same `400`.
+      - text: '`401 Unauthorized`'
+        feedback: >-
+          A bad key stays bad. Retrying only delays the error you need to see.
+
+  - type: code-challenge
+    id: write-call-with-retry
+    concept: interview.timeout-and-retry
+    difficulty: 4
+    language: ts
+    starter: retry.starter.ts
+    solution: retry.solution.ts
+    tests: retry.tests.ts
+    twin:
+      language: python
+      starter: retry.starter.py
+      solution: retry.solution.py
+      tests: retry.tests.py
+    prompt: >-
+      Write `callWithRetry(call, prompt, options)`. The tests pass a fake model and a fake
+      `sleep`, so no real time passes.
+
+
+      Give each attempt its own signal, `{ aborted: false }`. Race the call against
+      `sleep(timeoutMs)`. If the timer wins, set `aborted` to `true` and throw a
+      `TimeoutError`.
+
+
+      Retry a timeout, a `429` or a `5xx`, up to `retries` extra times. Before retry n
+      (from 0), wait `random() * baseMs * 2 ** n`. Throw anything else at once, and throw
+      the last error when you run out.
+    hints:
+      - Write one attempt first. `Promise.race` settles with whichever promise settles first.
+      - The timer is `sleep(timeoutMs).then(...)`, and the throw goes inside that callback.
+      - "Loop with `for (let tries = 0; ; tries++)`, and `return await` inside the `try`, or a rejection escapes it."
+
+  - type: prose
+    id: name-in-flight-cache
+    body: >-
+      Ten users ask the same question in the same second. A cache of answers misses ten
+      times, because no answer has arrived yet.
+
+
+      So cache the **promise**, the moment the call starts. Every identical call gets the
+      same promise, and the model runs once. That's **request de-duplication**. If the
+      promise rejects, delete it, or the failure stays cached.
+
+  - type: ai-review
+    id: review-cache-after-await
+    concept: interview.in-flight-cache
+    difficulty: 3
+    language: ts
+    request: Cache model answers so the same prompt is never paid for twice.
+    flawClass: race
+    code: |
+      const cache = new Map<string, string>();
+
+      async function complete(prompt: string): Promise<string> {
+        const hit = cache.get(prompt);
+        if (hit !== undefined) return hit;
+        const answer = await callModel(prompt);
+        cache.set(prompt, answer);
+        return answer;
+      }
+    prompt: >-
+      An assistant wrote this. The test calls it twice in a row, and the second call is free.
+      In production, a burst of identical questions still bills one call each. Tap the line
+      at fault.
+    lines: [6]
+    reasons:
+      - text: Nothing is stored until the answer arrives
+        correct: true
+        feedback: >-
+          Yes. Every call in the burst misses while the first is still running.
+      - text: '`cache.get` should be `cache.has`'
+        feedback: >-
+          Either finds a stored answer. The trouble is that nothing is stored yet.
+      - text: The map should be a plain object
+        feedback: >-
+          A `Map` is the right tool. The timing of `set` is the bug.
+    fix: |
+      const cache = new Map<string, Promise<string>>();
+
+      function complete(prompt: string): Promise<string> {
+        const hit = cache.get(prompt);
+        if (hit) return hit;
+        const pending = callModel(prompt);
+        cache.set(prompt, pending); // stored before anyone awaits it
+        pending.catch(() => cache.delete(prompt));
+        return pending;
+      }
+
+  - type: code-challenge
+    id: write-client
+    concept: interview.in-flight-cache
+    difficulty: 4
+    language: ts
+    starter: client.starter.ts
+    solution: client.solution.ts
+    tests: client.tests.ts
+    twin:
+      language: python
+      starter: client.starter.py
+      solution: client.solution.py
+      tests: client.tests.py
+    prompt: >-
+      Write `createClient(call)`. It returns two functions.
+
+
+      `complete(prompt)` stores the promise in a `Map` before returning it, so identical
+      prompts share one call. A rejected promise is removed, so the next caller tries again.
+
+
+      `completeMany(prompts, limit)` runs every prompt through `complete`, at most `limit` at
+      once. When one finishes, the next starts. Results come back in the order of `prompts`.
+    hints:
+      - In `complete`, look in the map first. On a miss, call, store, then return the promise.
+      - "`pending.catch(() => cache.delete(prompt))` forgets a failure without hiding it from the caller."
+      - For `completeMany`, start `limit` workers. Each takes the next index until none are left.
+
+  - type: prose
+    id: name-json-reask
+    body: >-
+      Ask for JSON and you'll often get it inside a code fence, or after a friendly
+      sentence. So strip the fence, parse, and check the shape.
+
+
+      A **type guard** does the check: a function that returns `value is T`. Once it returns
+      true, TypeScript treats the value as a `T`. If parsing or the check fails, ask once
+      more and say what was wrong.
+
+  - type: code-challenge
+    id: write-complete-json
+    concept: interview.validate-and-retry
+    difficulty: 4
+    language: ts
+    starter: json.starter.ts
+    solution: json.solution.ts
+    tests: json.tests.ts
+    twin:
+      language: python
+      starter: json.starter.py
+      solution: json.solution.py
+      tests: json.tests.py
+    prompt: >-
+      Write `stripFences(text)` and `completeJson(complete, prompt, isValid)`.
+
+
+      `stripFences` removes an opening fence, with or without `json`, and a closing one.
+
+
+      `completeJson` asks, strips, parses, then checks with `isValid`. If that fails, it asks
+      once more: the prompt, a blank line, then `Your last reply was invalid: <problem>.
+      Reply with JSON only.` The problem is `not valid JSON` or `wrong shape`. After two bad
+      replies, throw an error that names the last problem.
+    hints:
+      - Use a `for` loop of two attempts, and keep the last problem in a variable outside it.
+      - Put only `JSON.parse` inside `try`, and `continue` from the `catch`.
+      - "Strip with two `replace` calls: one anchored with `^`, one with `$`, then `trim()`."
+
+  - type: explain-back
+    id: explain-cache-promise
+    concept: interview.in-flight-cache
+    difficulty: 4
+    prompt: >-
+      An interviewer asks why your client caches the promise instead of the answer. Explain
+      it.
+    rubric:
+      - The promise exists as soon as the call starts, and the answer only later.
+      - Identical calls made meanwhile share the promise, so the model runs once.
+      - A rejected promise is removed, so one failure isn't served to everyone after.
+    modelAnswer: >-
+      The answer only exists once the call finishes, but the promise exists the moment it
+      starts. If I store the promise at once, every identical call that arrives meanwhile
+      gets the same one. So a burst costs one model call instead of ten. I remove it if it
+      rejects, so a single failure isn't handed to every later caller.
+
+recap:
+  - Retry timeouts, 429s and 5xx errors with backoff and jitter, and fail fast on the rest.
+  - Cache the promise so identical calls share one request, and cap calls in flight.
+  - Strip fences, parse, check with a type guard, and re-ask once with the problem.
+recall:
+  - id: card-retryable
+    concept: interview.timeout-and-retry
+    front: Which errors from a model API should a client retry?
+    back: >-
+      Timeouts, `429` and `5xx`. A `400`, `401` or `403` fails the same way every time, so
+      throw it at once.
+  - id: card-jitter
+    concept: interview.timeout-and-retry
+    front: Why add a random part to the backoff wait?
+    back: >-
+      Without it, every client that failed together retries together, and the overloaded
+      server gets hit again at once.
+  - id: card-cache-promise
+    concept: interview.in-flight-cache
+    front: What does a client cache to de-duplicate identical calls, and when does it store it?
+    back: >-
+      The promise, as soon as the call starts. Calls that arrive before the answer share it.
+  - id: card-evict-failure
+    concept: interview.in-flight-cache
+    front: What happens if a promise cache keeps a rejected promise?
+    back: >-
+      Every later caller gets the same error without a new try. Delete the entry when the
+      promise rejects.
+  - id: card-reask-once
+    concept: interview.validate-and-retry
+    front: The model's JSON fails to parse. What does the client do?
+    back: >-
+      Ask once more, adding what was wrong, and throw if the second reply fails too.
+
+references:
+  - kind: essay
+    title: Exponential Backoff And Jitter
+    authors: Marc Brooker
+    year: 2015
+    venue: AWS Architecture Blog
+    url: https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/
+    note: Why retries need jitter, and full jitter compared with the other variants.
+    primary: true
+    verified: false
+  - kind: rfc
+    title: 'RFC 9110: HTTP Semantics, section 15 (status codes)'
+    authors: Fielding, Nottingham and Reschke
+    year: 2022
+    url: https://www.rfc-editor.org/rfc/rfc9110#section-15
+    note: What 4xx and 5xx mean, and `Retry-After`. `429` is defined in RFC 6585.
+    primary: true
+    verified: false
+  - kind: docs
+    title: 'AbortSignal: timeout() static method'
+    authors: MDN contributors
+    venue: MDN Web Docs
+    url: https://developer.mozilla.org/en-US/docs/Web/API/AbortSignal/timeout_static
+    note: The real timeout signal to pass to `fetch`, and the `TimeoutError` it gives.
+    verified: false
+  - kind: docs
+    title: 'Narrowing: using type predicates'
+    authors: TypeScript team
+    venue: TypeScript Handbook
+    url: https://www.typescriptlang.org/docs/handbook/2/narrowing.html#using-type-predicates
+    note: How a function returning `value is T` narrows a value's type.
+    verified: false
+  - kind: source
+    title: AI engineering interview questions, company-wise
+    authors: owini
+    venue: GitHub
+    url: https://github.com/owini/ai-engineering-interview-questions-company-wise
+    note: Practical tasks AI companies set, such as async batching with retries and jitter.
+    verified: false
+
+deepDive: >-
+  **The real timeout.** Outside the sandbox you'd pass `AbortSignal.timeout(30_000)` to
+  `fetch`. It aborts the request itself, so the socket closes and the provider can stop
+  generating. A race alone only stops you waiting, which is why the challenge flips the
+  signal too.
+
+
+  **Retry-After.** A `429` or `503` may carry a `Retry-After` header. When it does, wait
+  that long instead of your own backoff.
+
+
+  **Where retries live.** Official SDKs already retry 429s and 5xx errors a few times. Retry
+  in one layer only, or the attempts multiply.

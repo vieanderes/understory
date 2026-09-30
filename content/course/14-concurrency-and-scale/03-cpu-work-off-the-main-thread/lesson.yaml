@@ -1,0 +1,301 @@
+id: scale.web-workers
+title: CPU work off the main thread
+objective: Spot CPU work that blocks a server or a page, and move it to a worker thread with messages.
+level: advanced
+minutes: 10
+concepts: [scale.blocking-the-loop, scale.worker-threads, scale.web-workers, scale.message-passing]
+prerequisites: [scale.concurrency-vs-parallelism, js.event-loop, perf.cost-of-javascript]
+opening:
+  text: >-
+    You'll stop one heavy request from freezing your server for everyone else. You'll move
+    the computing to another thread and get the answer back as a message.
+
+steps:
+  - type: prose
+    id: one-thread-for-everyone
+    body: |-
+      In the event loop lesson, a long task froze a page. A Node server has the same single
+      thread, and every request shares it.
+
+      ```js
+      export function report(request) {
+        const pdf = buildPdfReport(request.month); // 2 s of computing
+        return new Response(pdf);
+      }
+
+      export function health() {
+        return new Response("ok");
+      }
+      ```
+
+      No `await` in the report, so nothing else runs until it's done.
+
+  - type: multiple-choice
+    id: pick-when-health-answers
+    concept: scale.blocking-the-loop
+    difficulty: 1
+    question: A report starts. 10 ms later, the load balancer asks `GET /health`. When does it get "ok"?
+    choices:
+      - text: About 2 seconds later, after the report
+        correct: true
+        feedback: >-
+          Right. We measured a 2,032 ms wait for a reply that takes no time.
+      - text: At once, it's a different route
+        feedback: >-
+          Routes share the thread. The health handler can't run until the report hands it back.
+      - text: Never, the server refuses it
+        feedback: >-
+          Nothing refuses it. It waits in line, and answers once the report is finished.
+
+  - type: prose
+    id: what-a-worker-thread-is
+    body: |-
+      Computing needs another thread. A **worker thread** runs a separate JavaScript file
+      inside the same Node process, on another core. The two share no variables. They talk
+      in messages:
+
+      ```js
+      import { Worker } from "node:worker_threads";
+
+      const worker = new Worker("./build-report.js");
+      worker.on("message", (pdf) => sendToUser(pdf));
+      worker.on("error", (error) => reportFailure(error));
+      worker.postMessage({ month: "2026-09" });
+      ```
+
+  - type: ai-review
+    id: review-worker-never-rejects
+    concept: scale.worker-threads
+    difficulty: 3
+    language: js
+    request: Score each uploaded chess board on a worker thread, and return the result as a promise.
+    flawClass: edge-case
+    code: |
+      function runJob(board) {
+        return new Promise((resolve) => {
+          const worker = new Worker("./score.js");
+          worker.once("message", (score) => {
+            resolve(score);
+            worker.terminate();
+          });
+          worker.postMessage(board);
+        });
+      }
+    prompt: >-
+      Every test board is valid, and each gets its score. In production, one malformed board
+      made `score.js` throw, and the whole server exited. Tap the line at fault.
+    lines: [2]
+    reasons:
+      - text: Nothing listens for the worker's `error` event
+        correct: true
+        feedback: >-
+          Yes. An unheard `error` crashed our process. Heard, it rejects one promise.
+      - text: '`terminate` runs before the score is read'
+        feedback: >-
+          `resolve(score)` has the value already. Stopping the worker afterwards is fine.
+      - text: '`once` should be `on`'
+        feedback: >-
+          One job gives one reply, so `once` fits. Think about the job that gives no reply.
+    fix: |
+      return new Promise((resolve, reject) => {
+        const worker = new Worker("./score.js");
+        worker.once("message", resolve);
+        worker.once("error", reject);
+        worker.postMessage(board);
+      });
+
+  - type: code-challenge
+    id: write-run-in-worker
+    concept: scale.worker-threads
+    difficulty: 3
+    language: ts
+    editable: '10-13'
+    prompt: >-
+      Finish `runInWorker(worker, job)`. It sends `job` and resolves with the worker's first
+      message. It rejects when the worker sends an `error`. Either way, it calls
+      `terminate()` once it has an answer.
+
+
+      The fake worker in the tests replies inside `postMessage`, before the next line runs.
+    hints:
+      - Look at the order. Anything that arrives before `on` is called is never heard.
+      - Add a second listener for `'error'`, and take `reject` from the promise as well.
+      - Start the promise with both `worker.on` calls, then call `worker.postMessage(job)` last.
+
+  - type: prose
+    id: messages-are-copies
+    body: >-
+      A message isn't shared. `postMessage` makes a **copy** of the data, and the other
+      thread gets its own. Change the copy, and the original doesn't notice. To get a result
+      back, the worker sends it in a message of its own.
+
+
+      That's also why functions can't travel in a message: only data is copied.
+
+  - type: predict-output
+    id: predict-copy-not-shared
+    concept: scale.message-passing
+    difficulty: 2
+    language: js
+    code: |
+      // main.js
+      const order = { id: 7, total: 40 };
+      worker.on("message", () => console.log(order.total));
+      worker.postMessage(order);
+
+      // apply-discount.js, the worker
+      parentPort.on("message", (order) => {
+        order.total = 30;
+        parentPort.postMessage("done");
+      });
+    question: The worker sets the total to 30, then says "done". What does main.js log?
+    choices:
+      - text: '`40`'
+        correct: true
+        feedback: >-
+          Right. The worker changed its own copy. Send the new total back to use it.
+      - text: '`30`'
+        feedback: >-
+          Most people pick this. But `order` was copied into the worker, so main's object never changed.
+      - text: '`undefined`'
+        feedback: >-
+          Main's `order` is untouched and still has its total. Only the worker's copy changed.
+
+  - type: prose
+    id: pools-and-the-browser
+    body: >-
+      Starting a worker costs time and memory, so servers keep a **pool**: a few workers
+      started once, one per core, reused for every job. `os.availableParallelism()` says how
+      many cores there are, and libraries such as Piscina run the pool.
+
+
+      The browser has the same idea, a **Web Worker**. In its file, `self` is the worker's
+      own global object. It has no `document`, so it can't touch the page.
+
+  - type: bug-hunt
+    id: hunt-dom-in-worker
+    concept: scale.web-workers
+    difficulty: 3
+    language: js
+    code: |
+      // blur-worker.js, started with new Worker("blur-worker.js")
+      self.onmessage = (event) => {
+        const blurred = blurPixels(event.data, 8);
+        document.querySelector("#preview").src = toDataUrl(blurred);
+      };
+    prompt: >-
+      The photo editor stays smooth while blurring now. But the preview never updates, and
+      the console says `document is not defined`. Tap the line at fault.
+    lines: [4]
+    reasons:
+      - text: A worker has no `document` to change
+        correct: true
+        feedback: >-
+          Yes. Post `blurred` to the page, and let the page update the preview.
+      - text: '`event.data` is empty inside a worker'
+        feedback: >-
+          It holds a copy of the pixels the page sent. The blur itself works.
+      - text: '`blurPixels` blocks the page again'
+        feedback: >-
+          It runs on the worker's thread now, which is the point. The page stays free.
+    fix: |
+      self.onmessage = (event) => {
+        self.postMessage(blurPixels(event.data, 8));
+      };
+      // in the page:
+      // worker.onmessage = (event) => showPreview(event.data);
+
+  - type: explain-back
+    id: explain-when-a-worker-helps
+    concept: scale.worker-threads
+    difficulty: 4
+    prompt: >-
+      A teammate moves every database query into worker threads to make the API faster. Why
+      won't that help, and where would workers help?
+    rubric:
+      - Queries are I/O-bound, and their waits already overlap on the main thread.
+      - Workers help CPU-bound work, such as building reports, parsing huge files or resizing images.
+      - Workers cost startup and copying, so the heavy work goes to a reused pool, with errors handled.
+    modelAnswer: >-
+      A query spends its time waiting for the database, and the main thread already overlaps
+      those waits. Moving them to workers adds the cost of starting threads and copying
+      messages, and nothing gets faster. Workers pay off when a request computes for a long
+      time. Think of building a PDF, or splitting a big document into tokens for a model. I'd move
+      that work to a small pool, one worker per core, and handle its errors.
+
+recap:
+  - Spot a request that computes for long enough to hold up every other request.
+  - Move that work to a worker thread, and handle both its message and its error.
+  - Remember that messages are copies, and that Web Workers can't touch the page.
+
+recall:
+  - id: card-blocking
+    concept: scale.blocking-the-loop
+    front: Why does one slow report make a Node server's health check slow?
+    back: >-
+      Every request's code runs on the same thread. Until the report's computing finishes,
+      no other handler can run.
+  - id: card-worker-error
+    concept: scale.worker-threads
+    front: What happens if a worker thread throws and nothing listens for `error`?
+    back: >-
+      The error goes unhandled and can take the whole process down. Listen for it and reject.
+  - id: card-copies
+    concept: scale.message-passing
+    front: A worker changes an object it received in a message. Does the sender see the change?
+    back: >-
+      No. `postMessage` sends a copy. The worker must send the result back.
+  - id: card-web-worker-dom
+    concept: scale.web-workers
+    front: What can't a Web Worker do that the page's own script can?
+    back: >-
+      Touch the DOM. It has no `document`, so it sends results to the page to display.
+
+references:
+  - kind: docs
+    title: Worker threads
+    authors: Node.js contributors
+    venue: Node.js documentation
+    url: https://nodejs.org/api/worker_threads.html
+    note: '`Worker`, `parentPort`, the `error` event, and the advice that workers don''t help I/O-intensive work.'
+    primary: true
+    verified: true
+  - kind: spec
+    title: HTML Standard
+    authors: WHATWG
+    venue: WHATWG
+    url: https://html.spec.whatwg.org/multipage/workers.html
+    note: Web workers, their global scope, and how messages reach them.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Don't Block the Event Loop (or the Worker Pool)
+    authors: Node.js contributors
+    venue: Node.js documentation
+    url: https://nodejs.org/en/learn/asynchronous-work/dont-block-the-event-loop
+    note: When to offload work, and what offloading costs.
+    verified: true
+
+deepDive: >-
+  We ran the blocked server in Node 24. A report handler that computed for 2 seconds held a
+  health check, sent 10 ms later, for 2,032 ms. With the report on a worker, the health
+  check answered in 45 ms.
+
+
+  Messages are copied with the structured clone algorithm, which handles objects, arrays,
+  maps, dates and binary data, but not functions or class methods. Copying a large buffer
+  costs time, so some types can be transferred instead: the memory moves to the other
+  thread, and the sender can no longer use it. `SharedArrayBuffer` and `Atomics` let
+  threads share memory directly, which brings back every race in this chapter at a lower
+  level. You'll rarely need them.
+
+
+  Node had older ways to use more cores. `cluster` starts copies of a whole server that
+  share one port, and `child_process` runs another program. Today most apps run several
+  copies with their platform instead, and use worker threads for heavy computing inside one.
+
+
+  Node also keeps its own small pool of helper threads, four by default, for file system
+  calls, DNS lookups and some crypto. That's separate from your workers. In the browser, a
+  canvas can be handed to a worker with `OffscreenCanvas`, so drawing leaves the page's
+  thread too.

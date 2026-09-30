@@ -1,0 +1,291 @@
+id: pyai.asyncio
+title: Async Python
+objective: "Run many model calls at once with asyncio, cap them with a semaphore, and give each one a timeout."
+level: advanced
+minutes: 10
+concepts: [pyai.async-await, pyai.gather-and-tasks, pyai.semaphores, pyai.async-timeouts]
+prerequisites: [pyai.generators-and-decorators, js.promises]
+opening:
+  text: >-
+    You'll turn a job of 200 model calls from minutes into seconds, without tripping the
+    rate limit. Most AI pipelines need exactly this.
+
+steps:
+  - type: prose
+    id: why-async
+    body: >-
+      Say you classify 200 reviews, one model call each. A call takes about 2 seconds, and
+      almost all of it is waiting for the network. One by one, the job takes nearly 7
+      minutes of mostly waiting.
+
+
+      Waiting on a network or a disk is called **I/O**. While one call waits, your program
+      could start the next. That's what `asyncio` is for.
+
+  - type: prose
+    id: coroutines
+    body: |-
+      It works like `async` and `await` in JavaScript, from chapter 3:
+
+      ```python
+      import asyncio
+      import anthropic
+
+      client = anthropic.AsyncAnthropic()
+
+      async def classify(review):
+          reply = await client.messages.create(model="claude-opus-5",
+              max_tokens=50, messages=[{"role": "user", "content": review}])
+          return reply.content[0].text
+
+      print(asyncio.run(classify("Arrived broken.")))
+      ```
+
+      An `async def` function returns a **coroutine**. `await` pauses it until the reply
+      comes, and `asyncio.run` starts it.
+
+  - type: bug-hunt
+    id: hunt-missing-await
+    concept: pyai.async-await
+    difficulty: 2
+    language: python
+    code: |
+      client = anthropic.AsyncAnthropic()
+
+      async def classify(review):
+          reply = client.messages.create(model="claude-opus-5",
+              max_tokens=50, messages=[{"role": "user", "content": review}])
+          return reply.content[0].text
+
+      asyncio.run(classify("Arrived broken."))
+    prompt: >-
+      This stops with `AttributeError: 'coroutine' object has no attribute 'content'`,
+      and a warning that a coroutine was never awaited. Tap the line to fix.
+    lines: [4]
+    reasons:
+      - text: The call is missing `await`
+        correct: true
+        feedback: >-
+          Right. Without `await`, you hold the unstarted call, not its reply.
+      - text: '`asyncio.run` needs `await` in front'
+        feedback: >-
+          `asyncio.run` is the ordinary function that starts everything. The missing `await` is inside.
+      - text: The async client has no `messages`
+        feedback: >-
+          It has the same `messages.create`. It returns something to await instead of a reply.
+    fix: |
+      async def classify(review):
+          reply = await client.messages.create(model="claude-opus-5",
+              max_tokens=50, messages=[{"role": "user", "content": review}])
+          return reply.content[0].text
+
+  - type: prose
+    id: gather
+    body: |-
+      `await` in a `for` loop still runs one call after another. To overlap them, hand
+      them all to `asyncio.gather`:
+
+      ```python
+      async def classify_all(reviews):
+          return await asyncio.gather(*(classify(r) for r in reviews))
+      ```
+
+      The `*` spreads the coroutines out as separate arguments. They run together, and the
+      results come back in the same order as the reviews.
+
+  - type: fill-blank
+    id: fill-gather
+    concept: pyai.gather-and-tasks
+    difficulty: 2
+    language: python
+    prompt: Summarise every article at once, and return the summaries in order.
+    template: |
+      async def summarise_all(articles):
+          summaries = {{1}} asyncio.{{2}}(*(summarise(a) for a in articles))
+          return summaries
+    blanks:
+      - key: '1'
+        answer: await
+      - key: '2'
+        answer: gather
+    bank: [await, async, gather, run, sleep]
+
+  - type: prose
+    id: semaphore
+    body: |-
+      Now all 200 calls start at once, and the provider answers most of them with `429`.
+      You need a cap. An `asyncio.Semaphore` holds a fixed number of slots:
+
+      ```python
+      limit = asyncio.Semaphore(5)
+
+      async with limit:
+          return await classify(review)
+      ```
+
+      `async with` takes a slot, and gives it back at the end. With 5 slots, at most 5 calls
+      run at once, and the rest wait their turn.
+
+  - type: code-challenge
+    id: write-classify-all
+    concept: pyai.semaphores
+    difficulty: 3
+    language: python
+    starter: bounded.starter.py
+    solution: bounded.solution.py
+    tests: bounded.tests.py
+    prompt: >-
+      Write `classify_all(reviews, classify, limit)`. Call `classify` on every review at
+      once, but never more than `limit` at a time. Return the labels in the order of the
+      reviews.
+
+
+      The tests pass a fake `classify` that counts how many calls run together. They await
+      your function themselves, so don't call `asyncio.run`.
+    hints:
+      - The starter waits for each call before it starts the next. Which function starts them together?
+      - Make one `asyncio.Semaphore(limit)` at the top of `classify_all`, shared by every call.
+      - 'Inside, write `async def one(review):` that takes a slot with `async with`, then gather `one(r)` for every review.'
+
+  - type: prose
+    id: timeouts-and-blocking
+    body: |-
+      Sometimes a call hangs. `asyncio.timeout` gives up on it and raises `TimeoutError`:
+
+      ```python
+      async with asyncio.timeout(30):
+          reply = await classify(review)
+      ```
+
+      One more trap. Async only overlaps work that's awaited. An ordinary call that waits,
+      such as the non-async client, freezes every task until it returns.
+
+  - type: ai-review
+    id: review-blocking-call
+    concept: pyai.async-timeouts
+    difficulty: 3
+    language: python
+    request: Summarise many documents at once.
+    flawClass: performance
+    code: |
+      client = anthropic.Anthropic()
+
+      async def summarise(doc):
+          reply = client.messages.create(model="claude-opus-5", max_tokens=300,
+              messages=[{"role": "user", "content": f"Summarise: {doc}"}])
+          return reply.content[0].text
+
+      async def main(docs):
+          return await asyncio.gather(*(summarise(d) for d in docs))
+    prompt: >-
+      An assistant wrote this. It runs without errors, but ten documents take ten times as
+      long as one. Tap the line at fault.
+    lines: [1]
+    reasons:
+      - text: The normal client blocks the whole event loop
+        correct: true
+        feedback: >-
+          Yes. Its calls can't be awaited, so each one freezes every other task.
+      - text: '`gather` runs coroutines one at a time'
+        feedback: >-
+          `gather` overlaps awaited waits fine. This call never gives control back.
+      - text: '`max_tokens` makes each call slow'
+        feedback: >-
+          300 tokens is a short summary. The calls are slow because they run in turn.
+    fix: |
+      client = anthropic.AsyncAnthropic()
+
+      async def summarise(doc):
+          reply = await client.messages.create(model="claude-opus-5", max_tokens=300,
+              messages=[{"role": "user", "content": f"Summarise: {doc}"}])
+          return reply.content[0].text
+
+      async def main(docs):
+          return await asyncio.gather(*(summarise(d) for d in docs))
+
+  - type: explain-back
+    id: explain-overlap
+    concept: pyai.gather-and-tasks
+    difficulty: 3
+    prompt: >-
+      Ten awaited calls in a `for` loop took about 20 seconds. In `gather` with a semaphore
+      of 5, they took about 4. What changed?
+    rubric:
+      - Each call is mostly waiting on the network, not using the computer.
+      - '`gather` starts the calls together, so their waits overlap.'
+      - The semaphore lets 5 run at once, so ten calls take about two rounds.
+    modelAnswer: >-
+      Each call spends its 2 seconds waiting for the provider. In the loop, each wait
+      starts only after the last one ends. With `gather`, the waits overlap. The semaphore
+      lets 5 run at a time, so ten calls take two rounds of about 2 seconds.
+
+recap:
+  - Write `async def` functions and `await` every async call in them.
+  - Run many calls at once with `asyncio.gather`, capped by a shared `Semaphore`.
+  - Give slow calls a timeout, and never make a blocking call inside a coroutine.
+
+recall:
+  - id: card-missing-await
+    concept: pyai.async-await
+    front: What do you get from an async call you forgot to `await`?
+    back: >-
+      A coroutine object, not the result. Reading `.content` from it raises
+      `AttributeError`, and Python warns it was never awaited.
+  - id: card-gather
+    concept: pyai.gather-and-tasks
+    front: In what order does `asyncio.gather` return results?
+    back: >-
+      In the order you passed the coroutines, whichever finished first.
+  - id: card-semaphore
+    concept: pyai.semaphores
+    front: Why must the `Semaphore` be created once, outside the per-call function?
+    back: >-
+      Every call must share the same slots. One semaphore per call caps nothing.
+  - id: card-blocking
+    concept: pyai.async-timeouts
+    front: What happens when a coroutine makes an ordinary blocking call?
+    back: >-
+      The whole event loop waits for it, so no other task runs. Use the async client and
+      `await` it.
+
+references:
+  - kind: docs
+    title: Coroutines and Tasks
+    authors: Python Software Foundation
+    venue: Python documentation
+    url: https://docs.python.org/3/library/asyncio-task.html
+    note: async def, await, gather, TaskGroup and timeout.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Synchronization Primitives
+    authors: Python Software Foundation
+    venue: Python documentation
+    url: https://docs.python.org/3/library/asyncio-sync.html
+    note: Semaphore and async with.
+    primary: true
+    verified: true
+  - kind: source
+    title: anthropic-sdk-python
+    authors: Anthropic
+    venue: GitHub
+    url: https://github.com/anthropics/anthropic-sdk-python
+    note: AsyncAnthropic, the async client with the same methods.
+    verified: true
+
+deepDive: >-
+  **Async in the browser.** The Python here runs on the page's own event loop, so the tests
+  await your coroutine on it, and `asyncio.sleep` works as usual. `asyncio.run` can't start
+  a second loop there, and threads can't start at all, so the challenge never needs either.
+  Every sample was run with CPython 3.12. With 20 calls and a semaphore made inside the
+  per-call function, the peak was 20 at once. Shared, it was 5.
+
+
+  **TaskGroup.** Since Python 3.11, `async with asyncio.TaskGroup() as tg:` with
+  `tg.create_task(...)` is the stricter sibling of `gather`. If one task fails, it cancels
+  the rest and raises every error together. `gather` by default lets the others run on.
+
+
+  **Semaphores and rate limits.** A semaphore caps calls in flight, not calls per minute.
+  For a hard per-minute limit, add backoff on `429`, from the last lesson, or a token
+  bucket.

@@ -1,0 +1,293 @@
+id: cloud.releases
+title: Releasing without downtime
+objective: Release with rolling and blue-green deploys gated on health, roll back by redeploying the last image, and ship migrations the old code survives.
+level: essential
+minutes: 10
+concepts: [cloud.zero-downtime-release, cloud.blue-green, cloud.rollbacks, cloud.migrations-in-deploys]
+prerequisites: [cloud.ci-cd, cloud.reverse-proxies, db.migrations]
+opening:
+  text: >-
+    You'll ship a new version while people are using the old one, and nobody will notice.
+    And when the new one is bad, you'll have the old one back in seconds.
+
+steps:
+  - type: prose
+    id: the-gap
+    body: |-
+      The obvious deploy stops the old version, then starts the new one:
+
+      ```bash
+      # deploy.sh, run while k6 keeps loading the page
+      docker rm -f notes-v1
+      docker run -d --name notes-v2 --network-alias app notes:v2
+      ```
+
+      The proxy sends traffic to whatever answers as `app`. We ran this under load, and
+      hundreds of requests failed with `502`. The new version was fine. So what went wrong?
+
+  - type: multiple-choice
+    id: pick-why-requests-failed
+    concept: cloud.zero-downtime-release
+    difficulty: 1
+    question: Why did those requests fail?
+    choices:
+      - text: For a moment, nothing answered as `app`
+        correct: true
+        feedback: >-
+          Right. v1 was gone and v2 wasn't listening yet. Every request in that gap failed.
+      - text: v2 has a bug
+        feedback: >-
+          The same v2 served every request after the gap. The failures only came during the
+          swap.
+      - text: k6 sent more than the app can take
+        feedback: >-
+          Before the deploy, v1 handled the same load with no errors. The swap caused them.
+
+  - type: prose
+    id: name-zero-downtime
+    body: >-
+      The cure is an order. Start the new version next to the old one. Wait until its health
+      check passes. Switch traffic to it. Only then stop the old one. That's a
+      **zero-downtime release**.
+
+
+      Replace a few instances at a time and it's a **rolling** deploy. Start a whole second
+      copy, then switch everyone at once, and it's **blue-green**: blue is the old copy, green
+      the new.
+
+  - type: parsons
+    id: order-blue-green
+    concept: cloud.blue-green
+    difficulty: 2
+    language: bash
+    prompt: >-
+      Blue runs `notes:9c1e2b7`. Release `notes:4f2a9c1` as green, with no gap. One line
+      doesn't belong.
+    blocks:
+      - id: start-green
+        code: docker run -d --name green --network web notes:4f2a9c1
+        subgoal: Start the new copy next to the old one
+      - id: wait-green
+        code: ./wait-until-healthy.sh green
+        subgoal: Wait for its health check
+      - id: switch-proxy
+        code: ./point-proxy-at.sh green
+        subgoal: Send all traffic to it
+      - id: stop-blue
+        code: docker stop blue
+        subgoal: Only now stop the old copy
+    distractors:
+      - id: stop-blue-first
+        code: docker rm -f blue
+        feedback: >-
+          Removing blue at any point before the switch opens the same gap as before.
+          Stopping it comes last.
+
+  - type: prose
+    id: name-rollback
+    body: |-
+      A **rollback** is another deploy: of the last good image. It works because an image
+      never changes once built. `notes:9c1e2b7` still holds the old code, byte for byte. With
+      blue-green it's quicker still: point the proxy back at blue.
+
+      That's why lesson 5 tags by commit. Two builds both tagged `latest` leave one name:
+
+      ```bash
+      $ docker images notes
+      REPOSITORY   TAG       IMAGE ID
+      notes        latest    7e93af246479
+      ```
+
+  - type: ai-review
+    id: review-deploy-without-rollback
+    concept: cloud.rollbacks
+    difficulty: 3
+    language: bash
+    request: Simplify our deploy. No more commit hashes to copy around.
+    flawClass: logic
+    code: |
+      #!/bin/bash
+      # release.sh on the server does start, health check, switch, stop
+      docker build -t registry.example.com/notes:latest .
+      docker push registry.example.com/notes:latest
+      ssh deploy@notes.example.com ./release.sh latest
+    prompt: >-
+      The release goes out with no gap. An hour later it turns out to be broken, and the
+      last version can't be found. Tap the line at fault.
+    lines: [3]
+    reasons:
+      - text: Every build gets the same tag, `latest`
+        correct: true
+        feedback: >-
+          Yes. The push moved `latest`, so the old image lost its only name.
+      - text: The script should build on the server
+        feedback: >-
+          Building on the server doesn't give the old image a name back. The tag is the
+          problem.
+      - text: '`ssh` can''t run a release script'
+        feedback: >-
+          It can run any command on the server. The trouble is which image that command gets.
+    fix: |
+      TAG=$(git rev-parse --short HEAD)     # e.g. 4f2a9c1
+      docker build -t registry.example.com/notes:$TAG .
+      docker push registry.example.com/notes:$TAG
+      ssh deploy@notes.example.com ./release.sh $TAG
+
+  - type: code-challenge
+    id: write-wait-until-healthy
+    concept: cloud.zero-downtime-release
+    difficulty: 3
+    language: ts
+    editable: '9-10'
+    prompt: >-
+      Write the heart of `wait-until-healthy`. `waitUntilHealthy(check, attempts, pause)`
+      calls `check()` up to `attempts` times, with `pause()` between tries.
+
+
+      Return `true` as soon as a check says healthy. A check that throws means the app isn't
+      listening yet: count it as unhealthy and keep going. Return `false` when every attempt
+      fails, and don't pause after the last one.
+
+
+      So answers `false`, then `true`, give `true` after one pause.
+    hints:
+      - A loop that runs `attempts` times is the frame for everything else.
+      - Wrap `await check()` in `try` and `catch`, so a throw becomes `false` for that try.
+      - Pause only when this wasn't the last attempt, then go round again.
+
+  - type: prose
+    id: name-migrations-in-deploys
+    body: >-
+      During a release, old and new versions run at once, against one database. Blue and
+      green share it. After a rollback, the old code meets whatever schema the new release
+      left.
+
+
+      So a migration must suit both versions. That's the **expand and contract** pattern from
+      the databases chapter. Expand first, in its own release. Contract only once no running
+      code needs the old shape.
+
+  - type: sql
+    id: write-expand-step
+    concept: cloud.migrations-in-deploys
+    difficulty: 3
+    prompt: >-
+      Release 7 reads `full_name`. Release 6, still running, reads `name`. Replace the
+      rename with the expand step: add `full_name` and copy every name into it, leaving
+      `name` alone.
+    setup: |
+      CREATE TABLE customers (id integer PRIMARY KEY, name text NOT NULL);
+      INSERT INTO customers VALUES (1, 'Ana Silva'), (2, 'Ben Okafor');
+    starter: |
+      ALTER TABLE customers RENAME COLUMN name TO full_name;
+    solution: |
+      ALTER TABLE customers ADD COLUMN full_name text;
+      UPDATE customers SET full_name = name;
+    checks:
+      ordered: true
+      query: SELECT id, name, full_name FROM customers ORDER BY id
+    showSchema: true
+    hints:
+      - '`ADD COLUMN` adds a column, and leaves the others as they are.'
+      - A new column starts empty. An `UPDATE` without `WHERE` fills every row.
+      - 'Start with `ALTER TABLE customers ADD COLUMN full_name text;`'
+
+  - type: explain-back
+    id: explain-rollback-needs-compatible-schema
+    concept: cloud.migrations-in-deploys
+    difficulty: 4
+    prompt: >-
+      A team says "we can always roll back, the old image is in the registry". Why is that
+      only true if their migrations were written with care?
+    rubric:
+      - A rollback redeploys old code, but the database stays as the new release left it.
+      - If a migration dropped or renamed something the old code reads, the old code fails after the rollback.
+      - Expanding first and contracting in a later release keeps the schema right for both versions.
+    modelAnswer: >-
+      The image holds the code, and the code is only half of a release. The other half is the
+      schema, and redeploying an image doesn't touch it. If the new release dropped a column,
+      the old code comes back and asks for something that's gone. So a rollback is only safe
+      while the database suits both versions. Expand and contract buys that. Add the new
+      shape first, then deploy. Remove the old shape in a later release, once you're sure you
+      won't go back.
+
+recap:
+  - "Release in order: start the new version, wait for health, switch traffic, stop the old one."
+  - Roll back by redeploying the last image by its commit tag, or by switching back to blue.
+  - Ship schema changes as expand, then deploy, then contract, so both versions keep working.
+
+recall:
+  - id: card-release-order
+    concept: cloud.zero-downtime-release
+    front: What are the four steps of a zero-downtime release, in order?
+    back: >-
+      Start the new version, wait for its health check, switch traffic, then stop the old
+      version.
+  - id: card-blue-green
+    concept: cloud.blue-green
+    front: How do you roll back a blue-green release?
+    back: >-
+      Point the proxy back at blue, the old copy, which is still running. It takes seconds.
+  - id: card-rollback-tag
+    concept: cloud.rollbacks
+    front: Why can't you roll back if every build is tagged `latest`?
+    back: >-
+      Each push moves `latest` to the newest image, so the last good one has no name left to
+      deploy. Tag every build with its commit.
+  - id: card-migrations-in-deploys
+    concept: cloud.migrations-in-deploys
+    front: In what order do a schema change and its code ship?
+    back: >-
+      The expand migration first, then the code, and the contract in a later release. The
+      version still running must work throughout.
+
+references:
+  - kind: docs
+    title: reverse_proxy (Caddyfile directive)
+    authors: Caddy
+    venue: Caddy Documentation
+    url: https://caddyserver.com/docs/caddyfile/directives/reverse_proxy
+    note: Upstreams, health checks and retries, the proxy settings behind the releases in this lesson.
+    primary: true
+    verified: true
+  - kind: docs
+    title: ALTER TABLE
+    authors: The PostgreSQL Global Development Group
+    venue: PostgreSQL 17 Documentation
+    url: https://www.postgresql.org/docs/17/sql-altertable.html
+    note: '`ADD COLUMN`, `DROP COLUMN` and `RENAME COLUMN`, and which of them break code still running.'
+    primary: true
+    verified: true
+  - kind: essay
+    title: BlueGreenDeployment
+    authors: Martin Fowler
+    year: 2010
+    venue: martinfowler.com
+    url: https://martinfowler.com/bliki/BlueGreenDeployment.html
+    note: Two production environments, one live, and switching back as the rollback.
+    verified: true
+
+deepDive: >-
+  The releases ran on Docker 28 with Caddy 2.11.4 and k6 in containers, 10 virtual users
+  for 15 seconds against a small Node app. Stop, then start: 661 of 3,733 requests failed,
+  17.7%. The rate was low because everything ran on one laptop. Blue-green, with Caddy
+  pointed at `v2:8080`: we started v3, waited for `/health`, changed the Caddyfile to
+  `v3:8080`, ran `caddy reload`, then removed v2. 0 of 4,012 requests failed. A reload is
+  graceful: requests already in flight finish on the old config.
+
+
+  With several instances, a rolling deploy does the same one instance at a time. A proxy
+  that looks up its upstreams by DNS may keep dialling a stopped instance for a second or
+  so. Caddy's `lb_try_duration` retries such a request on another upstream. A server that
+  handles `SIGTERM` helps too: it stops accepting, finishes open requests, then exits.
+  That's **draining**. `docker stop` sends `SIGTERM` and waits ten seconds before it kills.
+
+
+  The `latest` run used Docker 28 with the containerd image store: after two builds with
+  the same tag, `docker images notes` listed one image. The first build had no name left.
+  In a registry the same thing happens when a push moves the tag. Some registries can make
+  tags immutable, which refuses the second push outright.
+
+
+  A rename in one release fails the same way a drop does. Release 6 asks for `name`, and
+  PostgreSQL answers `column "name" does not exist` until release 6 is gone.

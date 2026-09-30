@@ -1,0 +1,237 @@
+summary: >-
+  **DRY**, don't repeat yourself, comes from *The Pragmatic Programmer* by Andy Hunt and Dave
+  Thomas, and it's about knowledge, not text: every piece of knowledge should have a single,
+  unambiguous, authoritative representation within a system. A tax rate typed into three
+  files breaks that rule. Two functions that happen to have the same body may not, because
+  they may encode two different rules that agree today by chance.
+
+
+  Merging code that only looks alike creates the opposite problem: a shared helper that
+  every caller bends with a flag, until nobody can change it safely. Sandi Metz named this
+  **the wrong abstraction** and argued that duplication is far cheaper than the wrong
+  abstraction. The cure she describes is to inline the helper back into its callers, delete
+  what each one doesn't need, and extract again only what is truly shared.
+
+
+  The practical rules are three. Remove duplicated knowledge as soon as you see it. Tolerate
+  duplicated structure until a third copy shows what varies, which is the rule of three. And
+  when a helper has grown flags, go backwards before you go forwards.
+remember:
+  - DRY means every piece of knowledge has one authoritative place, not that no two lines may look alike.
+  - Ask whether two copies must change together, because only then are they one piece of knowledge.
+  - Duplicated knowledge, such as a rate, a rule or a list of statuses, should be merged or derived at once.
+  - The rule of three says to tolerate a second copy of similar code and extract on the third, when the variation is visible.
+  - A helper with boolean flags for different callers is a sign of the wrong abstraction.
+  - To undo the wrong abstraction, inline it into every caller, strip what each doesn't use, then extract only what's truly shared.
+  - Duplication across module or service boundaries is often cheaper than the coupling a shared helper brings.
+sections:
+  - title: One source of truth, derived everywhere
+    body: |-
+      Knowledge duplication hides in places a text search won't find: a type, a validation
+      rule and a dropdown menu that each list the same order statuses. Add a status in one
+      and forget another, and the system disagrees with itself. The fix is to keep the list
+      once and **derive** the rest from it.
+
+      ```ts
+      // One list is the single source: the type, the check and the menu all derive from it.
+      export const ORDER_STATUSES = ['draft', 'placed', 'shipped', 'delivered'] as const;
+      export type OrderStatus = (typeof ORDER_STATUSES)[number];
+
+      export function isOrderStatus(value: string): value is OrderStatus {
+        return (ORDER_STATUSES as readonly string[]).includes(value);
+      }
+
+      const menu = ORDER_STATUSES.map((status) => ({ value: status, label: status[0].toUpperCase() + status.slice(1) }));
+
+      console.log(isOrderStatus('shipped'), isOrderStatus('lost')); // true false
+      console.log(menu.map((item) => item.label).join(', ')); // Draft, Placed, Shipped, Delivered
+
+      // @ts-expect-error 'lost' is not an OrderStatus
+      const bad: OrderStatus = 'lost';
+      ```
+
+      `as const` keeps the literal strings, so `OrderStatus` is the union
+      `'draft' | 'placed' | 'shipped' | 'delivered'`. Adding `'returned'` to the array updates
+      the type, the runtime check and the menu in one edit.
+
+      The same move works at larger scale. A schema library such as Zod defines a shape once
+      and infers the TypeScript type from it with `z.infer`. An OpenAPI document can generate
+      client types. A database migration can be the source that generates the model. When
+      you can't derive, a test that compares the two copies is the next best thing: it turns
+      silent drift into a red build.
+
+      Not all repetition is knowledge. Tests often repeat set-up on purpose so that each test
+      reads on its own, and that's usually the right call. A test you must trace through
+      three helpers to understand has traded clarity for fewer lines.
+  - title: Is it one idea or two?
+    body: |-
+      The lesson's usernames and room names had identical bodies and different futures. The
+      question that separates real from coincidental duplication is: **if one changes, must
+      the other change too?** If yes, they're one piece of knowledge. If they could change
+      independently, they're two, however alike they look.
+
+      A useful follow-up is to ask *who* would ask for each change. Username rules belong to
+      whoever owns profiles and layout. Room-name rules belong to whoever owns chat. Two
+      owners means two reasons to change, which is the single responsibility principle from
+      the next lesson applied to duplication.
+
+      Some signs of coincidental duplication:
+
+      - The copies sit in different features or modules, owned by different people.
+      - The names differ, such as `isValidUsername` and `isValidRoomName`, because the ideas
+        differ.
+      - Merging would need a name vaguer than either original, such as `isValidName`.
+      - A likely next request would change one and not the other.
+
+      Some signs of real duplication:
+
+      - A fact from outside the code, such as a VAT rate, a legal limit or a price, appears
+        more than once.
+      - A bug fix in one copy would be a bug fix in the other.
+      - The copies already drifted, and the drift is itself a bug.
+
+      Across service boundaries, lean towards duplication. A shared library used by five
+      services couples their release schedules: a change for one forces the others to
+      upgrade or pin an old version. Copying twenty lines of formatting code is often the
+      cheaper price for independent teams. Keep genuinely shared knowledge, such as an API
+      contract, in one versioned place.
+  - title: Backing out of the wrong abstraction
+    body: |-
+      Metz describes a life cycle. Someone sees duplication and extracts a helper. A new
+      requirement almost fits, so the next person adds a parameter and a conditional. This
+      repeats until the helper is a knot of flags. Each person hesitates to undo it, because
+      the code looks important and so much effort went in. That hesitation is the sunk cost
+      fallacy.
+
+      Her way out runs backwards: inline the helper into every caller, remove from each copy
+      the branches it never takes, and only then look for what's really shared. Here is a
+      small version.
+
+      ```ts
+      interface Row {
+        sku: string;
+        qty: number;
+        pricePence: number;
+      }
+
+      // Before: one helper, two callers, two flags.
+      function exportCsv(rows: Row[], forAccounting: boolean, withHeader: boolean): string {
+        const lines = rows.map((row) =>
+          forAccounting
+            ? `${row.sku},${((row.qty * row.pricePence) / 100).toFixed(2)}`
+            : `${row.sku},${row.qty}`,
+        );
+        if (withHeader) lines.unshift(forAccounting ? 'sku,total' : 'sku,qty');
+        return lines.join('\n');
+      }
+
+      // After: each caller gets plain code it can read and change alone.
+      function stockCsv(rows: Row[]): string {
+        return ['sku,qty', ...rows.map((row) => `${row.sku},${row.qty}`)].join('\n');
+      }
+
+      function accountsCsv(rows: Row[]): string {
+        const pounds = (row: Row) => ((row.qty * row.pricePence) / 100).toFixed(2);
+        return ['sku,total', ...rows.map((row) => `${row.sku},${pounds(row)}`)].join('\n');
+      }
+
+      const rows: Row[] = [
+        { sku: 'mug', qty: 2, pricePence: 850 },
+        { sku: 'tea', qty: 1, pricePence: 399 },
+      ];
+      console.log(stockCsv(rows) === exportCsv(rows, false, true)); // true
+      console.log(accountsCsv(rows) === exportCsv(rows, true, true)); // true
+      ```
+
+      Two flags make four paths, and both callers pass `withHeader: true`, so two of the
+      paths were never used. That's typical: flag combinations multiply faster than callers.
+      The two equality checks at the bottom are the safety net for the change, the same
+      characterisation idea as the last lesson.
+
+      After inlining, notice what *is* shared: joining lines with a header. If a third export
+      appears with the same shape, a `toCsv(header, rows, toLine)` helper would take a
+      function rather than a flag, so each caller supplies its own difference. Passing the
+      varying part in as a function is usually a better abstraction than a boolean that
+      selects it.
+  - title: The rule of three, and when to break it
+    body: |-
+      Martin Fowler's *Refactoring* credits the rule to Don Roberts: the first time, you do
+      it; the second time, you wince at the duplication but do it anyway; the third time, you
+      refactor. The reasoning is statistical. With two examples you can't tell which
+      differences are essential and which are accidents. Three examples show the real axis of
+      variation, so the helper's parameters match reality instead of a guess.
+
+      The rule is about **structural** similarity, code that looks alike. It doesn't license
+      duplicated knowledge. If you type a VAT rate for the second time, extract the constant
+      now. Waiting for a third copy of a business fact only gives it more places to drift.
+
+      Break the rule towards earlier extraction when:
+
+      - The duplicated code is a known, stable concept, such as parsing a date format or
+        formatting money.
+      - A bug fix already had to be applied to both copies.
+      - The two copies must stay identical for correctness, such as the same validation
+        running on client and server.
+
+      Break it towards later extraction, or never, when:
+
+      - The copies live in different services or teams.
+      - The third copy needs a flag to fit, which means the abstraction isn't there yet.
+      - The duplication is in tests, where each test reading on its own matters more.
+
+      In a review, "we have three of these now, and they differ only in the header and the
+      line format" is a strong case for extracting. "These two look similar" is usually a
+      case for a comment and some patience.
+pitfalls:
+  - "**Merging code because it looks identical.** Identical bodies can encode different rules that diverge next month. Ask whether both must change together before you merge."
+  - "**Adding a flag to make a helper fit one more caller.** Each boolean doubles the paths every reader must trace, and a change for one caller now risks the others. Write the caller its own function, or pass the varying behaviour in as a function argument."
+  - "**Keeping the wrong abstraction because of the effort already spent.** That's the sunk cost fallacy. Inline it into every caller, delete the unused branches, and re-extract only what's truly shared."
+  - "**Applying the rule of three to knowledge.** A tax rate or a status list copied twice is already a bug waiting to happen. Put it in one place, or derive the copies from one source, as soon as it repeats."
+  - "**Drying out tests until they can't be read.** A test that depends on layers of shared helpers hides what it checks. Accept some repeated set-up so each test tells its own story."
+  - "**Sharing a helper library across services to save a few lines.** It couples release schedules and makes every change a coordinated upgrade. Copy small utilities, and share only true contracts, versioned."
+  - "**Naming the merged helper vaguely.** A name like `processData` or `isValidName` is a sign the merged code no longer means one thing. If you can't name it precisely, don't merge it."
+interview:
+  - question: What does DRY actually mean? Is all duplication bad?
+    answer: >-
+      DRY means every piece of knowledge has one authoritative representation, so it's about
+      facts and rules, not lines of text. The Pragmatic Programmer defines it that way. A VAT
+      rate typed in three places is real duplication, because changing one leaves the others
+      silently wrong. Two functions that look identical but serve different features aren't
+      necessarily duplication, because they may change for different reasons. My test is
+      whether both copies must change together. If yes, I merge them or derive one from the
+      other, for example deriving a TypeScript type from a const array or a schema. If no, I
+      leave them apart. Over-applying DRY is its own problem: it produces shared helpers with
+      flags that couple unrelated code.
+  - question: What's the wrong abstraction, and how do you fix it?
+    answer: >-
+      It's a shared helper that no longer fits its callers, so it's grown parameters and
+      conditionals to serve each one differently. Sandi Metz named it, and her point was that
+      duplication is far cheaper than the wrong abstraction. You spot it by boolean flags,
+      callers passing combinations nobody can explain, and fear of changing it. The fix is to
+      go backwards: inline the helper into every caller, delete the branches each caller
+      never takes, and look at what's left. Often very little is truly shared, and what is
+      can be extracted cleanly, with the varying part passed in as a function rather than a
+      flag. I do it under tests, since callers may rely on odd behaviour. The trade-off is
+      some repeated code, which is cheap to read.
+  - question: When do you extract a shared function? What's the rule of three?
+    answer: >-
+      For look-alike code I usually wait for the third occurrence. The rule of three, credited
+      to Don Roberts in Fowler's Refactoring, says to tolerate the second copy and refactor
+      on the third. Two examples don't tell you what varies, so an early helper tends to
+      encode a guess and then grow flags. Three examples show the real axis of variation. But
+      the rule is about structure, not knowledge: a business rule or constant I'd put in one
+      place the moment it repeats. I also extract earlier when a bug fix already had to be
+      applied twice, or when both copies must stay identical for correctness, like validation
+      on client and server. Across service boundaries I extract later, because a shared
+      library couples deployments.
+  - question: Would you share code between two microservices to avoid duplication?
+    answer: >-
+      Usually not for logic, often yes for contracts. A shared library means a change for one
+      service forces the others to upgrade or drift onto old versions, which couples teams
+      that chose services to be independent. Copying a small formatting helper costs a few
+      lines and keeps each service free to change. What I do centralise is knowledge the
+      services must agree on, such as the API schema or event format, versioned and ideally
+      generated into each service's types. If the shared code is large, stable and genuinely
+      identical, such as an auth client, a versioned internal package can be worth it. The
+      question is always the same: must these change together? If not, duplication is the
+      cheaper coupling.

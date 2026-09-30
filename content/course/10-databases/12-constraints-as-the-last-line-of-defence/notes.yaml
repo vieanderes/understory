@@ -1,0 +1,273 @@
+summary: >-
+  A constraint is a rule the database enforces on every write: `NOT NULL`, `CHECK`, `UNIQUE`,
+  foreign keys and exclusion constraints. The lesson shows why a rule that lives only in app
+  code breaks as soon as two requests arrive together. The app reads, decides, then writes,
+  and another request can slip into the gap between those statements.
+
+
+  Constraints close that gap because they are checked inside the write itself, by the one
+  component that sees every transaction. Pair them with conditional writes, such as an
+  `UPDATE` whose `WHERE` carries the rule, and with `ON CONFLICT`, and the database refuses a
+  broken state whatever code, script or admin console sends it.
+
+
+  Reach for a constraint whenever a rule must hold for every row, for ever: one account per
+  email, stock never below zero, no two bookings of a room at the same time. Keep checks in
+  the app too, for friendly messages and early feedback, but treat them as courtesy, not as
+  the guarantee. The one thing a constraint can't express is a rule over many rows that has
+  no single key; for that you need a counter row, an exclusion constraint or serializable
+  isolation.
+remember:
+  - A check in the app followed by a write is two steps, so a concurrent request can pass the same check; only the database, on the write itself, can enforce the rule.
+  - A `UNIQUE` constraint makes a concurrent second insert of the same key wait for the first transaction, then fail with SQLSTATE `23505` if the first committed.
+  - '`INSERT ... ON CONFLICT (key) DO NOTHING` skips a duplicate quietly, and `DO UPDATE SET col = EXCLUDED.col` turns the insert into an upsert.'
+  - Put an invariant in the write, `UPDATE ... SET stock = stock - 1 WHERE id = $1 AND stock > 0`, and treat zero rows changed as "refused".
+  - A `CHECK` sees only the row being written and passes when its condition is NULL, so pair it with `NOT NULL` where a value is required.
+  - A partial unique index (`UNIQUE ... WHERE status = 'active'`) enforces uniqueness for some rows only, such as one active subscription per user.
+  - An exclusion constraint with `btree_gist` refuses overlapping ranges, which is how you stop double bookings of one room.
+  - Catch constraint errors by SQLSTATE and constraint name, and turn each into a specific message; rethrow everything else.
+sections:
+  - title: Why a unique index holds when app code can't
+    body: |-
+      A `UNIQUE` constraint is backed by a unique B-tree index. When an insert adds its key to
+      that index, Postgres looks for the same key. If it finds a committed row, the insert
+      fails at once. If it finds a row written by a transaction that is **still in
+      progress**, the insert waits for that transaction to end. When it commits, the waiting
+      insert fails; when it rolls back, the waiting insert goes ahead.
+
+      That wait is the whole trick. It happens at every isolation level, including the
+      default read committed, because the check sits inside the write rather than in a
+      separate read. No amount of app code can reproduce it, since the app can't see other
+      transactions' uncommitted rows.
+
+      The error carries structured fields. With the `pg` driver (and PGlite) they are `code`
+      and `constraint`, so you can tell "email taken" apart from any other failure:
+
+      ```ts
+      function isUniqueViolation(err: unknown, constraint: string): boolean {
+        return (
+          typeof err === 'object' && err !== null &&
+          (err as { code?: unknown }).code === '23505' &&
+          (err as { constraint?: unknown }).constraint === constraint
+        );
+      }
+
+      async function signUp(email: string) {
+        try {
+          const { rows } = await db.query<{ id: number }>(
+            'INSERT INTO users (email) VALUES ($1) RETURNING id', [email]);
+          return { ok: true as const, id: rows[0]!.id };
+        } catch (err) {
+          if (isUniqueViolation(err, 'users_email_key')) {
+            return { ok: false as const, reason: 'email-taken' as const };
+          }
+          throw err; // a lost connection is not "email taken"
+        }
+      }
+      ```
+
+      Run twice with the same address, the first call returns `{ ok: true, id: 1 }` and the
+      second `{ ok: false, reason: 'email-taken' }`. Name your constraints explicitly
+      (`CONSTRAINT users_email_key UNIQUE (email)`) so this code doesn't depend on a
+      generated name.
+
+      Emails are case-insensitive in practice, and `UNIQUE (email)` treats `Ana@Example.com`
+      and `ana@example.com` as different. A unique index on an expression fixes that:
+      `CREATE UNIQUE INDEX users_email_key ON users (lower(email));`. `ON CONFLICT
+      (lower(email))` then finds it.
+  - title: ON CONFLICT in depth
+    body: |-
+      `ON CONFLICT` needs a conflict target that matches a unique index or constraint exactly.
+      For a partial unique index you must repeat its `WHERE`, or Postgres answers `there is
+      no unique or exclusion constraint matching the ON CONFLICT specification`.
+
+      `DO NOTHING ... RETURNING id` returns **no row** when it skips. A "get or create" has to
+      read the existing row as well:
+
+      ```sql
+      CREATE TABLE tags (
+        id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        name text NOT NULL UNIQUE
+      );
+
+      WITH ins AS (
+        INSERT INTO tags (name) VALUES ('urgent')
+        ON CONFLICT (name) DO NOTHING
+        RETURNING id
+      )
+      SELECT id FROM ins
+      UNION ALL
+      SELECT id FROM tags WHERE name = 'urgent'
+      LIMIT 1;
+      ```
+
+      Run twice, both return id 1. In one rare race, a row committed by another transaction
+      after this statement began is skipped by the insert and invisible to the `SELECT`, so
+      the query returns nothing; code that uses it should retry once.
+
+      `DO UPDATE` is an upsert. `EXCLUDED` is the row you tried to insert, and a `WHERE` on
+      the update skips pointless writes:
+
+      ```sql
+      CREATE TABLE contacts (
+        email text PRIMARY KEY,
+        name text NOT NULL,
+        updated_at timestamptz NOT NULL DEFAULT now()
+      );
+      INSERT INTO contacts (email, name) VALUES ('ana@example.com', 'Ana');
+
+      INSERT INTO contacts (email, name) VALUES ('ana@example.com', 'Ana')
+      ON CONFLICT (email) DO UPDATE
+        SET name = EXCLUDED.name, updated_at = now()
+        WHERE contacts.name IS DISTINCT FROM EXCLUDED.name
+      RETURNING email;
+      ```
+
+      The name is unchanged, so no row is updated and `RETURNING` shows nothing.
+
+      Two surprises. A multi-row `INSERT ... ON CONFLICT DO UPDATE` that contains the same
+      key twice fails with `ON CONFLICT DO UPDATE command cannot affect row a second time`,
+      so remove duplicates from the batch first. And identity and sequence values are used
+      up by attempts that conflict or fail: after two refused inserts, the next new row can
+      get id 5 instead of 2. Ids are unique, never gapless.
+  - title: What each kind of constraint can and can't express
+    body: |-
+      Each constraint looks at a different amount of data.
+
+      - **`NOT NULL`** looks at one column of one row.
+      - **`CHECK`** looks at one row. It can compare columns, as in
+        `CHECK (sale_price_pence < price_pence)`, but it can't use a subquery (Postgres
+        refuses with `cannot use subquery in check constraint`), and Postgres assumes its
+        result never changes for the same row, so don't call functions that read other
+        tables.
+      - **`UNIQUE`** and primary keys look across all rows, for one key.
+      - **Foreign keys** look at a row in another table.
+      - **Exclusion constraints** look across all rows with any operator, not only `=`.
+
+      A `CHECK` whose condition is NULL passes. With `sale_price_pence` NULL, the sale rule
+      above accepts the row, which is what you want for "no sale". For a required value, add
+      `NOT NULL`.
+
+      `UNIQUE` treats NULLs as distinct, so a column with `UNIQUE` can hold many NULLs. Since
+      Postgres 15, `UNIQUE NULLS NOT DISTINCT` allows only one.
+
+      Partial unique indexes express "unique among some rows":
+
+      ```sql
+      CREATE TABLE subscriptions (
+        id integer PRIMARY KEY,
+        user_id integer NOT NULL,
+        status text NOT NULL CHECK (status IN ('active', 'cancelled'))
+      );
+      CREATE UNIQUE INDEX one_active_subscription
+        ON subscriptions (user_id) WHERE status = 'active';
+
+      INSERT INTO subscriptions VALUES (1, 7, 'cancelled'), (2, 7, 'cancelled'), (3, 7, 'active');
+      INSERT INTO subscriptions VALUES (4, 7, 'active'); -- fails with 23505
+      ```
+
+      Unique and foreign key constraints can be declared `DEFERRABLE INITIALLY DEFERRED`,
+      which moves the check to `COMMIT`. That helps when a transaction passes through a
+      temporarily invalid state, such as swapping two positions in an ordered list. `CHECK`
+      and `NOT NULL` are always checked immediately.
+  - title: Rules across many rows
+    body: |-
+      "A room takes three bookings" has no single key for `UNIQUE` to watch. Three patterns
+      handle rules like it.
+
+      **A counter row, changed by a conditional update.** Keep the count on the parent row
+      and change it in the same transaction as the insert. The `UPDATE` locks the room row,
+      so a second booking waits, then rechecks `booked < capacity` against the new value.
+
+      ```sql
+      CREATE TABLE rooms (
+        id integer PRIMARY KEY,
+        capacity integer NOT NULL,
+        booked integer NOT NULL DEFAULT 0,
+        CHECK (booked BETWEEN 0 AND capacity)
+      );
+      CREATE TABLE room_bookings (
+        id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        room_id integer NOT NULL REFERENCES rooms,
+        guest text NOT NULL
+      );
+      INSERT INTO rooms VALUES (1, 3, 2);
+
+      BEGIN;
+      UPDATE rooms SET booked = booked + 1
+      WHERE id = 1 AND booked < capacity
+      RETURNING booked;                -- no row back means full: roll back
+      INSERT INTO room_bookings (room_id, guest) VALUES (1, 'Ana');
+      COMMIT;
+      ```
+
+      The app checks the result: one row back means a seat was taken, none means the room is
+      full. The `CHECK` is the backstop if some other code forgets the `WHERE`.
+
+      **An exclusion constraint** for overlapping ranges:
+
+      ```sql
+      CREATE EXTENSION btree_gist;
+      CREATE TABLE bookings (
+        id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        room_id integer NOT NULL,
+        during tstzrange NOT NULL,
+        EXCLUDE USING gist (room_id WITH =, during WITH &&)
+      );
+      INSERT INTO bookings (room_id, during)
+      VALUES (1, '[2026-10-01 09:00+00, 2026-10-01 10:00+00)');
+      INSERT INTO bookings (room_id, during)
+      VALUES (1, '[2026-10-01 09:30+00, 2026-10-01 11:00+00)'); -- fails with 23P01
+      ```
+
+      The half-open range `[start, end)` lets a booking start exactly when the previous one
+      ends. **Serializable isolation**, the next lesson, is the general answer when neither
+      pattern fits.
+pitfalls:
+  - '**Treating the app''s pre-check as the guarantee.** It passes in every test because tests send one request at a time. Keep it for the message, and let a constraint enforce the rule.'
+  - '**Turning every insert error into "email taken".** A timeout or a foreign key failure then shows a misleading message. Match SQLSTATE `23505` and the constraint name, and rethrow the rest.'
+  - '**`UNIQUE (email)` on mixed-case input.** `Ana@example.com` and `ana@example.com` both get in. Use a unique index on `lower(email)`, or the `citext` type.'
+  - '**A `CHECK` on a nullable column.** NULL makes the condition unknown, and unknown passes. Add `NOT NULL` to columns the rule depends on.'
+  - '**Upserting a batch with repeated keys.** `DO UPDATE` refuses to touch one row twice in a statement. Deduplicate the batch in code, keeping the last value per key.'
+  - '**Ignoring the row count of a conditional update.** `UPDATE ... WHERE stock > 0` that matches nothing is a refusal, not a success. Check `rowCount`, or use `RETURNING` and look for a row.'
+  - '**Expecting ids without gaps.** Refused and rolled-back inserts consume identity values. Use a separate numbering scheme if an invoice number must be gapless.'
+interview:
+  - question: Two sign-ups with the same email arrive at the same millisecond. How do you make sure only one account is created?
+    answer: >-
+      A unique constraint on the normalised email, and code that handles its error. The
+      app's "is this email free?" check is a read followed by a write, and both requests can
+      pass the read before either writes. A unique index is checked inside the insert: the
+      second insert waits for the first transaction, then fails with `23505`. I'd index
+      `lower(email)` so case variants collide, catch `23505` for that constraint name and
+      return a clear "already registered", or use `ON CONFLICT DO NOTHING` when a repeat
+      should be silent, such as a waitlist. I keep the app check too, because it gives a
+      friendly message before the user submits, but it's never the guarantee.
+  - question: What is an upsert in Postgres, and what can go wrong with it?
+    answer: >-
+      `INSERT ... ON CONFLICT (key) DO UPDATE SET ... = EXCLUDED....`: insert the row, or
+      update the existing one if the key is taken, atomically. It replaces the racy "select,
+      then insert or update" pattern. Things to watch: the conflict target must match a
+      unique index exactly, including the `WHERE` of a partial index; a batch containing the
+      same key twice fails with "cannot affect row a second time", so deduplicate first; it
+      locks and rewrites the row even when nothing changed, so add a `WHERE ... IS DISTINCT
+      FROM` to skip no-op updates; and `DO NOTHING ... RETURNING` returns no row for a skip,
+      so get-or-create needs a follow-up read.
+  - question: How would you stop an online shop overselling its last item when many servers take orders at once?
+    answer: >-
+      Put the rule in the write: `UPDATE products SET stock = stock - 1 WHERE id = $1 AND
+      stock > 0`, plus `CHECK (stock >= 0)`. The update locks the row, so concurrent orders
+      queue on it, and each rechecks `stock > 0` against the latest value. If it changes zero
+      rows, the item is sold out and the order is refused. I'd do it in the same transaction
+      as inserting the order line, so both happen or neither does. An in-memory lock doesn't
+      work across servers, and "read stock, then write stock minus one" loses updates. The
+      trade-off is a hot row on a flash sale; if that becomes the bottleneck, split stock
+      into several rows or reserve it in batches.
+  - question: How do you prevent double bookings of a meeting room?
+    answer: >-
+      An exclusion constraint: `EXCLUDE USING gist (room_id WITH =, during WITH &&)` on a
+      `tstzrange` column, with the `btree_gist` extension for the equality part. Postgres then
+      refuses any row whose range overlaps an existing booking of the same room, with
+      `23P01`, under any concurrency. Half-open ranges, `[start, end)`, let back-to-back
+      bookings touch without overlapping. Without it I'd need to lock the room row or run at
+      serializable and retry, and both put the burden on every code path that writes
+      bookings. The constraint protects writes from scripts and admin tools too.

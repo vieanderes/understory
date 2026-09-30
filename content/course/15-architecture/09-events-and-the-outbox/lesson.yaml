@@ -1,0 +1,269 @@
+id: arch.event-driven
+title: Events and the outbox
+objective: Tell events from commands, say what a message broker does, and publish events through an outbox so none is lost.
+level: advanced
+minutes: 10
+concepts: [arch.events-and-commands, arch.outbox]
+prerequisites: [arch.monolith-and-services, db.transactions, scale.queues-and-workers, scale.idempotency]
+opening:
+  text: >-
+    You'll let one part of a system tell the others what happened, without knowing who they
+    are. And you'll make sure the message is never lost, even when the server dies halfway.
+
+steps:
+  - type: prose
+    id: what-an-event-is
+    body: >-
+      When a room is booked, other parts of the system care. Email sends a confirmation, and
+      billing takes a deposit. Bookings can tell them in two ways.
+
+
+      A **command** asks one receiver to do something: `ChargeDeposit`. It's named as an
+      order, and it can be refused. An **event** says something happened: `RoomBooked`. It's
+      named in the past tense, and whoever listens decides what to do.
+
+  - type: multiple-choice
+    id: pick-the-event
+    concept: arch.events-and-commands
+    difficulty: 1
+    language: js
+    code: |
+      const messages = [
+        { type: 'SendConfirmationEmail', to: 'ana@example.com' },
+        { type: 'RoomBooked', room: 'Oak', by: 'ana' },
+        { type: 'ChargeDeposit', pence: 2000 },
+      ];
+    question: The bookings module shouldn't know that emails exist. Which message lets it stay ignorant?
+    choices:
+      - text: '`SendConfirmationEmail`'
+        feedback: >-
+          That names the email and tells someone to send it. Bookings now depends on the
+          email module's job.
+      - text: '`RoomBooked`'
+        correct: true
+        feedback: >-
+          Right. It states a fact. Whoever cares, email or billing or nobody, can listen.
+      - text: '`ChargeDeposit`'
+        feedback: >-
+          That's an instruction to the payments module. Bookings has to know who does it and
+          what to ask for.
+
+  - type: prose
+    id: what-a-broker-is
+    body: >-
+      Events travel through a **message broker**: a service that takes messages from one
+      program and holds them for every program that subscribed. It's the queue from the
+      scale chapter, with many readers.
+
+
+      Bookings publishes `RoomBooked` and knows no one. Add a listener next year, and
+      bookings doesn't change. The coupling points the other way.
+
+  - type: prose
+    id: name-dual-write
+    body: >-
+      Here's the catch. Saving the booking and publishing the event are two writes, to two
+      systems:
+
+
+      ```js
+      await db.query("INSERT INTO bookings (room) VALUES ('oak')");
+      // the server crashes here
+      await broker.publish('RoomBooked', { room: 'oak' });
+      ```
+
+
+      The room is booked, and nobody hears. That's the **dual write** problem: no
+      transaction covers a database and a broker.
+
+  - type: prose
+    id: name-outbox
+    body: >-
+      The fix is an **outbox**: a table in the same database. The event is written there, in
+      the booking's own transaction, so both exist or neither does.
+
+
+      A separate loop, the **relay**, reads unsent rows, publishes them and marks them sent.
+      If it crashes in between, it sends a row twice. So listeners skip event ids they've
+      seen, as in the idempotency lesson.
+
+  - type: parsons
+    id: arrange-outbox-transaction
+    concept: arch.outbox
+    difficulty: 2
+    language: sql
+    prompt: >-
+      Write the booking and its event in one transaction. The relay will publish the row
+      later.
+    blocks:
+      - id: begin
+        code: BEGIN;
+        subgoal: One transaction
+      - id: insert-booking
+        code: INSERT INTO bookings (room) VALUES ('Ash');
+        subgoal: The state change
+      - id: insert-outbox
+        code: INSERT INTO outbox (type, payload) VALUES ('RoomBooked', '{"bookingId":3}');
+        subgoal: The event, as a row
+      - id: commit
+        code: COMMIT;
+        subgoal: Both or neither
+    distractors:
+      - id: publish-inside
+        code: SELECT publish_to_broker('RoomBooked');
+        feedback: >-
+          The broker isn't part of this transaction. A rollback can't recall what's been
+          published.
+
+  - type: ai-review
+    id: review-publish-before-commit
+    concept: arch.outbox
+    difficulty: 3
+    language: js
+    request: When a room is booked, publish RoomBooked so the email service can confirm it.
+    flawClass: race
+    code: |
+      async function bookRoom(room, user) {
+        await db.query('BEGIN');
+        const booking = await insertBooking(room, user);
+        await broker.publish('RoomBooked', { bookingId: booking.id });
+        await chargeDeposit(user);              // can throw
+        await db.query('COMMIT');
+        return booking;
+      }
+    prompt: >-
+      An assistant wrote this. In the test the deposit always clears. In production the email
+      service sometimes looks up the booking and finds nothing. Tap the line at fault.
+    lines: [4]
+    reasons:
+      - text: '`chargeDeposit` should run before the insert'
+        feedback: >-
+          Moving the charge doesn't help. The event would still leave before the commit.
+      - text: The event goes out before the booking commits
+        correct: true
+        feedback: >-
+          Yes. Listeners race the commit, and a rollback leaves a false event. Use the outbox.
+      - text: '`publish` needs a retry loop'
+        feedback: >-
+          Retrying makes delivery surer. It can't make the event true if the transaction rolls
+          back.
+    fix: |
+      await db.query('BEGIN');
+      const booking = await insertBooking(room, user);
+      await insertOutbox('RoomBooked', { bookingId: booking.id });
+      await chargeDeposit(user);
+      await db.query('COMMIT');     // the relay publishes after this
+
+  - type: code-challenge
+    id: write-outbox
+    concept: arch.outbox
+    difficulty: 4
+    language: ts
+    prompt: >-
+      `bookRoom` saves the booking, then publishes to the broker: a dual write. Make it write
+      a `'RoomBooked'` outbox row inside the same transaction, and drop its `broker`
+      parameter.
+
+
+      Then write `relayOnce(db, broker)`: publish each unsent row, mark it sent after the
+      publish, and return how many it sent. If the broker is down, the row stays unsent.
+
+
+      So one booking, then two relay runs, return `1` and `0`.
+    hints:
+      - '`tx` has both inserts. Call both inside the one `transaction` callback.'
+      - The order in the relay matters. Which order means a crash sends a row twice, not never?
+      - 'Start the relay with `const rows = db.unsent();` and loop over them.'
+
+  - type: explain-back
+    id: explain-outbox
+    concept: arch.outbox
+    difficulty: 4
+    prompt: >-
+      A service saves an order, then publishes `OrderPlaced` to a broker. Once a month an
+      order exists that no other service heard about. Why does an outbox table cure that?
+    rubric:
+      - Saving and publishing are two writes to two systems, so a crash between them loses the event.
+      - The outbox row is written in the same database transaction as the order, so both commit or neither does.
+      - A relay publishes unsent rows afterwards and may repeat one, so listeners must skip events they've seen.
+    modelAnswer: >-
+      The save and the publish are separate writes, and nothing ties them together. A crash
+      or a broker hiccup after the save loses the event for good. With an outbox, the event
+      is a row in the same database, written in the order's own transaction. Either both
+      exist or neither does. A relay reads unsent rows, publishes them, then marks them
+      sent. If it crashes in between, it sends one twice. So listeners skip event ids
+      they've already handled.
+
+recap:
+  - Name facts as events and requests as commands, and publish events so the sender knows nobody.
+  - Write the event to an outbox table in the same transaction, and let a relay publish it.
+  - Expect a relayed event more than once, and make every listener skip repeats.
+
+recall:
+  - id: card-event-vs-command
+    concept: arch.events-and-commands
+    front: How does an event differ from a command?
+    back: >-
+      A command asks one receiver to act and can be refused. An event states a fact in the
+      past tense to whoever listens, and the sender knows none of them.
+  - id: card-dual-write
+    concept: arch.outbox
+    front: What is the dual write problem?
+    back: >-
+      Writing to a database and a broker with no shared transaction. A crash between them
+      leaves a change nobody hears about, or an event for nothing.
+  - id: card-outbox
+    concept: arch.outbox
+    front: How does the transactional outbox work, and what does it guarantee?
+    back: >-
+      The event is a row written in the state change's transaction. A relay publishes it
+      later. Delivery is at least once, so listeners skip repeats.
+  - id: card-broker
+    concept: arch.events-and-commands
+    front: What does a message broker do?
+    back: >-
+      It takes messages from one program and holds them for every program that subscribed,
+      so the sender doesn't need to know who listens.
+
+references:
+  - kind: docs
+    title: 'Pattern: Transactional outbox'
+    authors: Chris Richardson
+    venue: microservices.io
+    url: https://microservices.io/patterns/data/transactional-outbox.html
+    note: The outbox table, the message relay, and why the relay may publish a message more than once.
+    primary: true
+    verified: true
+  - kind: essay
+    title: What do you mean by “Event-Driven”?
+    authors: Martin Fowler
+    year: 2017
+    venue: martinfowler.com
+    url: https://martinfowler.com/articles/201701-event-driven.html
+    note: Four different things people mean by the phrase, and the line between an event and a command.
+    primary: true
+    verified: true
+
+deepDive: >-
+  Everything here ran on PostgreSQL 17 and Node 24, with an array standing in for the
+  broker. After a crash between the writes, the table held 1 booking and the broker 0
+  events. Publishing first, with an insert that violated `NOT NULL`, left 1 event and no
+  booking. With the outbox, a failed transaction left no outbox row at all.
+
+
+  A real relay runs on a timer and reads with `FOR UPDATE SKIP LOCKED`, which passes over
+  rows another relay has locked. So two relays can run side by side without sending the
+  same row. Our relay
+  crashed after the publish, and the next run sent event 1 again. A listener that kept a
+  list of seen event ids sent one email, not two. Polling isn't the only relay. Some teams
+  read the database's own change log, which is called change data capture.
+
+
+  Brokers come in two main shapes. A queue hands each message to one worker. A log, like
+  Kafka, keeps every message and lets each reader keep its own place. The system design
+  chapter compares them.
+
+
+  When a job spans several services and a later step fails, the earlier ones must be
+  undone by hand: the saga from the last lesson's deep dive. Events are how each step
+  tells the next one to go, or tells the earlier ones to undo.

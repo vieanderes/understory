@@ -1,0 +1,284 @@
+summary: >-
+  A model call is stateless. Everything the model knows about your task, your rules and the
+  conversation so far is in the request you send: a system prompt, a list of messages and,
+  later, tool results and retrieved documents. Prompting is writing that request so the
+  likely reply is the one your code expects. Context engineering is deciding what goes into
+  it, because the window is finite and every token costs money and attention.
+
+
+  The problem it solves is the most common AI bug: the model did something reasonable that
+  wasn't what you meant. Vague instructions leave many plausible replies open, and your code
+  gets one at random. A specific system prompt, a few clean examples and only the relevant
+  context narrow the options to the shape you want.
+
+
+  Reach for prompt and context changes first, before a bigger model or fine-tuning. They're
+  cheap, fast to try and simple to roll back. They stop being enough when the task needs
+  knowledge the model can't be given in context, a guarantee on format (use structured
+  output), or an action (use tools). And a prompt is never a security boundary: rules that
+  must hold go in code.
+remember:
+  - The model remembers nothing between calls, so the app resends the system prompt and the conversation every time.
+  - The system prompt holds what's true for every turn, the task, the rules, and the exact output format your code parses.
+  - Few-shot examples set the output shape better than a paragraph of rules, and the model copies their mistakes too.
+  - The system prompt, every message sent and the reply all share one context window, counted in tokens.
+  - Resending the whole chat makes total input grow roughly with the square of the number of turns, so trim by a token budget.
+  - Facts that must survive trimming, like an allergy or a user's plan, are pinned in the system prompt or a summary sent every turn.
+  - More context isn't free or always better, because a key fact buried in unrelated text is used less reliably.
+  - A prompt is guidance, not enforcement, so anything that must hold is checked in code.
+sections:
+  - title: Anatomy of a system prompt that works
+    body: |-
+      A good system prompt reads like a brief to a capable new colleague who knows nothing
+      about your company. It usually has five parts, in roughly this order.
+
+      1. **Role and task.** One or two sentences: who the model is acting as and what it's
+         for. "You tag incoming support emails for an online bookshop."
+      2. **Context it can't guess.** The categories and what each covers, who the users
+         are, what the product does.
+      3. **Rules, with reasons.** "Refunds go to billing, because billing owns the payment
+         system." A reason lets the model handle cases you didn't list.
+      4. **What to do when unsure.** "If none fits, use other." Without this, the model
+         forces a guess into a real category, which is worse than an honest unknown.
+      5. **The exact output format.** The literal shape your parser expects, ideally with
+         an example.
+
+      Separate the parts clearly. Many teams wrap long inputs in labelled delimiters, such
+      as XML-style tags, so the model can tell instructions from the email it is reading.
+      That helps clarity; it doesn't make injected text in the email safe, which is lesson
+      13's topic.
+
+      Keep the stable parts stable and first. Some providers offer **prompt caching**,
+      which reuses the processed prefix of a prompt across calls and cuts cost and latency
+      for that part. It only works if the prefix is byte-for-byte the same, so put the
+      system prompt and fixed examples before anything that changes per request, and don't
+      put a timestamp at the top.
+
+      Treat the prompt as code. Keep it in version control, give it a version identifier
+      you log with each call, and change it only with an evaluation run, as lesson 10
+      shows. A one-word change can move results.
+  - title: Few-shot examples done well
+    body: |-
+      Examples can sit inline in the system prompt, as the lesson showed, or as alternating
+      user and assistant turns before the real input. The turn form shows the model exactly
+      what a reply looks like, including the absence of any friendly preamble.
+
+      ```python
+      SYSTEM = """You tag customer emails for a bike shop.
+      Reply with exactly one line: Category: billing, delivery or product."""
+
+      EXAMPLES = [
+          ("My card was charged twice.", "Category: billing"),
+          ("The parcel hasn't arrived after a week.", "Category: delivery"),
+          ("Do you sell a lock for this bike?", "Category: product"),
+      ]
+
+      def build_messages(email):
+          messages = []
+          for text, label in EXAMPLES:
+              messages.append({"role": "user", "content": text})
+              messages.append({"role": "assistant", "content": label})
+          messages.append({"role": "user", "content": email})
+          return messages
+
+      msgs = build_messages("Can I pay by bank transfer?")
+      print(len(msgs), msgs[-2]["content"], "|", msgs[-1]["content"])
+      # 7 Category: product | Can I pay by bank transfer?
+      ```
+
+      Choose examples like test cases. Cover every label, so the model doesn't learn that
+      one category is rare. Vary the surface: short and long, polite and angry, typos
+      included, so it doesn't latch on to length or tone. Include one tricky boundary
+      case with the right answer, such as an accessory that sounds like a delivery
+      question. Keep them consistent, since the model copies formatting as faithfully as
+      labels. Watch the order too: the last example can weigh a little more, so don't
+      end on the label you least want over-predicted.
+
+      Examples cost tokens on every call. Three good ones usually beat ten mediocre ones.
+      If you need dozens to cover the cases, that's a sign to pick examples per request
+      by similarity to the input, which is retrieval, or to reconsider the task split.
+  - title: Why long chats get expensive, and trimming by budget
+    body: |-
+      Because the whole history is resent, each turn's input is bigger than the last, and
+      the total grows roughly with the square of the number of turns.
+
+      ```python
+      SYSTEM_TOKENS = 500
+      TOKENS_PER_MESSAGE = 150  # a question or a reply, on average
+
+      total_input = 0
+      for turn in range(1, 41):
+          history = (turn - 1) * 2 * TOKENS_PER_MESSAGE  # earlier questions and replies
+          sent = SYSTEM_TOKENS + history + TOKENS_PER_MESSAGE
+          total_input += sent
+          if turn in (1, 10, 20, 40):
+              print(f"turn {turn:>2}: sends {sent:>6} tokens, {total_input:>7} so far")
+      # turn  1: sends    650 tokens,     650 so far
+      # turn 10: sends   3350 tokens,   20000 so far
+      # turn 20: sends   6350 tokens,   70000 so far
+      # turn 40: sends  12350 tokens,  260000 so far
+      ```
+
+      Doubling the chat from 20 to 40 turns nearly quadruples the input tokens. The lesson's
+      challenge kept the last `keep` messages. Production code trims by tokens instead,
+      because one pasted log can be larger than twenty short turns. Walk back from the
+      newest message, stop before the budget, then make sure the list starts with a user
+      turn. Pinned facts ride in the system prompt, so trimming can't drop them.
+
+      ```python
+      def rough_tokens(text):
+          # Placeholder: in production, use the provider's token counter.
+          return len(text) // 4 + 1
+
+      def build_request(system, pinned, history, question, budget, count=rough_tokens):
+          system_text = system + "\n\nFacts to keep:\n" + "\n".join(f"- {f}" for f in pinned)
+          used = count(system_text) + count(question)
+          kept = []
+          for message in reversed(history):
+              cost = count(message["content"])
+              if used + cost > budget:
+                  break
+              kept.append(message)
+              used += cost
+          kept.reverse()
+          while kept and kept[0]["role"] != "user":
+              kept.pop(0)
+          return {"system": system_text,
+                  "messages": kept + [{"role": "user", "content": question}]}
+
+      history = []
+      for n in range(1, 31):
+          history.append({"role": "user", "content": f"Question {n} about tonight's dinner " * 3})
+          history.append({"role": "assistant", "content": f"Answer {n} with a recipe idea " * 6})
+
+      request = build_request("You are a cooking assistant.", ["The user is allergic to peanuts."],
+                              history, "What can I make with rice?", budget=400)
+      print(len(request["messages"]), request["messages"][0]["content"][:12])  # 11 Question 26
+      print("peanuts" in request["system"])  # True
+      ```
+
+      Remember to leave room for the reply: the budget for input is the window minus
+      `max_tokens`.
+  - title: Choosing what goes in the window
+    body: |-
+      Context engineering is a ranking problem under a budget. For each call, list the
+      candidates and ask what the model needs for this turn: the system prompt, pinned
+      facts, a summary of older turns, the recent turns, retrieved documents, tool results
+      and the question.
+
+      Four strategies cover most apps. A **sliding window** keeps recent turns and is
+      enough for short chats. **Pinned facts** carry the few things that must never be
+      forgotten, which the app extracts or the user sets. A **rolling summary** replaces
+      old turns with a short text the model writes, trading detail for space; summaries
+      lose specifics, so keep exact values like order numbers as pinned facts instead.
+      **Retrieval** fetches only the passages relevant to this question from a large
+      store, which lessons 6 to 8 build.
+
+      Bigger windows don't remove the need to choose. Every token is paid for on every call
+      and adds latency. And long-context research has found that models tend to use
+      information at the start and end of a long input more reliably than information in
+      the middle. So put the instructions and the most relevant material where the model
+      uses them best, and leave out what doesn't help.
+
+      Two checks keep this honest. Log the token count of each part per call, so you can
+      see what dominates. And when a reply is wrong, look at the exact request that was
+      sent before touching the prompt: many "the model forgot" bugs are "the app never
+      sent it".
+pitfalls:
+  - "**Vague instructions with a strict parser.** \"Be helpful and concise\" leaves the format open, and the parser breaks on the first creative reply. State the exact output format and show it in an example."
+  - "**Trimming by message count.** One pasted document can blow the window while twenty short turns fit easily. Trim by counted tokens, and reserve room for `max_tokens`."
+  - "**Starting the messages with an assistant turn after trimming.** Some APIs reject it, and others misread the conversation. Drop leading assistant messages after you cut."
+  - "**Letting trimming drop facts that matter.** The allergy from turn 3 falls off the window and the assistant suggests peanut noodles. Pin such facts in the system prompt or a stored summary."
+  - "**Unchecked few-shot examples.** One mislabelled example teaches the wrong label on every call. Review examples like test fixtures and cover every category."
+  - "**Putting changing text at the start of the prompt.** A date or user name at the top breaks prompt caching for everything after it. Keep the stable prefix first."
+  - "**Relying on the prompt for rules that must hold.** \"Never offer more than 10% off\" can be talked round. Enforce limits in the code that acts on the reply."
+interview:
+  - question: How does a chat assistant remember earlier turns, and what breaks as conversations get long?
+    answer: >-
+      It doesn't: the app resends the conversation on every call, and the model reads it
+      fresh. Each request carries the system prompt plus the user and assistant turns so
+      far. Two things break with length. Cost and latency grow, because input tokens per
+      turn grow linearly, so the total over a conversation grows roughly quadratically.
+      And eventually the history exceeds the context window. The fix is to choose what to
+      send: a token-budgeted window of recent turns, pinned facts that must never drop, a
+      rolling summary for older turns, and retrieval for large material. The trade-off is
+      detail: summaries lose specifics, so exact values stay pinned.
+  - question: A classifier built on a prompt returns free-form text about a fifth of the time. How do you fix it?
+    answer: >-
+      Make the expected output explicit, show it, and stop depending on prose. First I'd
+      read the system prompt: usually it describes the task but never says what to reply
+      with. I'd add the exact format, the list of allowed labels, what to do when none fits,
+      and two or three few-shot examples that cover every label with no preamble. Then I'd
+      measure on a labelled set of real emails rather than eyeballing. If the format must
+      be guaranteed, I'd move to structured output with an enum field, and still validate.
+      I wouldn't reach for a bigger model first: it costs more and doesn't fix an
+      under-specified instruction.
+  - question: What is context engineering, and how is it different from prompt engineering?
+    answer: >-
+      Prompt engineering is how you phrase the instructions; context engineering is
+      deciding everything that goes into the window on each call. In a simple app they're
+      the same thing. In a chat, a RAG system or an agent, the system prompt is a small,
+      stable part, and most tokens are history, retrieved passages and tool results that
+      change every turn. Context engineering ranks those under a token budget: what does
+      the model need for this step, what can be summarised, what should be fetched on
+      demand. It matters because every token costs money and latency, and relevant facts
+      buried in noise get used less reliably. More context is not automatically better.
+  - question: Where would you put a rule like "never promise delivery dates", and is that enough?
+    answer: >-
+      In the system prompt, with the reason, and it isn't enough on its own. The system
+      prompt is the right place for rules that hold every turn, and a reason such as
+      "dates depend on the courier and we can't guarantee them" helps the model apply it to
+      phrasings I didn't list. But a prompt is guidance: a determined user or injected text
+      can talk the model round, and models occasionally slip. If a broken rule has real
+      cost, I add a check in code, for example flagging replies that contain a date for
+      review, and I cover it in the evaluation set so a prompt change that weakens it is
+      caught before release.
+  - question: What is in-context learning, and how is it different from fine-tuning?
+    answer: >-
+      In-context learning is the model picking up a task from examples in the prompt, with
+      no change to its weights. Give it three reviews each labelled with a sentiment and it
+      labels the fourth in the same format. It's instant and cheap to change, which makes
+      it the first thing to try. The limits: examples take up context and cost tokens on
+      every call, and nothing is remembered after the request. Fine-tuning changes the
+      weights, so the behaviour sticks without the examples, which pays off for a narrow,
+      high-volume task or a format the model keeps getting wrong. I move to fine-tuning
+      only when evals show prompting and retrieval have hit a ceiling.
+  - question: How do you structure a prompt for a task that matters?
+    answer: >-
+      In five parts. The job: what I want, in one or two sentences. The why: who it's for
+      and what it's used for, so the model can make sensible choices I didn't foresee. The
+      context: the documents, data or code it needs, clearly marked as data. The
+      constraints: what not to do, such as inventing facts or changing the format. And a
+      definition of done: exactly what a finished answer looks like, often shown with one or
+      two examples of the output. For hard multi-step problems I let it reason before the
+      final answer, or use a reasoning model. Then I treat the prompt like code: it lives in
+      version control, and every change runs against the eval set before it ships.
+
+terms:
+  - term: System prompt
+    say: Secret instructions users can't see or override.
+    means: "The part of the request that holds what is true for every turn: the task, the rules
+      and the output format. It is guidance, not enforcement, and users can often coax it
+      out."
+  - term: Context window
+    say: The model's memory.
+    means: The maximum number of tokens one call can hold, counting the system prompt, every
+      message sent and the reply. Nothing carries over between calls.
+  - term: Token
+    say: A word.
+    means: A piece of text as the model's tokeniser splits it, often part of a word. Prices,
+      limits and context windows are all counted in tokens.
+  - term: Few-shot examples
+    say: Training the model with examples.
+    means: Example inputs and outputs placed in the prompt to show the shape of the answer. The
+      weights don't change; this is in-context learning, and the model copies the examples'
+      mistakes too.
+  - term: Context engineering
+    say: A new name for prompt engineering.
+    means: Deciding what goes into the window on each call, such as instructions, history,
+      retrieved documents and tool results, within a token budget. Prompt engineering is the
+      wording of that request.
+  - term: Fine-tuning
+    say: The fix when the prompt isn't working.
+    means: Further training that changes the model's weights on your examples. It shifts
+      behaviour and style; it is slower to change than a prompt and a poor way to add facts.

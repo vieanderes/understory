@@ -1,0 +1,334 @@
+summary: >-
+  Caching is keeping a result you've already worked out, so the next person gets it without
+  the work. With `cacheComponents: true`, Next.js 16 caches nothing unless you say so. You
+  mark a function or component with `'use cache'`, give it a lifetime with `cacheLife`, and
+  label it with `cacheTag` so a write can throw it away. Everything else runs per request,
+  or streams in behind a `<Suspense>` fallback.
+
+
+  The hard part isn't the syntax. It's knowing which copy a visitor sees. There are several:
+  a per-request memo, the `'use cache'` entry in the server's memory, the prerendered HTML
+  of the page, and the copy in each browser tab. A change has to reach the right ones, and
+  some it can't reach at all.
+
+
+  Reach for caching when many people share the same slow read: a catalogue, a league table,
+  an article, a price list. Don't cache what is personal to one visitor in a shared entry,
+  and don't cache what must be exact on every view, such as a stock count at checkout. The
+  senior skill is choosing the invalidation: `updateTag` when the person who saved must see
+  their change, `revalidateTag` when a short delay is fine.
+remember:
+  - With Cache Components on, nothing is cached until you add `'use cache'`, and uncached or request data outside `<Suspense>` fails the build check.
+  - A cache entry's key is the build id, the function's id and its serialised arguments, including variables it captures, so different inputs get separate entries.
+  - '`cookies()`, `headers()` and `searchParams` can''t be read inside `''use cache''`; read them outside and pass the values in as arguments, which join the key.'
+  - '`cacheLife` sets three limits: `stale` for the browser''s copy, `revalidate` after which the old result is served while a new one is made, and `expire` after which the next request waits.'
+  - '`updateTag` expires a tag at once so the next read waits for fresh data; it only works in Server Actions and gives the saver read-your-own-writes.'
+  - '`revalidateTag(tag, ''max'')` marks a tag stale, so the next request gets the old result while it refreshes; it works in route handlers too, and `{ expire: 0 }` drops it at once.'
+  - Prefer tags to `revalidatePath`, because a tag reaches every page that uses the data and a path reaches only one route.
+  - The default cache lives in each server's memory, so several instances or serverless functions need a shared cache handler to agree.
+sections:
+  - title: The four copies, and what reaches each
+    body: |-
+      The lesson's lab shows four stores. Here's what each one is, from the server outwards.
+
+      - **The request memo.** `React.cache` wraps a function so two components asking for
+        the same thing in one render share one call. It lasts for one request and then
+        disappears. It avoids duplicate work, not repeat visits.
+      - **The `'use cache'` entry.** The serialised result, kept by a cache handler, in
+        memory by default. It's reused across requests until `revalidate`, `expire` or a tag
+        says otherwise. Revalidation functions act on this store.
+      - **The prerendered page.** At build time, Next.js renders each route to a **static
+        shell**: static parts, cached results and the fallbacks of any `<Suspense>`
+        boundaries. Uncached or personal parts stream into those holes per request. This is
+        Partial Prerendering, the default with Cache Components. `revalidate` and `expire`
+        also decide when this HTML is rebuilt.
+      - **The client router cache.** Each browser tab keeps the pages and data it has
+        received, so Back and repeat navigations are instant. It trusts them for the
+        `stale` time, never less than 30 seconds.
+
+      Now the rule the lab teaches. When a Server Action calls `updateTag`,
+      `revalidateTag`, `revalidatePath` or `refresh`, the **acting** browser's client cache is
+      cleared at once. Except after a stale-while-revalidate `revalidateTag`, the action's
+      response also carries the fresh page. Other visitors'
+      tabs are untouched. Their copies age out after `stale`, or refresh on a reload.
+      Nothing on the server can push into someone else's browser.
+
+      So when a tester says "I saved, and my colleague still sees the old price", the
+      question is which store answered. If a reload fixes it, it was the browser. If a
+      reload doesn't, it's the server: a missing tag, a stale-while-revalidate refresh
+      still running, or another instance with its own memory.
+  - title: What goes into a cache key, and what can't go inside
+    body: |-
+      A `'use cache'` function is like a pure function with a memory. Its key combines the
+      **build id** (or `deploymentId`), a hash of the **function's location and signature**,
+      and its **serialised arguments**. Variables it captures from outer scopes are bound as
+      extra arguments, so they join the key too.
+
+      Two consequences follow. A new deploy starts with an empty cache, because the build
+      id changed. And arguments must be serialisable: primitives, plain objects, arrays,
+      dates, maps and sets are fine; class instances, functions you call and `URL` objects
+      aren't. JSX and actions can pass through if the function doesn't read them, which is
+      how a cached layout can wrap uncached `children`.
+
+      Request data can't be read inside. It isn't part of the key, so one visitor's cookie
+      could shape a result served to everyone. The restriction follows the call stack: a
+      helper that reads `cookies()` fails the same way. Read it outside and pass it in.
+
+      ```tsx
+      async function getPrice(id: string, currency: string) {
+        'use cache';
+        cacheLife('hours');
+        cacheTag(`product-${id}`);
+        return db.products.prices(id, currency); // currency is an argument, so it's in the key
+      }
+
+      async function Price({ id }: { id: string }) {
+        const currency = (await cookies()).get('currency')?.value ?? 'GBP';
+        return <p>{await getPrice(id, currency)} {currency}</p>;
+      }
+
+      // In the page: <Suspense fallback={<p>Loading price</p>}><Price id={id} /></Suspense>
+      ```
+
+      Three currencies mean at most three entries per product, shared by everyone who
+      picked that currency. Passing a session id would work too, but then each visitor gets
+      their own entry, and the default in-memory store may not keep it on serverless. For
+      the rare case you can't restructure, `'use cache: private'` reads request data
+      directly and keeps the result only in that visitor's browser.
+
+      One more isolation rule: `React.cache` values set outside a `'use cache'` scope aren't
+      visible inside it. Pass data in as arguments.
+  - title: Choosing the invalidation
+    body: |-
+      Four functions from `next/cache` refresh data after a write. Picking the right one is
+      the most common caching question in reviews.
+
+      - **`updateTag(tag)`**: expires every entry with that tag. The next read, including the
+        re-render sent back with the action, waits for fresh data. Server Actions only. Use
+        it when the person who saved must see their change.
+      - **`revalidateTag(tag, 'max')`**: marks the entries stale. The next request is served
+        the old result while a fresh one is made in the background. Works in Server Actions
+        and route handlers, so webhooks use it. `{ expire: 0 }` makes the next request wait
+        instead. The one-argument form is deprecated.
+      - **`revalidatePath(path)`**: invalidates one route, or every route matching a pattern
+        such as `'/products/[id]'` with `'page'` or `'layout'`. Other pages using the same
+        data keep their cached copies.
+      - **`refresh()`**: re-renders the current page without touching cached data. Server
+        Actions only. Use it when what changed lives outside the cache.
+
+      Tag design matters more than the choice of function. Give each item its own tag, and
+      each list a shared one, then refresh exactly what a write touched.
+
+      ```ts
+      // app/products/data.ts
+      export async function getProducts() {
+        'use cache';
+        cacheLife('hours');
+        cacheTag('products');
+        return db.products.all();
+      }
+
+      export async function getProduct(id: string) {
+        'use cache';
+        cacheLife('days');
+        cacheTag(`product-${id}`);
+        return db.products.byId(id);
+      }
+
+      // app/products/actions.ts
+      'use server';
+      export async function changePrice(id: string, formData: FormData) {
+        const session = await getSession();
+        if (!session?.isStaff) throw new Error('Forbidden');
+        const price = Number(formData.get('price'));
+        if (!Number.isFinite(price) || price <= 0) throw new Error('Invalid price');
+        await savePrice(id, price);
+        updateTag(`product-${id}`); // this product's page and price
+        updateTag('products'); // every list that shows it
+      }
+      ```
+
+      A tag set by `cacheTag` is case-sensitive, and one call accepts several tags. Save
+      first and invalidate second. The other order lets a visitor in between cache the old
+      value again.
+  - title: Lifetimes, profiles and the prerender
+    body: |-
+      Each preset profile of `cacheLife` sets `stale`, `revalidate` and `expire`:
+
+      ```text
+      profile   stale   revalidate   expire
+      default   5m      15m          never
+      seconds   30s     1s           1m
+      minutes   5m      1m           1h
+      hours     5m      1h           1d
+      days      5m      1d           1w
+      weeks     5m      1w           30d
+      max       5m      30d          1y
+      ```
+
+      A `'use cache'` scope without `cacheLife` gets `default`. The docs recommend setting it
+      in every scope, so the behaviour is visible where it's defined. You can also pass an
+      object such as `{ revalidate: 900, expire: 86400 }`, or name custom profiles in
+      `next.config.ts`. `expire` must be longer than `revalidate`, and Next.js raises an
+      error otherwise.
+
+      Short lifetimes change where a result can live. A `revalidate` of 0, or an `expire`
+      under five minutes, is left out of the prerender and becomes a **dynamic hole** that
+      resolves at request time. A `stale` under 30 seconds is left out too, because a
+      prefetched copy would expire before the click. Of the presets, only `seconds` crosses
+      a line. So `cacheLife('seconds')` isn't a faster static page. It turns that part of
+      the page dynamic, and it wants a `<Suspense>` boundary around it.
+
+      One timing detail surprises people: revalidation is triggered by requests, not by the
+      clock or by `revalidateTag`. A page nobody visits is never refreshed. After `expire`
+      with no traffic, the next visitor waits for a fresh render.
+  - title: Stale-while-revalidate, outside Next.js
+    body: |-
+      The rule behind `revalidate` and `expire` fits any cache in front of something slow: a
+      database, a third-party API, or a language model call that costs money per request.
+      Here it is with the part that stops a stampede, a single in-flight refresh per key.
+
+      ```ts
+      type Entry<T> = { value: T; storedAt: number };
+
+      export function swrCache<T>(
+        load: (key: string) => Promise<T>,
+        life: { revalidate: number; expire: number },
+        now = () => Date.now(),
+      ) {
+        const entries = new Map<string, Entry<T>>();
+        const inFlight = new Map<string, Promise<T>>();
+
+        function refresh(key: string): Promise<T> {
+          let pending = inFlight.get(key);
+          if (!pending) {
+            pending = load(key)
+              .then((value) => {
+                entries.set(key, { value, storedAt: now() });
+                return value;
+              })
+              .finally(() => inFlight.delete(key));
+            inFlight.set(key, pending);
+          }
+          return pending;
+        }
+
+        return async function get(key: string): Promise<T> {
+          const entry = entries.get(key);
+          if (!entry) return refresh(key); // nothing kept: wait
+          const age = (now() - entry.storedAt) / 1000;
+          if (age >= life.expire) return refresh(key); // too old: wait
+          if (age >= life.revalidate) refresh(key).catch(() => {}); // serve old, refresh behind
+          return entry.value;
+        };
+      }
+      ```
+
+      We ran it with a fake clock. Three simultaneous first calls made one load. At 30
+      minutes it served the kept value. At 67 minutes it served the old value and started
+      one refresh, and the next call got the new one. Past a day it waited for a fresh load.
+
+      Without the in-flight map, a popular key that goes stale sends every concurrent
+      request to the slow service at once. That's the **thundering herd**, and it's why
+      a cache can make an outage worse.
+  - title: Caching on more than one server
+    body: |-
+      The default `'use cache'` store is an in-memory LRU inside each server process. On a
+      single self-hosted `next start`, entries persist across requests, and
+      `cacheMaxMemorySize` limits the size. On serverless platforms, each request may hit a
+      different instance, so runtime entries often aren't reused; build-time caching still
+      works.
+
+      With several instances, two problems appear. Each has its own entries, so they fill
+      separately. Worse, an `updateTag` or `revalidateTag` on one instance invalidates only
+      that instance, and the others keep serving the old result. The lesson's deep dive
+      showed it: 36 points on one copy, 33 on the other.
+
+      The fixes are configuration, not code in your pages:
+
+      - `'use cache: remote'` with a custom handler in `cacheHandlers`, stored somewhere every
+        instance reaches, such as Redis. It costs a network round trip per lookup, so it
+        pays off only when the hit rate is high.
+      - A handler's `refreshTags()` method, called before each request, syncs which tags were
+        invalidated, so every instance learns about a write.
+
+      Neither survives a deploy, because the key includes the build id. For data that must
+      outlive deploys, the docs point to `unstable_cache` or the `fetch` cache instead.
+pitfalls:
+  - >-
+    **A tag that doesn't match.** `cacheTag('table')` with `updateTag('standings')` refreshes
+    nothing, and a test that waits past the lifetime still passes. Keep tag names in one
+    module of constants or helper functions.
+  - >-
+    **Reading cookies inside `'use cache'`.** It fails with an error, sometimes only under
+    `next start` on a dynamic route. Read the cookie outside and pass the value as an
+    argument.
+  - >-
+    **Using `revalidateTag` where the saver must see the change.** Stale-while-revalidate
+    serves the old result once more, so the person who pressed Save sees their edit vanish.
+    Use `updateTag` in the Server Action.
+  - >-
+    **Invalidating before saving.** A visitor between the two steps caches the old value
+    again. Write first, then call `updateTag`.
+  - >-
+    **Expecting `updateTag` to reach other browsers.** It clears the server entry and the
+    acting tab's cache, not tabs elsewhere. They catch up after `stale` or on reload.
+  - >-
+    **Picking `cacheLife('seconds')` for speed.** Its one-minute `expire` takes it out of
+    the prerender, so that part renders per request. Use `minutes` or longer, or tags.
+  - >-
+    **One cache per server without knowing it.** An invalidation on one instance leaves the
+    others stale. Use a shared cache handler with `refreshTags`, or run one instance.
+  - >-
+    **Caching personal data under a shared key.** A cached function that returns the
+    current user's basket, with no user id among its arguments, would serve one person's
+    basket to everyone. Pass the id in, or leave it uncached behind `<Suspense>`.
+interview:
+  - question: What's the difference between `updateTag` and `revalidateTag`?
+    answer: >-
+      `updateTag` expires the data now; `revalidateTag` marks it stale and refreshes it in
+      the background. After `updateTag('cart')`, the next read waits for fresh data,
+      including the re-render the Server Action sends back, so the user sees their own write.
+      It's only allowed in Server Actions. After `revalidateTag('cart', 'max')`, the next
+      request gets the old value while a new one is made, which keeps pages fast. It also
+      works in route handlers, so a CMS webhook uses it. If a webhook needs the data gone at
+      once, I pass `{ expire: 0 }`. My rule: `updateTag` for user-initiated writes, and
+      `revalidateTag` for content changes where a few seconds of staleness is fine.
+  - question: A user saves a change and their colleague still sees old data. How do you debug it?
+    answer: >-
+      First I find which copy answered. If a hard reload shows the new data, it was the
+      colleague's client router cache, which trusts its copy for the `stale` time and which
+      the server can't push into. That's expected, and I'd shorten `stale` if it matters. If
+      a reload still shows old data, it's the server. I check that the action's `updateTag`
+      name matches the `cacheTag`, and that the write happens before the invalidation. I
+      check whether `revalidateTag` served one stale response. Then I check for several
+      instances without a shared cache handler, where the invalidation only reached one.
+  - question: How does a `'use cache'` key work, and why can't you read cookies inside?
+    answer: >-
+      The key is the build id, a hash of the function's location and signature, and its
+      serialised arguments, including any variables it captures. Same inputs, same entry,
+      shared across every request. A cookie isn't an argument, so if the function read it,
+      the first visitor's cookie would shape a result served to everyone, which leaks data.
+      Next.js therefore throws when request APIs are called inside a cached scope, even
+      through a helper. The fix is to read the cookie outside and pass the value in, so it
+      joins the key. The trade-off is cardinality: a currency makes three entries, a user id
+      makes one per user.
+  - question: How would you cache a slow product listing that changes a few times a day?
+    answer: >-
+      I'd put the query in a function with `'use cache'`, `cacheLife('hours')` and
+      `cacheTag('products')`, and each product read gets its own `product-${id}` tag. The
+      listing then lands in the static shell, served instantly and refreshed in the
+      background after an hour. The staff action that edits a product saves, then calls
+      `updateTag` for that product and for the list, so staff see the change at once. Stock
+      levels stay uncached behind `<Suspense>`, because they must be exact. On several
+      servers I'd add a shared cache handler, or a write on one instance won't reach the
+      others.
+  - question: What happens to your cache when you deploy, or run three instances?
+    answer: >-
+      A deploy empties it, and three instances each keep their own. The key includes the
+      build id or `deploymentId`, so a new deploy never reads old entries, even from a
+      remote store. With three instances on the default in-memory handler, each fills its own
+      cache, and an invalidation reaches only the instance that ran it. The fix is
+      `'use cache: remote'` with a handler in `cacheHandlers` backed by shared storage, plus
+      `refreshTags()` so each instance syncs invalidated tags before a request. The cost is
+      a network round trip per lookup, which is worth it only at a good hit rate.

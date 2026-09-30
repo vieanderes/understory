@@ -1,0 +1,212 @@
+summary: >-
+  A webhook is an HTTP request another service sends to your endpoint when something happens
+  on its side: a payment clears, a transcription finishes, a repository gets a push. It
+  replaces polling. Instead of asking "done yet?" every few seconds, you give the provider a
+  URL and it calls you once, when there's news.
+
+
+  The endpoint is public, so the hard part is trust and repetition, not parsing. You verify a
+  signature over the exact raw bytes, so a forged or altered request is refused. You expect
+  every event at least once and in any order, so the handler claims each event id before
+  doing work and reads current state instead of replaying history. And you answer `2xx`
+  within a few seconds, leaving slow work to a queue.
+
+
+  These notes cover what the provider's library does when it checks a signature, a durable
+  claim in PostgreSQL that holds across servers, a guard against out-of-order events, the
+  inbox pattern for slow work, and the other side of the fence: what to get right when your
+  own system sends webhooks.
+remember:
+  - Verify the signature over the raw request body before trusting anything in it, and parse the JSON only afterwards.
+  - Providers deliver at least once, so the same event can arrive twice and events can arrive out of order.
+  - Claim the event id before doing the work, with a unique constraint in a shared database, and release the claim if the work fails.
+  - Answer `2xx` within a few seconds; a timeout counts as a failure and the provider retries.
+  - Compare signatures with a constant-time function such as `timingSafeEqual`, never `===`.
+  - A signed timestamp with a tolerance of a few minutes stops an old captured request being replayed.
+  - For ordering, store the object's latest state guarded by its version or timestamp, rather than applying each event as a change.
+  - Answer `200` to event types you don't handle, or the provider keeps resending them.
+sections:
+  - title: What the signature check does
+    body: |-
+      A webhook signature is an **HMAC**: a hash of the message mixed with a secret only you
+      and the provider know. Nobody without the secret can make a valid one, and changing one
+      byte of the body changes the result completely.
+
+      Stripe's scheme is typical. The `Stripe-Signature` header carries `t`, a Unix
+      timestamp, and one or more `v1` values, each an HMAC-SHA256 in hex of the string
+      `t.body`. More than one `v1` can appear, for example while a secret is being rolled, so
+      a match against any of them passes. Here is the check written out, which is what the
+      library does for you:
+
+      ```ts
+      import { createHmac, timingSafeEqual } from 'node:crypto';
+
+      const TOLERANCE_SECONDS = 300;
+
+      export function verifySignature(
+        rawBody: string,
+        header: string | null,
+        secret: string,
+        nowSeconds = Math.floor(Date.now() / 1000),
+      ): boolean {
+        if (!header) return false;
+        const parts = header.split(',').map((part) => part.split('='));
+        const timestamp = Number(parts.find(([k]) => k === 't')?.[1]);
+        const signatures = parts.filter(([k]) => k === 'v1').map(([, v]) => v ?? '');
+        if (!Number.isInteger(timestamp) || signatures.length === 0) return false;
+        if (Math.abs(nowSeconds - timestamp) > TOLERANCE_SECONDS) return false;
+
+        const expected = createHmac('sha256', secret).update(`${timestamp}.${rawBody}`).digest();
+        return signatures.some((hex) => {
+          const given = Buffer.from(hex, 'hex');
+          // timingSafeEqual throws on different lengths, so check first.
+          return given.length === expected.length && timingSafeEqual(given, expected);
+        });
+      }
+      ```
+
+      Run against a real HMAC, it accepts the right body, refuses a body with one character
+      changed, refuses the same request 301 seconds later, and accepts a header whose second
+      `v1` matches.
+
+      Three details carry the security. The timestamp is inside the signed string, so an
+      attacker can't refresh it. The comparison is constant-time, so response timings leak
+      nothing about how many leading bytes matched. And the input is the raw body, because
+      `JSON.stringify(JSON.parse(raw))` can reorder keys or change whitespace. In production
+      use the provider's library rather than your own copy: it tracks their scheme as it
+      changes.
+  - title: A claim that works across servers
+    body: |-
+      The lesson's `Set` lives in one process. Run two servers, or restart one, and the claim
+      is gone. The durable version is a table with a primary key on the event id, and an
+      insert that tells you whether you were first.
+
+      ```sql
+      create table processed_events (
+        event_id    text primary key,
+        received_at timestamptz not null default now()
+      );
+
+      insert into processed_events (event_id) values ($1)
+      on conflict (event_id) do nothing
+      returning event_id;
+      ```
+
+      One row back means you claimed it; zero rows means another delivery already did. The
+      unique index decides, so two deliveries arriving on two servers in the same millisecond
+      still produce exactly one winner.
+
+      Better still, put the claim and the work in **one transaction**. If the work fails, the
+      transaction rolls back and the claim disappears with it, so the retry can try again
+      without any explicit release.
+
+      ```sql
+      begin;
+      insert into processed_events (event_id) values ('evt_2') on conflict do nothing;
+      update orders set status = 'paid', updated_at = now()
+      where id = 'ord_1' and status = 'pending';
+      commit;
+      ```
+
+      In code, check the insert's row count before the update and stop if it's zero. Work
+      that leaves the database, such as sending an email, can't join the transaction. That's
+      what the inbox pattern in the next section is for. Old rows can be deleted after the
+      provider's retry period, days rather than hours.
+  - title: The inbox pattern, and events out of order
+    body: |-
+      The fastest handler does almost nothing. It verifies the signature, inserts the raw
+      event into an `inbox` table with the event id as primary key, and answers `200`. A
+      worker reads the inbox and does the real work, retrying on its own schedule. The
+      provider sees fast `2xx` answers, and a slow email server or a model call can't cause
+      redeliveries.
+
+      Order is the other trap. A subscription can be updated at 11:00 and cancelled at 12:00,
+      and the cancellation can reach you first. If the handler applies whatever each event
+      says, the late "active" event revives a cancelled subscription. Two fixes work.
+
+      - **Re-fetch.** Treat the event as a hint that something changed, and read the object's
+        current state from the provider's API before storing it.
+      - **Guard by version.** Store the provider's own timestamp or version beside the state,
+        and only write when the incoming one is newer.
+
+      ```sql
+      update subscriptions
+      set status = $2, source_updated_at = $3
+      where id = $1 and source_updated_at < $3;
+      ```
+
+      Applying "cancelled at 12:00" updates one row. The late "active at 11:00" then updates
+      zero rows, and the subscription stays cancelled. Use the time the provider recorded,
+      never the time your server received the request.
+  - title: When you are the one sending webhooks
+    body: |-
+      Senior interviews often flip the question: design webhooks for your own API. The
+      receiver's rules become your promises.
+
+      - **Sign every delivery** with a per-endpoint secret, over a timestamp and the body, and
+        document the scheme. Let customers hold two secrets during rotation.
+      - **Give every event a stable id** and resend the same id on retries, so receivers can
+        deduplicate.
+      - **Retry with exponential backoff** for a day or more, then mark the endpoint failing
+        and tell its owner. Disable endpoints that fail for days.
+      - **Use short timeouts**, a few seconds per attempt, and deliver from a queue with
+        per-endpoint concurrency limits, so one slow customer can't stall everyone else.
+      - **Guard against SSRF.** A customer-supplied URL can point at `localhost` or your cloud
+        metadata address. Resolve the host and refuse private and link-local ranges, and
+        send from an isolated network.
+      - **Offer replays**: a way to resend past events, and an API to list them, so a customer
+        who was down can catch up.
+
+      Keep payloads small, or send only the id and type and let receivers fetch the object.
+      That also removes the ordering problem, because a fetch always returns current state.
+pitfalls:
+  - '**Parsing before verifying.** Frameworks that parse JSON automatically hand you an object, and re-encoding it doesn''t reproduce the signed bytes. Read the raw text, verify, then parse.'
+  - '**Comparing signatures with `===`.** It stops at the first difference, which leaks timing. Use `timingSafeEqual` on equal-length buffers.'
+  - '**Recording the event id after the work.** A redelivery that arrives mid-work slips past the check. Claim first, and release on failure, or put claim and work in one transaction.'
+  - '**Keeping claims in memory.** A `Set` forgets on restart and isn''t shared between servers. Use a unique key in the database.'
+  - '**Doing slow work before answering.** The provider times out, counts it as a failure and resends, which multiplies the load. Store the event and answer `2xx`; let a worker do the rest.'
+  - '**Applying events in arrival order.** A late, older event overwrites newer state. Guard writes by the provider''s timestamp or version, or re-fetch the object.'
+  - '**Answering `400` for unknown event types.** The provider treats it as a failure and retries for days. Answer `200` and ignore it.'
+interview:
+  - question: How do you make a webhook handler safe and reliable?
+    answer: >-
+      Verify, claim, acknowledge, then work. I verify the HMAC signature over the raw body
+      with the provider's library, including its timestamp tolerance against replays. I
+      claim the event id with an insert into a table whose primary key is the event id, so
+      duplicates across servers lose. I answer `2xx` fast, and slow work such as emails goes
+      to a queue or an inbox table processed by a worker. Handlers are idempotent because
+      delivery is at least once, and they guard against ordering by comparing the provider's
+      timestamp or re-fetching the object. The trade-off of the inbox pattern is an extra
+      table and a worker to run, in exchange for handlers that never time out.
+  - question: Why must the signature be checked on the raw body?
+    answer: >-
+      Because the provider signed those exact bytes, and parsing then re-encoding doesn't
+      reproduce them. `JSON.stringify` of a parsed object can change key order, whitespace
+      and number formatting, and a single different byte gives a different HMAC, so valid
+      events fail. The practical consequence is framework configuration: many frameworks
+      parse the body automatically, so the webhook route needs raw-body access, such as
+      `await request.text()` in a fetch-style handler. There's also a security angle: if you
+      verify one representation and act on another, an attacker may find a gap between the
+      two. Verify the bytes, then parse those same bytes.
+  - question: A provider sends the same event three times. How does your system act on it exactly once?
+    answer: >-
+      It can't prevent delivery three times, so it makes the effect happen once. Each event
+      has a unique id. Before doing the work, the handler inserts that id into a table with a
+      unique constraint, `on conflict do nothing returning event_id`. The first insert
+      returns a row and proceeds; the others get nothing back and answer `200` without
+      working. Where the work is a database change, claim and change go in one transaction,
+      so a failure rolls back the claim and the retry can succeed. Side effects outside the
+      database, like emails, still need their own idempotency, such as a key passed to the
+      email provider. Exactly-once delivery doesn't exist; exactly-once effect is what you
+      build.
+  - question: You're designing outbound webhooks for your own API. What goes into the design?
+    answer: >-
+      A durable queue of deliveries, signed payloads, retries with backoff, and protection
+      for my own network. Each event gets a stable id and is signed with a per-endpoint
+      secret over a timestamp and the body. Delivery workers use short timeouts and
+      exponential backoff over a day or more, with per-endpoint concurrency so one slow
+      customer can't block the rest. After repeated failure the endpoint is disabled and the
+      owner notified, and a replay API lets them catch up. Customer URLs are an SSRF risk, so
+      I resolve hosts and refuse private ranges. The trade-off is payload size: thin events
+      with only an id force receivers to call back, but remove ordering problems and stale
+      data.

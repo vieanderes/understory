@@ -1,0 +1,253 @@
+summary: >-
+  The same-origin policy is the browser rule that keeps one site's script from reading
+  another origin's data. It exists because every page runs with the visitor's cookies and
+  network position: without it, any page you opened could read your email, your bank
+  balance or a router on your home network. The policy lets pages send requests and embed
+  resources across origins, and forbids reading what comes back.
+
+
+  CORS is the opt-in that relaxes the read rule. The server names, per response, which
+  origins may read it, whether cookies may be involved, and which methods and headers it
+  accepts. For anything beyond a simple request, the browser asks first with a preflight.
+  The browser enforces the answer; the server only states it.
+
+
+  Reach for CORS when a browser front end on one origin must read an API on another. Keep
+  it as narrow as the product allows: exact origins, credentials only where cookies are
+  needed. Don't treat it as access control. It protects users' data from other sites'
+  scripts inside a browser, and it does nothing about requests from servers, scripts or
+  `curl`. These notes add what the policy covers beyond `fetch`, how the preflight works,
+  the full credentials rules and the misconfigurations that turn CORS into a data leak.
+remember:
+  - The same-origin policy lets a page send requests and embed resources across origins, but not read the responses, the DOM of another origin's frame, or pixels from its images.
+  - CORS headers are instructions to the browser, so they protect users from other sites' scripts and never replace authentication on the server.
+  - A request needs a preflight unless it uses GET, HEAD or POST with only safelisted headers and a form or text content type.
+  - The preflight is an `OPTIONS` request without cookies, answered with the allowed origin, methods, headers and an optional `Access-Control-Max-Age`.
+  - With credentials, the browser rejects `*` in `Access-Control-Allow-Origin` and treats `*` in the allowed methods, headers and exposed headers as a literal name.
+  - "Send `Vary: Origin` on every response whose CORS headers depend on the request's origin, including refusals, so caches never mix them up."
+  - Never trust the `null` origin, suffix or unanchored pattern matches, or every subdomain by default, because attackers can produce each of them.
+  - Scripts can read only a few safelisted response headers unless the server lists more in `Access-Control-Expose-Headers`.
+sections:
+  - title: What the same-origin policy actually allows
+    body: |-
+      A useful summary: across origins, **writes and embeds are allowed, reads are
+      blocked**. The web was built on cross-origin links, forms and images long before the
+      policy, so it couldn't forbid them.
+
+      ```text
+      allowed across origins                     blocked without CORS or opt-in
+      ─────────────────────────                  ──────────────────────────────
+      follow a link, submit a form               read a fetch or XHR response
+      load <img>, <script>, <link>, <video>      read the DOM of a cross-origin iframe
+      show a page in an <iframe>                 read pixels of a cross-origin image drawn on a canvas
+      postMessage to another window              read another origin's cookies or storage
+      ```
+
+      Two consequences follow. First, a `script` tag can run another origin's JavaScript,
+      but the page never sees its source text; that's why including a third-party script is
+      a trust decision, not a read. Second, a `fetch` with `mode: 'no-cors'` is allowed to
+      send, and gives back an **opaque response**: status `0`, no headers, no body. It can be
+      cached or shown, never read.
+
+      `postMessage` is the sanctioned channel between windows of different origins, such as
+      a payment frame talking to your checkout. It moves the check into your code. The
+      receiver must check `event.origin` against an exact expected value before acting, and
+      the sender should name the target origin instead of `'*'`, or it may hand data to
+      whatever page now sits in that window.
+
+      Some cross-origin reads were never fully blocked, because the resource still loads into
+      your process. Side-channel attacks in the Spectre family can read memory from such a
+      process. A server can add `Cross-Origin-Resource-Policy: same-origin` or `same-site` to
+      a response, and the browser then refuses to load it into a page from another origin at
+      all, even as an image or script.
+  - title: The preflight, step by step
+    body: |-
+      A request is **simple**, and goes straight out, only if all of this holds: the method
+      is `GET`, `HEAD` or `POST`; every header you set is on the safelist (`Accept`,
+      `Accept-Language`, `Content-Language`, `Content-Type`, and simple `Range`); and
+      `Content-Type`, if set, is `application/x-www-form-urlencoded`, `multipart/form-data` or
+      `text/plain`. Those are the requests an HTML form could always send, so servers already
+      had to cope with them.
+
+      Anything else gets a **preflight**: a `PUT`, a `DELETE`, a JSON body, an
+      `Authorization` header, a custom `X-CSRF-Token`. The browser first asks:
+
+      ```http
+      OPTIONS /bookings/42 HTTP/1.1
+      Host: api.shop.example
+      Origin: https://app.shop.example
+      Access-Control-Request-Method: PUT
+      Access-Control-Request-Headers: content-type, x-csrf-token
+      ```
+
+      And the server answers with a 2xx status and its permissions:
+
+      ```http
+      HTTP/1.1 204 No Content
+      Access-Control-Allow-Origin: https://app.shop.example
+      Access-Control-Allow-Credentials: true
+      Access-Control-Allow-Methods: GET, POST, PUT, DELETE
+      Access-Control-Allow-Headers: Content-Type, X-CSRF-Token
+      Access-Control-Max-Age: 600
+      Vary: Origin
+      ```
+
+      Only if every requested method and header is allowed does the real `PUT` go out, and
+      its response must carry `Access-Control-Allow-Origin` again. A refused preflight means
+      the real request is **never sent**, which is the one case where CORS stops a request.
+
+      The preflight never carries cookies, so it can't be authenticated. Answer it before
+      your auth middleware, or every preflight fails with `401` and the real request never
+      happens. `Access-Control-Max-Age` lets the browser cache the answer, which saves a
+      round trip per request; browsers cap it, at two hours in Chromium and a day in
+      Firefox. Adding `Authorization` to a request always forces a preflight, and a
+      wildcard in `Access-Control-Allow-Headers` never covers it: it must be listed by name.
+  - title: A CORS handler that gets the details right
+    body: |-
+      Most teams use a library or gateway setting. Knowing what it must do lets you review
+      one. This handler serves a front end on two exact origins, with cookies.
+
+      ```js
+      import { createServer } from 'node:http';
+
+      const ALLOWED = new Set(['https://app.example.com', 'https://admin.example.com']);
+
+      function applyCors(req, res) {
+        const origin = req.headers.origin;
+        // Every response varies by Origin, allowed or not, so caches keep them apart.
+        res.setHeader('Vary', 'Origin');
+        if (!origin || !ALLOWED.has(origin)) return false;
+        res.setHeader('Access-Control-Allow-Origin', origin);
+        res.setHeader('Access-Control-Allow-Credentials', 'true');
+        return true;
+      }
+
+      const server = createServer((req, res) => {
+        const allowed = applyCors(req, res);
+        if (req.method === 'OPTIONS' && req.headers['access-control-request-method']) {
+          // Preflight: answer and stop. It carries no cookies, so no auth here.
+          if (allowed) {
+            res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE');
+            res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-CSRF-Token');
+            res.setHeader('Access-Control-Max-Age', '600');
+          }
+          res.writeHead(204).end();
+          return;
+        }
+        // Real request: the route still authenticates and authorises as usual.
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ bookings: [] }));
+      });
+
+      server.listen(3000);
+      ```
+
+      Sent a preflight from `https://app.example.com` asking for `PUT`, it answers `204`
+      with all five CORS headers. The same preflight from `https://evil.example` gets `204`
+      with only `Vary: Origin`, and the browser refuses to send the `PUT`. A refusal needs
+      no error status: the missing headers are the refusal.
+
+      `Vary: Origin` goes on refusals too. Otherwise a cache could store the refused
+      response and serve it to your real front end, breaking it, or store an allowed one and
+      serve its `Access-Control-Allow-Origin` to a request it shouldn't match.
+
+      A public API that uses no cookies is simpler and safer: send
+      `Access-Control-Allow-Origin: *`, no credentials header, and authenticate with an API
+      key or token in a header. A wildcard without credentials can't leak a user's
+      cookie-authenticated data, because the browser sends no cookies with such requests.
+  - title: The misconfigurations that leak data
+    body: |-
+      A CORS bug matters when it's combined with credentials: the attacker's page makes the
+      victim's browser call your API with their cookies and reads the answer. The lesson
+      covered reflecting any origin and prefix matching. These are the others.
+
+      ```ts
+      const endsWithCheck = (o: string) => o.endsWith('example.com');
+      const looseRegex = (o: string) => /^https:\/\/.*example.com$/.test(o);
+      const nullAllowed = (o: string) => o === 'null' || o === 'https://app.example.com';
+
+      // Parse, then compare parts. Allows https subdomains of example.com, default port only.
+      function trustedOrigin(origin: string): boolean {
+        let url: URL;
+        try {
+          url = new URL(origin);
+        } catch {
+          return false; // includes the literal "null"
+        }
+        if (url.origin !== origin) return false; // no paths, no userinfo, canonical form only
+        return url.protocol === 'https:' && url.port === '' && url.hostname.endsWith('.example.com');
+      }
+
+      for (const o of ['https://app.example.com', 'https://evilexample.com', 'http://app.example.com', 'null']) {
+        console.log(o.padEnd(26), endsWithCheck(o), looseRegex(o), nullAllowed(o), trustedOrigin(o));
+      }
+      // https://app.example.com    true true true true
+      // https://evilexample.com    true true false false
+      // http://app.example.com     true false false false
+      // null                       false false true false
+      ```
+
+      **Suffix matches** accept `evilexample.com`, which anyone can register. **Unanchored or
+      unescaped patterns** do the same: `.` matches any character and `.*` matches
+      everything. **Trusting `null`** is tempting because local files and sandboxed iframes
+      send it during development, but an attacker can send it on purpose from a sandboxed
+      iframe. **Allowing `http:` origins** on an HTTPS API lets anyone on the same café
+      network inject script into the plain HTTP page and read through it.
+
+      Even the correct matcher above trusts **every subdomain**. That's a real decision: XSS
+      on any subdomain, or one taken over through a dangling DNS record, then reads your API
+      with users' cookies. Prefer an explicit list of origins, and test the refusals, not
+      only the happy path.
+pitfalls:
+  - '**Authenticating the preflight.** Preflights carry no cookies, so auth middleware answers `401` and the real request is never sent. Handle `OPTIONS` with CORS headers before authentication runs.'
+  - '**Forgetting `Vary: Origin` on refusals.** A cache that stores a response without it can serve one origin''s CORS answer to another. Send it on every response whose headers depend on the origin.'
+  - '**Allowing the `null` origin to fix local development.** Sandboxed iframes send `Origin: null`, so attackers can too. Use a real local origin such as `http://localhost:5173` in a development-only list.'
+  - '**Listing `*` in Allow-Headers and expecting `Authorization` to pass.** The wildcard never covers `Authorization`, and with credentials it means a header literally named `*`. List the headers you accept by name.'
+  - '**Expecting to read a custom response header.** Scripts see only safelisted headers such as `Content-Type` and `Cache-Control`. Name the others, such as a pagination header, in `Access-Control-Expose-Headers`.'
+  - '**Debugging CORS by widening the policy.** Setting `*` or echoing the origin makes the console error go away and the leak appear. Read the exact error, check the preflight in the network panel, and add only the origin, method or header it names.'
+interview:
+  - question: What does the same-origin policy protect, and what doesn't it?
+    answer: >-
+      It protects data from being read across origins in a browser, not servers from
+      receiving requests. A script on one origin can't read another origin's responses, its
+      frames' DOM or its canvas pixels, so a page you visit can't read your bank balance even
+      though your browser holds the bank's cookie. It deliberately allows sending: links,
+      form posts, image loads and simple `fetch` calls all go out, which is why CSRF exists
+      and needs its own defence. It also means nothing outside a browser: `curl` or a server
+      script can call any API. So the server still authenticates and authorises every
+      request, and the same-origin policy is a guarantee for users, not an access-control
+      layer for APIs.
+  - question: Walk me through what happens when a front end makes a cross-origin PUT with a JSON body.
+    answer: >-
+      The browser sends a preflight first, because both `PUT` and `application/json` are
+      outside the simple-request safelist. It's an `OPTIONS` request with `Origin`,
+      `Access-Control-Request-Method: PUT` and `Access-Control-Request-Headers:
+      content-type`, and no cookies. The server replies with a 2xx carrying
+      `Access-Control-Allow-Origin` for that exact origin, `Allow-Methods` including `PUT`,
+      `Allow-Headers` including `Content-Type`, credentials if cookies are involved, and
+      optionally `Max-Age` to cache the answer. If everything matches, the real `PUT` goes
+      out with cookies, and its response must again carry the allow-origin header for the
+      script to read it. If the preflight fails, the `PUT` is never sent. The cost is an
+      extra round trip, which `Max-Age` amortises.
+  - question: How would you configure CORS for an app on app.example.com calling api.example.com with cookies?
+    answer: >-
+      An exact allow-list with credentials, and nothing broader. The API returns
+      `Access-Control-Allow-Origin: https://app.example.com` only when the request's origin
+      matches exactly, plus `Access-Control-Allow-Credentials: true` and `Vary: Origin` on
+      every response. Preflights are answered before auth, listing the methods and headers
+      the front end uses. The front end calls `fetch` with `credentials: 'include'`. Because
+      the two hosts share a site, `SameSite=Lax` cookies are still sent on these requests, so
+      CSRF defences stay on for writes. An often better alternative is serving the API under
+      the app's own origin, such as `app.example.com/api` through a reverse proxy, which
+      removes CORS and preflights entirely.
+  - question: What are the most common CORS misconfigurations you'd look for in a review?
+    answer: >-
+      Anything that lets an attacker-controlled origin read credentialed responses. First,
+      reflecting the request's `Origin` into `Access-Control-Allow-Origin` with credentials,
+      which is a wildcard in disguise. Second, weak matching: prefix or suffix checks, and
+      regular expressions with unescaped dots or no anchors, which accept look-alike domains
+      anyone can register. Third, allowing `null`, which sandboxed iframes produce on demand.
+      Fourth, trusting every subdomain or `http:` origins, which turns any subdomain XSS or a
+      network attacker into a reader of the API. Fifth, missing `Vary: Origin`, which lets
+      caches serve the wrong answer. I'd test each by sending crafted `Origin` headers with
+      `curl` and checking which come back allowed.

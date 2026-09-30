@@ -1,0 +1,153 @@
+summary: |-
+  Native apps today are written the way React taught you to think. SwiftUI on Apple platforms and Jetpack Compose on Android both describe the screen as a function of state: change a value, and the framework redraws whatever reads it. A React developer can read a native screen on day one, even before learning Swift or Kotlin properly.
+
+  What's genuinely different is getting code onto phones and keeping it working there. Every build is signed with a key tied to the developer account, phones install only builds that verify, and every update must carry the same signature, so the signing key is one of the most valuable secrets a company holds. Every release passes store review, then reaches users only as fast as they choose to update.
+
+  That slow, uneven roll-out shapes everything else. Teams ship on release trains with phased roll-outs, keep the server working for versions that are months old, and build a minimum-version check from the first release. These notes map SwiftUI and Compose onto React, explain signing on both platforms, and give the patterns that keep old app versions working, with model answers for the interview questions on mobile release engineering.
+remember:
+  - SwiftUI and Jetpack Compose build the screen from state, as React does, so `@State` and `remember { mutableStateOf() }` play the role of `useState`.
+  - Phones install only builds whose signature verifies, and every update must be signed with the same key, so whoever holds the key can ship updates as you.
+  - Keep signing keys and their passwords out of the repository, in a CI secret store or the platform's key management, such as Play App Signing.
+  - A store release waits for review and then reaches users only as they update, so fixes take days to reach most people and old versions linger for months.
+  - The server must keep every API that versions still in use call working, which means additive changes, optional new fields and tolerant clients.
+  - Compare versions as numbers, part by part, because as strings "2.10.0" sorts before "2.9.0".
+  - Build a minimum-version check into the first release, since no store lets you pull a build back from a phone that has it.
+sections:
+  - title: Reading SwiftUI and Compose with React in mind
+    body: |-
+      The three frameworks share one model: UI is a function of state, and the framework works out what to redraw. The vocabulary differs.
+
+      ```text
+      Idea                   React                 SwiftUI                   Jetpack Compose
+      A component            function component    struct conforming to View @Composable function
+      Local state            useState              @State                    remember { mutableStateOf() }
+      Inputs                 props                 init parameters           function parameters
+      Child edits parent     callback prop         @Binding                  state hoisting + lambda
+      Shared data            context               @Environment              CompositionLocal
+      Work when shown        useEffect             .task / .onAppear         LaunchedEffect
+      Lists                  map with key          List / ForEach with id    LazyColumn with key
+      ```
+
+      A few behaviours are worth knowing before you read real code.
+
+      SwiftUI views are value types, cheap structs recreated often; the framework keeps `@State` storage alive separately, which is why the struct can be thrown away without losing the count. Compose functions re-run (recompose) when state they read changes; `remember` keeps a value across those re-runs, and without it the value would reset every time.
+
+      Both frameworks favour one-way data flow, as React does: state lives as high as it needs to, flows down as inputs, and changes flow up as events. Compose calls moving state up "state hoisting", the same idea as lifting state up in React. For larger screens, both ecosystems use a view model holding state outside the view, similar to a custom hook or a store.
+
+      The practical upshot in a cross-functional team: you can review a native pull request for logic and state handling without being a Swift or Kotlin expert, and you'll recognise the same bugs, such as state kept in the wrong place or recomputation on every render.
+  - title: Signing on both platforms
+    body: |-
+      **Android.** You sign with a key stored in a keystore file. With Play App Signing, Google holds the app signing key that users' devices verify, and you sign uploads with a separate upload key. If the upload key is lost or leaked, Google can reset it after you prove ownership. Without Play App Signing, the key you sign with is the key devices trust, and losing it means you can't publish updates to that app listing. That's why new apps on Google Play use Play App Signing.
+
+      **Apple.** Builds are signed with certificates issued to your developer account, and a provisioning profile ties the app's identifier, the certificate and, for development builds, specific devices together. Xcode can manage this automatically for one developer. Teams and CI usually centralise certificates and profiles, for example with fastlane's match, which stores them encrypted and gives CI read access.
+
+      For CI on either platform, the pattern is the same:
+
+      - The key or certificate lives in the CI provider's secret store, never in the repository.
+      - The build job decodes it into a temporary file, signs, and deletes it.
+      - Only the release pipeline can read the secret, not every branch build.
+      - Access is audited, and more than one person knows how to recover it.
+
+      If a signing secret does land in the repository, treat it as compromised even after deleting it, because it remains in history and in every clone. For an upload key, ask the store to reset it. Then rewrite the history and rotate every password stored alongside it.
+  - title: Keeping old app versions working
+    body: |-
+      Web clients update on the next page load. App clients update when users choose to, so the server faces many versions at once, some months old. Four patterns keep them working.
+
+      **Additive changes only.** Add new fields and endpoints; don't rename or remove ones that old versions read. When something must go, deprecate it, watch its traffic by app version, and remove it once usage is negligible or those versions are blocked.
+
+      **Tolerant clients.** Build the app to ignore fields it doesn't know and to cope with enum values invented after it shipped:
+
+      ```js
+      // Version 3.2 of the app knows three order states. The server later adds "refunded".
+      const KNOWN = new Set(['placed', 'shipped', 'delivered']);
+
+      function statusLabel(order) {
+        // An old app must not crash on a value invented after it shipped.
+        return KNOWN.has(order.status) ? order.status : 'unknown';
+      }
+
+      const fromServer = JSON.parse('{"id": 9, "status": "refunded", "giftNote": "Enjoy"}');
+      console.log(statusLabel(fromServer)); // unknown, and the extra field is ignored
+      ```
+
+      It prints `unknown`. A strict decoder that throws on an unknown value would crash every old copy the day the server adds a state.
+
+      **Send the version.** Every request carries the app version in a header. The server can then log version distribution, keep compatibility code for specific versions, and gate new behaviour.
+
+      **A minimum-version check.** On start-up the app asks the server for the minimum supported version and a recommended one. Below the recommended, show a gentle prompt; below the minimum, block with a link to the store. It's the only lever you have over builds already on phones, and it must exist before you need it.
+  - title: Release trains and phased roll-outs
+    body: |-
+      Because each release is expensive, mobile teams make releases routine.
+
+      A typical **release train**: on a fixed day each week or fortnight, the release branch is cut from main. Whatever is merged and behind a finished feature flag goes; unfinished work waits for the next train, hidden behind a flag. The branch gets a regression pass, then is submitted to both stores. Nobody lobbies to hold the train for their feature, because the next one is days away.
+
+      A **phased roll-out** limits the damage of a bad build. Apple's phased release spreads the automatic update over seven days and can be paused. Google Play's staged roll-out goes to a percentage you choose and raise, and can be halted. While it runs, watch crash-free sessions, error rates and key product metrics by version. If they drop, pause the roll-out and fix forward.
+
+      Neither store removes a build from phones that already installed it. That's why the plan for a serious bug has several layers:
+
+      - A server-side fix or feature flag, which reaches every version instantly.
+      - An over-the-air update, where the framework supports it and the bug is in JavaScript.
+      - A hotfix build through the stores; Apple accepts requests for expedited review for critical fixes.
+      - The minimum-version check, as the last resort for builds that must stop running.
+
+      Most teams find that designing features so the server can switch them off saves more incidents than any of the other layers.
+pitfalls:
+  - >-
+    **Committing the keystore or its password.** Anyone with repository access can then sign
+    updates as you. Keep both in CI secrets or Play App Signing.
+  - >-
+    **Comparing versions as strings.** "2.10.0" sorts before "2.9.0", so new users get told
+    to update. Split on dots and compare the parts as numbers.
+  - >-
+    **Removing an API field old versions read.** Every copy of those versions breaks at once.
+    Add fields, deprecate, measure traffic by version, then remove.
+  - >-
+    **Strict decoding of enums.** A new server value crashes old clients. Map unknown values
+    to a safe default.
+  - >-
+    **No minimum-version check in the first release.** Builds already on phones can't be
+    recalled. Ship the check from day one.
+  - >-
+    **Releasing to everyone at once.** A bad build then reaches every updating user. Use a
+    phased roll-out and watch crash rates by version.
+interview:
+  - question: How do you evolve an API that mobile apps depend on?
+    answer: >-
+      "Assume every version ever shipped is still calling it, and change it additively."
+      New fields are optional, new behaviour is opt-in, and nothing an old version reads is
+      renamed or removed. Clients are built to be tolerant, ignoring unknown fields and
+      mapping unknown enum values to a safe default. Every request sends the app version, so
+      I can see which versions still call an endpoint. When something must go, I deprecate it,
+      watch its traffic by version, and remove it once usage is negligible, using the
+      minimum-version check to block versions that are too old to support. The trade-off is
+      carrying compatibility code for months, which is the price of clients you can't update.
+  - question: What happens if a company loses its Android app signing key?
+    answer: >-
+      It depends on whether it uses Play App Signing. With it, Google holds the app signing
+      key that devices verify, and the company signs uploads with a separate upload key; a
+      lost or leaked upload key can be reset by Google after the owner proves who they are,
+      and users notice nothing. Without Play App Signing, the lost key is the one devices
+      trust, and updates must be signed with the same key, so the company can't publish
+      updates to that listing. A leaked key is arguably worse, since someone else could sign
+      builds as the company. So keys live in a secret store, with restricted, audited access
+      and a documented recovery plan.
+  - question: Why do mobile fixes take so much longer to reach users than web fixes, and how do you design for it?
+    answer: >-
+      A web fix is one deploy, and everyone has it on their next page load. A mobile fix is a
+      build, a store review, then a slow wave of installs as users update, and some never do.
+      So I design for it in layers. Server-side feature flags and configuration, which reach
+      every version instantly, handle most incidents. Over-the-air updates cover JavaScript
+      bugs where the framework supports them. Release trains and phased roll-outs make store
+      releases routine and limit a bad build's reach. And a minimum-version check lets me
+      block versions that must stop running. The server stays compatible with every version
+      in use.
+  - question: If you know React, how would you approach a SwiftUI or Compose codebase?
+    answer: >-
+      With the same mental model: the UI is a function of state, and the framework redraws
+      what reads changed state. `@State` in SwiftUI and `remember { mutableStateOf() }` in
+      Compose are local state like `useState`; `@Binding` and state hoisting are how a child
+      changes a parent's state, like a callback prop; `@Environment` and `CompositionLocal`
+      resemble context. I'd start by tracing one screen's state from where it's owned to
+      where it's shown and changed. The differences to learn are the languages, the platform's
+      navigation and lifecycle, and details like SwiftUI views being short-lived structs,
+      with the framework keeping their state elsewhere.

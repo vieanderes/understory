@@ -1,0 +1,309 @@
+summary: >-
+  A build turns the files you write into the files you ship. You write many small modules,
+  in TypeScript or modern JavaScript, with long names and comments. A visitor's browser
+  wants a few small files it can run straight away. The build bridges the two, in a fixed
+  order: transpile, bundle, drop unused code, minify, and write the output with a source map
+  beside it.
+
+
+  Each step has one job, and knowing which step does what tells you where to look when
+  something breaks. A type error that reaches production means nobody ran the type checker,
+  because transpilers don't check types. A helper that should have vanished from the bundle
+  points at tree-shaking and side effects. A stack trace full of one-letter names needs a
+  source map.
+
+
+  During development you rarely run a full build. A dev server transpiles each file when
+  the browser asks for it, and reloads on save. That's why a bug can appear only in
+  production: the build did something the dev server skipped, such as tree-shaking a module
+  with a side effect or replacing an environment variable with a fixed value. When that
+  happens, build locally and run the output.
+remember:
+  - A dev server serves files one by one as you edit, while a production build writes a few optimised files for visitors.
+  - Transpiling rewrites syntax into JavaScript the target can run, and for TypeScript it deletes the types without checking them.
+  - A transpiler rewrites syntax but doesn't add missing functions, so a new built-in such as `toSorted` still needs a runtime that has it.
+  - Bundling follows `import` statements from an entry file and joins everything reachable into as few files as possible.
+  - Tree-shaking drops exports nothing imports, but it keeps any module code that might have a side effect.
+  - Minifying shortens names and removes whitespace, so the output is smaller but unreadable without a source map.
+  - A source map links each position in the built file back to the original file, line, column and name.
+  - Node 24 runs `.ts` files directly by stripping types, but it still doesn't check them, and syntax such as `enum` needs a transform.
+sections:
+  - title: The pipeline, one step at a time
+    body: |-
+      Here are two TypeScript files for a shopping cart. `unusedHelper` is exported but
+      never imported.
+
+      ```ts
+      // src/cart.ts
+      export function checkQty(name: string, qty: number): number {
+        if (qty < 1) {
+          throw new Error(`Bad quantity for ${name}`);
+        }
+        return qty;
+      }
+      export function unusedHelper(): string {
+        return 'never called';
+      }
+
+      // src/main.ts
+      import { checkQty } from './cart';
+      console.log(checkQty('cake', 2));
+      checkQty('tea', 0);
+      ```
+
+      Bundled with `esbuild src/main.ts --bundle --platform=node`, without minifying, you can
+      see three steps at once. The types are gone (transpiling), both files are in one
+      (bundling), and `unusedHelper` is missing (tree-shaking):
+
+      ```js
+      // src/cart.ts
+      function checkQty(name, qty) {
+        if (qty < 1) {
+          throw new Error(`Bad quantity for ${name}`);
+        }
+        return qty;
+      }
+
+      // src/main.ts
+      console.log(checkQty("cake", 2));
+      checkQty("tea", 0);
+      ```
+
+      Add `--minify` and the last step squeezes it onto one line with short names:
+
+      ```js
+      function r(n,e){if(e<1)throw new Error(`Bad quantity for ${n}`);return e}console.log(r("cake",2));r("tea",0);
+      ```
+
+      Real builds add one more step: **content hashing**. The file name includes a hash of
+      its contents, so `main-3DSVPB2H.js` becomes `main-GGPMDRTV.js` after a one-word change.
+      In esbuild that's `--entry-names=[name]-[hash]`. The server can then tell browsers to
+      cache each file for a long time, because a changed file always gets a new name. That's
+      what the odd names in Vite's `dist/assets/index-Co9_76t9.js` are.
+
+      Notice what the build did not do: it didn't check that `'cake'` is a string or that
+      `2` is a number. Type checking is a separate command.
+  - title: Transpiling is not type checking, and not polyfilling
+    body: |-
+      A transpiler changes **syntax**. Ask esbuild for an older target and it rewrites newer
+      operators into older ones:
+
+      ```js
+      // in:  const limit = options.limit ?? 10;
+      // out, with --target=es2019:
+      var _a;
+      const limit = (_a = options.limit) != null ? _a : 10;
+      ```
+
+      It does not add missing **functions**. `prices.toSorted((a, b) => a - b)` passes
+      through `--target=es2019` untouched, because `toSorted` is a method call, not syntax.
+      On a runtime without `toSorted`, the built file throws. Adding missing built-ins is a
+      separate job called polyfilling, and most projects avoid it by choosing a target that
+      matches the browsers and Node versions they support.
+
+      It doesn't check types either. esbuild, the transpiler inside Vite, and the SWC compiler
+      used by Next.js all remove types without reading them, one file at a time. That's why
+      they're fast, and it's why every project also runs `tsc --noEmit`, in CI at least.
+
+      Node 24 does the same. It runs a TypeScript file directly by erasing the types:
+
+      ```bash
+      $ node price.ts
+      550
+      ```
+
+      Erasing only works for syntax that is pure type information. An `enum` generates real
+      code, so Node refuses it:
+
+      ```text
+      SyntaxError [ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX]: TypeScript enum is not supported in strip-only mode
+      ```
+
+      `node --experimental-transform-types` handles it, with an experimental warning.
+      TypeScript's `erasableSyntaxOnly` compiler option makes `tsc` report such syntax, so
+      your code stays runnable by type-stripping tools.
+  - title: Why tree-shaking keeps code, and how `sideEffects` changes that
+    body: |-
+      A bundler may only remove code when removing it can't change what the program does.
+      Exports nobody imports are safe to drop. Top-level statements are not: a module might set
+      something up when it loads.
+
+      Here's a package whose first line logs:
+
+      ```js
+      // node_modules/temp-kit/index.js
+      console.log('temp-kit loaded');
+      export function toF(c) { return c * 9 / 5 + 32; }
+
+      // main.js: imports toF but never calls it
+      import { toF } from 'temp-kit';
+      console.log('app');
+      ```
+
+      Bundled, `toF` is dropped, but the log stays, because it runs on load:
+
+      ```js
+      (() => {
+        // node_modules/temp-kit/index.js
+        console.log("temp-kit loaded");
+
+        // main.js
+        console.log("app");
+      })();
+      ```
+
+      Add `"sideEffects": false` to the package's `package.json` and the whole module goes.
+      That promise is what lets big libraries shrink to the parts you use. It's also a trap.
+      If a file really does have a side effect, say `import './styles.css'` or code that
+      registers a plugin, the bundler drops it. esbuild warns when it ignores a bare import
+      for this reason:
+
+      ```text
+      ▲ [WARNING] Ignoring this import because "node_modules/temp-kit/index.js" was marked as having no side effects [ignored-bare-import]
+      ```
+
+      `sideEffects` can also be a list of files that do have effects, such as `["*.css"]`.
+
+      The other direction is marking a single call as safe to drop. A call like `const cart
+      = createCart()` could do anything, so an unused result still runs. Writing `/*
+      @__PURE__ */` before the call tells the bundler the result is the only effect. Bundled,
+      the annotated unused call disappeared and the plain one stayed.
+  - title: Dead code and build-time constants
+    body: |-
+      Bundlers remove more than unused exports. When a condition is known at build time,
+      the branch that can't run is deleted too. That's how libraries ship development
+      warnings that cost nothing in production.
+
+      ```js
+      // def.js
+      if (process.env.NODE_ENV !== "production") {
+        console.log("debug build");
+      }
+      console.log("region", process.env.PUBLIC_REGION);
+      ```
+
+      ```bash
+      $ esbuild def.js --minify --define:process.env.NODE_ENV='"production"' --define:process.env.PUBLIC_REGION='"eu"'
+      console.log("region","eu");
+      ```
+
+      `--define` replaced each expression with a string literal. The condition became
+      `"production" !== "production"`, which is always false, so the minifier removed the
+      whole `if`. The region is now text inside the file.
+
+      Two consequences matter every day.
+
+      First, a defined value is fixed. Change it and you need a new build. The configuration
+      lesson builds on this: anything that differs between servers should be read at
+      runtime instead.
+
+      Second, a defined value is public. Anything baked into browser code can be read by
+      every visitor, which is why frameworks only expose variables with a public prefix,
+      such as `NEXT_PUBLIC_` or `VITE_`, to the client.
+
+      Note the quoting. `--define` takes JavaScript source, so a string needs its own quotes
+      inside the shell's: `'"eu"'`. Without them, `eu` would be read as a variable name.
+  - title: Inside a source map, and whether to ship it
+    body: |-
+      A source map is a JSON file. esbuild's map for the minified cart looked like this, in
+      outline:
+
+      ```json
+      {
+        "version": 3,
+        "sources": ["../src/cart.ts", "../src/main.ts"],
+        "sourcesContent": ["...the original TypeScript...", "..."],
+        "mappings": "AAAO,SAASA,...",
+        "names": ["checkQty", "name", "qty", "checkQty"]
+      }
+      ```
+
+      `sources` lists the original files, `names` the original identifiers, and `mappings`
+      the position pairs. `sourcesContent` embeds the full original code, so the map works
+      without access to your source folder.
+
+      The built file ends with a comment pointing to the map, `//# sourceMappingURL=app.js.map`.
+      Browser dev tools follow it when they're open. Node needs `--enable-source-maps`, and
+      then prints your own lines:
+
+      ```text
+      $ node dist/app.js
+      Error: Bad quantity for tea
+          at r (/app/dist/app.js:1:30)
+
+      $ node --enable-source-maps dist/app.js
+      Error: Bad quantity for tea
+          at checkQty (/app/src/cart.ts:3:11)
+      ```
+
+      esbuild's `--sourcemap` has variants. `inline` puts the map inside the JavaScript as a
+      base64 comment, which is handy in development but bloats the file. `external` writes
+      the `.map` file without the comment, so browsers don't find it automatically.
+
+      Should you publish maps? For servers, yes: nobody downloads them, and readable traces
+      save hours. For browsers, it's a choice. Public maps with `sourcesContent` hand anyone
+      your original source, comments included. Many teams build maps, upload them to their
+      error-tracking service, and don't serve them. Either way, never rely on minifying to
+      hide a secret. Minified code is only harder to read, not private.
+pitfalls:
+  - '**Treating a green build as type-safe.** esbuild, Vite and Node''s type stripping all delete types without checking them. Run `tsc --noEmit` as its own step, locally and in CI.'
+  - '**Assuming the target setting adds missing functions.** `--target` rewrites syntax only, so a new method like `toSorted` still crashes on an old runtime. Pick a target your users have, or add a polyfill on purpose.'
+  - '**Marking a package `"sideEffects": false` when a file has setup code.** The bundler then drops stylesheet imports or registration code, and the bug appears only in the production build. List those files in `sideEffects` instead.'
+  - '**Exporting helpers as one object.** The import names the object, so every method stays in the bundle. Export functions separately so each one can be dropped.'
+  - '**Debugging only with the dev server.** It skips bundling, tree-shaking and defines, so production-only bugs never show up there. Run the production build locally and test its output before you ship.'
+  - '**Serving source maps without deciding to.** With `sourcesContent`, a public map gives away your original code and comments. Decide per project, and upload maps to your error tracker if you don''t serve them.'
+interview:
+  - question: Walk me through what happens when you run a production build of a web app.
+    answer: >-
+      The build turns many source modules into a few small, cacheable files. It starts at
+      the entry file and resolves every `import`. Each file is transpiled: types removed,
+      JSX turned into function calls, newer syntax rewritten for the target. The bundler
+      joins everything reachable into a few files, and dynamic `import()` calls become
+      separate chunks. Tree-shaking drops unused exports, and build-time constants such as
+      `NODE_ENV` let the minifier delete dead branches. Minifying renames and compresses.
+      File names get a content hash so they can be cached for a long time, and a source
+      map is written alongside. The trade-off is that the output differs from what the dev
+      server ran, so I test the built output before shipping.
+  - question: What's the difference between transpiling, bundling and minifying?
+    answer: >-
+      Transpiling changes the language, bundling changes the file layout, and minifying
+      changes the size. A transpiler rewrites source into JavaScript the target understands:
+      it strips TypeScript types, converts JSX and downlevels newer syntax, one file at a
+      time. A bundler follows imports and combines modules into a few files, handling code
+      splitting and tree-shaking along the way. A minifier then renames local identifiers,
+      removes whitespace and folds constants, which shrinks the download. Tools like esbuild
+      do all three, but they're separate concerns. A library published to npm, for example,
+      is often transpiled but not bundled or minified. Its users' bundlers can then
+      tree-shake it, and their stack traces stay readable.
+  - question: What is tree-shaking, and why might a bundle still contain code you don't use?
+    answer: >-
+      Tree-shaking is the bundler removing exports that nothing imports, and it only removes
+      code when it can prove nobody would notice. It relies on static ES module `import` and
+      `export`, so it can see which names are used. Unused code survives in a few common
+      cases. A module's top-level statements might have side effects, so they're kept unless
+      the package declares `"sideEffects": false`. Helpers exported as one object stay
+      together, because the object is what's imported. CommonJS modules are kept whole,
+      since `exports` can be built at run time. And a function call whose result is unused
+      still runs, unless it's marked `/* @__PURE__ */`. When a bundle is bigger than
+      expected, I look for those patterns first.
+  - question: What are source maps, and would you deploy them to production?
+    answer: >-
+      A source map is a JSON file that maps positions in built code back to the original
+      files, lines and names. It lets dev tools and error trackers show `checkQty` at
+      `cart.ts:3` instead of `r` at `app.js:1:30`. Browsers load a map when the built file's
+      `sourceMappingURL` comment points to it and dev tools are open. Node uses maps when run
+      with `--enable-source-maps`. For server code I always ship them, because nobody else
+      can download them. For browser code it's a trade-off: a public map with
+      `sourcesContent` exposes the original source and comments. A common middle ground is
+      generating maps in CI, uploading them to the error tracker and not serving them. Maps
+      are never a security boundary, and neither is minification.
+  - question: Why can TypeScript with a type error still build, and how do you prevent that reaching production?
+    answer: >-
+      Because most build tools only strip types; they don't check them. esbuild, the
+      transpiler Vite uses and Node 24's type stripping all process one file at a time and
+      delete the annotations, which is why they're fast. Checking types needs the whole
+      program, which is what `tsc` does. So I run `tsc --noEmit` as a separate step. It sits
+      in the same `check` script as the pre-commit hook and CI, and CI blocks the merge when
+      it fails. In the editor, the TypeScript language service shows errors as I
+      type. The trade-off is time. On a big project a full type check is slower than an
+      esbuild build, so it runs beside the other checks rather than on every save.

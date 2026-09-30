@@ -1,0 +1,288 @@
+id: perf.memory-leaks
+title: Memory leaks
+objective: Say what keeps memory alive, find a leak by comparing heap snapshots, and clean up listeners, timers and caches.
+level: essential
+minutes: 10
+concepts: [perf.memory-leaks, perf.heap-snapshots, perf.cleanup]
+prerequisites: [perf.cost-of-javascript, js.closures, react.effects]
+opening:
+  text: >-
+    You'll find out why a tab slows down the longer it stays open, and what's holding on
+    to memory. Then you'll write the clean-up that stops it.
+
+steps:
+  - type: prose
+    id: heap-and-collector
+    body: >-
+      Every object and array your code makes takes memory on the **heap**: the area where
+      objects live while they're in use. You never free it by hand.
+
+
+      The **garbage collector** does. Now and then it starts from the globals and the running
+      code, and follows every reference. Whatever it can't reach, it frees. Reachable
+      means kept.
+
+  - type: prose
+    id: what-a-leak-is
+    body: >-
+      A **memory leak** is memory that stays reachable by mistake. The collector isn't
+      broken: something still points at the old data, so it must keep it.
+
+
+      Each click or request leaves a little behind. Over an afternoon the tab grows, slows
+      and may crash. The usual holders: listeners, timers, closures, and lists or caches
+      that only ever grow.
+
+  - type: multiple-choice
+    id: pick-growing-list
+    concept: perf.memory-leaks
+    difficulty: 1
+    language: js
+    code: |
+      const recent = [];
+
+      function handle(request) {
+        recent.push({ url: request.url, at: Date.now() });
+        return render(request);
+      }
+    question: A server runs `handle` for every request, for a week. What happens to `recent`'s memory?
+    choices:
+      - text: It grows for as long as the server runs
+        correct: true
+        feedback: >-
+          Right. `recent` is reachable for ever, so every entry is kept.
+      - text: The collector frees the old entries
+        feedback: >-
+          It only frees what nothing can reach. `recent` reaches every entry.
+      - text: It resets after each request
+        feedback: >-
+          `recent` sits outside `handle`, so it outlives every call.
+
+  - type: prose
+    id: heap-snapshots
+    body: |-
+      Chrome's Memory panel takes a **heap snapshot**: every object on the heap, grouped by kind. To find a leak, take one, repeat the action ten times, take another, and compare them:
+
+      ```text
+      Constructor                     # New  # Deleted  # Delta
+      (string)                           42         42        0
+      Detached <div class="dialog">      10          0      +10
+      Array                               3          3        0
+      ```
+
+      An element removed from the page but still reachable is **detached**.
+
+  - type: multiple-choice
+    id: pick-the-leaking-row
+    concept: perf.heap-snapshots
+    difficulty: 2
+    question: You opened and closed a dialog ten times between the snapshots. Which row is the leak?
+    choices:
+      - text: '`Detached <div class="dialog">`, +10'
+        correct: true
+        feedback: >-
+          Yes. Ten closed dialogs, all still in memory. One per repeat is the tell.
+      - text: '`(string)`, 42 new'
+        feedback: >-
+          42 made, 42 freed. Busy, but nothing was kept.
+      - text: '`Array`, 3 new'
+        feedback: >-
+          Three made and three freed, so the delta is 0. No growth.
+
+  - type: bug-hunt
+    id: hunt-dialog-leak
+    concept: perf.memory-leaks
+    difficulty: 3
+    language: js
+    code: |
+      function openDialog() {
+        const dialog = document.createElement("div");
+        dialog.className = "dialog";
+        dialog.innerHTML = "<p>Delete this photo?</p><button>Close</button>";
+        document.body.append(dialog);
+        document.addEventListener("keydown", (event) => {
+          if (event.key === "Escape") dialog.remove();
+        });
+        dialog.querySelector("button").addEventListener("click", () => dialog.remove());
+      }
+    prompt: >-
+      This is the dialog from that snapshot. Closing it removes it from the page, yet every
+      closed dialog stays in memory. Tap the line at fault.
+    lines: [6]
+    reasons:
+      - text: The document's listener keeps each dialog reachable
+        correct: true
+        feedback: >-
+          Right. `document` lives for ever, and its listener refers to `dialog`.
+      - text: '`dialog.remove()` doesn''t delete the element'
+        feedback: >-
+          It takes it off the page. The element is freed once nothing refers to it.
+      - text: The button's click listener is never removed
+        feedback: >-
+          That listener sits on the button inside the dialog, so it goes with it.
+    fix: |
+      const onKey = (event) => {
+        if (event.key === "Escape") close();
+      };
+      function close() {
+        dialog.remove();
+        document.removeEventListener("keydown", onKey);
+      }
+      document.addEventListener("keydown", onKey);
+      dialog.querySelector("button").addEventListener("click", close);
+
+  - type: prose
+    id: timers-and-closures
+    body: >-
+      A timer from `setInterval` keeps its function, and everything that function uses,
+      until `clearInterval`. So whatever starts something must stop it. React's effect
+      clean-up exists for exactly this.
+
+
+      A closure keeps alive the variables it uses. We kept ten closures that mentioned
+      `rows.length`: 49 MB. Copying the length out first: 8 MB.
+
+  - type: ai-review
+    id: review-closure-keeps-rows
+    concept: perf.memory-leaks
+    difficulty: 3
+    language: js
+    request: Make a label function for each report, so the page can show its total later.
+    flawClass: performance
+    code: |
+      function makeLabel(rows) {
+        const total = rows.reduce((sum, row) => sum + row.price, 0);
+        return () => `Total: ${total} across ${rows.length} rows`;
+      }
+
+      labels.push(makeLabel(await loadRows(reportId)));
+    prompt: >-
+      An assistant wrote this. The labels read correctly. After ten reports of 100,000 rows,
+      the tab holds 49 MB it doesn't need. Tap the line at fault.
+    lines: [3]
+    reasons:
+      - text: The label uses `rows`, so every row is kept
+        correct: true
+        feedback: >-
+          Yes. Copy `rows.length` into a variable first, and the rows can go.
+      - text: '`reduce` makes a copy of the rows'
+        feedback: >-
+          `reduce` returns one number. The rows are kept by what the label refers to.
+      - text: '`labels` should be a `Set`, not an array'
+        feedback: >-
+          Ten labels are fine to keep. It's what each label holds on to.
+    fix: |
+      function makeLabel(rows) {
+        const total = rows.reduce((sum, row) => sum + row.price, 0);
+        const count = rows.length;
+        return () => `Total: ${total} across ${count} rows`;
+      }
+
+  - type: code-challenge
+    id: write-stop-clock
+    concept: perf.cleanup
+    difficulty: 3
+    language: js
+    starter: starter.js
+    solution: solution.js
+    tests: tests.js
+    editable: '8'
+    prompt: >-
+      `startClock` starts a timer and a focus listener, and returns `stop()`. The page calls
+      `stop()` when it removes the clock. But clocks keep piling up in memory.
+
+
+      Make `stop()` remove the same listener it added, and clear the timer.
+    hints:
+      - '`removeEventListener` only removes the very function that was added. Is that the one passed here?'
+      - A new arrow function is a different function, even with the same code inside.
+      - 'Pass `tick` itself to `removeEventListener`, then call `clearInterval(timer)`.'
+
+  - type: explain-back
+    id: explain-tab-grows
+    concept: perf.heap-snapshots
+    difficulty: 3
+    prompt: >-
+      A support page gets slower the longer it stays open. How would you prove it's a leak,
+      and find what's holding the memory?
+    rubric:
+      - The collector frees only what's unreachable, so a leak is something still referring to old data.
+      - Take a heap snapshot, repeat the action several times, take another and compare.
+      - Rows that grow with each repeat, such as detached elements, point at the leaking code.
+    modelAnswer: >-
+      Memory is only freed when nothing can reach it, so something is holding on. I'd take a
+      heap snapshot, repeat the suspect action ten times, take another, and compare. A row
+      growing by ten, like detached dialogs, is the leak. Then I'd look for the listener,
+      timer or list that still refers to them, and remove it on close.
+
+recap:
+  - Explain why memory stays alive while anything reachable refers to it.
+  - Find a leak by comparing heap snapshots around a repeated action.
+  - Pair every listener, timer and growing list with its clean-up.
+
+recall:
+  - id: card-reachable
+    concept: perf.memory-leaks
+    front: What does the garbage collector free?
+    back: >-
+      Only what nothing can reach from the globals and the running code.
+  - id: card-snapshot-compare
+    concept: perf.heap-snapshots
+    front: How do you find a leak with heap snapshots?
+    back: >-
+      Snapshot, repeat the action several times, snapshot again, and look for rows that grew by
+      the number of repeats.
+  - id: card-detached
+    concept: perf.heap-snapshots
+    front: What is a detached element?
+    back: >-
+      One removed from the page that something in your code still refers to, so it can't be
+      freed.
+  - id: card-remove-listener
+    concept: perf.cleanup
+    front: Why does `removeEventListener("focus", () => tick())` remove nothing?
+    back: >-
+      It passes a new function. Only the exact function that was added can be removed.
+
+references:
+  - kind: docs
+    title: Record heap snapshots
+    authors: Meggin Kearney and Sofia Emelianova
+    venue: Chrome for Developers
+    url: https://developer.chrome.com/docs/devtools/memory-problems/heap-snapshots
+    note: Taking and comparing snapshots, and finding detached elements.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Memory management
+    authors: MDN contributors
+    venue: MDN Web Docs
+    url: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide/Memory_management
+    note: Reachability, and how the garbage collector decides what to free.
+    verified: true
+  - kind: docs
+    title: 'EventTarget: removeEventListener() method'
+    authors: MDN contributors
+    venue: MDN Web Docs
+    url: https://developer.mozilla.org/en-US/docs/Web/API/EventTarget/removeEventListener
+    note: The listener removed must be the same function that was added.
+    verified: true
+
+deepDive: >-
+  The 49 MB and 8 MB came from Node with `--expose-gc`, forcing a collection before each
+  reading. In V8, closures made in the same call share one set of captured variables. If any
+  of them uses `rows`, all of them keep it.
+
+
+  `addEventListener` also takes `{ signal }` from an `AbortController`. One
+  `controller.abort()` then removes every listener added with that signal, which is handy
+  when a widget adds several.
+
+
+  A cache that only grows is a leak with a nicer name. Give it a size limit or a lifetime.
+  `WeakMap` holds its keys weakly: an entry goes when nothing else refers to its key object.
+
+
+  In React, an effect that adds a listener or starts a timer returns a function that removes
+  or clears it. The Performance monitor in DevTools graphs the heap live, which shows a
+  climbing line before you take any snapshot.

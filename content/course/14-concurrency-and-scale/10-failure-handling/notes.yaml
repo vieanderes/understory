@@ -1,0 +1,322 @@
+summary: >-
+  Every remote call can fail, and at scale some always are failing. Failure handling decides
+  whether one bad dependency stays a small problem or becomes your outage. The dangerous case
+  isn't a service that's down, which fails fast. It's one that's slow, because every waiting
+  request holds a connection, memory and a worker until your own server runs out.
+
+
+  The lesson's four habits each answer one part of that. **Timeouts** bound how long you
+  wait. **Retries with backoff and jitter** recover from brief failures without stampeding.
+  **Circuit breakers** stop calling a dependency that is clearly broken, so it can recover
+  and your users get a fast answer. **Load shedding** refuses work you can't finish in time,
+  so the work you accept stays fast.
+
+
+  These notes add the machinery underneath: deadlines that shrink down a call chain, a
+  complete circuit breaker, `Retry-After` and retry budgets. Bulkheads then keep one slow
+  dependency from starving the rest. Use all of it on calls that cross a
+  network: model APIs, payment providers, other services, even your own database. Retries in
+  particular have a cost. They multiply load at exactly the moment a service is struggling,
+  so each one needs a reason, a limit and an idempotent operation to repeat.
+remember:
+  - Every remote call gets a timeout, because a slow dependency ties up your resources while a dead one fails fast.
+  - A call's deadline is the smaller of its own cap and what's left of its caller's budget, so no inner call outlives the request.
+  - Retry only failures that may pass next time, such as timeouts, dropped connections, `429` and `5xx`, and only operations that are safe to repeat.
+  - Backoff with full jitter waits a random time between zero and a capped exponential delay, so clients that failed together spread out.
+  - Retry in one layer only, because layers multiply, and three layers of three attempts turn one failure into 27 calls.
+  - A circuit breaker opens after repeated failures, fails calls instantly during a cool-down, then lets one trial call decide.
+  - Honour `Retry-After` when a server sends it, since it knows its own recovery better than your backoff.
+  - A bulkhead caps concurrent calls per dependency, so one slow service can't take every connection and worker you have.
+sections:
+  - title: Deadlines that shrink down the call chain
+    body: |-
+      A timeout per call isn't enough on its own. A request with a 1-second budget that
+      makes two calls, each with an 800 ms timeout, can take 1.6 seconds, long after the
+      caller gave up. The fix is a **deadline**: one budget for the whole request, and each
+      call gets the smaller of its own cap and what remains.
+
+      `AbortSignal.any` combines signals, so a call aborts when either fires.
+
+      ```ts
+      // A stand-in for a remote call that stops when its signal fires.
+      function remote(name: string, ms: number, signal: AbortSignal): Promise<string> {
+        return new Promise((resolve, reject) => {
+          const timer = setTimeout(() => resolve(`${name} answered`), ms);
+          signal.addEventListener(
+            'abort',
+            () => {
+              clearTimeout(timer);
+              reject(signal.reason);
+            },
+            { once: true },
+          );
+        });
+      }
+
+      // Each call gets its own cap, and never more than what the request has left.
+      const within = (request: AbortSignal, capMs: number) =>
+        AbortSignal.any([request, AbortSignal.timeout(capMs)]);
+
+      const start = Date.now();
+      const elapsed = () => `${Math.round((Date.now() - start) / 100) * 100} ms`;
+
+      const request = AbortSignal.timeout(1000); // the whole request's budget
+      try {
+        console.log(await remote('prices', 300, within(request, 800)), elapsed());
+        console.log(await remote('stock', 900, within(request, 800)), elapsed());
+      } catch (error) {
+        console.log((error as Error).name, 'after', elapsed());
+      }
+      ```
+
+      Run in Node 24 as a module, it prints `prices answered 300 ms`, then `TimeoutError
+      after 1000 ms`. The stock call's own cap would have fired at 1,100 ms. The request's
+      budget fired first. In real code you pass `signal` to `fetch` or to your SDK instead.
+
+      Across services, send the deadline along, for example as a header holding the time
+      left, and have the next service build its own signal from it. gRPC does this for you.
+
+      Pick caps from measurements: a little above the dependency's p99 latency, not a round
+      number. For the slowest tail, *The Tail at Scale* describes hedged requests: after
+      the p95 time, send the same read to a second replica and take whichever answers first.
+      That's only for idempotent reads.
+  - title: A circuit breaker, written out
+    body: |-
+      A breaker is a small state machine around one dependency. This one opens after three
+      failures in a row, stays open for a cool-down, then allows one trial call at a time.
+
+      ```ts
+      type State = 'closed' | 'open' | 'half-open';
+
+      class CircuitBreaker {
+        private state: State = 'closed';
+        private failures = 0;
+        private openedAt = 0;
+        private trialRunning = false;
+
+        constructor(
+          private readonly threshold: number,
+          private readonly coolDownMs: number,
+          private readonly now: () => number = Date.now,
+        ) {}
+
+        get current(): State {
+          return this.state;
+        }
+
+        async call<T>(fn: () => Promise<T>): Promise<T> {
+          if (this.state === 'open') {
+            if (this.now() - this.openedAt < this.coolDownMs) throw new Error('Circuit open');
+            this.state = 'half-open';
+          }
+          const isTrial = this.state === 'half-open';
+          if (isTrial && this.trialRunning) throw new Error('Circuit open');
+          if (isTrial) this.trialRunning = true;
+          try {
+            const result = await fn();
+            this.state = 'closed';
+            this.failures = 0;
+            return result;
+          } catch (error) {
+            this.failures += 1;
+            if (isTrial || this.failures >= this.threshold) {
+              this.state = 'open';
+              this.openedAt = this.now();
+            }
+            throw error;
+          } finally {
+            if (isTrial) this.trialRunning = false;
+          }
+        }
+      }
+      ```
+
+      Driven by a fake clock against a failing service: three calls fail and the breaker
+      opens after the third. A call at 5 seconds fails with `Circuit open` without touching
+      the service. At 11 seconds a trial runs, fails, and reopens the breaker. At 22 seconds,
+      with the service healthy, the trial succeeds and the breaker closes. The service saw
+      five calls instead of one per request.
+
+      Production breakers differ in three ways. They trip on an error rate over a rolling
+      window with a minimum number of calls, since "three in a row" is noisy at high traffic.
+      The opossum library for Node, for example, has an `errorThresholdPercentage` option.
+      They count only failures that mean the dependency is unhealthy: timeouts and `5xx`,
+      not a `400` your own code caused. And an open breaker should lead to a fallback, such
+      as cached results or a smaller model, not only an error.
+  - title: Retry-After, capped backoff and retry budgets
+    body: |-
+      A good retry policy has three limits: how long a single wait can be, how many attempts
+      one request may make, and how much retry traffic the whole client may send.
+
+      ```ts
+      // Retry-After is either whole seconds or an HTTP date.
+      function retryAfterMs(header: string | null, nowMs: number): number | undefined {
+        if (header === null) return undefined;
+        const value = header.trim();
+        if (/^\d+$/.test(value)) return Number(value) * 1000;
+        const at = Date.parse(value);
+        return Number.isNaN(at) ? undefined : Math.max(0, at - nowMs);
+      }
+
+      // Full jitter, with a ceiling so late attempts don't wait for minutes.
+      function backoffMs(attempt: number, baseMs: number, capMs: number, random = Math.random): number {
+        return random() * Math.min(capMs, baseMs * 2 ** (attempt - 1));
+      }
+
+      // The server knows best when it says so. Otherwise, back off.
+      function nextDelayMs(attempt: number, header: string | null, nowMs: number): number {
+        return retryAfterMs(header, nowMs) ?? backoffMs(attempt, 200, 10_000);
+      }
+
+      const now = Date.parse('Fri, 25 Sep 2026 10:00:00 GMT');
+      console.log(retryAfterMs('120', now)); // 120000
+      console.log(retryAfterMs('Fri, 25 Sep 2026 10:00:30 GMT', now)); // 30000
+      console.log(retryAfterMs('soon', now)); // undefined
+      console.log(backoffMs(10, 200, 10_000, () => 0.5)); // 5000, not 51200
+      console.log(nextDelayMs(1, '2', now)); // 2000
+      ```
+
+      Without the cap, the tenth attempt could wait up to 102 seconds. If `Retry-After` asks
+      for longer than the caller will wait, don't sleep inside a user's request. Fail now, or
+      hand the work to a queue.
+
+      Attempts per request are usually three or so. The budget across requests is the limit
+      people forget. Google's SRE book, in its chapter on handling overload, describes a
+      per-client budget: retry only while retries are below about 10% of requests. In a
+      healthy system that allows every retry you need. In an outage it caps the extra load
+      at a tenth, instead of doubling or tripling it.
+
+      Other jitter variants exist. Equal jitter keeps half the backoff fixed and randomises
+      the other half, so no wait is near zero. Decorrelated jitter bases each wait on the
+      previous one. Full jitter is the usual default.
+  - title: Bulkheads, shedding and graceful degradation
+    body: |-
+      Ships have bulkheads so one flooded compartment doesn't sink the vessel. In software, a
+      **bulkhead** gives each dependency its own limited pool of concurrent calls. When the
+      recommendations service slows down, its pool fills and further calls are refused at
+      once, while checkout calls still have their own capacity.
+
+      ```ts
+      import { setTimeout as sleep } from 'node:timers/promises';
+
+      // At most `limit` calls in flight to one dependency. The rest are refused at once.
+      class Bulkhead {
+        private active = 0;
+        constructor(private readonly limit: number) {}
+
+        async run<T>(fn: () => Promise<T>): Promise<T> {
+          if (this.active >= this.limit) throw new Error('Bulkhead full');
+          this.active += 1;
+          try {
+            return await fn();
+          } finally {
+            this.active -= 1;
+          }
+        }
+      }
+
+      const recommender = new Bulkhead(2);
+      const slowRecommendations = async () => {
+        await sleep(500); // the recommender is having a bad day
+        return ['lamp', 'rug'];
+      };
+
+      const pages = await Promise.all(
+        [1, 2, 3, 4].map((page) =>
+          recommender
+            .run(slowRecommendations)
+            .catch(() => [] as string[])
+            .then((similar) => ({ page, similar })),
+        ),
+      );
+      console.log(pages);
+      ```
+
+      Pages 1 and 2 get `['lamp', 'rug']` after 500 ms. Pages 3 and 4 get an empty list at
+      once and render without recommendations. That's **graceful degradation**: decide in
+      advance what each feature does without its dependency. Recommendations disappear, a
+      search falls back to a cached result, an AI summary says it's unavailable. Checkout
+      never waits on any of them.
+
+      Load shedding is the same refusal at the front door. Limit concurrent requests, or
+      watch how long requests wait in your own queue, and answer the excess with `503` and
+      `Retry-After`. Shed by priority where you can: background syncs before interactive
+      pages, anonymous traffic before paying customers. Drop work whose caller has already
+      timed out, because finishing it helps nobody.
+pitfalls:
+  - '**Retrying a `POST` that isn''t idempotent.** A timed-out charge may have succeeded, and the retry charges again. Send an idempotency key with every retried write, or don''t retry it.'
+  - '**Inner timeouts longer than the outer one.** A 30-second call inside a 10-second request keeps working after the caller has gone. Derive each call''s deadline from the remaining budget.'
+  - '**Retrying on every error.** A `400`, `401` or a bug in your own code fails the same way every time, and retries only add load. Retry on timeouts, dropped connections, `429` and `5xx`.'
+  - '**Uncapped exponential backoff.** By the tenth attempt the wait can be minutes, and the request has long been abandoned. Cap each wait, cap the attempts, and give up or enqueue.'
+  - '**A breaker that counts client errors.** Your own bad requests open it and cut off a healthy service. Count only timeouts and server errors, over a rolling window with a minimum volume.'
+  - '**No fallback when the breaker opens.** Failing fast only helps if the caller has something to show. Decide the degraded behaviour for each feature before the incident.'
+interview:
+  - question: Your service calls a flaky third-party API. How do you make it resilient?
+    answer: >-
+      I'd layer a deadline, a narrow retry policy, a breaker and a fallback. Every call gets
+      a timeout a little above the API's p99, derived from the request's remaining budget. I
+      retry only timeouts, connection errors, `429` and `5xx`, up to about three attempts
+      with capped full-jitter backoff and honouring `Retry-After`. I retry only idempotent
+      operations, or ones with an idempotency key. A circuit breaker per dependency trips on error
+      rate so an outage costs users milliseconds, not seconds, and gives the API room to
+      recover. A bulkhead caps concurrent calls so a slowdown can't take all my workers. When
+      the breaker is open, the feature degrades, for example to cached data. If the work
+      doesn't need an immediate answer, I'd move it to a queue, where retries are cheap.
+  - question: Explain how a circuit breaker works and how you'd tune it.
+    answer: >-
+      A breaker wraps calls to one dependency and has three states. Closed, calls pass and
+      failures are counted. When failures cross a threshold, it opens and every call fails
+      immediately for a cool-down, without touching the dependency. After the cool-down it's
+      half-open: a trial call or a few go through. Success closes it, failure reopens it. Fo
+      r tuning, I'd trip on error rate over a rolling window, say 50% of at least 20 calls
+      in ten seconds. Then a couple of errors at low traffic don't trip it. Count timeouts and
+      `5xx`, never client errors. Set the cool-down near the dependency's typical recovery
+      time. The trade-off is sensitivity: too eager and it cuts off a healthy service, too
+      lax and users wait on a dead one.
+  - question: What is a retry storm, and how do you prevent one?
+    answer: >-
+      A retry storm is when retries multiply load on a service that's already failing, which
+      keeps it failing. It comes from three things. Layers multiply: an SDK, your code and a
+      queue each retrying three times turn one failure into 27 calls. Synchronised waits
+      bring clients back in waves. And unlimited retries turn an outage into several times
+      normal traffic. The fixes follow. Retry in one layer and set the others to zero, for
+      example `maxRetries: 0` on the SDK inside a queued job. Use full jitter so returns
+      spread out. Cap attempts per request and keep a per-client retry budget of around 10%
+      of requests. Add a circuit breaker, so a clearly broken dependency gets no traffic.
+  - question: What's the difference between back-pressure and load shedding?
+    answer: >-
+      Both protect a system from more work than it can do. They differ in who slows down.
+      Back-pressure tells the producer to slow: a bounded queue that blocks or refuses the
+      enqueue, a stream that stops reading, a worker that claims only what it can run. It
+      works between parts you control, which can wait. Load shedding is for callers you can't
+      slow, such as public traffic: the server refuses the excess early with `503` and
+      `Retry-After`, so the requests it accepts finish in time. The key point for both is
+      that an unbounded queue is neither. It accepts everything and makes every request slow,
+      until they all time out and the work done is wasted.
+terms:
+  - term: Timeout
+    say: The request gives up after a while.
+    means: "A bound on how long you wait, on every remote call, so a slow dependency can't hold your
+      connections and workers. Down a call chain it becomes a deadline: the smaller of its own cap
+      and the caller's remaining budget."
+  - term: Backoff with jitter
+    say: Wait a bit longer after each retry.
+    means: Backoff grows the delay exponentially up to a cap. Full jitter waits a random time between
+      zero and that delay, so clients that failed together don't retry together.
+  - term: Retry storm
+    say: Too many retries.
+    means: Retries multiplying across layers and clients until they add load to a service that is
+      already failing. Three layers of three attempts turn one failure into 27 calls.
+  - term: Circuit breaker
+    say: It cuts off a service when it fails.
+    means: After repeated failures it opens and fails calls instantly for a cool-down. Then it goes
+      half-open and lets one trial call decide whether to close again.
+  - term: Idempotent
+    say: Safe to call twice.
+    means: Doing it twice has the same effect as doing it once. Only failures that may pass next time,
+      on operations like that, are safe to retry automatically.
+  - term: Load shedding
+    say: The same as rate limiting.
+    means: Refusing work early, with a fast `503`, when the server can't finish it in time, so accepted
+      requests stay fast. Rate limiting caps what one client may send; shedding protects the
+      server's own capacity.

@@ -1,0 +1,207 @@
+summary: >-
+  An error response has two readers. Code reads the status and a stable error type to decide
+  what to do: fix the input, log in, wait and retry, or give up. A person reads a sentence that
+  says what went wrong. A good API serves both with a true status code and one body shape for
+  every error, and **problem details** (RFC 9457, `application/problem+json`) is the standard
+  shape.
+
+
+  The other half is failures you didn't plan for. An exception that escapes a handler must
+  never reach the client as a stack trace, and must never vanish silently. One wrapper around
+  every handler turns known errors into their statuses, logs the unknown ones with enough
+  context to debug, and answers a generic `500` that reveals nothing.
+
+
+  Get this right early. Once clients parse your error bodies, their shape is part of the
+  contract, and a status that lies, such as `200` with an error inside, breaks every client,
+  cache and dashboard that trusts it.
+remember:
+  - The status is the truth a client acts on, so an error is never a `200`.
+  - '`4xx` means the client must change the request, and `5xx` means the server failed and the same request may work later.'
+  - Problem details give every error the same body, with `type`, `title`, `status`, `detail` and `instance`, sent as `application/problem+json`.
+  - Code branches on `type` or `status`, never on the wording of `detail`, which is written for people and may change.
+  - One wrapper catches everything a handler throws, maps known error classes to statuses and turns the rest into a logged `500`.
+  - In an async wrapper, write `return await handler(request)` inside the `try`, or a rejected promise escapes the `catch`.
+  - The stack trace goes to the log and the client gets a request id, so support can find the log line without leaking internals.
+  - Validation errors list every bad field at once in an extension member such as `errors`, so a form can show them all.
+sections:
+  - title: A complete error layer
+    body: |-
+      Production code gives expected errors a class that knows its status. The wrapper then
+      needs no list of cases: anything that is an `HttpProblem` renders itself, and anything
+      else is a bug.
+
+      ```ts
+      class HttpProblem extends Error {
+        constructor(
+          readonly status: number,
+          readonly title: string,
+          detail: string,
+          readonly extra: Record<string, unknown> = {},
+        ) {
+          super(detail);
+        }
+      }
+      class NotFound extends HttpProblem {
+        constructor(detail: string) {
+          super(404, 'Not Found', detail);
+        }
+      }
+      class Invalid extends HttpProblem {
+        constructor(errors: { field: string; message: string }[]) {
+          super(422, 'Invalid request', 'Some fields need changing.', { errors });
+        }
+      }
+
+      const problem = (status: number, body: Record<string, unknown>) =>
+        Response.json({ status, ...body }, { status, headers: { 'Content-Type': 'application/problem+json' } });
+
+      type Handler = (request: Request) => Promise<Response>;
+
+      function withErrors(handler: Handler): Handler {
+        return async (request) => {
+          const requestId = crypto.randomUUID();
+          try {
+            return await handler(request);
+          } catch (error) {
+            if (error instanceof HttpProblem) {
+              return problem(error.status, { title: error.title, detail: error.message, ...error.extra });
+            }
+            console.error(JSON.stringify({ requestId, url: request.url, error: String(error) }));
+            return problem(500, {
+              title: 'Internal Server Error',
+              detail: 'Something went wrong on our side.',
+              requestId,
+            });
+          }
+        };
+      }
+      ```
+
+      With routes that throw each kind, the responses are:
+
+      ```text
+      404 {"status":404,"title":"Not Found","detail":"No ticket with id 9"}
+      422 {"status":422,"title":"Invalid request","detail":"Some fields need changing.","errors":[{"field":"email","message":"Must be an email address"}]}
+      500 {"status":500,"title":"Internal Server Error","detail":"Something went wrong on our side.","requestId":"7db30783-..."}
+      ```
+
+      The `500` log line carries the same `requestId`. A user who reports it gives support
+      the one string needed to find the stack trace. In a real app, log `error.stack` too,
+      and generate the id once per request in middleware so every log line shares it.
+  - title: The missing await that lets errors escape
+    body: |-
+      A `try` only catches a rejection it waits for. This wrapper looks right and isn't:
+
+      ```ts
+      function leaky(handler: Handler): Handler {
+        return async (request) => {
+          try {
+            return handler(request); // returns the promise without waiting for it
+          } catch {
+            return problem(500, { title: 'Internal Server Error' });
+          }
+        };
+      }
+      ```
+
+      `handler(request)` returns a promise that rejects later. The `try` block has already
+      finished by then, so the `catch` never runs and the rejection travels out to the server
+      adapter, which answers an empty `500` or, with some setups, nothing sensible at all.
+      Running it against a handler that throws a `TypeError` shows the error escaping the
+      wrapper. `return await handler(request)` fixes it, because the `await` keeps the `try`
+      open until the promise settles.
+
+      The same rule explains a harder crash. In Node 24, a rejected promise that nothing
+      handles terminates the process by default. A handler that starts work without awaiting
+      it, such as `sendEmail(user)` with no `await` and no `.catch`, can take the whole server
+      down when that email fails. Await it, or attach a `.catch` that logs.
+  - title: Designing the error contract
+    body: |-
+      A few decisions make errors pleasant to build against:
+
+      - **`type` is the stable identifier.** Use a URI you control, such as
+        `https://api.example/problems/out-of-stock`, and document each one. Clients switch on
+        it. When omitted, RFC 9457 treats `type` as `about:blank`, meaning the status says it
+        all.
+      - **`detail` is for humans** and can change freely. Never make clients parse it.
+      - **Extension members carry data.** An `out-of-stock` problem can include
+        `"available": 2`. Clients must ignore members they don't know, so you can add them
+        later without breaking anyone.
+      - **Validation reports every field.** Returning only the first error forces a user to
+        submit a form five times. `400` for a body that can't be parsed, `422` for one that
+        parses and breaks rules, is a common split. Some APIs use `400` for both; pick one
+        and stay with it.
+      - **No internals.** No SQL, stack frames, file paths or library versions in any body.
+        Error messages from dependencies can contain data, so don't forward them either.
+
+      Documenting the problem types with the endpoints, for example in an OpenAPI
+      description, turns errors from surprises into a designed part of the API.
+  - title: What clients do with each status
+    body: |-
+      The status also tells a client whether to retry, which is where a wrong status does real
+      damage.
+
+      ```text
+      400, 404, 409, 422   don't retry; show the problem or fix the input
+      401                  refresh the token or send the user to log in, then retry once
+      403                  don't retry; the answer won't change
+      408, 429, 503        retry after Retry-After, or with backoff
+      500                  maybe retry an idempotent request, a few times at most
+      502, 504             a proxy's upstream failed; retry idempotent requests with backoff
+      ```
+
+      A server that answers bad input with `500` invites clients to hammer it with the same
+      bad request. A server that answers an overload with `400` tells clients to give up when
+      waiting would have worked. Backoff means waiting longer after each failure, with random
+      jitter so thousands of clients don't return in the same second.
+
+      On the monitoring side, `5xx` rates are what alerts watch. Mislabelled `4xx` responses
+      hide real outages, and client mistakes labelled `5xx` page someone at night for nothing.
+pitfalls:
+  - '**An error with a `200` status.** Clients, caches and dashboards treat it as success. Use the true `4xx` or `5xx`.'
+  - '**`return handler()` inside an async `try`.** The rejection escapes the `catch`. Write `return await handler()`.'
+  - '**Sending `error.message` or the stack in a `500`.** It leaks file paths, queries and sometimes data. Log it with a request id and send the id.'
+  - '**Clients matching on message text.** Rewording a message breaks them. Give each error a stable `type` and branch on that.'
+  - '**Catching and swallowing.** A `catch` that returns a response without logging hides bugs forever. Every unexpected error gets logged.'
+  - '**Un-awaited background work.** An unhandled rejection stops a Node 24 process. Await it or attach a `.catch`.'
+  - '**Reporting one validation error at a time.** Users fix one field, submit, and meet the next. Return all of them in one response.'
+interview:
+  - question: How would you design error responses for a public API?
+    answer: >-
+      A true HTTP status on every response and one body shape for every error, which I'd
+      take from RFC 9457 problem details: `type`, `title`, `status`, `detail`, `instance`,
+      served as `application/problem+json`. `type` is a documented, stable URI clients branch
+      on; `detail` is human text they never parse. Extension members carry specifics, like an
+      `errors` array for validation with every bad field. Unexpected failures become a generic
+      `500` with a request id, never a stack trace. The benefit is that client code needs one
+      error branch for the whole API. The cost is discipline: every new error needs a type and
+      documentation, and the shape can't change once clients depend on it.
+  - question: A handler throws an exception you didn't expect. What should happen?
+    answer: >-
+      One place catches it, logs it and answers a safe `500`. In practice that's error
+      middleware wrapping every route. It logs the error with its stack, the route, the user
+      id and a request id, ideally to a service that alerts when the `5xx` rate rises. The
+      client gets a problem details body with a generic message and the request id, nothing
+      internal. Known errors, such as a not-found or a validation failure, are thrown as
+      classes carrying their status and bypass the logging. In async code the wrapper must
+      await the handler, and I also guard against un-awaited promises, because an unhandled
+      rejection stops a Node process.
+  - question: Should validation failures be `400` or `422`?
+    answer: >-
+      Either is defensible, and consistency matters more than the choice. A common split is
+      `400` when the request can't be understood at all, such as invalid JSON or the wrong
+      content type, and `422 Unprocessable Content` when it parses but breaks rules, like a
+      negative quantity or an email already in use. RFC 9110 defines `422` for that case, so
+      it isn't limited to WebDAV any more. Whatever the status, the body should list every
+      failing field with a machine-readable code, so a form can mark them all at once. Some
+      large APIs use `400` for everything, and that's fine if it's documented.
+  - question: How do you make production errors debuggable without leaking details to users?
+    answer: >-
+      Correlate instead of exposing. Middleware assigns each request an id, or reuses one from
+      an incoming trace header, and every log line for that request includes it. The error
+      handler logs the full error, stack and context against that id and returns only the id
+      in the response. A user or a support ticket then quotes one string, and an engineer
+      finds the exact failure in seconds. Structured JSON logs make it searchable, and
+      distributed tracing extends the same id across services. The trade-off is log volume
+      and cost, so sample successful requests but always keep errors.

@@ -1,0 +1,294 @@
+summary: >-
+  NumPy gives Python a real array: a block of memory holding numbers of one type, with a
+  shape that says how to read it as rows and columns. Operations on the array run as loops
+  in compiled code. Summing a million numbers costs one function call, not a million trips
+  through the interpreter. Almost every Python library for data and machine
+  learning, from pandas to PyTorch, speaks this format.
+
+
+  It solves two problems. The first is speed: a Python list stores pointers to separate
+  objects, while an array stores raw numbers side by side. The second is expression:
+  broadcasting and `axis` let one line describe work on a whole table. Scaling every row is
+  one line, and so is comparing a query with ten thousand embeddings.
+
+
+  Reach for NumPy when you have many numbers of one type and the same operation for each:
+  eval scores, latencies, embeddings. Don't reach for it for a handful of values, mixed
+  records or text, where lists, dicts and pandas are clearer. The price of the speed is
+  vigilance about shapes: a wrong axis or an accidental broadcast gives wrong numbers
+  without an error.
+remember:
+  - An ndarray is one block of memory with a single dtype, a shape and strides, which is why whole-array operations run in compiled loops.
+  - Vectorisation means replacing a Python loop with one array operation, and it is usually hundreds of times faster.
+  - Two shapes broadcast when, lined up from the right, each pair of sizes is equal or one of them is 1.
+  - '`axis=k` is the dimension that disappears, and `keepdims=True` keeps it as size 1 so the result broadcasts back against the original.'
+  - Basic slices return views that share memory with the original, while boolean masks and lists of positions return copies.
+  - Combine masks with `&`, `|` and `~`, with brackets around each comparison, because `and` and `or` need a single truth value.
+  - Cosine similarity is the dot product of unit-length vectors, so normalise the rows once and one matrix multiply scores them all.
+  - For top-k out of many rows, `argpartition` finds the k best in linear time, then `argsort` orders only those k.
+sections:
+  - title: What an array is in memory
+    body: |-
+      A Python list of numbers is a list of pointers, each to a separate `float` object with
+      its own header. An ndarray is a single buffer of raw values plus a little metadata.
+      The **dtype** says what each value is. The **shape** says how many there are along
+      each axis. The **strides** say how many bytes to step to the next item on each axis.
+
+      ```python
+      import numpy as np
+
+      prices = np.array([3, 5, 8])
+      print(prices.dtype, prices.itemsize, prices.nbytes)  # int64 8 24
+
+      mixed = np.array([3, 5.5])
+      print(mixed.dtype)  # float64: one dtype for all, so the int is upcast
+
+      grid = np.arange(6).reshape(2, 3)
+      print(grid.strides)  # (24, 8): 24 bytes to the next row, 8 to the next column
+      print(grid.T.strides)  # (8, 24): the transpose swaps strides, copies nothing
+      print(np.shares_memory(grid, grid.T))  # True
+
+      small = np.array([250, 10], dtype=np.uint8)
+      print(small + np.uint8(10))  # [ 4 20]: fixed-size ints wrap, no error
+      ```
+
+      This layout explains the speed. A compiled loop walks the buffer at machine speed, with
+      no type checks per item. Modern CPUs can also apply one instruction to several values
+      at once. A Python loop, by contrast, creates a Python object for every item it touches and
+      dispatches `+` dynamically each time.
+
+      It also explains the limits. Every item has the same type, so a mixed list gets
+      upcast, and strings in an array are rarely what you want. Integers have a fixed width,
+      so they can overflow silently, unlike Python's unbounded `int`. And an array's size is
+      fixed: `np.append` builds a whole new array each call, so growing one in a loop is
+      O(n²). Collect into a list, then convert once. Compared with JavaScript, an ndarray is
+      closer to a `Float64Array` with a shape than to a normal `Array`.
+  - title: Views and copies
+    body: |-
+      Because an array is a buffer plus metadata, NumPy can often give you a new array
+      that reads the same buffer differently. That is a **view**. Slices, `reshape` and `.T`
+      usually return views, which is fast and uses no extra memory. But writing through a
+      view changes the original.
+
+      ```python
+      import numpy as np
+
+      scores = np.array([0.2, 0.9, 0.4, 0.7])
+
+      top_half = scores[:2]  # a slice is a view
+      top_half[0] = 1.0
+      print(scores)  # [1.  0.9 0.4 0.7]: the original changed
+
+      passing = scores[scores > 0.5]  # a mask makes a copy
+      passing[:] = 0.0
+      print(scores)  # [1.  0.9 0.4 0.7]: unchanged
+
+      picked = scores[[0, 3]]  # a list of positions makes a copy too
+      print(np.shares_memory(picked, scores))  # False
+
+      scores[scores < 0.5] = 0.0  # but assigning through a mask writes in place
+      print(scores)  # [1.  0.9 0.  0.7]
+
+      safe = scores[:2].copy()  # an explicit copy when you need one
+      print(safe.base is None)  # True: it owns its memory
+      ```
+
+      The rule to remember: **basic indexing** (integers and slices) gives views, and
+      **advanced indexing** (boolean masks, integer arrays) gives copies. Assignment is the
+      exception: `a[mask] = value` always writes into `a`.
+
+      This differs from JavaScript, where `array.slice()` always copies. In NumPy, a function
+      that slices its input and edits the slice mutates the caller's data. Call `.copy()`
+      when you hand out part of an array that the receiver might change. Also copy when you
+      keep a small slice of a huge array: a view keeps the whole buffer alive in memory.
+  - title: Broadcasting, all the way through
+    body: |-
+      Broadcasting lets arrays of different shapes combine without copying data. NumPy lines
+      the shapes up from the right. Each pair of sizes must be equal, or one of them must be
+      1, and a missing dimension counts as 1. A size-1 dimension is stretched to match,
+      without allocating the stretched array.
+
+      ```python
+      import numpy as np
+
+      grades = np.array([[4, 5, 3], [2, 2, 3], [5, 4, 4], [1, 2, 1]])
+
+      row_means = grades.mean(axis=1)  # shape (4,)
+      try:
+          grades - row_means  # (4, 3) and (4,): 3 and 4 clash
+      except ValueError as error:
+          print(error)  # operands could not be broadcast together with shapes (4,3) (4,)
+
+      centred = grades - grades.mean(axis=1, keepdims=True)  # (4, 3) - (4, 1)
+      print(centred.shape)  # (4, 3)
+
+      # Every pairwise difference between two sets, no loop.
+      a = np.array([0.0, 1.0, 2.0])  # shape (3,)
+      b = np.array([10.0, 20.0])  # shape (2,)
+      print((a[:, None] - b[None, :]).shape)  # (3, 1) - (1, 2) -> (3, 2)
+      ```
+
+      Indexing with `None` (also spelt `np.newaxis`) inserts a size-1 axis. That is the tool
+      for "every pair" computations: distances between all queries and all documents, or a
+      price table for every product and every discount.
+
+      The danger is the accidental success. `(4, 1) - (4,)` doesn't fail. It broadcasts to
+      `(4, 4)`, sixteen numbers where you wanted four, and a later `.mean()` hides the
+      mistake. The same happens when a column vector meets a row vector by accident. Square
+      arrays are worse, since both axes fit. Guard the shapes that enter your functions with
+      `assert x.shape == (n, d)`, and print shapes, not values, when a number looks odd.
+  - title: Masks, where and friends
+    body: |-
+      A comparison on an array gives a boolean array of the same shape, a **mask**. Masks
+      are how you filter, count and replace without loops.
+
+      ```python
+      import numpy as np
+
+      latency_ms = np.array([850, 2300, 700, 4100, 1200])
+      passed = np.array([True, False, True, True, False])
+
+      slow_and_passed = (latency_ms > 1000) & passed
+      print(slow_and_passed)  # [False False False  True False]
+      print(int(slow_and_passed.sum()))  # 1: True counts as 1
+      print(np.where(latency_ms > 2000, "slow", "ok"))  # ['ok' 'slow' 'ok' 'slow' 'ok']
+      print(np.clip(latency_ms, 0, 2000))  # [ 850 2000  700 2000 1200]
+      print(np.flatnonzero(~passed))  # [1 4]: positions of the failures
+      ```
+
+      The brackets matter. In Python, `&` binds tighter than `>`, so
+      `latency_ms > 1000 & passed` is read as `latency_ms > (1000 & passed)`. And `and`
+      fails outright, because it asks the whole array for one `True` or `False`. The error
+      says "The truth value of an array with more than one element is ambiguous". The same rule carries over to pandas.
+
+      `np.where(cond, a, b)` is the vectorised ternary: it evaluates both `a` and `b` in full,
+      then picks per item. That is fine for arithmetic, but it means a division in one branch
+      still runs, and warns, for items the other branch covers. `sum` of a mask counts,
+      `mean` of a mask gives a share, and `any` or `all` answer yes-or-no questions about the
+      whole array.
+  - title: Top-k search over embeddings, done properly
+    body: |-
+      The lesson's `top_k` sorts every score. That is O(n log n), and with a million rows
+      you only need three. `argpartition` moves the k best into the first k positions in
+      linear time, in no particular order, and then you sort only those.
+
+      ```python
+      import numpy as np
+
+
+      def top_k(query: np.ndarray, rows: np.ndarray, k: int) -> list[int]:
+          norms = np.linalg.norm(rows, axis=1, keepdims=True)
+          unit = rows / np.maximum(norms, 1e-12)  # a zero row scores 0, not NaN
+          q = query / max(np.linalg.norm(query), 1e-12)
+          scores = unit @ q
+          k = min(k, len(scores))
+          if k == 0:
+              return []
+          part = np.argpartition(-scores, k - 1)[:k]  # the k best, unordered: O(n)
+          best = part[np.argsort(-scores[part])]  # sort only those k
+          return [int(i) for i in best]
+
+
+      rng = np.random.default_rng(0)
+      table = rng.normal(size=(100_000, 384)).astype(np.float32)
+      table[7] = 0.0  # an empty passage
+      query = table[42] + rng.normal(scale=0.1, size=384).astype(np.float32)
+      print(top_k(query, table, 3)[0])  # 42
+      print(len(top_k(query, table, 10**6)))  # 100000
+
+      with np.errstate(invalid="ignore"):
+          naive = table[7] / np.linalg.norm(table[7])
+      print(naive[:3])  # [nan nan nan]
+      ```
+
+      Three production details hide in there. A zero vector has no direction, and dividing
+      by its norm gives NaN, which then sorts unpredictably, so guard the division. `k`
+      larger than the table must not crash. And **normalise once at write time**: store
+      unit-length rows, and each query costs one matrix-vector product.
+
+      Memory matters too. This table in float32 is about 154 MB. In float64 it would be
+      twice that, for no gain in ranking quality. Past a few million rows, or with filters
+      and updates, a vector index such as the ones in chapter 20 takes over. It trades exact
+      results for approximate ones that are much faster. Up to that point, a NumPy matrix
+      multiply is exact, simple and often fast enough.
+  - title: Floating-point precision
+    body: |-
+      Floats are binary fractions with a fixed number of bits, so most decimals are stored
+      approximately. That is the same IEEE 754 arithmetic as JavaScript's `number`, and the
+      same surprises follow.
+
+      ```python
+      import numpy as np
+
+      print(0.1 + 0.2 == 0.3)  # False
+      print(np.isclose(0.1 + 0.2, 0.3))  # True
+
+      ones = np.ones(20_000_000, dtype=np.float32)
+      print(ones.sum())  # 2e+07: pairwise summation stays accurate
+      print(np.cumsum(ones)[-1])  # 1.6777216e+07: a running total stalls at 2**24
+      print(ones.sum(dtype=np.float64))  # 20000000.0
+      ```
+
+      float64 carries about 16 significant decimal digits, float32 about 7. At 2**24, which
+      is 16,777,216, adding 1 to a float32 no longer changes it, so a naive running total
+      stops growing. `np.sum` uses pairwise summation on contiguous data, which keeps the
+      error small, but `cumsum` and a Python loop add one by one.
+
+      The practical rules follow. Compare floats with `np.isclose` or `np.allclose`, never
+      `==`. Store embeddings in float32 to halve memory, since ranking survives the lost
+      digits, but accumulate large sums in float64 with `dtype=np.float64`. And don't use
+      floats for money: store whole pence as integers, or use Python's `decimal`. A cosine
+      that comes out as 1.0000001 is normal, so clip it with `np.clip(x, -1, 1)` before
+      passing it to `arccos`.
+pitfalls:
+  - '**Looping over an array in Python.** `for x in scores` throws away the speed and boxes every item as a Python object. Find the whole-array operation: a ufunc, a reduction with `axis`, a mask or `@`.'
+  - '**Choosing the wrong axis.** `axis=0` squashes the rows and leaves one value per column. On a square array both axes give the same shape, so the wrong one runs without an error. Name the axis in a comment and assert the result''s shape.'
+  - '**Broadcasting by accident.** `(n, 1)` minus `(n,)` gives `(n, n)`, not `(n,)`. Use `keepdims=True` for reductions you subtract back, and check shapes where arrays enter a function.'
+  - '**Writing through a view.** A slice shares memory, so editing it edits the original. Call `.copy()` before changing part of an array that someone else owns.'
+  - '**Growing an array in a loop.** `np.append` copies the whole array each time, which is O(n²) overall. Collect values in a list and call `np.array` once, or preallocate with `np.empty`.'
+  - '**Using `and` or leaving out brackets with masks.** `and` raises "truth value is ambiguous", and `a > 1 & b` parses as `a > (1 & b)`. Write `(a > 1) & b`.'
+  - '**Comparing floats with `==`.** `0.1 + 0.2 == 0.3` is `False`. Use `np.isclose` with a tolerance that suits the data.'
+  - '**Dividing by a zero norm.** An empty or all-zero embedding turns into NaN and poisons the ranking. Guard with `np.maximum(norms, 1e-12)` or drop such rows at ingest.'
+interview:
+  - question: Why is a NumPy operation so much faster than the equivalent Python loop?
+    answer: >-
+      Because the work moves from the interpreter into one compiled loop over contiguous,
+      typed memory. An ndarray stores raw values of one dtype side by side. So `scores.mean()`
+      hands a pointer and a length to C code that runs at machine speed, often with SIMD
+      instructions. A Python loop does interpreter work
+      for every item: it creates a float object, looks up `+` dynamically and updates a
+      reference count. That gap is typically a few hundred times. The trade-off is
+      flexibility: arrays need one dtype and a fixed size, integers can overflow silently,
+      and code must be phrased as whole-array operations. For a handful of values, the
+      overhead of creating the array can outweigh the gain.
+  - question: Explain broadcasting. Give an example where it silently does the wrong thing.
+    answer: >-
+      Broadcasting combines arrays of different shapes by stretching size-1 dimensions,
+      without copying. Shapes are compared from the right, and each pair must be equal or
+      include a 1. So `(4, 3) - (3,)` subtracts one value per column from every row. The
+      silent failure is `(n, 1) - (n,)`: both are "a vector of n", but the result is an
+      `(n, n)` matrix, and a following `mean()` returns a plausible number. It often happens
+      when one side came from a reduction without `keepdims=True`. I assert shapes at
+      function boundaries and keep dimensions on reductions I broadcast back. I also test
+      with non-square data, so a wrong axis fails loudly.
+  - question: How would you find the top 10 most similar documents to a query among a million embeddings?
+    answer: >-
+      Normalise the embeddings to unit length once when they're stored, then score with one
+      matrix-vector product and pick the top 10 with `argpartition`. With unit vectors, the
+      dot product equals the cosine, so `scores = rows @ q` is a single BLAS call.
+      `np.argpartition(-scores, 9)[:10]` finds the ten best in O(n), and sorting those ten
+      orders them. I store rows in float32, which halves memory to about 1.5 GB for a million
+      384-dimensional vectors, and guard against zero vectors. This exact search is fine up to
+      a few million rows. Beyond that, or with metadata filters and frequent updates, I'd use
+      an approximate index such as HNSW. It accepts slightly imperfect recall for much lower
+      latency.
+  - question: When does NumPy return a view and when a copy? Why does it matter?
+    answer: >-
+      Basic indexing, meaning integers and slices, plus `reshape` and transpose, usually
+      return views that share the original buffer. Advanced indexing, meaning boolean masks
+      and integer arrays, returns copies. It matters in two ways. Correctness: editing a view
+      edits the original, so a helper that slices and modifies its argument mutates the
+      caller's data. Memory: a small view of a huge array keeps the whole buffer alive, so
+      `.copy()` can free gigabytes. Assignment through any index, as in `a[mask] = 0`, always
+      writes into `a`. `np.shares_memory` tells you for sure. Pandas 3 went the other way and
+      made every derived object behave as a copy, which is simpler but hides these costs.

@@ -1,0 +1,318 @@
+id: pro.sql
+title: SQL like a pro
+objective: 'Write readable, set-based SQL: explicit columns, CTEs, consistent formatting, NULL-safe logic and parameters.'
+level: essential
+minutes: 10
+concepts: [pro.sql-style, pro.set-based-thinking, pro.readable-queries]
+prerequisites: [db.transactions]
+opening:
+  text: >-
+    You'll write SQL that a senior reads in one pass and trusts. The same habits stop queries
+    breaking quietly when the table changes.
+
+steps:
+  - type: prose
+    id: sql-style
+    body: |-
+      You can write SQL. Now make it quick to read and hard to break. Pros keep a few habits:
+
+      - **Explicit columns**: name them, never `SELECT *` in application code.
+      - One clause per line: `SELECT`, `FROM`, `WHERE`, `GROUP BY`, `ORDER BY`.
+      - One consistent case for keywords, kept by a formatter, not by hand.
+
+      None of this changes the result. It makes the query quick to scan and safe to change.
+
+  - type: multiple-choice
+    id: pick-explicit-columns
+    concept: pro.sql-style
+    difficulty: 1
+    question: Which query tells you what comes back without opening the schema?
+    code: |
+      -- A
+      select * from loans where returned_on is null;
+
+      -- B
+      SELECT id, member_id, title, due_on
+      FROM loans
+      WHERE returned_on IS NULL;
+    language: sql
+    choices:
+      - text: B, because it names every column
+        correct: true
+        feedback: >-
+          Yes. The reader sees the result's shape right there in the query.
+      - text: A, because it's shorter
+        feedback: >-
+          Shorter to type, slower to read. `*` sends you to the schema to find out what returns.
+      - text: Neither, both need a comment
+        feedback: >-
+          B needs none. Named columns already say what the query returns.
+
+  - type: sql
+    id: predict-select-star-breaks
+    concept: pro.sql-style
+    difficulty: 2
+    prompt: >-
+      The nightly job copies returned loans into the archive. Yesterday someone added a
+      `renewals` column to `loans`, and today the job fails. Run it, read the error, and fix it
+      by naming the columns.
+    setup: |
+      CREATE TABLE loans (
+        id integer PRIMARY KEY,
+        member_id integer,
+        title text NOT NULL,
+        due_on date NOT NULL,
+        returned_on date,
+        renewals integer NOT NULL DEFAULT 0
+      );
+      CREATE TABLE loans_archive (
+        id integer PRIMARY KEY,
+        member_id integer,
+        title text NOT NULL,
+        due_on date NOT NULL,
+        returned_on date
+      );
+      INSERT INTO loans (id, member_id, title, due_on, returned_on) VALUES
+        (1, 1, 'Dune', '2026-08-01', '2026-08-03'),
+        (2, 2, 'Emma', '2026-08-20', NULL),
+        (3, 1, 'Beloved', '2026-08-25', '2026-08-24');
+    starter: |
+      INSERT INTO loans_archive
+      SELECT * FROM loans WHERE returned_on IS NOT NULL;
+    solution: |
+      INSERT INTO loans_archive
+      SELECT id, member_id, title, due_on, returned_on
+      FROM loans
+      WHERE returned_on IS NOT NULL;
+    checks:
+      query: SELECT id, title FROM loans_archive ORDER BY id
+    showSchema: true
+    hints:
+      - The error says the copy brings more columns than the archive has.
+      - Replace `*` with the five columns the archive holds.
+
+  - type: prose
+    id: set-based
+    body: |-
+      Here's a common amateur shape. The app loops and sends one query per row:
+
+      ```js
+      for (const loan of overdueLoans) {
+        await db.query('UPDATE loans SET fine_pence = fine_pence + 50 WHERE id = $1', [loan.id]);
+      }
+      ```
+
+      A pro thinks in **sets**. One statement with a `WHERE` covers every matching row, in one
+      trip to the database.
+
+  - type: sql
+    id: predict-one-update
+    concept: pro.set-based-thinking
+    difficulty: 2
+    prompt: >-
+      This script fines overdue loans one id at a time, and a new overdue loan slipped past it.
+      Replace it with one `UPDATE` that fines every loan due before 1 September and not yet
+      returned.
+    setup: |
+      CREATE TABLE loans (
+        id integer PRIMARY KEY,
+        title text NOT NULL,
+        due_on date NOT NULL,
+        returned_on date,
+        fine_pence integer NOT NULL DEFAULT 0
+      );
+      INSERT INTO loans (id, title, due_on, returned_on) VALUES
+        (1, 'Dune', '2026-08-01', '2026-08-03'),
+        (2, 'Emma', '2026-08-20', NULL),
+        (3, 'Beloved', '2026-09-20', NULL),
+        (4, 'Middlemarch', '2026-08-10', NULL),
+        (5, 'Persuasion', '2026-08-28', NULL);
+    starter: |
+      UPDATE loans SET fine_pence = fine_pence + 50 WHERE id = 2;
+      UPDATE loans SET fine_pence = fine_pence + 50 WHERE id = 4;
+    solution: |
+      UPDATE loans
+      SET fine_pence = fine_pence + 50
+      WHERE due_on < '2026-09-01'
+        AND returned_on IS NULL;
+    checks:
+      query: SELECT id, fine_pence FROM loans ORDER BY id
+    showSchema: true
+    hints:
+      - Say which rows to fine with conditions, not with ids.
+      - Two conditions, joined with `AND`. One compares `due_on`, one checks `returned_on`.
+
+  - type: prose
+    id: ctes
+    body: |-
+      Long queries get nested, and nested reads inside out. A **common table expression**, or
+      CTE, fixes that. `WITH` gives a query a name, and the next query uses it like a table:
+
+      ```sql
+      WITH returned AS (
+        SELECT member_id FROM loans WHERE returned_on IS NOT NULL
+      )
+      SELECT member_id, COUNT(*) FROM returned GROUP BY member_id;
+      ```
+
+      Each step reads top to bottom. Name it for what it holds.
+
+  - type: fill-blank
+    id: fill-cte
+    concept: pro.readable-queries
+    difficulty: 2
+    language: sql
+    prompt: >-
+      Name the overdue loans first, then count them per member. Fill the gaps.
+    template: |
+      {{1}} overdue AS (
+        SELECT member_id
+        FROM loans
+        WHERE returned_on IS NULL
+          AND due_on < '2026-09-01'
+      )
+      SELECT members.name, COUNT(*) AS overdue_loans
+      FROM {{2}}
+      JOIN members ON members.id = overdue.member_id
+      GROUP BY members.name;
+    blanks:
+      - key: '1'
+        answer: WITH
+      - key: '2'
+        answer: overdue
+    bank: [WITH, overdue, AS, loans, VIEW]
+
+  - type: prose
+    id: not-in
+    body: |-
+      One more trap, and it's a `NULL` one. `NOT IN` keeps rows whose value isn't in a list:
+
+      ```sql
+      WHERE id NOT IN (SELECT member_id FROM loans)
+      ```
+
+      Remember that `NULL` means unknown. Is 4 in a list holding `NULL`? Postgres can't say,
+      so the answer is unknown, and `WHERE` drops the row.
+
+  - type: ai-review
+    id: review-not-in-null
+    concept: pro.set-based-thinking
+    difficulty: 3
+    language: sql
+    request: List members who have never borrowed a book.
+    flawClass: edge-case
+    code: |
+      SELECT name
+      FROM members
+      WHERE id NOT IN (
+        SELECT member_id
+        FROM loans
+      );
+    prompt: >-
+      An assistant wrote this, and it worked on test data. In production it returns no rows at
+      all. One loan's `member_id` is `NULL` after an account was deleted. Tap the line at fault.
+    lines: [3]
+    reasons:
+      - text: '`NOT IN` meets a `NULL` and nothing is ever true'
+        correct: true
+        feedback: >-
+          Exactly. `4 NOT IN (1, NULL)` is unknown, not true, so every row drops.
+      - text: The subquery needs `DISTINCT`
+        feedback: >-
+          Duplicates don't change `NOT IN`. The single `NULL` in the list is what empties the result.
+      - text: '`SELECT name` should be `SELECT *`'
+        feedback: >-
+          The columns are fine. The filter never lets a row through.
+    fix: |
+      -- NOT EXISTS asks "is there a matching loan?", and NULL can't confuse it
+      SELECT name
+      FROM members
+      WHERE NOT EXISTS (
+        SELECT 1
+        FROM loans
+        WHERE loans.member_id = members.id
+      );
+
+  - type: explain-back
+    id: explain-set-based
+    concept: pro.set-based-thinking
+    difficulty: 4
+    prompt: >-
+      A loop in the app sends one `UPDATE` per overdue loan. Why is one `UPDATE` with a
+      `WHERE` the better design?
+    rubric:
+      - The loop makes one trip to the database per row, so it slows as rows grow.
+      - One statement picks the rows by a rule, so a row the loop's list missed can't slip past.
+      - One statement is one transaction, so it can't stop halfway through the rows.
+    modelAnswer: >-
+      Each pass of the loop is a trip to the database, so ten thousand loans means ten
+      thousand trips. One `UPDATE` with a `WHERE` sends one statement, and the database
+      changes every matching row in one pass. The rule picks the rows, so a loan the app's
+      list missed still gets its fine. And it's all or nothing, so a crash can't leave half
+      the fines added.
+
+recap:
+  - Name columns and put one clause per line, and let a formatter keep the case.
+  - Replace a loop of single-row queries with one set-based statement.
+  - Split a long query into named CTEs, and use `NOT EXISTS` where `NULL` can appear.
+recall:
+  - id: card-select-star
+    concept: pro.sql-style
+    front: Why does `SELECT *` in application code break later?
+    back: >-
+      Adding a column changes what it returns, so inserts, copies and code expecting the old
+      shape fail or misbehave.
+  - id: card-set-based
+    concept: pro.set-based-thinking
+    front: How do you add a 50p fine to every overdue loan without a loop?
+    back: >-
+      One `UPDATE loans SET fine_pence = fine_pence + 50 WHERE ...` that matches all of them.
+  - id: card-cte
+    concept: pro.readable-queries
+    front: What does a `WITH` clause give a long query?
+    back: >-
+      Named steps that read top to bottom, each usable like a table in the next.
+  - id: card-not-in-null
+    concept: pro.set-based-thinking
+    front: Why can `NOT IN (subquery)` return no rows at all?
+    back: >-
+      One `NULL` in the subquery makes every comparison unknown. `NOT EXISTS` doesn't have
+      that problem.
+
+references:
+  - kind: docs
+    title: WITH Queries (Common Table Expressions)
+    authors: The PostgreSQL Global Development Group
+    venue: PostgreSQL Documentation
+    url: https://www.postgresql.org/docs/current/queries-with.html
+    note: CTEs, how they are evaluated, and when Postgres inlines them.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Subquery Expressions
+    authors: The PostgreSQL Global Development Group
+    venue: PostgreSQL Documentation
+    url: https://www.postgresql.org/docs/current/functions-subquery.html
+    note: The exact NULL rules for IN, NOT IN and EXISTS.
+    primary: true
+    verified: true
+  - kind: essay
+    title: SQL Style Guide
+    authors: Simon Holywell
+    url: https://www.sqlstyle.guide/
+    note: A widely used set of formatting and naming conventions.
+    verified: true
+
+deepDive: >-
+  Every result here ran on PostgreSQL 17. `INSERT ... SELECT *` failed with `INSERT has more
+  expressions than target columns` once `renewals` was added, the `NOT IN` query returned 0
+  rows while `NOT EXISTS` returned Dee, and the set-based fine reported `UPDATE 3`.
+
+
+  Parameters matter even in one-off scripts. Building SQL by gluing strings lets a value like
+  `' OR '1'='1` rewrite the query; a placeholder such as `$1` keeps data and code apart, and
+  the Security module shows the attack in full. For comparisons where either side may be
+  `NULL`, `IS DISTINCT FROM` treats `NULL` as a value. Since Postgres 12, a CTE used once is
+  usually inlined into the main query, so naming steps costs nothing. Add `MATERIALIZED` only
+  when you want it computed once on purpose. SQL formatters such as sqlfluff enforce style
+  in CI, the same way prettier does for JavaScript.

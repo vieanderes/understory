@@ -1,0 +1,240 @@
+summary: >-
+  A web app does three kinds of work: talking to the outside world, deciding things, and
+  storing things. Layering keeps them apart. Handlers and components translate requests
+  and render results, the domain holds the business rules, and data access talks to the
+  database. Each layer calls only the one below it.
+
+
+  The payoff is that a rule lives in one place that every entry point has to pass. A rule
+  inside one HTTP handler guards one door; the CSV import, the scheduled job and the new
+  bulk endpoint walk straight past it. Rules in plain functions are also far quicker to
+  test, because a function call needs no server.
+
+
+  These notes add what the lesson leaves implicit: how a domain function reports failure
+  without knowing about HTTP, which validation belongs at the edge and which in the
+  domain, who owns a database transaction, what counts as an entry point in a Next.js app,
+  and the ways layering goes wrong when it's applied without thought.
+remember:
+  - Put each business rule in one domain function that every entry point calls, because a rule in a handler only guards that handler.
+  - A thin handler reads the request, makes one call into the domain, and turns the result into a status and a body.
+  - The domain returns results in its own words, such as `'over-limit'`, and only the handler maps them to HTTP status codes.
+  - Check the shape of input at the edge and the business rules in the domain, since a well-formed request can still break a rule.
+  - 'Every way in counts as an entry point: routes, server actions, imports, jobs, scripts and admin screens.'
+  - A Next.js server action is a public HTTP endpoint, so it needs the same authentication and domain call as any route.
+  - Layers are about the direction of calls, not folder names, and they fit inside feature folders.
+sections:
+  - title: Results in the domain, status codes at the edge
+    body: |-
+      A domain function shouldn't return `404` or `422`. Those are HTTP words, and the same
+      rule runs from a job or an import where HTTP means nothing. Instead the domain returns
+      a result in its own vocabulary, and the handler translates.
+
+      ```ts
+      type RefundError = 'not-found' | 'not-yours' | 'over-limit';
+      type RefundResult = { ok: true; refundId: string } | { ok: false; error: RefundError };
+      type Order = { id: string; ownerId: string; paidPence: number };
+
+      const orders = new Map<string, Order>([
+        ['o1', { id: 'o1', ownerId: 'u1', paidPence: 4000 }],
+      ]);
+
+      // domain: plain values in, a result out
+      function refund(orderId: string, userId: string, pence: number): RefundResult {
+        const order = orders.get(orderId);
+        if (!order) return { ok: false, error: 'not-found' };
+        if (order.ownerId !== userId) return { ok: false, error: 'not-yours' };
+        if (pence > order.paidPence) return { ok: false, error: 'over-limit' };
+        return { ok: true, refundId: `r-${orderId}` };
+      }
+
+      // handler: the only place that knows HTTP
+      const HTTP: Record<RefundError, { status: number; message: string }> = {
+        'not-found': { status: 404, message: 'order not found' },
+        'not-yours': { status: 404, message: 'order not found' },
+        'over-limit': { status: 422, message: 'refund is more than was paid' },
+      };
+
+      function postRefund(body: unknown, session: { userId: string }) {
+        const input = body as { orderId?: unknown; pence?: unknown };
+        if (typeof input.orderId !== 'string' || !Number.isInteger(input.pence)) {
+          return { status: 400, body: { error: 'orderId and whole pence are required' } };
+        }
+        const result = refund(input.orderId, session.userId, input.pence as number);
+        if (!result.ok) {
+          const { status, message } = HTTP[result.error];
+          return { status, body: { error: message } };
+        }
+        return { status: 201, body: { refundId: result.refundId } };
+      }
+
+      console.log(postRefund({ orderId: 'o1', pence: 1000 }, { userId: 'u1' })); // 201
+      console.log(postRefund({ orderId: 'o1', pence: 1000 }, { userId: 'u2' })); // 404
+      console.log(postRefund({ orderId: 'o1', pence: 9000 }, { userId: 'u1' })); // 422
+      console.log(postRefund({ orderId: 'o1', pence: '10' }, { userId: 'u1' })); // 400
+      ```
+
+      Two choices here are deliberate. `not-yours` maps to `404`, not `403`, so a stranger
+      can't learn which order ids exist. And because the error type is a union, adding a
+      new error without a mapping is a compile error in the `Record`. A CSV importer maps
+      the same results to "line 12 refused: over-limit", with no change to the rule.
+
+      Throwing is the common alternative: the domain throws typed errors and a middleware
+      maps them. It works, but the possible failures no longer appear in the function's
+      type, so callers forget to handle them.
+  - title: Two kinds of validation
+    body: |-
+      Validation happens in two places, and they check different things.
+
+      At the edge, the handler checks **shape**: is `pence` a whole number, is `orderId` a
+      string, is the body JSON at all. A shape error means the caller sent something
+      malformed, and the answer is `400`. This is where a schema library such as Zod sits,
+      because it turns untrusted input into typed values the rest of the code can rely on.
+
+      In the domain, the rule checks **meaning**: is the refund more than was paid, does
+      the room take this many guests, is this booking the caller's. A perfectly
+      well-formed request can still break a rule, and the answer is usually `422`, or `404`
+      or `403` for access.
+
+      The split matters for entry points. A CSV import has no JSON body, so it has its own
+      shape checks: splitting lines, converting `'4'` to `4`. But it calls the same domain
+      function, so the business rules are checked once for everyone. If you put business
+      rules in the Zod schema, such as "at most 8 guests", the import skips them again,
+      which is the lesson's bug in a new place.
+
+      A useful test: could this check be true or false depending on data in the database,
+      or on a business decision that might change? Then it belongs in the domain.
+  - title: Who owns the transaction
+    body: |-
+      Many operations write more than once: book a room and record the payment, or cancel a
+      booking and release its slot. Those writes should succeed or fail together, which
+      means one database transaction. The question is which layer opens it.
+
+      Not the handler, because the import and the job would each need to remember. Not deep
+      inside a data-access function, because it can't see the other writes. The usual answer
+      is the **use case**: the domain-facing function for one thing a user does, such as
+      `cancelBooking`. It opens the transaction, calls the rules, and passes the transaction
+      to the data-access functions.
+
+      ```ts
+      type Tx = { log: string[] };
+
+      async function withTransaction<T>(work: (tx: Tx) => Promise<T>): Promise<T> {
+        const tx: Tx = { log: ['BEGIN'] };
+        try {
+          const result = await work(tx);
+          tx.log.push('COMMIT');
+          return result;
+        } catch (error) {
+          tx.log.push('ROLLBACK');
+          throw error;
+        } finally {
+          console.log(tx.log.join(' > '));
+        }
+      }
+
+      async function cancelBooking(bookingId: string) {
+        return withTransaction(async (tx) => {
+          tx.log.push(`UPDATE bookings ${bookingId}`);
+          tx.log.push(`UPDATE slots for ${bookingId}`);
+          return { ok: true as const };
+        });
+      }
+
+      await cancelBooking('b7'); // BEGIN > UPDATE bookings b7 > UPDATE slots for b7 > COMMIT
+      ```
+
+      The pure rules, such as "a booking can't be cancelled within 24 hours of the stay",
+      stay free of any transaction and remain trivially testable. Some codebases call this
+      layer the application layer, or services, and keep the domain for pure rules only.
+      The name matters less than the rule: one function per use case owns its transaction,
+      and every entry point calls that function.
+  - title: Entry points you might forget
+    body: |-
+      The lesson's bug came from a second entry point. In a real app there are more than
+      people expect, and each one is a door a rule in a handler doesn't guard:
+
+      - REST or GraphQL routes, including new bulk versions of old ones.
+      - **Next.js server actions.** A function marked `'use server'` can be called by a
+        `POST` request from anyone who finds its id, not only from your form. Treat it like
+        a public route: check the session and call the domain.
+      - Webhooks from a payment provider or another service.
+      - Queue consumers and scheduled jobs.
+      - CSV imports, seed scripts, admin panels and one-off data fixes.
+
+      A thin handler in each case does the same three things: turn its input into plain
+      values, make one call into the domain, and turn the result into its own output, a
+      status code, a log line or a retry. The domain function is then the single place to
+      read, test and audit the rule.
+
+      In Next.js, the `server-only` package gives the data-access and domain modules a
+      guard: importing a module that imports `server-only` from a client component fails
+      the build. That keeps database code and secrets from being bundled for the browser
+      by accident.
+  - title: How layering goes wrong
+    body: |-
+      Layers help when each one does real work. Two failure modes show up often.
+
+      **Pass-through layers.** A controller calls a service that calls a repository, and
+      the service's method is one line that forwards the call. Every change now edits three
+      files for no gain. If a layer has nothing to decide, skip it: a handler that only
+      reads a list can call data access directly, as long as it decides nothing.
+
+      **The anaemic domain.** The "domain" is a set of type definitions, and all the
+      decisions live in handlers and services. The folder exists, but rules are still
+      scattered across entry points. The test is simple: can you run every business rule
+      without a request object or a database? If not, the domain isn't doing its job.
+
+      Layering also isn't a reason to make every call go through every layer. A report
+      that needs a complex query can live in data access and be called from its handler.
+      What must go through the domain is anything that decides: prices, limits, who may do
+      what, what state changes are allowed.
+pitfalls:
+  - '**A business rule inside a handler or component.** It feels natural because that''s where the feature started, but the next entry point skips it. Move it into a domain function and call it from every entry point.'
+  - '**Domain functions that return HTTP statuses or take `req`.** They tie rules to one framework and one kind of caller. Return a result in domain words and map it at the edge.'
+  - '**Business rules in the request schema.** "At most 8 guests" in a Zod schema only guards the routes that use it. Keep shape in the schema and meaning in the domain.'
+  - '**Forgetting server actions are public.** A `''use server''` function can be called directly with a `POST`, so a missing session or owner check is an open door. Check the session and call the same domain function as the route.'
+  - '**Transactions opened in handlers.** Each entry point must then remember to open one, and the job that forgets writes half an operation. Let the use case own the transaction.'
+  - '**Layers that only forward calls.** Three files change for every edit. Remove a layer that decides nothing.'
+interview:
+  - question: What does a thin controller or handler look like, and why does it matter?
+    answer: >-
+      It does three things: parses the request into plain values, makes one call into the
+      domain, and maps the result to a status and a body. It matters because business
+      rules then live in one function that every entry point shares. When a refund limit
+      sits inside one route, the bulk endpoint, the CSV import and the nightly job all skip
+      it, and nobody notices until bad data appears. A thin handler also makes rules cheap
+      to test with plain function calls, which run much faster than tests through a server.
+      The trade-off is an extra function and a result type per use case, which is worth it
+      for anything that decides, but not for a trivial read.
+  - question: Where should validation live in a layered application?
+    answer: >-
+      In two places, for two purposes. The edge validates shape: types, required fields,
+      formats, with a schema library that turns untrusted input into typed values, failing
+      with a `400`. The domain validates meaning: limits, ownership, allowed state changes,
+      anything that depends on data or on business decisions, usually failing with `422`,
+      `403` or `404`. The split matters because entry points differ in shape but share
+      rules: a CSV import has no JSON body, yet it must still respect the guest limit. If
+      business rules sit in the request schema, every other entry point bypasses them.
+      Checking twice is a small cost compared with a rule that one door skips.
+  - question: How should domain code report errors to the HTTP layer?
+    answer: >-
+      As results in the domain's own vocabulary, which the handler maps to statuses. For
+      example, a refund returns `{ ok: false, error: 'over-limit' }`, and the route maps
+      that to `422` while an importer maps it to a refused line. With a union type for the
+      errors and a `Record` for the mapping, the compiler catches a new error nobody
+      mapped. I'd map "not yours" to `404` so ids can't be probed. Throwing typed errors
+      caught by middleware is the common alternative and keeps happy paths short, but the
+      failures vanish from the function's type, so callers tend to forget them. I use
+      exceptions for unexpected faults and results for expected business outcomes.
+  - question: Who should own a database transaction in a layered design?
+    answer: >-
+      The use case: the function for one user action, such as `cancelBooking`. It opens the
+      transaction, runs the business rules, and passes the transaction to each data-access
+      call, so all the writes commit or roll back together. The handler is the wrong place,
+      because every other entry point would have to remember to open one, and a
+      data-access function is too low, because it can't see the other writes. The pure
+      rules stay outside the transaction entirely, so they're still tested as plain
+      functions. The trade-off is that data-access functions take a transaction argument,
+      which is a little more plumbing but makes the boundary of each atomic operation
+      explicit.

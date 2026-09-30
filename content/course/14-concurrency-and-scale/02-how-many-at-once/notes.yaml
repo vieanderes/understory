@@ -1,0 +1,330 @@
+summary: >-
+  Starting async work is nearly free, so the danger is starting too much of it.
+  `Promise.all(items.map(call))` fires every call in the same instant, and the service on
+  the other end sees a flood: a rate limit trips, a connection pool runs dry, or memory
+  fills with pending responses. Three tools keep a system inside its limits. **Bounded
+  concurrency** caps how many calls are in flight. **Batching** puts many items in one call
+  to spread its fixed cost. **Backpressure** makes a producer slow down or get refused when
+  the consumer can't keep up.
+
+
+  These notes go under the lesson's `mapWithLimit`: a reusable limiter that caps a whole
+  process rather than one loop, what happens to the other calls when one fails, how to pick
+  the numbers instead of guessing them, how Node streams apply backpressure for you, and a
+  batch insert into Postgres that sidesteps the parameter limit.
+
+
+  Reach for a cap whenever the number of items comes from data rather than code: a list of
+  users, rows, files or documents. Reach for batching when the other side accepts lists, as
+  embedding APIs, bulk database inserts and message queues do. Put a bound on every queue
+  and buffer, and decide in advance what happens when it's full.
+remember:
+  - Never start one call per item with `Promise.all` when the number of items comes from data, because every call starts at once.
+  - Pick the concurrency cap from the other side's limit, such as the provider's rate limit or the database pool size.
+  - Little's law sizes a cap, because calls in flight equal the rate of calls times the time each takes.
+  - A sliding window of workers beats fixed chunks, because a chunk waits for its slowest call before the next chunk starts.
+  - A cap per loop doesn't cap the process, so share one limiter across every caller of a scarce resource.
+  - '`Promise.all` rejects on the first failure but doesn''t stop the other calls, so cancel them with an `AbortSignal` or use `Promise.allSettled`.'
+  - "Every buffer needs a bound and a rule for when it's full: make the producer wait, or refuse new work with `429` or `503`."
+  - Batches have hard limits too, including the provider's maximum and PostgreSQL's 65,535 parameters in one statement.
+sections:
+  - title: A limiter the whole process shares
+    body: |-
+      `mapWithLimit` caps one loop. But a server has many loops running at once: fifty
+      requests, each summarising a few documents with a cap of 8, can still put 400 calls
+      in flight. When the scarce thing is shared, such as one API key or one database, the
+      cap has to be shared too. That's a **semaphore**: a count of free slots, with a queue
+      of callers waiting for one.
+
+      ```ts
+      // A semaphore: at most `limit` tasks run at once, the rest wait in line.
+      function createLimiter(limit: number) {
+        let active = 0;
+        const waiting: (() => void)[] = [];
+
+        async function run<T>(task: () => Promise<T>): Promise<T> {
+          if (active >= limit) {
+            await new Promise<void>((resume) => waiting.push(resume));
+          }
+          active += 1;
+          try {
+            return await task();
+          } finally {
+            active -= 1;
+            waiting.shift()?.(); // hand the free slot to the next in line
+          }
+        }
+        return run;
+      }
+
+      // One limiter shared by every caller in the process caps the total.
+      const limitModelCalls = createLimiter(3);
+
+      let inFlight = 0;
+      let most = 0;
+      async function fakeModelCall(id: number): Promise<string> {
+        inFlight += 1;
+        most = Math.max(most, inFlight);
+        await new Promise((done) => setTimeout(done, 10));
+        inFlight -= 1;
+        if (id === 4) throw new Error(`call ${id} failed`);
+        return `summary ${id}`;
+      }
+
+      const results = await Promise.allSettled(
+        Array.from({ length: 10 }, (_, id) => limitModelCalls(() => fakeModelCall(id))),
+      );
+      console.log("most in flight:", most); // 3
+      console.log(results.filter((r) => r.status === "rejected").length, "failed"); // 1 failed
+      ```
+
+      The `finally` matters: a failed task must still free its slot, or three failures
+      would jam the limiter for good. The `waiting` queue is first in, first out, so no
+      caller waits for ever behind newer ones. This is the idea inside the `p-limit`
+      package.
+
+      The limiter still lives in one process. Four copies of the server with a cap of 3
+      each put 12 calls in flight. For a limit that covers every copy, such as a provider
+      quota, the count has to live in a shared store like Redis, or the work goes through a
+      queue with a fixed number of workers, which the queues lesson covers.
+  - title: Chunks or a sliding window
+    body: |-
+      A common first attempt at a cap is to cut the list into chunks and `Promise.all` each
+      chunk. It does cap the calls in flight, but it wastes the slots: the next chunk can't
+      start until the slowest call in the current one finishes.
+
+      ```js
+      const wait = (ms) => new Promise((done) => setTimeout(done, ms));
+      // Eight calls. Most take 10 ms, and one in each group of four takes 100 ms.
+      const durations = [100, 10, 10, 10, 100, 10, 10, 10];
+
+      async function inChunks(limit) {
+        for (let i = 0; i < durations.length; i += limit) {
+          await Promise.all(durations.slice(i, i + limit).map(wait)); // waits for the slowest
+        }
+      }
+
+      async function slidingWindow(limit) {
+        let next = 0;
+        async function worker() {
+          while (next < durations.length) await wait(durations[next++]);
+        }
+        await Promise.all(Array.from({ length: limit }, worker));
+      }
+
+      for (const run of [inChunks, slidingWindow]) {
+        const start = performance.now();
+        await run(4);
+        console.log(run.name, Math.round(performance.now() - start), "ms");
+      }
+      // inChunks about 200 ms, slidingWindow about 110 ms
+      ```
+
+      With chunks, three slots sit idle for 90 ms in every group. The sliding window starts
+      the next call the moment any slot frees up, which is what `mapWithLimit` does. The
+      gap grows with the spread of latencies, and model APIs have a wide spread: one reply
+      takes a second, another fifteen.
+
+      Chunks still have one use. When the other side limits calls per time window rather
+      than calls in flight, "send 50, wait for the next minute, send 50" matches the rule
+      directly. For everything else, use a window.
+  - title: When one call fails
+    body: |-
+      Each `Promise` combinator answers a different question, and picking the wrong one
+      decides what your users see when a single call goes wrong.
+
+      ```js
+      const later = (ms, value, fail = false) =>
+        new Promise((resolve, reject) =>
+          setTimeout(() => (fail ? reject(new Error(value)) : resolve(value)), ms),
+        );
+
+      const jobs = () => [later(30, "a"), later(10, "b failed", true), later(20, "c")];
+
+      console.log(await Promise.all(jobs()).catch((e) => `all: ${e.message}`));
+      // all: b failed   (rejects at 10 ms; a and c keep running, their results are dropped)
+      console.log((await Promise.allSettled(jobs())).map((r) => r.status));
+      // [ 'fulfilled', 'rejected', 'fulfilled' ]
+      console.log(await Promise.any(jobs()));
+      // c   (the first to fulfil; rejects with an AggregateError only if all reject)
+      console.log(await Promise.race(jobs()).catch((e) => `race: ${e.message}`));
+      // race: b failed   (the first to settle, either way)
+      ```
+
+      `Promise.all` fits "all or nothing". `allSettled` fits bulk jobs where you want every
+      success and a list of failures to retry. `any` fits asking two mirrors and taking the
+      first answer. `race` is mostly used for timeouts.
+
+      The trap is that `Promise.all` doesn't cancel anything. The other calls keep running,
+      spending quota and connections for results nobody reads. With a cap in front, the
+      workers even keep starting new items. To stop for real, share an `AbortController`:
+
+      ```js
+      // Stop starting new work after the first failure, and tell running calls to give up.
+      async function mapUntilFailure(items, limit, fn) {
+        const controller = new AbortController();
+        const results = [];
+        let next = 0;
+        async function worker() {
+          while (next < items.length && !controller.signal.aborted) {
+            const index = next++;
+            try {
+              results[index] = await fn(items[index], controller.signal);
+            } catch (error) {
+              controller.abort(error);
+              throw error;
+            }
+          }
+        }
+        await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+        return results;
+      }
+
+      let started = 0;
+      async function lookUp(id, signal) {
+        started += 1;
+        await new Promise((done) => setTimeout(done, 10));
+        signal.throwIfAborted(); // a real call would pass `signal` to fetch
+        if (id === 3) throw new Error(`lookup ${id} failed`);
+        return id * 10;
+      }
+
+      const outcome = await mapUntilFailure([...Array(100).keys()], 4, lookUp).catch((e) => e.message);
+      console.log(outcome, "after", started, "of 100 started");
+      // lookup 3 failed after 7 of 100 started
+      ```
+
+      `fetch` accepts the signal and closes the connection when it fires, so your side stops
+      waiting at once. Whether the provider stops working, and billing, depends on the
+      provider.
+  - title: Picking the numbers
+    body: |-
+      A cap is a guess until you tie it to a limit you can read. Start from the other side.
+
+      **A provider's rate limit.** Suppose a model API allows 600 requests a minute, which
+      is 10 a second, and a call takes about 2 seconds. By **Little's law**, calls in flight
+      equal rate times duration, so 10 × 2 = 20 calls in flight is the most that stays
+      under the limit. Pick something below that, such as 15, to leave room for retries and
+      other callers. Many providers also limit tokens per minute, and a batch of long
+      documents can hit that first, so count tokens as well when prompts vary in size.
+
+      **A database pool.** node-postgres pools default to 10 connections. A cap above the
+      pool size doesn't add throughput: the extra calls wait inside the pool instead of
+      inside your limiter. Size the cap at or below the pool.
+
+      **Your own memory.** Each call in flight holds its request and response. Twenty calls
+      that each return a 5 MB document is 100 MB before you've done anything with them.
+
+      Then measure. Raise the cap while throughput climbs and latency stays flat. When
+      latency starts rising with no gain in throughput, the other side is saturated, and
+      more concurrency only lengthens its queue.
+
+      Batch size follows the same logic. Bigger batches pay the per-call cost fewer times,
+      up to the provider's maximum. They also take longer, hold more memory, and a single
+      bad item can fail the lot. Postgres counts a statement's parameters in 16 bits, so a
+      multi-row `INSERT ... VALUES` with three columns stops at 21,845 rows. Passing each
+      column as one array parameter avoids that ceiling entirely:
+
+      ```sql
+      -- Two parameters, however many rows: $1 is an integer array, $2 a text array.
+      INSERT INTO labels (ticket_id, label)
+      SELECT * FROM unnest($1::int[], $2::text[]);
+      ```
+
+      Run on PostgreSQL 18 (in PGlite) with two arrays of 50,000 elements, that one
+      statement inserted all 50,000 rows. For millions of rows, `COPY` is faster still.
+  - title: Backpressure in streams and at the door
+    body: |-
+      Node streams implement backpressure for you if you let them. `pipeline` connects a
+      source to a destination, pauses the source whenever the destination's buffer reaches
+      its `highWaterMark`, and resumes it on `drain`. It also destroys every stream in the
+      chain if one fails, which hand-written `.pipe()` chains don't.
+
+      ```js
+      import { Readable, Writable } from "node:stream";
+      import { pipeline } from "node:stream/promises";
+
+      // A fast producer: 10,000 log lines, generated as fast as they are asked for.
+      async function* logLines() {
+        for (let i = 0; i < 10_000; i++) yield `line ${i}\n`;
+      }
+
+      // A slow consumer, like a network upload: 1 ms per chunk, room for 16 chunks.
+      let mostBuffered = 0;
+      const slowUpload = new Writable({
+        highWaterMark: 16,
+        objectMode: true,
+        write(chunk, _encoding, done) {
+          mostBuffered = Math.max(mostBuffered, this.writableLength);
+          setTimeout(done, 1);
+        },
+      });
+
+      await pipeline(Readable.from(logLines()), slowUpload);
+      console.log("most chunks waiting in memory:", mostBuffered);
+      // 15 in our run, never near 10,000: the generator pauses while the buffer is full
+      ```
+
+      The generator is pulled, not pushed: it only produces the next line when the stream
+      asks for one. Any `for await` loop over an async iterator has this property, which is
+      why it's the simplest way to process a large file or a paginated API without
+      loading everything.
+
+      At the edge of a service, backpressure means refusing. A bounded queue that's full
+      should answer at once rather than accept work it can't finish: `503 Service
+      Unavailable` when the server is overloaded, `429 Too Many Requests` when one client is
+      over its share, each with a `Retry-After` header. Refusing early is kinder than
+      accepting everything and timing out later, because the client learns in milliseconds
+      and can back off or try another copy. When the queue is full you also choose which
+      work to drop: the newest request, which is fair to those already waiting, or the
+      oldest, whose caller may have given up already.
+pitfalls:
+  - '**Capping one loop and calling it done.** Each request gets its own `mapWithLimit`, so concurrent requests multiply the cap. Share one limiter per scarce resource, and a shared store or a queue across server copies.'
+  - '**Cutting work into chunks and awaiting each chunk.** Every chunk waits for its slowest call while the other slots sit idle. Use a sliding window of workers, as `mapWithLimit` does.'
+  - '**Releasing a slot only on success.** A limiter that decrements after `await task()` but not in `finally` leaks a slot on every failure, until nothing runs. Always free the slot in `finally`.'
+  - '**Assuming `Promise.all` stops the rest on failure.** It rejects early and leaves every other call running. Pass an `AbortSignal` to the calls, and stop starting new ones once it fires.'
+  - '**Choosing batch size by "bigger is faster".** Past a point, a batch hits the provider maximum or the 65,535-parameter limit, holds more memory, and fails more items at once. Measure, stay under the limits, and retry failed batches on their own.'
+  - '**Queues and buffers without a bound.** An in-memory array that grows while the consumer falls behind ends in an out-of-memory crash that loses everything in it. Set a maximum and refuse or wait when it''s reached.'
+interview:
+  - question: You need to call an external API for 50,000 records. How do you do it?
+    answer: >-
+      With bounded concurrency sized to the API's limits, batching if the API accepts lists,
+      and a record of progress so a failure doesn't mean starting again. I'd read the limits
+      first: requests and tokens per minute, and items per call. By Little's law, if calls
+      take two seconds and the limit is ten a second, about twenty in flight is the ceiling,
+      so I'd run around fifteen with a sliding window, not chunks. Failed items go to a
+      retry list with exponential backoff and jitter, honouring `Retry-After` on a `429`.
+      For a job this size I'd usually put it on a queue with a fixed number of workers
+      rather than one long request, so it survives a deploy and several copies can't
+      exceed the limit together.
+  - question: What is backpressure, and how does Node handle it?
+    answer: >-
+      Backpressure is a signal from a slow consumer to a fast producer to slow down, so the
+      buffer between them stays bounded instead of growing until memory runs out. In Node
+      streams, `write()` returns `false` once the buffer passes its `highWaterMark`, and a
+      well-behaved producer waits for `drain`. `stream.pipeline` does that for you and also
+      tears down every stream if one fails. Async iterators get it naturally, because a
+      `for await` loop only pulls the next item when it's ready. At the service level,
+      backpressure means bounded queues that refuse work with `503` or `429` and a
+      `Retry-After`, instead of accepting everything and timing out. The trade-off is
+      honesty over throughput: some requests fail fast so the rest succeed.
+  - question: How do you choose a concurrency limit?
+    answer: >-
+      From the constraint on the other side, then by measuring. If a provider allows ten
+      requests a second and each takes two seconds, Little's law says twenty in flight
+      saturates it, so I'd sit a little below. If the calls use a database pool of ten
+      connections, a cap above ten only moves the queueing into the pool. Memory per call in
+      flight sets a third ceiling. Then I'd ramp it in a load test: while throughput rises
+      and latency stays flat, there's room; once latency climbs without more throughput,
+      the downstream is saturated. The limiter has to be shared, too: a cap per request
+      handler multiplies with traffic.
+  - question: '`Promise.all` or `Promise.allSettled` for a bulk job?'
+    answer: >-
+      `allSettled` for a bulk job where items are independent, `all` when the result is
+      meaningless unless every part succeeds. Summarising a thousand tickets is
+      independent: I want every summary that worked and a list of failures to retry, and
+      `Promise.all` would throw away 999 results because of one error. Loading a user, their
+      cart and their prices for one page is all-or-nothing, so `all` is right and fails
+      fast. Neither cancels anything, though. With `all`, the other calls keep running after
+      the rejection, so if the work is expensive I pass an `AbortSignal` to each call and
+      abort it on the first failure.

@@ -1,0 +1,255 @@
+id: ai.structured-output-and-tools
+title: Structured output
+objective: "Get JSON your code can trust from a model: ask for a schema, validate the reply with Pydantic, and retry once with the error."
+level: essential
+minutes: 10
+concepts: [ai.structured-output, ai.output-validation]
+prerequisites: [ai.prompting-and-context, pyai.pydantic]
+opening:
+  text: >-
+    You'll turn a model's reply into data your code can use, and handle the replies that
+    don't fit. It's the step between a demo and a feature.
+
+steps:
+  - type: prose
+    id: why-json
+    body: >-
+      Your code can't do much with "It sounds like a billing issue, and fairly urgent". It
+      needs data: `{"category": "billing", "urgent": true}`.
+
+
+      So you ask for JSON. Most of the time you get it. Sometimes you get it with a friendly
+      sentence in front, or wrapped in a code fence. Your parser only needs to meet one of
+      those.
+
+  - type: bug-hunt
+    id: hunt-chatty-json
+    concept: ai.output-validation
+    difficulty: 1
+    language: python
+    code: |
+      reply = ask(client, "Tag this email as JSON with category and urgent: " + email)
+      # reply == 'Sure! Here is the JSON: {"category": "bug", "urgent": true}'
+      ticket = json.loads(reply)
+      print(ticket["category"])
+    prompt: >-
+      This stops with `JSONDecodeError: Expecting value: line 1 column 1`. The JSON is right
+      there. Tap the line that fails.
+    lines: [3]
+    reasons:
+      - text: '`json.loads` meets `Sure!` before any JSON'
+        correct: true
+        feedback: >-
+          Right. A polite preamble broke the parser at its very first character.
+      - text: The reply is missing a closing brace
+        feedback: >-
+          The braces match. The trouble is the sentence in front of them.
+      - text: '`ticket["category"]` is the wrong key'
+        feedback: >-
+          The program never gets that far. Parsing fails a line earlier.
+    fix: |
+      ticket = Ticket.model_validate_json(reply)   # and ask for JSON only, with a schema
+
+  - type: prose
+    id: structured-outputs
+    body: |-
+      **Structured output** removes the guesswork. You send a schema, and the model can only
+      write tokens that fit it. With a Pydantic model the SDK does the rest:
+
+      ```python
+      class Ticket(BaseModel):
+          category: Literal["billing", "delivery", "bug"]
+          urgent: bool
+
+      response = client.messages.parse(model="claude-opus-5", max_tokens=1024,
+          messages=[{"role": "user", "content": email}], output_format=Ticket)
+      ticket = response.parsed_output
+      ```
+
+      `parsed_output` is a checked `Ticket`, as in chapter 19.
+
+  - type: fill-blank
+    id: fill-parse
+    concept: ai.structured-output
+    difficulty: 2
+    language: python
+    prompt: Get a checked `Receipt` back from a photo's text.
+    template: |
+      class Receipt(BaseModel):
+          shop: str
+          total_pence: int
+
+      response = client.messages.{{1}}(model="claude-opus-5", max_tokens=1024,
+          messages=[{"role": "user", "content": receipt_text}], output_format={{2}})
+      receipt = response.{{3}}
+    blanks:
+      - key: '1'
+        answer: parse
+      - key: '2'
+        answer: Receipt
+      - key: '3'
+        answer: parsed_output
+    bank: [parse, create, Receipt, '"Receipt"', parsed_output, content]
+
+  - type: prose
+    id: validate-anyway
+    body: >-
+      Keep validating. Not every provider or model supports schemas. A reply cut off by
+      `max_tokens` is half a JSON object. And a schema checks shape, not sense: a refund of
+      £900 on a £9 order fits `int` perfectly.
+
+
+      When a reply fails, retry once and show the model its mistake. It usually fixes it.
+      If it fails again, stop and report the error. Don't guess.
+
+  - type: code-challenge
+    id: write-ask-json
+    concept: ai.output-validation
+    difficulty: 3
+    language: python
+    starter: repair.starter.py
+    solution: repair.solution.py
+    tests: repair.tests.py
+    prompt: >-
+      Write `ask_json(client, prompt, validate, attempts=2)`. Send `prompt` as a user
+      message, join the reply's text blocks, and return `validate(text)`.
+
+
+      If `validate` raises `ValueError`, call again with two more messages: the reply as an
+      `assistant` message, then a user message holding the error. After `attempts` calls,
+      raise `ValueError`. Pydantic's `ValidationError` is a kind of `ValueError`, so this
+      works with `model_validate_json`.
+    hints:
+      - A loop over `range(attempts)` with a `try` inside, and the final `raise` after it.
+      - Keep one `messages` list, and add the two new messages to it after each failure.
+      - 'The retry message can read `f"That reply was invalid: {error}. Reply with only the JSON."`.'
+
+  - type: ai-review
+    id: review-trust-the-schema
+    concept: ai.output-validation
+    difficulty: 3
+    language: python
+    request: Let the support bot issue refunds it decides on.
+    flawClass: security
+    code: |
+      class Refund(BaseModel):
+          order_id: str
+          amount_pence: int
+
+      def handle(client, conversation):
+          response = client.messages.parse(model="claude-opus-5", max_tokens=500,
+              messages=conversation, output_format=Refund)
+          refund = response.parsed_output
+          payments.refund(refund.order_id, refund.amount_pence)
+    prompt: >-
+      An assistant wrote this. Every reply matches the schema. A customer talked the bot
+      into refunding £900 on a £9 order. Tap the line at fault.
+    lines: [9]
+    reasons:
+      - text: The amount is never checked against the order
+        correct: true
+        feedback: >-
+          Yes. A schema checks shape, not sense. Compare with the order before paying.
+      - text: '`amount_pence` should be a float'
+        feedback: >-
+          Money in whole pence is the safe choice. The value is the problem, not its type.
+      - text: '`parse` doesn''t validate the reply'
+        feedback: >-
+          It does, against `Refund`. £900 is a valid `int`, which is exactly the gap.
+    fix: |
+      def handle(client, conversation):
+          response = client.messages.parse(model="claude-opus-5", max_tokens=500,
+              messages=conversation, output_format=Refund)
+          refund = response.parsed_output
+          order = orders.get(refund.order_id)
+          if order is None or not 0 < refund.amount_pence <= order.total_pence:
+              raise ValueError("Refund needs a person to review it")
+          payments.refund(refund.order_id, refund.amount_pence)
+
+  - type: explain-back
+    id: explain-schema-not-enough
+    concept: ai.structured-output
+    difficulty: 3
+    prompt: >-
+      Your provider guarantees replies match your schema. Why does your code still validate
+      and check them?
+    rubric:
+      - Cut-off replies, refusals and other models can still break the shape.
+      - A schema checks types and fields, not whether the values make sense.
+      - Model output is untrusted input, so business rules are checked in code.
+    modelAnswer: >-
+      The guarantee covers the shape, and only when the reply finishes normally. A reply cut
+      off by `max_tokens` or a refusal can still break it. And a well-shaped reply can be
+      wrong: a refund bigger than the order is a perfectly valid integer. So I treat the
+      reply like any user input and check the rules in my own code.
+
+recap:
+  - Ask for structured output with a schema, and read `parsed_output` from `messages.parse`.
+  - Validate every reply, retry once with the error, then fail loudly.
+  - Check values against your own rules, since a schema only checks shape.
+
+recall:
+  - id: card-chatty-json
+    concept: ai.output-validation
+    front: Why can `json.loads` fail on a reply that clearly contains JSON?
+    back: >-
+      Text before it, such as `Sure! Here is the JSON:`, or a code fence around it. The
+      parser starts at the first character.
+  - id: card-structured-output
+    concept: ai.structured-output
+    front: What does structured output do?
+    back: >-
+      You send a schema, and the model can only write tokens that fit it, so the reply parses
+      into your type.
+  - id: card-repair-retry
+    concept: ai.output-validation
+    front: What do you send when you retry an invalid reply?
+    back: >-
+      The conversation, the invalid reply as an assistant message, and a user message with
+      the validation error. Retry once or twice, then fail loudly.
+  - id: card-shape-not-sense
+    concept: ai.output-validation
+    front: What can't a schema check?
+    back: >-
+      Whether the values make sense, such as a refund no bigger than the order. That's for
+      your own code.
+
+references:
+  - kind: docs
+    title: Structured outputs
+    authors: Anthropic
+    venue: Claude Platform documentation
+    url: https://platform.claude.com/docs/en/build-with-claude/structured-outputs
+    note: JSON outputs, strict tools, the Pydantic helpers and their limits.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Validation Errors
+    authors: Pydantic
+    venue: Pydantic documentation
+    url: https://docs.pydantic.dev/latest/errors/validation_errors/
+    note: The errors your retry message can pass back to the model.
+    verified: true
+  - kind: docs
+    title: Structured model outputs
+    authors: OpenAI
+    venue: OpenAI API documentation
+    url: https://platform.openai.com/docs/guides/structured-outputs
+    note: The same idea from another provider, with its own parameter names.
+    verified: false
+
+deepDive: >-
+  **How the constraint works.** At each step the model gives every token a probability.
+  With a schema, the provider masks out tokens that would break the JSON, so only valid
+  continuations can be drawn. That's why it can't write `Sure!` first.
+
+
+  **Names change.** Providers rename these parameters from time to time. Python's
+  `output_format=` on `messages.parse` is the SDK's shortcut for the API's
+  `output_config` format. When an assistant writes a parameter you don't recognise, check
+  the current docs rather than trusting either of you.
+
+
+  **Without schema support**, ask for JSON only, give one example, validate with Pydantic,
+  and use the retry from the challenge. Some teams also strip a code fence before parsing.
+  That's a patch; validation is the fix.

@@ -1,0 +1,276 @@
+summary: >-
+  A Python function is defined with `def`, returns `None` unless it says otherwise, and
+  refuses to run with a missing argument. Its signature does far more than a JavaScript
+  one. Callers can pass arguments by position or by name, parameters can have defaults,
+  and starred parameters collect extras into a tuple and a dict. Every model SDK you'll
+  call leans on this: `client.create(model="large", temperature=0.2)` is keyword arguments
+  and defaults, and the SDK's own wrappers forward `**kwargs`.
+
+
+  The signature is a contract with every caller. Names you accept by keyword become part of
+  your public API, and so does their order when you accept them by position. That's why
+  the language gives you markers to control it: a bare `*` makes the rest keyword-only, and
+  a `/` makes the earlier ones positional-only.
+
+
+  One rule causes most of the trouble. Default values are built once, when the `def` line
+  runs, and then shared by every call. That's harmless for numbers and strings and a
+  classic bug for lists and dicts. The fix is a `None` default and a fresh object inside the
+  function.
+remember:
+  - Default values are evaluated once, when `def` runs, so a mutable default like `[]` or `{}` is shared by every call; default to `None` and build it inside.
+  - A function with no `return` returns `None`, and a missing argument raises `TypeError` instead of becoming `undefined`.
+  - The full order is positional-only, then `/`, normal, `*args` or a bare `*`, keyword-only, and `**kwargs` last.
+  - Make flags and options keyword-only with a bare `*`, so `send(to, retry=True)` reads clearly and `send(to, True)` is refused.
+  - '`*args` collects extra positional arguments into a tuple and `**kwargs` collects extra named ones into a dict; at a call site the same stars unpack.'
+  - 'Python passes references to objects, like JavaScript: mutating an argument is visible to the caller, rebinding the parameter name isn''t.'
+  - Assigning to a name anywhere in a function makes it local for the whole function, which is what raises `UnboundLocalError`.
+  - Names are looked up in the order local, enclosing, global, built-in (LEGB), and only functions, classes and modules create a scope, never `if` or `for`.
+sections:
+  - title: The full signature, and what each marker is for
+    body: |-
+      A signature can have up to five kinds of parameter, always in this order:
+
+      ```python
+      def transfer(amount, /, currency="GBP", *, dry_run=False):
+          return amount, currency, dry_run
+
+
+      print(transfer(10))                         # (10, 'GBP', False)
+      print(transfer(10, "EUR", dry_run=True))    # (10, 'EUR', True)
+
+      for call in (
+          lambda: transfer(10, "EUR", True),
+          lambda: transfer(amount=10),
+          lambda: transfer(),
+      ):
+          try:
+              call()
+          except TypeError as error:
+              print(error)
+      # transfer() takes from 1 to 2 positional arguments but 3 were given
+      # transfer() got some positional-only arguments passed as keyword arguments: 'amount'
+      # transfer() missing 1 required positional argument: 'amount'
+      ```
+
+      Everything before `/` is **positional-only**. Callers can't name it, so you're free to
+      rename it later without breaking anyone. Many built-ins work this way: `len(obj=[])`
+      is an error. It also lets a function accept `**kwargs` containing a key with the same
+      name as the parameter. `MutableMapping.update` is written as
+      `update(self, other=(), /, **kwds)` for exactly that reason.
+
+      Everything after a bare `*` or after `*args` is **keyword-only**. Callers must name it.
+      That's the right default for booleans and tuning options, because `transfer(10, "EUR",
+      True)` says nothing about what `True` means. It also lets you add new options later in
+      any order without breaking existing calls.
+
+      JavaScript has no keyword arguments. The closest idiom is an options object with
+      destructuring, `function transfer(amount, { currency = "GBP", dryRun = false } = {})`.
+      Python's keyword-only parameters give the same readability, and a typo like
+      `dry_rn=True` fails loudly with `TypeError` instead of being ignored. That's the reason
+      to prefer explicit keyword-only parameters over `**kwargs` whenever you know the
+      options in advance.
+  - title: Why defaults are shared, underneath
+    body: |-
+      `def` is a statement that runs. When it runs, Python evaluates each default expression
+      once and stores the results on the function object, in `__defaults__`. A call that
+      omits the argument gets the stored object itself, not a copy.
+
+      ```python
+      import time
+
+
+      def add_tag(tag, tags=[]):
+          tags.append(tag)
+          return tags
+
+
+      add_tag("urgent")
+      print(add_tag.__defaults__)  # (['urgent'],)
+
+
+      def stamp(label, at=time.time()):
+          return label, at
+
+
+      first = stamp("a")
+      time.sleep(0.01)
+      second = stamp("b")
+      print(first[1] == second[1])  # True
+      ```
+
+      The list lives on the function and keeps growing. The second example has no mutation
+      at all and is still wrong: the timestamp was taken once, at import time. Any default
+      that must be fresh per call, a list, a dict, the current time or a new id, belongs
+      inside the body.
+
+      `None` works as the "not given" marker until `None` is a value the caller may really
+      pass. Then use a private **sentinel**, an object nobody else can create:
+
+      ```python
+      _MISSING = object()
+
+
+      def lookup(settings, key, default=_MISSING):
+          if key in settings:
+              return settings[key]
+          if default is _MISSING:
+              raise KeyError(key)
+          return default
+
+
+      print(lookup({"theme": None}, "theme"))   # None
+      print(lookup({}, "theme", default=None))  # None
+      ```
+
+      JavaScript differs twice here. It evaluates a default expression on every call, so
+      `function addTag(tag, tags = [])` is safe in JS. And JS applies a default when the
+      argument is `undefined`, while Python applies it only when the argument is absent:
+      passing `None` explicitly skips the default.
+  - title: Scope, LEGB and UnboundLocalError
+    body: |-
+      Python resolves a name by searching four scopes in order: **L**ocal to the function,
+      **E**nclosing functions, **G**lobal (the module), then **B**uilt-in. Only functions,
+      classes, modules and comprehensions create a scope. An `if` block or a `for` loop
+      doesn't, so a loop variable is still defined after the loop. In JavaScript, `let` and
+      `const` are block-scoped; Python behaves more like `var`.
+
+      Whether a name is local is decided when the function is compiled, not line by line. If
+      the function assigns to a name anywhere, including `+=`, that name is local
+      everywhere in the function:
+
+      ```python
+      count = 0
+
+
+      def bump():
+          count += 1
+
+
+      try:
+          bump()
+      except UnboundLocalError as error:
+          print(error)
+      # cannot access local variable 'count' where it is not associated with a value
+      ```
+
+      `count += 1` means "read local `count`, add one, store it", and the local has no value
+      yet. It's the same idea as JavaScript's temporal dead zone, where reading a `let` before
+      its declaration throws `ReferenceError`.
+
+      `global count` inside the function would make the assignment target the module
+      variable, and `nonlocal` does the same for an enclosing function's variable, which the
+      next lesson uses for closures. Reach for `global` rarely. A function that returns a new
+      value, or an object that owns its state, is easier to test and safe to call from two
+      places at once.
+  - title: Passing arguments, mutation and forwarding
+    body: |-
+      Python passes a reference to each object, the same model as JavaScript objects. It's
+      often called **call by sharing**. The function and the caller hold the same object, so
+      mutating it is visible outside. Assigning a new object to the parameter only moves the
+      local name:
+
+      ```python
+      def add_item(cart, item):
+          cart.append(item)
+
+
+      def reset(cart):
+          cart = []
+
+
+      basket = ["tea"]
+      add_item(basket, "cake")
+      reset(basket)
+      print(basket)  # ['tea', 'cake']
+      ```
+
+      Good functions pick one style: return a new value, or mutate in place and return
+      `None`, as `list.sort` does. Doing both invites bugs where the caller doesn't know its
+      data changed.
+
+      The stars shine when a function forwards arguments it doesn't need to understand.
+      Wrappers, decorators and SDK clients all look like this:
+
+      ```python
+      def logged(func, *args, **kwargs):
+          print(f"calling {func.__name__} with {args} {kwargs}")
+          return func(*args, **kwargs)
+
+
+      def book(room, nights=1, breakfast=False):
+          return f"{room}: {nights}, {breakfast}"
+
+
+      print(logged(book, "Suite", breakfast=True))
+      # calling book with ('Suite',) {'breakfast': True}
+      # Suite: 1, True
+
+      defaults = {"model": "small", "temperature": 0.7}
+      overrides = {"temperature": 0.2}
+      print({**defaults, **overrides})  # {'model': 'small', 'temperature': 0.2}
+      ```
+
+      In a dict literal the later key wins, like JS spread. At a call site it doesn't:
+      `f(**defaults, **overrides)` raises `TypeError` with "got multiple values for keyword
+      argument 'temperature'". Merge the dicts first, then unpack once.
+pitfalls:
+  - '**Defaulting to `[]`, `{}` or `set()`.** The object is built once and shared, so data leaks between calls, and between users in a server. Default to `None` and create the object in the body.'
+  - '**Defaulting to `datetime.now()` or a new id.** The value is computed once at import and frozen. Default to `None` and compute it inside the call.'
+  - '**Writing `if not tags:` instead of `if tags is None:`.** A caller who passes an empty list to be filled gets it silently swapped for a new one, and their list stays empty. Test for exactly `None`.'
+  - '**Passing flags by position.** `label("Warning", True)` lands `True` in whatever slot comes next. Name it at the call, and make such parameters keyword-only with `*` in the signature.'
+  - '**Accepting `**kwargs` when the options are known.** A typo such as `temprature=0.2` is swallowed without an error, and editors can''t autocomplete the names. Declare real keyword-only parameters, and use `**kwargs` for forwarding.'
+  - '**Printing instead of returning.** The caller receives `None`, and the bug surfaces far away as `TypeError` on `None`. Return the value and print at the edge of the program.'
+  - '**Expecting `param = new_value` to update the caller.** Rebinding moves only the local name. Return the new value, or mutate the object in place on purpose.'
+interview:
+  - question: What's the mutable default argument problem, and why does Python behave that way?
+    answer: >-
+      A default like `tags=[]` is created once and shared by every call that omits the
+      argument, so mutations pile up across calls. It happens because `def` is an executable
+      statement: Python evaluates the default expressions when the function is defined and
+      stores them on the function object in `__defaults__`. A call gets that stored object,
+      not a copy. The fix is `tags=None` and `if tags is None: tags = []` inside, or a private
+      sentinel object when `None` is a meaningful value. The same trap catches
+      `created=datetime.now()`, which freezes the time at import. In a web server it's worse
+      than a bug: state can leak from one request to another. Linters such as ruff flag it
+      with rule B006.
+  - question: Is Python pass by value or pass by reference?
+    answer: >-
+      Neither, strictly: it passes references to objects by value, often called call by
+      sharing, the same as JavaScript objects. The function receives a new name bound to the
+      caller's object. If it mutates that object, say `cart.append(item)`, the caller sees
+      the change. If it rebinds the name, `cart = []`, only the local name moves and the
+      caller's object is untouched. Immutable types like `int`, `str` and `tuple` make it
+      look like pass by value, because every "change" builds a new object. In practice I
+      make it explicit: a function either returns a new value or mutates in place and
+      returns `None`, like `sorted` versus `list.sort`, so callers never get surprised.
+  - question: When would you use keyword-only or positional-only parameters?
+    answer: >-
+      Keyword-only for flags and tuning options, positional-only when the parameter name
+      shouldn't be part of the API. A bare `*` forces `send(to, retry=True)`, which reads
+      clearly at every call site and lets me add or reorder options later without breaking
+      callers. Positional-only, marked with `/`, means callers can't write `len(obj=x)`, so
+      I can rename the parameter freely. It also lets a function accept `**kwargs` whose
+      keys clash with a parameter name, which `MutableMapping.update` relies on. The trade-off is
+      flexibility for callers: too many positional-only parameters make calls cryptic, so I
+      keep them for one or two obvious leading arguments.
+  - question: When are `*args` and `**kwargs` the right choice, and what do they cost?
+    answer: >-
+      They're right when a function forwards arguments it doesn't need to understand:
+      decorators, retry and logging wrappers, and thin SDK layers that pass options through
+      to an HTTP body. `*args` arrives as a tuple and `**kwargs` as a dict, and
+      `func(*args, **kwargs)` passes them on unchanged. The cost is that the signature
+      stops documenting itself. A typo such as `max_token=50` is accepted silently, editors
+      can't autocomplete, and type checkers can't check the call unless you add
+      `ParamSpec` or `TypedDict` with `Unpack`. So when I know the options, I declare them as
+      keyword-only parameters and keep `**kwargs` for genuine pass-through.
+  - question: Why does this raise `UnboundLocalError` even though `count` exists at module level?
+    answer: >-
+      Because assigning to `count` anywhere in the function makes it local for the whole
+      function, decided at compile time. `count += 1` reads the local before it has a value,
+      hence "cannot access local variable 'count' where it is not associated with a value".
+      Python looks names up local, enclosing, global, built-in, but assignment always
+      targets the local scope unless you declare `global count`, or `nonlocal count` for an
+      enclosing function. I'd rarely add `global` though. Module-level mutable state is hard
+      to test and unsafe under concurrency. Returning the new value, or keeping the counter
+      on an object, is the cleaner fix.

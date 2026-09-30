@@ -1,0 +1,259 @@
+id: ai.production
+title: Cost and latency
+objective: "Work out what a call costs from its usage, cut waiting with streaming, and cut cost with prompt caching and a smaller model where it's enough."
+level: advanced
+minutes: 10
+concepts: [ai.cost-and-latency, ai.streaming, ai.prompt-caching]
+prerequisites: [ai.failures]
+opening:
+  text: >-
+    You'll know what each model call costs and why replies feel slow, and fix both. That's
+    the difference between a demo and a feature your company can afford.
+
+steps:
+  - type: prose
+    id: where-cost-comes-from
+    body: >-
+      You pay per token, with separate prices for input and output. Output usually costs
+      several times more. For Claude Opus 5 it's $5 per million input tokens and $25 per
+      million output.
+
+
+      Time follows output too. A model writes tokens one by one, so a long reply is a slow
+      reply. Sending a long prompt costs money, but it's read quickly.
+
+  - type: prose
+    id: usage
+    body: |-
+      Every reply says what it used, so you never guess:
+
+      ```python
+      print(reply.usage)
+      # input_tokens=1850, output_tokens=412,
+      # cache_read_input_tokens=0, cache_creation_input_tokens=0
+      ```
+
+      Log these with every call. They're how you find the feature that eats the budget, and
+      how you check a fix worked.
+
+  - type: multiple-choice
+    id: pick-latency
+    concept: ai.cost-and-latency
+    difficulty: 1
+    question: Replies take 12 seconds, and users complain. What cuts the total time most?
+    choices:
+      - text: Asking for three bullet points, not an essay
+        correct: true
+        feedback: >-
+          Right. Fewer output tokens is the biggest lever on time.
+      - text: A shorter system prompt
+        feedback: >-
+          Input is read fast. Trimming it saves money, not much time.
+      - text: A higher `max_tokens`
+        feedback: >-
+          That only allows longer replies. It never makes one faster.
+
+  - type: prose
+    id: streaming
+    body: >-
+      Some replies must be long. Then **stream** them, as in chapter 19. The total time is the same. But the first words show in about a second, and
+      people read while the rest arrives.
+
+
+      Streaming only helps if each piece reaches the screen as it comes. Collect it all
+      first, and you're back to staring at a spinner.
+
+  - type: ai-review
+    id: review-stream-then-wait
+    concept: ai.streaming
+    difficulty: 2
+    language: python
+    request: Stream the chat reply, so users see it sooner.
+    flawClass: performance
+    code: |
+      def show_reply(messages):
+          with client.messages.stream(model="claude-opus-5", max_tokens=2000,
+                  messages=messages) as stream:
+              reply = stream.get_final_message()
+          screen.show(reply.content[0].text)
+    prompt: >-
+      An assistant wrote this. It streams, yet users still wait 12 seconds for the first
+      word. Tap the line at fault.
+    lines: [4]
+    reasons:
+      - text: It waits for the whole reply before showing any
+        correct: true
+        feedback: >-
+          Yes. `get_final_message` returns at the end. Show each piece of `text_stream`.
+      - text: '`max_tokens` of 2000 slows the stream'
+        feedback: >-
+          The cap doesn't slow anything. The first words never reach the screen early.
+      - text: '`stream` is slower than `create`'
+        feedback: >-
+          Same speed overall. Streaming only helps if you use the pieces as they come.
+    fix: |
+      def show_reply(messages):
+          with client.messages.stream(model="claude-opus-5", max_tokens=2000,
+                  messages=messages) as stream:
+              for text in stream.text_stream:
+                  screen.append(text)
+
+  - type: prose
+    id: prompt-caching
+    body: >-
+      Many calls start the same way: a long system prompt, the same tools, the same
+      handbook. **Prompt caching** keeps that start on the provider's side. A later call
+      that starts with exactly the same text reads it faster, for a tenth of the price.
+
+
+      "Exactly" matters. One changed character near the start and nothing after it is
+      cached. Put what changes at the end, and check `cache_read_input_tokens`.
+
+  - type: bug-hunt
+    id: hunt-cache-buster
+    concept: ai.prompt-caching
+    difficulty: 3
+    language: python
+    code: |
+      def system_prompt():
+          return [{
+              "type": "text",
+              "text": f"Now: {datetime.now()}\n\n{HANDBOOK}",   # the handbook is 40,000 tokens
+              "cache_control": {"type": "ephemeral"},
+          }]
+
+      reply = client.messages.create(**request, system=system_prompt(), messages=messages)
+    prompt: >-
+      Caching is switched on, but every call's `cache_read_input_tokens` is `0`, and the
+      bill hasn't moved. Tap the line to fix.
+    lines: [4]
+    reasons:
+      - text: The time at the start changes every call
+        correct: true
+        feedback: >-
+          Right. The prefix never repeats. Put the time after the handbook, or leave it out.
+      - text: The handbook is too long to cache
+        feedback: >-
+          Long, stable text is exactly what caching is for. Its start keeps changing.
+      - text: '`ephemeral` turns caching off'
+        feedback: >-
+          `ephemeral` is the normal cache type, kept for a few minutes. The prefix is the problem.
+    fix: |
+      def system_prompt():
+          return [{
+              "type": "text",
+              "text": HANDBOOK,
+              "cache_control": {"type": "ephemeral"},
+          }]
+      # Anything that changes, like the time, goes in the messages after it.
+
+  - type: code-challenge
+    id: write-cost
+    concept: ai.cost-and-latency
+    difficulty: 2
+    language: python
+    starter: cost.starter.py
+    solution: cost.solution.py
+    tests: cost.tests.py
+    prompt: >-
+      Write `cost_usd(usage, price)`. `usage` is a dict like a reply's usage, and `price`
+      gives dollars per million tokens for `"input"` and `"output"`. Return the call's cost.
+
+
+      Cache reads cost `CACHE_READ` times the input price, and cache writes `CACHE_WRITE`
+      times. The two cache fields may be missing, so count them as 0. `input_tokens` counts
+      only the uncached input.
+    hints:
+      - Work out the price of one input token and one output token first.
+      - '`usage.get("cache_read_input_tokens", 0)` gives 0 when the field is missing.'
+      - Add four parts, one per kind of token, each with its own price.
+
+  - type: explain-back
+    id: explain-cheaper
+    concept: ai.cost-and-latency
+    difficulty: 3
+    prompt: >-
+      A support bot costs twice its budget. Name three changes you'd look at, and how you'd
+      know each one worked.
+    rubric:
+      - Shorter replies, since output tokens cost the most.
+      - Caching the long stable start of each prompt, checked in `usage`.
+      - A smaller, cheaper model for simple questions, checked with the eval set.
+    modelAnswer: >-
+      First, shorter replies, since output tokens cost several times more. Second, cache the
+      system prompt and handbook, and watch `cache_read_input_tokens` rise. Third, send
+      simple questions to a smaller model, and run the eval set to prove answers didn't get
+      worse. The logged usage shows what each change saved.
+
+recap:
+  - Work out a call's cost from `usage`, knowing output costs most.
+  - Stream long replies, and show each piece as it arrives.
+  - Cache a long stable prompt start, and keep what changes at the end.
+
+recall:
+  - id: card-cost-levers
+    concept: ai.cost-and-latency
+    front: Which tokens cost more, and which make a reply slow?
+    back: >-
+      Output tokens, on both counts. They cost several times more than input, and they're
+      written one by one.
+  - id: card-stream-feel
+    concept: ai.streaming
+    front: What does streaming change, and what doesn't it?
+    back: >-
+      The first words appear in about a second. The total time and the cost stay the same.
+  - id: card-cache-check
+    concept: ai.prompt-caching
+    front: How do you prove the prompt cache is working?
+    back: >-
+      Send the same prefix twice and check `cache_read_input_tokens` in the second reply's
+      `usage`. Zero means something in the prefix changed.
+  - id: card-cache-order
+    concept: ai.prompt-caching
+    front: Where does text that changes every call go in a cached prompt?
+    back: >-
+      After the stable part. Any change near the start stops everything after it from being
+      cached.
+
+references:
+  - kind: docs
+    title: Pricing
+    authors: Anthropic
+    venue: Claude Platform documentation
+    url: https://platform.claude.com/docs/en/about-claude/pricing
+    note: Input, output and cache prices per model.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Prompt caching
+    authors: Anthropic
+    venue: Claude Platform documentation
+    url: https://platform.claude.com/docs/en/build-with-claude/prompt-caching
+    note: Cache breakpoints, prefix matching, lifetimes and the usage fields.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Streaming messages
+    authors: Anthropic
+    venue: Claude Platform documentation
+    url: https://platform.claude.com/docs/en/build-with-claude/streaming
+    note: The event stream and the SDK's text stream helper.
+    verified: true
+
+deepDive: >-
+  **Prices change.** The figures here were checked in September 2026. Check the pricing
+  page before you budget, and read the price from config, not code.
+
+
+  **Smaller models.** Simple jobs, such as tagging an email, often run as well on a smaller,
+  cheaper, faster model. Only your eval set can tell you. Sending each request to the
+  cheapest model that passes is called model routing, and chapter 21 builds it.
+
+
+  **Batches.** Work nobody waits for, like a nightly report, can go through a batch API
+  that answers within hours at about half the price.
+
+
+  **Cache lifetime.** A cached prefix lasts about five minutes by default, renewed each
+  time it's read. A longer lifetime costs more to write. Very short prefixes aren't cached
+  at all, below a minimum length that depends on the model.

@@ -1,0 +1,245 @@
+summary: >-
+  An automated test is a small program that calls your code with a known input and
+  compares the answer with one you worked out yourself. A test runner such as Vitest finds
+  those programs, runs them, and reports each one by name. You write the check once, and it
+  runs again on every save and every commit for as long as the code lives.
+
+
+  The mechanics are simpler than they look. `test` registers a name and a function. `expect`
+  wraps a value, and a matcher such as `toBe` throws an error when the value is wrong. The
+  runner calls each registered function and counts a throw, or a rejected promise, as a
+  failure. Everything else is reporting.
+
+
+  These notes cover what the steps leave out: how a runner collects and runs tests, the
+  three equality matchers and when each one lies to you, async tests that pass without
+  checking anything, and the commands you use day to day. In an interview, this is the
+  vocabulary everything else rests on.
+remember:
+  - A test is code that calls your code with a known input and asserts on an answer you worked out yourself, never one the code under test computed.
+  - A test fails when its function throws or its returned promise rejects, and a matcher is a function that throws when the check doesn't hold.
+  - '`toBe` compares with `Object.is`, so two arrays with the same items are not `toBe` each other.'
+  - '`toEqual` compares contents recursively and ignores `undefined` properties and class types, while `toStrictEqual` checks both.'
+  - An async test must `await` or return every promise it asserts on, or the check can run after the test has already passed.
+  - Test a thrown error by passing a function to `expect`, as in `expect(() => parse('{')).toThrow()`, and a rejected promise with `await expect(p).rejects.toThrow()`.
+  - Watch a new test fail once, by breaking the code on purpose, before you trust it when it passes.
+  - '`vitest` watches and reruns affected tests as you save, and `vitest run` runs everything once, which is what CI uses.'
+sections:
+  - title: What a test runner does underneath
+    body: |-
+      A runner works in two phases. First it **collects**: it finds files that match a
+      pattern, loads each one, and records every `test` call without running its body.
+      Then it **runs**: it calls each recorded function and catches what it throws.
+
+      You can write the core of one in twenty lines. Save this as `mini-runner.mjs` and run
+      `node mini-runner.mjs`:
+
+      ```js
+      const tests = [];
+      const test = (name, fn) => tests.push({ name, fn });
+
+      const expect = (actual) => ({
+        toBe(expected) {
+          if (!Object.is(actual, expected)) {
+            throw new Error(`expected ${actual} to be ${expected}`);
+          }
+        },
+      });
+
+      // Collect: the file only registers tests.
+      const total = (prices) => prices.reduce((sum, p) => sum + p, 0);
+      test('an empty basket costs nothing', () => expect(total([])).toBe(0));
+      test('three items add up', () => expect(total([250, 100, 400])).toBe(755));
+
+      // Run: call each one, and a throw means it failed.
+      let failed = 0;
+      for (const { name, fn } of tests) {
+        try {
+          await fn();
+          console.log(`✓ ${name}`);
+        } catch (error) {
+          failed++;
+          console.log(`× ${name}\n  ${error.message}`);
+        }
+      }
+      process.exitCode = failed > 0 ? 1 : 0;
+      ```
+
+      ```text
+      ✓ an empty basket costs nothing
+      × three items add up
+        expected 750 to be 755
+      ```
+
+      The exit code is what CI reads. Any failure makes it non-zero, and the pipeline stops.
+
+      Vitest adds a lot on top: it collects files matching
+      `**/*.{test,spec}.?(c|m)[jt]s?(x)` by default, runs files in parallel workers, each
+      with its own module state so one file can't leak into another, compiles TypeScript
+      on the fly, and prints a diff when a matcher fails. The model underneath stays the same.
+
+      One consequence of the two phases catches people out. Code inside a `describe` body
+      runs during collection, before any test. Setup that belongs to each test goes in
+      `beforeEach`, not loose in the `describe` body.
+  - title: toBe, toEqual and toStrictEqual
+    body: |-
+      Vitest has three equality matchers, and each answers a different question.
+
+      - `toBe` asks "is it the same value?" using `Object.is`. Right for numbers, strings
+        and booleans. For objects it checks identity.
+      - `toEqual` asks "does it hold the same data?" recursively. It forgives
+        `undefined` properties, holes in arrays and the class an object was built from.
+      - `toStrictEqual` asks the same, and forgives none of those.
+
+      ```ts
+      import { describe, it, expect } from 'vitest';
+
+      class Item {
+        constructor(public name: string) {}
+      }
+
+      describe('the three equality matchers', () => {
+        it('toBe uses Object.is', () => {
+          expect(NaN).toBe(NaN); // === says false, Object.is says true
+          expect(0).not.toBe(-0); // === says true, Object.is says false
+          const tags = ['sale'];
+          expect(tags).toBe(tags); // same array
+          expect(tags).not.toBe(['sale']); // two arrays
+        });
+
+        it('toEqual compares contents and forgives some differences', () => {
+          expect({ qty: 1, note: undefined }).toEqual({ qty: 1 });
+          expect(new Item('mug')).toEqual({ name: 'mug' });
+        });
+
+        it('toStrictEqual forgives none of them', () => {
+          expect({ qty: 1, note: undefined }).not.toStrictEqual({ qty: 1 });
+          expect(new Item('mug')).not.toStrictEqual({ name: 'mug' });
+          expect(new Item('mug')).toStrictEqual(new Item('mug'));
+        });
+
+        it('decimals need toBeCloseTo', () => {
+          expect(0.1 + 0.2).not.toBe(0.3);
+          expect(0.1 + 0.2).toBeCloseTo(0.3);
+        });
+      });
+      ```
+
+      Which to reach for? `toEqual` for most data. `toStrictEqual` when the difference
+      matters to a caller: code that reads `Object.keys` or `'note' in order`, where an
+      `undefined` key counts, or code that checks `instanceof`. `toBeCloseTo` for any sum of
+      decimals, because binary floating point can't hold 0.1 exactly. Money in whole pence
+      avoids the problem altogether.
+  - title: Async tests and errors
+    body: |-
+      A test that returns a promise is async, and the runner waits for it. Forget to wait
+      and the test can pass before the check runs.
+
+      ```ts
+      import { test, expect } from 'vitest';
+
+      async function reserveSeat(seat: string) {
+        if (seat === 'Z99') throw new Error('No such seat');
+        return { seat, status: 'held' };
+      }
+
+      test('holds a seat that exists', async () => {
+        await expect(reserveSeat('A1')).resolves.toEqual({ seat: 'A1', status: 'held' });
+      });
+
+      test('refuses a seat that does not exist', async () => {
+        await expect(reserveSeat('Z99')).rejects.toThrow('No such seat');
+      });
+
+      test('a sync throw needs a function around it', () => {
+        const parse = (text: string) => JSON.parse(text);
+        expect(() => parse('{')).toThrow(SyntaxError);
+      });
+      ```
+
+      `toThrow` needs a function because `expect(parse('{'))` would throw while the
+      argument is evaluated, before `expect` exists to catch it.
+
+      Vitest 5 fails a test that forgets to `await` a `.resolves` or `.rejects` assertion,
+      with a message saying so. It can't see a bare `.then`. In this test the check fires
+      a second and a half later, after the file has finished, and the run reports a pass:
+
+      ```ts
+      const later = <T>(value: T, ms: number) =>
+        new Promise<T>((resolve) => setTimeout(() => resolve(value), ms));
+
+      test('no await on a slow then', () => {
+        later('held', 1500).then((status) => expect(status).toBe('cancelled'));
+      });
+      ```
+
+      Two habits prevent this. Write `async` and `await` every promise you assert on. And
+      when the assertion sits in a `catch` block that might never run, start the test with
+      `expect.assertions(1)`, which fails the test unless exactly one assertion ran.
+  - title: The commands you use every day
+    body: |-
+      `npx vitest` starts **watch mode** in an interactive terminal. It keeps the process
+      alive, and on each save it reruns only the tests whose files import what changed,
+      found through the module graph. Feedback arrives in well under a second, which is
+      the whole point of a fast unit suite. In CI, or any terminal that isn't interactive,
+      the same command runs once and exits.
+
+      `npx vitest run` always runs once. Scripts and pipelines use it so the behaviour
+      doesn't depend on the environment.
+
+      ```bash
+      npx vitest                         # watch, rerun what a save affects
+      npx vitest run                     # everything, once
+      npx vitest run cart                # only files whose path contains "cart"
+      npx vitest run -t "empty basket"   # only tests whose name matches
+      npx vitest run --reporter verbose  # a line for every test, passing or not
+      ```
+
+      Inside a file, `describe` groups tests under a heading, and `it` is another name for
+      `test`, so `it('adds tax', ...)` reads as a sentence. `test.skip` and `test.todo`
+      mark tests that shouldn't run yet, and the report counts them so they aren't
+      forgotten. `test.only` runs one test alone while you debug. Vitest refuses `.only`
+      when it detects CI, failing the run with "Unexpected .only modifier", so a focused
+      test left in by accident can't silently skip the rest of the suite.
+pitfalls:
+  - "**Computing the expected value with the code under test.** `expect(total(prices)).toBe(total(prices))` can never fail. Work the answer out by hand and write it as a literal."
+  - "**Using `toBe` on arrays and objects.** It checks identity, so a correct result fails. Use `toEqual`, or `toStrictEqual` when `undefined` keys or classes matter."
+  - "**Calling the function inside `expect` when testing a throw.** `expect(parse('{')).toThrow()` throws before `expect` runs. Pass a function: `expect(() => parse('{')).toThrow()`."
+  - "**Asserting inside a `.then` without awaiting it.** The test finishes first and passes. Make the test `async` and `await` every promise, or `await expect(p).resolves`."
+  - "**Trusting a test you have never seen fail.** A typo in the matcher or a wrong import can make it check nothing. Break the code once and watch it go red."
+  - "**Names that describe the code instead of the behaviour.** `test('total works')` tells you nothing when it fails. Name the rule and the case: `an empty basket costs nothing`."
+interview:
+  - question: What's the difference between toBe, toEqual and toStrictEqual?
+    answer: >-
+      `toBe` checks identity with `Object.is`, `toEqual` checks contents, and
+      `toStrictEqual` checks contents plus the details `toEqual` forgives. `toBe` is right
+      for primitives: numbers, strings, booleans. On objects it only passes for the very
+      same reference, so a freshly built array with the right items fails. `toEqual`
+      recurses through the structure but treats a property set to `undefined` as missing
+      and ignores the prototype, so a class instance equals a plain object with the same
+      fields. `toStrictEqual` fails on both. I default to `toEqual` for data and switch to
+      `toStrictEqual` when the shape itself is the contract, such as an API payload or code
+      that relies on `instanceof`. For decimals I use `toBeCloseTo`, since `0.1 + 0.2` isn't
+      `0.3`.
+  - question: How can a test pass without testing anything, and how do you guard against it?
+    answer: >-
+      When its assertion can't fail or never runs. The common causes: comparing the code
+      with itself, a loose matcher such as `toBeTruthy` on an object, an assertion inside a
+      callback or `.then` that runs after the test has finished, and an assertion in a
+      `catch` block when nothing throws. The first guard is process: watch every new test
+      fail once, either by writing it before the code or by breaking the code on purpose.
+      The second is mechanical: `await` every promise, use `expect.assertions(n)` when
+      assertions sit in branches, and turn on a lint rule for floating promises. Mutation
+      testing is the systematic version: it breaks the code for you and reports tests that
+      stayed green.
+  - question: Why automate tests at all, rather than checking by hand?
+    answer: >-
+      Because a manual check only proves the code worked once, while an automated test
+      re-proves it on every change for the life of the code. The cost of a manual check
+      repeats every time; the cost of a test is paid once and then it's nearly free to run.
+      That changes behaviour: with a fast suite you refactor freely, because a mistake shows
+      up within seconds with a name saying what broke. It also documents intent: a test
+      named "an empty basket costs nothing" states a rule a reader can trust, since it's
+      executed. The trade-off is maintenance. Tests that are slow, flaky or tied to
+      implementation details cost more than they save, so the skill is writing the right
+      ones, not the most.

@@ -1,0 +1,351 @@
+id: cloud.compose
+title: Compose and multi-service systems
+objective: Run an API and its database together with Compose, keep data in a volume, and write a health check that tells the truth.
+level: essential
+minutes: 10
+concepts: [cloud.compose, cloud.container-networks, cloud.volumes, cloud.health-checks]
+prerequisites: [cloud.building-images, db.what-a-database-is]
+opening:
+  text: >-
+    You'll start an API and its database with one command, and keep the data safe when
+    containers are replaced. Then you'll write a health check that says when the API is
+    really broken.
+
+steps:
+  - type: prose
+    id: what-compose-is
+    body: |-
+      An API and a database make two containers, a network and some storage. **Compose**
+      starts them all from one file, `compose.yaml`. It's written in **YAML**, a text format
+      for settings: `key: value` lines, indented to nest, with `-` for list items.
+
+      ```yaml
+      services:
+        api:
+          build: .
+          ports:
+            - "8080:3000"
+          environment:
+            DATABASE_URL: postgres://postgres:secret@db:5432/postgres
+        db:
+          image: postgres:17
+          environment:
+            POSTGRES_PASSWORD: secret
+      ```
+
+  - type: prose
+    id: names-and-ports
+    body: |-
+      `docker compose up -d` builds the API and starts both **services** on a private
+      network. On that network, a service's name is its hostname, so the API reaches `db`.
+
+      From your laptop, only ports listed under `ports` answer:
+
+      ```bash
+      $ curl localhost:8080/todos
+      [{"title":"Buy milk"}]
+      $ curl localhost:5432
+      $ echo $?
+      7
+      ```
+
+      The database stays hidden. Only the API is a way in.
+
+  - type: multiple-choice
+    id: pick-service-name-url
+    concept: cloud.container-networks
+    difficulty: 1
+    language: yaml
+    code: |
+      services:
+        api:
+          environment:
+            DATABASE_URL: postgres://postgres:secret@HOST:5432/postgres
+        db:
+          image: postgres:17
+    question: What replaces `HOST` so the API finds the database?
+    choices:
+      - text: '`localhost`'
+        feedback: >-
+          Inside a container, `localhost` is that container. The database lives in another one.
+      - text: '`db`'
+        correct: true
+        feedback: >-
+          Right. The service name is a hostname on the Compose network.
+      - text: The database container's IP address
+        feedback: >-
+          It works until the container is replaced and gets a new address. The name follows it.
+
+  - type: prose
+    id: volumes
+    body: |-
+      A container's files are thrown away with the container. A **volume** is storage Docker
+      keeps outside it, mounted at a path inside. Under `db`, add
+      `volumes: ["dbdata:/var/lib/postgresql/data"]`.
+
+      `docker compose down` removes the containers and keeps volumes. We ran `down`, then
+      `up`, and the to-do list was still there. `down -v` deletes the volumes too:
+
+      ```bash
+      $ curl localhost:8080/todos
+      {"error":"relation \"todos\" does not exist"}
+      ```
+
+  - type: bug-hunt
+    id: hunt-down-v
+    concept: cloud.volumes
+    difficulty: 2
+    language: bash
+    code: |
+      #!/bin/bash
+      # deploy.sh, run on the server for each release
+      git pull
+      docker compose down -v
+      docker compose up -d --build
+
+      # after Monday's release:
+      $ curl localhost:8080/todos
+      {"error":"relation \"todos\" does not exist"}
+    prompt: >-
+      The release went out, and every customer's to-do list vanished. Tap the line that did
+      it.
+    lines: [4]
+    reasons:
+      - text: '`-v` deleted the database volume'
+        correct: true
+        feedback: >-
+          Yes. The data lived in the volume, and `-v` removes it. Plain `down` keeps it.
+      - text: '`git pull` overwrote the database'
+        feedback: >-
+          Git only changes the code. The data sits in a Docker volume, which Git never touches.
+      - text: '`--build` resets the data'
+        feedback: >-
+          It rebuilds the API's image. The database's data lives outside any image.
+    fix: |
+      git pull
+      docker compose up -d --build   # replaces only what changed, keeps volumes
+
+  - type: prose
+    id: health-checks
+    body: >-
+      `depends_on: [db]` starts the database first. But started isn't ready. Our API's first
+      request failed with `ECONNREFUSED`, while Postgres said "the database system is
+      starting up".
+
+
+      A **health check** is a command Docker runs again and again. Exit code 0 means
+      healthy. `pg_isready` asks Postgres if it takes connections. A good check asks what the
+      service needs to do its work, such as its database.
+
+  - type: fill-blank
+    id: fill-health-gate
+    concept: cloud.compose
+    difficulty: 2
+    language: yaml
+    prompt: >-
+      Make the API wait until Postgres is healthy, not only started.
+    template: |
+      services:
+        api:
+          build: .
+          depends_on:
+            db:
+              condition: {{1}}
+        db:
+          image: postgres:17
+          {{2}}:
+            test: ["CMD", "{{3}}", "-U", "postgres"]
+            interval: 2s
+            retries: 10
+    blanks:
+      - key: '1'
+        answer: service_healthy
+      - key: '2'
+        answer: healthcheck
+      - key: '3'
+        answer: pg_isready
+    bank: [service_healthy, service_started, healthcheck, depends_on, pg_isready, psql]
+
+  - type: ai-review
+    id: review-always-ok
+    concept: cloud.health-checks
+    difficulty: 3
+    language: js
+    request: Add a /health endpoint so the load balancer knows when to stop sending us traffic.
+    flawClass: logic
+    code: |
+      if (req.url === "/health") {
+        res.end("ok");
+        return;
+      }
+      try {
+        const { rows } = await pool.query("SELECT title FROM todos");
+        res.end(JSON.stringify(rows));
+      } catch (err) {
+        res.statusCode = 500;
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    prompt: >-
+      We stopped the database. `/health` still answered `200 OK`, while every `/todos` got a
+      500. Tap the line at fault.
+    lines: [2]
+    reasons:
+      - text: It says ok without checking the database
+        correct: true
+        feedback: >-
+          Right. A check that can't fail never pulls a broken API out of service.
+      - text: '`/health` should return JSON'
+        feedback: >-
+          The format is fine. Balancers read the status code. This one is always 200.
+      - text: The `return` skips the database query
+        feedback: >-
+          Skipping the list query is right. Health should run a small check of its own instead.
+    fix: |
+      if (req.url === "/health") {
+        try {
+          await pool.query("SELECT 1");
+          res.end("ok");
+        } catch {
+          res.statusCode = 503;
+          res.end("database unreachable");
+        }
+        return;
+      }
+
+  - type: code-challenge
+    id: write-health
+    concept: cloud.health-checks
+    difficulty: 3
+    language: ts
+    prompt: >-
+      Write `health(pingDb, sleep, timeoutMs)`. `pingDb()` resolves when the database
+      answers and rejects when it refuses. `sleep(ms)` resolves after `ms` milliseconds.
+
+
+      Return `{ status: 200, body: 'ok' }` when the ping resolves. Return `503` with
+      `'database unreachable'` when it rejects, and `503` with `'database timeout'` when
+      `sleep(timeoutMs)` finishes first. A hung database must not hang the check.
+    hints:
+      - Two things race here, the ping and the deadline. The first to finish decides the answer.
+      - Turn each into a promise of a result object, using `.then` with a success and a failure callback.
+      - '`Promise.race([ping, late])` settles with whichever promise finishes first.'
+
+  - type: explain-back
+    id: explain-started-is-not-ready
+    concept: cloud.health-checks
+    difficulty: 4
+    prompt: >-
+      A container's status says "Up", yet requests to it fail for the first few seconds. Why
+      isn't a started container the same as a ready one?
+    rubric:
+      - '"Up" only means the process has been launched, not that it can do its work yet.'
+      - A database or an app needs time after launch to load, recover and open its port.
+      - A health check asks the service itself, so others can wait for, or be routed by, a real answer.
+    modelAnswer: >-
+      "Up" means Docker launched the process, and nothing more. A database still has to read
+      its files and open its port. An app still has to load its code and connect to things.
+      For those seconds the container is running and useless. A health check closes that gap.
+      It runs a small command that asks a real question, like `pg_isready`. Other services
+      can then wait for "healthy", and a balancer can keep traffic away until then.
+
+recap:
+  - Declare an API and its database in `compose.yaml`, and start them with `docker compose up -d`.
+  - Reach services by name, publish only what must be public, and keep data in a volume.
+  - Wait for `service_healthy`, and make `/health` check the database with a deadline.
+
+recall:
+  - id: card-service-name
+    concept: cloud.container-networks
+    front: How does one Compose service reach another, and what can the host reach?
+    back: >-
+      By service name, which is a hostname on the Compose network. The host reaches only
+      ports listed under `ports`.
+  - id: card-volume
+    concept: cloud.volumes
+    front: What happens to a named volume on `docker compose down`, and on `down -v`?
+    back: >-
+      `down` keeps it, so new containers find the old data. `down -v` deletes it, and the
+      data with it.
+  - id: card-service-healthy
+    concept: cloud.health-checks
+    front: What does plain `depends_on` wait for, and what waits for readiness?
+    back: >-
+      Plain `depends_on` waits only for the container to start. `condition: service_healthy`
+      waits for its health check to pass.
+  - id: card-honest-health
+    concept: cloud.health-checks
+    front: What should an API's `/health` endpoint check, and what should it return on failure?
+    back: >-
+      What the API needs to work, such as a quick query to its database, with a deadline. On
+      failure or timeout it returns 503.
+
+references:
+  - kind: docs
+    title: Define services in Docker Compose
+    authors: Docker
+    venue: Docker Docs
+    url: https://docs.docker.com/reference/compose-file/services/
+    note: '`ports`, `volumes`, `environment`, `healthcheck` and `depends_on`.'
+    primary: true
+    verified: true
+  - kind: docs
+    title: Control startup and shutdown order in Compose
+    authors: Docker
+    venue: Docker Docs
+    url: https://docs.docker.com/compose/how-tos/startup-order/
+    note: '`service_started` against `service_healthy`.'
+    primary: true
+    verified: true
+  - kind: docs
+    title: Networking in Compose
+    authors: Docker
+    venue: Docker Docs
+    url: https://docs.docker.com/compose/how-tos/networking/
+    note: The default network, and reaching a service by its name.
+    verified: true
+  - kind: docs
+    title: YAML Ain't Markup Language, version 1.2.2
+    authors: YAML Language Development Team
+    year: 2021
+    venue: yaml.org
+    url: https://yaml.org/spec/1.2.2/
+    note: The YAML specification, for when indentation surprises you.
+    verified: false
+  - kind: docs
+    title: Packet filtering and firewalls
+    authors: Docker
+    venue: Docker Docs
+    url: https://docs.docker.com/engine/network/packet-filtering-firewalls/
+    note: How published ports interact with the host's firewall, including ufw.
+    verified: true
+
+deepDive: >-
+  All of this ran on Docker 28.3 with Compose 2.39: a to-do API on `node:24-slim` using the
+  `pg` driver, and PostgreSQL 17. `curl localhost:5432` exited with code 7 because nothing
+  publishes that port. From inside the API container, the name `db` resolved to the
+  database's address on the network.
+
+
+  With plain `depends_on`, `psql` right after `up` printed `FATAL: the database system is
+  starting up`, and the API's first query failed with `connect ECONNREFUSED`. With a
+  `pg_isready` health check and `service_healthy`, Compose printed `todoh-db-1 Healthy`
+  before it started the API. An app should still retry its first connection: health checks
+  order the start, and they can't promise the database stays up.
+
+
+  After `docker compose stop db`, the always-OK `/health` returned `200 OK` while `/todos`
+  returned `500` with `getaddrinfo ENOTFOUND db`. One more real catch: without
+  `pool.on("error", ...)`, the `pg` pool threw when the database went away and the whole API
+  process exited. Handle that event, then let `/health` report the problem.
+
+
+  Keep health checks cheap and quick, like `SELECT 1`, because they run every few seconds.
+  Kubernetes, in lesson 19, splits them into two: readiness, which takes an instance out of
+  traffic, and liveness, which restarts it. A liveness check that tests the database
+  restarts every copy when the database blips.
+
+
+  The password in `compose.yaml` is fine for a laptop. On a server it comes from the
+  environment or a secret store, as the CI lesson shows. And Docker writes its own firewall
+  rules for published ports, which can bypass ufw from lesson 2. Publish only what must be
+  public, or bind to `127.0.0.1:8080:3000`.

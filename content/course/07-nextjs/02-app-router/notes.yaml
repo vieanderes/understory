@@ -1,0 +1,292 @@
+summary: >-
+  The App Router turns a folder tree into two things at once: a set of URLs, and the
+  component tree drawn for each URL. A folder adds a segment to the path. A `page.tsx` makes
+  that path public. A `layout.tsx` wraps everything below it, and special files such as
+  `loading.tsx`, `error.tsx` and `not-found.tsx` become Suspense and error boundaries at that
+  level.
+
+
+  The design exists so that moving between pages redraws as little as possible. Layouts stay
+  mounted when you navigate with `<Link>`, so a header, a sidebar or a playing audio player
+  keeps its state, and only the part of the tree that changed is fetched and swapped. That
+  same rule has a cost: a layout doesn't re-render on navigation, so it can't read the query
+  string or the current path.
+
+
+  Knowing the exact nesting order of the special files is what lets you predict behaviour:
+  which errors an `error.tsx` catches, when a `loading.tsx` actually shows, and why a route
+  that streams can't change its status code to 404 once it has started.
+remember:
+  - >-
+    A folder adds a URL segment, and only a folder with a `page.tsx` (or a `route.ts`) is
+    reachable; folders in brackets match any value.
+  - >-
+    In Next.js 16, `params` and `searchParams` are promises, so a page awaits them, or passes
+    them down unawaited to the component that needs the value.
+  - >-
+    Within one segment the files nest as layout, template, error, loading, not-found, then
+    the page, so an `error.tsx` never catches errors from the layout beside it.
+  - >-
+    Layouts don't re-render on navigation, which is why they keep state and why they can't
+    read `searchParams`; read the path with `usePathname` in a Client Component.
+  - >-
+    `<Link>` prefetches routes in the viewport in production and swaps only the changed
+    segments; a plain `<a>` reloads the whole document and loses all client state.
+  - >-
+    `error.tsx` must be a Client Component, receives `error` and `retry`, and in production
+    shows a generic message with a `digest` for errors thrown on the server.
+  - >-
+    Calling `notFound()` renders the nearest `not-found.tsx`; the response is a real 404
+    only if streaming hasn't started yet.
+sections:
+  - title: The component tree a URL becomes
+    body: |-
+      Every segment on the path contributes its special files, and Next.js nests them in a
+      fixed order. For `app/books/[slug]/`, with all the files present, the tree is roughly:
+
+      ```tsx
+      <RootLayout>
+        <BooksLayout>
+          <Template key={slug}>
+            <ErrorBoundary fallback={<BooksError />}>
+              <Suspense fallback={<BooksLoading />}>
+                <NotFoundBoundary fallback={<BooksNotFound />}>
+                  <BookPage params={params} />
+                </NotFoundBoundary>
+              </Suspense>
+            </ErrorBoundary>
+          </Template>
+        </BooksLayout>
+      </RootLayout>
+      ```
+
+      Three consequences follow from the order, and each one catches people out.
+
+      First, `error.tsx` sits inside the layout of its own segment. A crash in
+      `app/books/layout.tsx` isn't caught by `app/books/error.tsx`; it bubbles to the error
+      boundary of the parent segment. A crash in the root layout needs `global-error.tsx`,
+      which must render its own `<html>` and `<body>` because it replaces the root layout.
+
+      Second, `loading.tsx` wraps the page, not the layout. If the layout itself awaits slow
+      data, the loading file can't cover it, and navigation waits for the layout. Move the
+      slow read into the page, or give it its own `<Suspense>`.
+
+      Third, `template.tsx` receives a unique key. A key change makes React throw away the
+      old subtree, so client state below a template resets on every navigation, which is
+      exactly what a layout avoids. Use it when you want that, for example to rerun an
+      effect on each page view.
+  - title: Why layouts keep state, and what they can't see
+    body: |-
+      On a client-side navigation, Next.js fetches only the segments that changed and keeps
+      the rest of the React tree mounted. React sees the same layout component at the same
+      position with the same type, so it keeps its state and DOM. That's the mechanism
+      behind the lesson's music player that keeps playing.
+
+      Because layouts don't re-render when you move between their child pages, they can't
+      be given the query string or the pathname: the value would go stale after the first
+      navigation. The fix is to read those in a Client Component, which does re-render on
+      navigation. A navigation link that marks the current page is the classic case:
+
+      ```tsx
+      'use client';
+
+      import Link from 'next/link';
+      import { usePathname } from 'next/navigation';
+      import type { ReactNode } from 'react';
+
+      export function NavLink({ href, children }: { href: string; children: ReactNode }) {
+        const pathname = usePathname();
+        const active = pathname === href || pathname.startsWith(`${href}/`);
+        return (
+          <Link href={href} aria-current={active ? 'page' : undefined}>
+            {children}
+          </Link>
+        );
+      }
+      ```
+
+      The layout stays a Server Component and renders `<NavLink href="/books">Books</NavLink>`.
+      Only the small link ships to the browser. `aria-current="page"` tells screen readers
+      which link is the current page, and it gives CSS a hook for the active style.
+
+      One boundary to know: navigating between two different root layouts, for example
+      `app/(shop)/layout.tsx` and `app/(admin)/layout.tsx` with no `app/layout.tsx` above
+      them, causes a full page load, because there is no shared layout to keep.
+  - title: Dynamic segments and pages that don't exist
+    body: |-
+      A bracket folder matches one segment, and variants match more:
+
+      ```text
+      app/books/[slug]/page.tsx        /books/emma          { slug: 'emma' }
+      app/docs/[...parts]/page.tsx     /docs/a/b            { parts: ['a', 'b'] }
+      app/docs/[[...parts]]/page.tsx   /docs                { parts: undefined }
+      ```
+
+      The value arrives in `params`, a promise in Next.js 16. When a slug matches the route
+      but not your data, call `notFound()` from `next/navigation`. It throws, so TypeScript
+      knows the code after it only runs when the book exists:
+
+      ```tsx
+      import { notFound } from 'next/navigation';
+
+      type Book = { slug: string; title: string; author: string };
+
+      const books: Book[] = [
+        { slug: 'emma', title: 'Emma', author: 'Jane Austen' },
+        { slug: 'middlemarch', title: 'Middlemarch', author: 'George Eliot' },
+      ];
+
+      async function getBook(slug: string): Promise<Book | undefined> {
+        return books.find((book) => book.slug === slug);
+      }
+
+      export default async function BookPage({ params }: { params: Promise<{ slug: string }> }) {
+        const { slug } = await params;
+        const book = await getBook(slug);
+        if (!book) notFound();
+        return (
+          <article>
+            <h1>{book.title}</h1>
+            <p>by {book.author}</p>
+          </article>
+        );
+      }
+      ```
+
+      The nearest `not-found.tsx` renders in place of the page. The HTTP status depends on
+      timing. Once a response has started streaming, for example because a `loading.tsx`
+      fallback was sent, the `200` status is already on the wire and can't change. Next.js
+      then adds `<meta name="robots" content="noindex">` so search engines skip the page. If
+      you need a real `404` status, check existence before anything suspends, as above,
+      where the check runs at the top of the page.
+  - title: What `<Link>` does that an anchor doesn't
+    body: |-
+      `<Link>` renders a real `<a href>`, so it works before hydration, opens in a new tab
+      with a middle click, and is announced as a link. On top of that it adds three things.
+
+      **Prefetching.** In production, when a link enters the viewport, Next.js fetches the
+      target route in the background. For a static route the whole route is prefetched. For
+      a dynamic route it prefetches down to the nearest `loading.tsx`, so the loading state
+      can show the instant someone clicks. Without a `loading.tsx`, a click on a dynamic
+      route waits for the server before anything changes. That's why the docs recommend a
+      `loading.tsx` on dynamic routes.
+
+      **Client-side transitions.** A click swaps only the segments that changed and keeps
+      shared layouts, instead of loading a new document.
+
+      **Scroll handling.** If the new page isn't visible, Next.js scrolls to its top.
+
+      A long list of links, such as an infinite table, can prefetch far more than anyone
+      will visit. `prefetch={false}` turns it off for a link, at the cost of a slower click.
+      For slow networks, the `useLinkStatus` hook from `next/link` reports `pending` while a
+      navigation is in flight, so you can show a small hint inside the clicked link.
+  - title: What error boundaries catch, and what they show
+    body: |-
+      `error.tsx` is a React error boundary, and error boundaries catch errors thrown while
+      rendering. They don't catch errors in event handlers or in async code that runs after
+      render. Catch those yourself and store the error in state. The exception is a
+      transition: an error thrown inside `startTransition` bubbles to the nearest boundary.
+
+      ```tsx
+      'use client';
+
+      import { useEffect } from 'react';
+
+      export default function BooksError({
+        error,
+        retry,
+      }: {
+        error: Error & { digest?: string };
+        retry: () => void;
+      }) {
+        useEffect(() => {
+          console.error(error.digest ?? error);
+        }, [error]);
+        return (
+          <div role="alert">
+            <h2>Couldn't load this book</h2>
+            <button type="button" onClick={() => retry()}>
+              Try again
+            </button>
+          </div>
+        );
+      }
+      ```
+
+      The message you see differs by environment. In development the original message is
+      forwarded. In production, an error thrown in a Server Component reaches the browser as
+      a generic message plus a `digest`, an identifier that matches the server logs. That's
+      deliberate: server errors often contain connection strings or query details. So the
+      lesson's `<p>{error.message}</p>` is fine for learning, but in production write your
+      own friendly text and log the digest.
+
+      `retry()` re-fetches and re-renders the boundary's children, so a flaky network call
+      gets another chance. `reset()` clears the error and re-renders without fetching again;
+      the docs recommend `retry` in most cases.
+pitfalls:
+  - >-
+    **Reading `params.slug` without awaiting.** `params` is a promise in Next.js 16, so the
+    property is `undefined` and the dev server warns. Make the page `async` and write
+    `const { slug } = await params`.
+  - >-
+    **Expecting `error.tsx` to catch its own layout.** It sits inside that layout. Put the
+    boundary one level up, or use `global-error.tsx` for the root layout.
+  - >-
+    **Reading the query string in a layout.** Layouts don't re-render on navigation, so they
+    don't receive `searchParams`. Read it in the page, or with `useSearchParams` in a Client
+    Component.
+  - >-
+    **Using `<a>` for internal links.** Every click reloads the document, throws away client
+    state and skips prefetching. Use `<Link>` for routes in the app and keep `<a>` for other
+    sites.
+  - >-
+    **Forgetting `'use client'` in `error.tsx`.** Error boundaries need client code, so the
+    file must be a Client Component.
+  - >-
+    **A folder with no page.** `app/shop/basket/page.tsx` doesn't make `/shop` a page. Add
+    `app/shop/page.tsx`, or accept the 404.
+  - >-
+    **Showing `error.message` to users in production.** Server errors arrive as a generic
+    text with a digest. Write your own message and log the digest to find the real cause.
+interview:
+  - question: How does the App Router decide what to render for a URL?
+    answer: >-
+      It walks the folder tree along the URL's segments and nests each segment's files in a
+      fixed order: layout, template, error boundary, Suspense boundary from `loading.tsx`,
+      not-found boundary, then the page or the next layout. Brackets match dynamic values,
+      which arrive as a `params` promise. The order explains real behaviour: an
+      `error.tsx` can't catch a crash in the layout beside it, and a `loading.tsx` can't
+      cover a layout that awaits slow data. On navigation, only the segments that changed
+      are fetched; shared layouts stay mounted. The trade-off of convention over
+      configuration is that a misnamed file silently does nothing, so I lean on the build
+      output and typed routes to catch it.
+  - question: Why does a layout keep its state across navigations, and what does that cost you?
+    answer: >-
+      Because a `<Link>` navigation fetches only the changed segments and React keeps the
+      rest of the tree mounted, so the layout component stays at the same position with its
+      state and DOM intact. That's why a search box or audio player in a layout survives page
+      changes. The cost is that layouts don't re-render on navigation, so Next.js doesn't
+      give them `searchParams` or the pathname, which would go stale. I read those in the
+      page or in a small Client Component with `usePathname` or `useSearchParams`, such as an
+      active nav link. When I want state to reset on every navigation, I use `template.tsx`,
+      which is keyed per route.
+  - question: How do you handle errors and missing data in the App Router?
+    answer: >-
+      I separate expected cases from bugs. A missing record is expected, so the page calls
+      `notFound()` and a `not-found.tsx` renders; I do that check before anything suspends,
+      so the status is a real 404 rather than a streamed 200 with a noindex tag. Unexpected
+      exceptions are thrown and caught by `error.tsx` boundaries placed per segment, so one
+      broken panel doesn't take down the whole app. The boundary is a Client Component with
+      a `retry` button. In production, server error messages are replaced by a digest, so I
+      log that and show my own text. Boundaries don't catch event-handler errors, so those I
+      catch and keep in state.
+  - question: What does `<Link>` give you over a plain anchor?
+    answer: >-
+      It still renders a real anchor, so it's accessible and works before hydration, but it
+      adds prefetching and client-side transitions. In production, links in the viewport
+      prefetch their route: fully for static routes, and down to the nearest `loading.tsx`
+      for dynamic ones. A click then swaps only the changed segments instead of reloading the
+      document, so layout state and scroll behaviour are kept. The trade-off is extra
+      background requests. For a page with hundreds of links I set `prefetch={false}`, or
+      prefetch on hover, and I add a `loading.tsx` to dynamic routes so clicks respond
+      instantly.

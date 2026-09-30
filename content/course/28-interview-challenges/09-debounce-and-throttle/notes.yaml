@@ -1,0 +1,319 @@
+summary: >-
+  Debounce and throttle both limit how often a function runs while events pour in. Debounce
+  waits for a pause and then runs once, with the latest arguments: a search box, an autosave,
+  a resize that triggers layout work. Throttle runs at most once per interval while events
+  keep coming: a scroll position, a drag, progress reporting.
+
+
+  Interviewers like them because they are short, full of edge cases and extend in predictable ways. The
+  first version must clear the pending timer on every call and remember the latest
+  arguments. The follow-ups are predictable: `cancel`, `flush`, a leading call, a trailing call,
+  and "how would you test this without waiting?"
+
+
+  The testing answer is to inject the timers, or the clock, as an argument. A test passes a
+  fake that only moves time when told, so a burst of keystrokes and a 300 ms pause run in a
+  millisecond and the same way every time. The code under test does not change.
+remember:
+  - >-
+    Debounce waits for `wait` ms of quiet and then calls once with the latest arguments;
+    throttle calls at most once per interval while calls keep coming.
+  - >-
+    Every call to a debounced function must clear the pending timer before setting a new one.
+  - >-
+    Keep the latest arguments in a variable beside the timer id, so `flush` can run the pending
+    call immediately and `cancel` can drop it.
+  - >-
+    A leading call runs on the first event of a burst; a trailing call runs once the burst ends.
+    With both on, a lone call runs once and a burst runs twice.
+  - >-
+    A throttle without a trailing call loses the last event of a burst, such as the final
+    scroll position.
+  - >-
+    Inject the timers or the clock so tests move time themselves instead of sleeping.
+  - >-
+    Debounce reduces the number of requests but does not stop an older response arriving after
+    a newer one; abort or ignore stale responses separately.
+sections:
+  - title: A complete debounce with leading, trailing, cancel, flush and pending
+    body: |-
+      This is the version to aim for when the interviewer keeps extending the task. It takes
+      the timers as an argument and supports both edges.
+
+      ```ts
+      export interface Timers {
+        set(fn: () => void, ms: number): number;
+        clear(id: number | undefined): void;
+      }
+
+      export interface Debounced<A extends unknown[]> {
+        (...args: A): void;
+        cancel(): void;
+        flush(): void;
+        pending(): boolean;
+      }
+
+      export function debounce<A extends unknown[]>(
+        fn: (...args: A) => void,
+        wait: number,
+        timers: Timers,
+        { leading = false, trailing = true } = {},
+      ): Debounced<A> {
+        let timer: number | undefined; // set while a burst is in progress
+        let lastArgs: A | undefined; // the call still owed to the trailing edge, if any
+
+        const invoke = () => {
+          const args = lastArgs as A;
+          lastArgs = undefined;
+          fn(...args);
+        };
+
+        const endBurst = () => {
+          timers.clear(timer);
+          timer = undefined;
+          if (trailing && lastArgs) invoke();
+          lastArgs = undefined;
+        };
+
+        const debounced = (...args: A) => {
+          const startsBurst = timer === undefined;
+          lastArgs = args;
+          timers.clear(timer);
+          // Set before fn runs, so a call to debounced from inside fn joins this burst.
+          timer = timers.set(endBurst, wait);
+          // The leading call consumes lastArgs, so a lone call never repeats on the trailing edge.
+          if (startsBurst && leading) invoke();
+        };
+
+        return Object.assign(debounced, {
+          cancel() {
+            timers.clear(timer);
+            timer = undefined;
+            lastArgs = undefined;
+          },
+          flush() {
+            if (timer !== undefined) endBurst();
+          },
+          pending() {
+            return timer !== undefined;
+          },
+        });
+      }
+
+      // A minimal fake clock. It fires only timers set before advance began, which is
+      // enough here; the lesson's fake also runs timers set during advance.
+      let now = 0;
+      let nextId = 1;
+      const due = new Map<number, { at: number; fn: () => void }>();
+      const timers: Timers = {
+        set: (fn, ms) => (due.set(nextId, { at: now + ms, fn }), nextId++),
+        clear: (id) => void (id !== undefined && due.delete(id)),
+      };
+      function advance(ms: number) {
+        const end = now + ms;
+        for (const [id, t] of [...due].sort((a, b) => a[1].at - b[1].at)) {
+          if (t.at > end || !due.has(id)) continue;
+          due.delete(id);
+          now = t.at;
+          t.fn();
+        }
+        now = end;
+      }
+
+      const log: string[] = [];
+      const both = debounce((q: string) => log.push(q), 100, timers, { leading: true });
+      both('c'); both('ca'); both('cat'); // a burst: leading 'c', trailing 'cat'
+      advance(100);
+      both('dog'); // a lone call: leading only
+      advance(100);
+      console.log(log); // [ 'c', 'cat', 'dog' ]
+      ```
+
+      How each option combination behaves, which is worth saying before you code:
+
+      - **Trailing only** (the default): a burst runs once, at the end, with the last
+        arguments.
+      - **Leading only**: the first call of a burst runs at once; the rest are dropped until
+        `wait` ms pass with no calls.
+      - **Both**: the first call runs at once, and if more calls came, the last one runs at the
+        end. A lone call runs only once, because the leading call consumes the stored
+        arguments.
+      - **Neither**: nothing ever runs. Reject it or say so.
+
+      `flush` ends the burst now, running the trailing call if one is owed. `cancel` ends it
+      and drops the owed call. After either, the next call starts a new burst, so with
+      `leading` on it runs immediately.
+  - title: Throttle variants, and how libraries relate the two
+    body: |-
+      The simplest throttle compares timestamps and needs no timer at all. It gives a leading
+      call and nothing else:
+
+      ```ts
+      // Leading-edge throttle with no timer at all: compare timestamps from an injected clock.
+      function throttleLeading<A extends unknown[]>(
+        fn: (...args: A) => void,
+        interval: number,
+        now: () => number,
+      ): (...args: A) => void {
+        let last = -Infinity;
+        return (...args: A) => {
+          const t = now();
+          if (t - last < interval) return;
+          last = t;
+          fn(...args);
+        };
+      }
+
+      let clock = 0;
+      const seen: number[] = [];
+      const onScroll = throttleLeading((y: number) => seen.push(y), 100, () => clock);
+      for (clock = 0; clock < 250; clock += 10) onScroll(clock);
+      console.log(seen); // [ 0, 100, 200 ]: and the final position, 240, is lost
+      ```
+
+      The output shows the problem the lesson fixed with a trailing call: the burst ended at
+      240, and no call ever reported it. A trailing call needs a timer, because something has
+      to run after the events stop.
+
+      Lodash builds its throttle out of its debounce. A throttle is a debounce with both edges
+      on and a `maxWait` equal to the interval: during a continuous burst, the function is
+      forced to run at least every `maxWait` ms. Lodash's debounce also avoids clearing and
+      resetting a timer on every call. When its timer fires, it checks how long ago the last
+      call was, and if that is shorter than `wait` it sets a new timer for the remainder. That
+      trades a little logic for far fewer timer operations during fast bursts, which is worth
+      mentioning if the interviewer asks about performance.
+  - title: Debounce does not fix stale responses
+    body: |-
+      A debounced search sends fewer requests, but two can still overlap. If the request for
+      "ca" is slow and the one for "cat" is fast, "ca" can arrive last and overwrite the right
+      results. The fix is separate from the debounce: abort the request you are replacing, and
+      ignore any response whose request was aborted.
+
+      ```ts
+      // Debounce cuts the number of requests. It does not stop an old, slow response from
+      // landing after a newer one, so the search also aborts the request it replaces.
+      type Search = (query: string, signal: AbortSignal) => Promise<string[]>;
+
+      function createSearchBox(search: Search, show: (results: string[]) => void, wait = 250) {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        let inFlight: AbortController | undefined;
+
+        return (query: string) => {
+          clearTimeout(timer);
+          timer = setTimeout(async () => {
+            inFlight?.abort();
+            const controller = new AbortController();
+            inFlight = controller;
+            try {
+              const results = await search(query, controller.signal);
+              if (!controller.signal.aborted) show(results);
+            } catch (error) {
+              if (!controller.signal.aborted) throw error;
+            }
+          }, wait);
+        };
+      }
+
+      // A fake server where the first query is slow and the second is fast.
+      const delays: Record<string, number> = { ca: 300, cat: 20 };
+      const fakeSearch: Search = (query, signal) =>
+        new Promise((resolve, reject) => {
+          const id = setTimeout(() => resolve([`${query} result`]), delays[query] ?? 10);
+          signal.addEventListener('abort', () => {
+            clearTimeout(id);
+            reject(signal.reason);
+          });
+        });
+
+      const shown: string[][] = [];
+      const type = createSearchBox(fakeSearch, (r) => shown.push(r), 50);
+      type('ca');
+      setTimeout(() => type('cat'), 100); // after the first request has gone out
+      setTimeout(() => console.log(shown), 600); // [ [ 'cat result' ] ]
+      ```
+
+      Without the abort, the list would show `cat result` and then flip to `ca result` when the
+      slow response landed. An alternative to aborting is a request counter: tag each request
+      with an increasing number and show a response only if its number is the latest. Aborting
+      is better when the server can stop work early; the counter works with any promise.
+  - title: Using a debounced function inside a component
+    body: |-
+      In a React component the debounced function must survive renders, or every render
+      creates a fresh one with its own timer and nothing is ever debounced. Three rules cover
+      it:
+
+      - **Create it once.** Keep it in a `useRef` or a `useMemo` with stable dependencies, not
+        in the component body.
+      - **Call the latest callback.** If the debounced function closes over props or state, it
+        sees the values from the render that created it. Store the latest callback in a ref
+        and have the debounced function call `ref.current`.
+      - **Clean up.** Call `cancel` (or `flush`, for an autosave that must not lose the last
+        edit) in the effect cleanup when the component unmounts.
+
+      The same rules apply outside React: whoever owns the debounced function owns its timer,
+      and must cancel or flush it when it goes away.
+pitfalls:
+  - >-
+    **Not clearing the previous timer.** Every call then schedules its own run, and a burst of
+    three keystrokes sends three searches. Clear before you set.
+  - >-
+    **Capturing arguments inside the timer.** `timers.set(() => fn(...args), wait)` works for
+    the basic case but leaves nothing for `flush` to run. Store the latest arguments beside the
+    timer id.
+  - >-
+    **Declaring the timer id inside the returned function.** A fresh variable per call forgets
+    the last timer, so there is nothing to clear. Declare it in the outer function, where the
+    closure keeps it.
+  - >-
+    **A leading call that repeats on the trailing edge.** A lone call then runs twice. Clear the
+    stored arguments when the leading call runs.
+  - >-
+    **Testing with real timers.** Sleeping in tests is slow and flaky under load. Inject the
+    timers or use the test framework's fake timers.
+  - >-
+    **Creating the debounced function on every render.** Each render gets a new timer, so
+    nothing is debounced. Create it once and cancel it on unmount.
+interview:
+  - question: >-
+      Implement debounce. Then, how would you add a leading-edge option?
+    answer: >-
+      The core is a closure holding the timer id: each call clears the pending timer and sets
+      a new one that calls the function with the latest arguments after `wait` ms of quiet. I
+      keep the latest arguments in their own variable, which makes `cancel` and `flush` one
+      line each. For a leading edge, I check whether a burst is starting, meaning no timer is
+      pending. If so, I call the function immediately and clear the stored arguments, so a
+      lone call does not run again on the trailing edge. The timer still restarts on every
+      call, so the burst only ends after `wait` ms of quiet. I would ask whether both edges
+      are wanted, since that choice changes what users see.
+  - question: >-
+      When would you use debounce and when throttle? Give an example of each.
+    answer: >-
+      Debounce when only the final value after activity stops matters; throttle when you need
+      regular updates during the activity. A search box or an autosave is debounce: sending
+      "c", "ca" and "cat" wastes requests, and one request after the user pauses is what you
+      want. A scroll-driven progress bar or a drag position is throttle: the user expects it
+      to move while they scroll, but not on every pixel. For throttle I usually want a
+      trailing call as well, so the final position is not lost. The wrong choice shows up as
+      either a UI that lags until the user stops, or a flood of work during the activity.
+  - question: >-
+      How do you test timing code like this without making the tests slow or flaky?
+    answer: >-
+      I inject the time source. The function takes a small timers object, or a clock, instead
+      of calling `setTimeout` or `Date.now` directly. In production I pass wrappers around the
+      real functions; in tests I pass a fake that stores callbacks and fires them only when
+      the test advances time. Then a test can call the function three times, advance 299 ms,
+      assert nothing ran, advance 1 ms more and assert one call with the last arguments,
+      instantly and the same way every time. Jest and Vitest fake timers do the same by
+      replacing the globals. I prefer injection for utilities because it is explicit and
+      needs no global patching.
+  - question: >-
+      Your search box is debounced, but users still sometimes see results for an older query.
+      Why?
+    answer: >-
+      Because debounce controls when requests start, not the order responses arrive in. Two
+      requests can still overlap, and if the older one is slower it lands last and overwrites
+      the newer results. I would fix it by aborting the previous request with an
+      `AbortController` when a new one starts, and ignoring any response whose signal was
+      aborted. If aborting is not possible, I tag each request with an increasing number and
+      only render a response whose number is the latest. Caching results per query also helps,
+      since a repeated query then needs no request at all.

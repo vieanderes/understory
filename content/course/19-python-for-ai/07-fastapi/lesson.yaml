@@ -1,0 +1,302 @@
+id: pyai.fastapi
+title: FastAPI
+objective: "Build an API with typed routes, Pydantic request models, dependencies, and a streamed model reply."
+level: advanced
+minutes: 10
+concepts: [pyai.fastapi-routes, pyai.dependency-injection, pyai.streaming-responses]
+prerequisites: [pyai.pytest, backend.validation]
+opening:
+  text: >-
+    You'll put a model behind your own API, so an app can call it safely. Most AI features
+    ship this way: a small Python service between the user and the model.
+
+steps:
+  - type: prose
+    id: what-fastapi-is
+    body: |-
+      In chapter 9 you met routes: code that answers one method and path, such as
+      `POST /summaries`. **FastAPI** is a Python framework for writing them:
+
+      ```python
+      from fastapi import FastAPI
+      from pydantic import BaseModel
+
+      app = FastAPI()
+
+      class SummaryRequest(BaseModel):
+          text: str
+          max_words: int = 50
+
+      @app.post("/summaries")
+      def create_summary(request: SummaryRequest):
+          return {"summary": summarise(request.text, request.max_words)}
+      ```
+
+      The decorator ties the function to the route. The returned dict goes back as JSON.
+
+  - type: prose
+    id: typed-routes
+    body: >-
+      FastAPI reads the function's parameters. A Pydantic model parameter is the JSON body.
+      A name in `{}` in the path, such as `/chats/{chat_id}`, is a path parameter. Other
+      plain parameters come from the query string.
+
+
+      Each is validated before your function runs. Bad input gets a `422` answer that
+      names the field, and your code never sees it.
+
+  - type: fill-blank
+    id: fill-route
+    concept: pyai.fastapi-routes
+    difficulty: 1
+    language: python
+    prompt: Answer `POST /translations` with a body checked against `TranslateRequest`.
+    template: |
+      @app.{{1}}("/translations")
+      def translate(request: {{2}}):
+          return {"text": run_translation(request.text, request.language)}
+    blanks:
+      - key: '1'
+        answer: post
+      - key: '2'
+        answer: TranslateRequest
+    bank: [post, get, route, TranslateRequest, dict, str]
+
+  - type: multiple-choice
+    id: pick-422
+    concept: pyai.fastapi-routes
+    difficulty: 2
+    code: |
+      {"text": "Long meeting notes...", "max_words": "ten"}
+    language: json
+    question: This body is posted to `/summaries`. What comes back?
+    choices:
+      - text: '`422`, pointing at `max_words`'
+        correct: true
+        feedback: >-
+          Right. `"ten"` isn't an integer, and your function never runs.
+      - text: '`500`, when the code uses `max_words`'
+        feedback: >-
+          The function never runs. Validation fails first and answers for you.
+      - text: '`200`, with a 50-word summary'
+        feedback: >-
+          The default applies only when the field is missing. A wrong value is rejected.
+      - text: '`400 Bad Request`'
+        feedback: >-
+          A common guess. FastAPI uses `422` for JSON that parses but doesn't validate.
+
+  - type: prose
+    id: dependencies
+    body: |-
+      Many routes need the same thing, like the current user. Write it once as a
+      **dependency**, and ask for it with `Depends`:
+
+      ```python
+      def get_user(x_api_key: Annotated[str | None, Header()] = None) -> str:
+          user = USERS_BY_KEY.get(x_api_key)
+          if user is None:
+              raise HTTPException(status_code=401, detail="Unknown key")
+          return user
+
+      @app.get("/chats/{chat_id}")
+      def read_chat(chat_id: int, user: Annotated[str, Depends(get_user)]): ...
+      ```
+
+      FastAPI calls `get_user` on every request and passes in the result. `Annotated` adds
+      that note to the type hint. `HTTPException` stops the request with a status code.
+
+  - type: ai-review
+    id: review-chat-owner
+    concept: pyai.dependency-injection
+    difficulty: 3
+    language: python
+    request: Add a route that returns one of the caller's saved chats by id.
+    flawClass: security
+    code: |
+      @app.get("/chats/{chat_id}")
+      def read_chat(chat_id: int, user: Annotated[str, Depends(get_user)]):
+          chat = CHATS.get(chat_id)
+          if chat is None:
+              raise HTTPException(status_code=404)
+          return chat
+    prompt: >-
+      Each chat is a dict with an `"owner"` and its `"messages"`. The test, where Ana reads
+      her own chat, passed. Tap the line at fault.
+    lines: [6]
+    reasons:
+      - text: It returns the chat without checking its owner
+        correct: true
+        feedback: >-
+          Exactly. Ana can read chat 2, which is Ben's. Check `chat["owner"] == user`.
+      - text: '`get_user` should be called directly'
+        feedback: >-
+          `Depends` calls it on every request. Knowing who's calling works fine.
+      - text: '`404` leaks that the chat exists'
+        feedback: >-
+          `404` says it doesn't exist. The leak is returning chats that do exist.
+    fix: |
+      @app.get("/chats/{chat_id}")
+      def read_chat(chat_id: int, user: Annotated[str, Depends(get_user)]):
+          chat = CHATS.get(chat_id)
+          if chat is None or chat["owner"] != user:
+              raise HTTPException(status_code=404)
+          return chat
+
+  - type: prose
+    id: streaming
+    body: |-
+      To stream a reply to a chat app, return a **StreamingResponse** around a generator.
+      Each piece goes out as a server-sent event from chapter 9. `async with` and
+      `async for` are the async forms of `with` and `for`:
+
+      ```python
+      def event(data):
+          return f"data: {json.dumps(data)}\n\n"
+
+      async def events(text):
+          try:
+              async with client.messages.stream(**request_for(text)) as stream:
+                  async for piece in stream.text_stream:
+                      yield event({"type": "token", "text": piece})
+              yield event({"type": "done"})
+          except Exception:
+              yield event({"type": "error", "message": "The model failed."})
+
+      @app.post("/answer")
+      async def answer(question: Question):
+          return StreamingResponse(events(question.text), media_type="text/event-stream")
+      ```
+
+  - type: prose
+    id: errors-in-the-stream
+    body: >-
+      FastAPI checks the `Question` body before your function runs, so bad input still gets
+      a `422`. Check everything you can there, before the stream starts.
+
+
+      Once the first byte leaves, the `200` has been sent and can't change. So a failure
+      mid-stream travels inside it, as an `error` event the app shows.
+
+  - type: parsons
+    id: arrange-stream-route
+    concept: pyai.streaming-responses
+    difficulty: 3
+    language: python
+    prompt: >-
+      Stream a story to the app as it's written. `story_request(topic)` returns the
+      request's arguments as a dict. Write the generator first, then the route.
+    checkIndent: true
+    blocks:
+      - id: gen
+        code: 'async def story_pieces(topic):'
+      - id: open
+        code: 'async with client.messages.stream(**story_request(topic)) as stream:'
+        indent: 1
+      - id: loop
+        code: 'async for text in stream.text_stream:'
+        indent: 2
+      - id: give
+        code: yield text
+        indent: 3
+      - id: route
+        code: '@app.get("/story")'
+      - id: handler
+        code: 'async def story(topic: str):'
+      - id: respond
+        code: return StreamingResponse(story_pieces(topic), media_type="text/plain")
+        indent: 1
+    distractors:
+      - id: join
+        code: return "".join(story_pieces(topic))
+        feedback: >-
+          That waits for the whole story, so nothing streams. Hand the generator on instead.
+      - id: plain-for
+        code: 'for text in stream.text_stream:'
+        feedback: >-
+          The async client's stream needs `async for`, so waiting doesn't block the server.
+
+  - type: explain-back
+    id: explain-owner-check
+    concept: pyai.dependency-injection
+    difficulty: 3
+    prompt: >-
+      Ana is logged in, so `get_user` succeeded. Why must `read_chat` still check the chat's
+      owner?
+    rubric:
+      - Logging in proves who Ana is, not what she may read.
+      - Ids are simple to guess, so anyone can ask for chat 2.
+      - Each route that returns someone's data checks that it belongs to the caller.
+    modelAnswer: >-
+      The dependency only proves who is calling. It says nothing about whose chat this is.
+      Ids like 1, 2 and 3 are simple to guess, so Ana could read Ben's chat. The route has to
+      compare the chat's owner with the caller, and answer `404` if they differ.
+
+recap:
+  - Write routes whose parameters and Pydantic body FastAPI validates, with `422` for bad input.
+  - Share checks such as the current user with `Depends`, and still check who owns the data.
+  - Stream a model's reply to the app with a `StreamingResponse` around a generator.
+
+recall:
+  - id: card-where-params-come-from
+    concept: pyai.fastapi-routes
+    front: Where does FastAPI take a Pydantic model parameter from, and a plain `int`?
+    back: >-
+      The model comes from the JSON body. A plain parameter comes from the path if it's in
+      `{}` there, and from the query string otherwise.
+  - id: card-422
+    concept: pyai.fastapi-routes
+    front: What does FastAPI answer when the body fails validation?
+    back: >-
+      `422`, with a `detail` list that names each bad field. Your function never runs.
+  - id: card-depends
+    concept: pyai.dependency-injection
+    front: What does `Depends(get_user)` do?
+    back: >-
+      FastAPI calls `get_user` on every request and passes the result in. If it raises
+      `HTTPException`, the route never runs.
+  - id: card-stream
+    concept: pyai.streaming-responses
+    front: How do you stream a model's reply out of a FastAPI route?
+    back: >-
+      Return a `StreamingResponse` around a generator that yields each piece of
+      `text_stream`: plain text, or server-sent events with `media_type="text/event-stream"`.
+
+references:
+  - kind: docs
+    title: FastAPI Tutorial - User Guide
+    authors: Sebastián Ramírez and contributors
+    venue: FastAPI documentation
+    url: https://fastapi.tiangolo.com/tutorial/
+    note: Path, query and body parameters, validation and the 422 response.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Dependencies
+    authors: Sebastián Ramírez and contributors
+    venue: FastAPI documentation
+    url: https://fastapi.tiangolo.com/tutorial/dependencies/
+    note: Depends, Annotated and sharing checks between routes.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Custom Response - StreamingResponse
+    authors: Sebastián Ramírez and contributors
+    venue: FastAPI documentation
+    url: https://fastapi.tiangolo.com/advanced/custom-response/#streamingresponse
+    note: Streaming a body from a generator.
+    verified: true
+
+deepDive: >-
+  **Checked with FastAPI 0.141 and its TestClient** on Python 3.12. `max_words: "ten"`
+  gave `422` with `loc` `["body", "max_words"]`. `"10"` was accepted as `10`, since
+  Pydantic converts safely. The browser Python in this course can't run a web server, so
+  this lesson has reviews and arranging instead of a challenge.
+
+
+  **def or async def.** FastAPI runs a plain `def` route in a thread pool, so a blocking
+  call there is fine. Inside `async def`, use async clients only, or you freeze the
+  server, as the async lesson showed.
+
+
+  **Docs for free.** FastAPI builds an OpenAPI description from your types and serves it
+  at `/docs`, where you can try every route. Run the app with `uv run fastapi dev main.py`.

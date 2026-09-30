@@ -1,0 +1,332 @@
+summary: >-
+  Encryption keeps data private, and signatures prove who made it and that it hasn't
+  changed. Symmetric encryption uses one shared key and is fast; public-key cryptography
+  uses a key pair, so strangers can lock messages for you or check what you signed without
+  holding your secret. Real systems combine them: key pairs to agree or protect a key, and a
+  fast symmetric cipher for the data itself.
+
+
+  In application code, the choice is short. For data you store or send and need back, use
+  **authenticated encryption**, AES-256-GCM or ChaCha20-Poly1305, which detects any change to
+  the ciphertext. For a message many parties must check but none may forge, sign it with
+  Ed25519. For data in transit, use TLS and let it do all of the above for you.
+
+
+  TLS is where these pieces meet. The handshake agrees a fresh key per connection with a key
+  exchange, proves the server's identity with a certificate and a signature, and then
+  encrypts everything with an AEAD cipher. HSTS closes the gap before TLS starts, the
+  first plain `http://` request. None of it protects what happens inside your server once the
+  bytes arrive.
+remember:
+  - Use authenticated encryption such as AES-256-GCM, which detects tampering, and never unauthenticated modes such as CTR or CBC on their own.
+  - A GCM nonce must never repeat under the same key, so use 12 random bytes per message and rotate the key long before 2^32 messages.
+  - Encryption without authentication is malleable, so an attacker can change the plaintext predictably without the key.
+  - Sign with the private key and verify with the public key; Ed25519 is the modern default.
+  - Public-key operations protect a small symmetric key, which then encrypts the data, because asymmetric crypto is slow and size-limited.
+  - TLS 1.3 agrees a fresh key per connection with ephemeral key exchange, which gives forward secrecy.
+  - A certificate binds a public key to a hostname, and the client checks the chain, the dates and the name in the subject alternative names.
+  - '`Strict-Transport-Security` makes browsers use HTTPS for your site on every visit after the first, and the preload list covers the first.'
+sections:
+  - title: AES-256-GCM in Node, done properly
+    body: |-
+      AES-GCM is an **AEAD** mode: authenticated encryption with associated data. It returns
+      a ciphertext and a 16-byte **authentication tag**. Decryption recomputes the tag and
+      refuses if a single bit of the ciphertext, the nonce or the associated data changed.
+
+      ```js
+      import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
+
+      const key = randomBytes(32); // 256 bits; in real code, from a key store
+
+      function encrypt(plaintext, aad) {
+        const iv = randomBytes(12); // a fresh 96-bit nonce for every message
+        const cipher = createCipheriv('aes-256-gcm', key, iv);
+        cipher.setAAD(aad);
+        const body = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
+        return Buffer.concat([iv, cipher.getAuthTag(), body]).toString('base64url');
+      }
+
+      function decrypt(sealed, aad) {
+        const raw = Buffer.from(sealed, 'base64url');
+        const iv = raw.subarray(0, 12);
+        const tag = raw.subarray(12, 28);
+        const decipher = createDecipheriv('aes-256-gcm', key, iv, { authTagLength: 16 });
+        decipher.setAAD(aad);
+        decipher.setAuthTag(tag);
+        return Buffer.concat([decipher.update(raw.subarray(28)), decipher.final()]).toString('utf8');
+      }
+
+      const aad = Buffer.from('customer:42');
+      const sealed = encrypt('4111 1111 1111 1111', aad);
+      console.log(decrypt(sealed, aad)); // 4111 1111 1111 1111
+
+      const flipped = Buffer.from(sealed, 'base64url');
+      flipped[flipped.length - 1] ^= 1;
+      for (const [label, attempt] of [['tampered', () => decrypt(flipped.toString('base64url'), aad)],
+        ['moved', () => decrypt(sealed, Buffer.from('customer:43'))]]) {
+        try { attempt(); } catch (err) { console.log(label, err.message); }
+      }
+      // tampered Unsupported state or unable to authenticate data
+      // moved Unsupported state or unable to authenticate data
+      ```
+
+      The **associated data** is authenticated but not encrypted. Binding the row's id into it
+      means a ciphertext copied into another customer's row fails to decrypt, which stops a
+      quiet class of swap attacks.
+
+      The **nonce** (called `iv` in the API) needn't be secret, and it's stored in front of the
+      ciphertext. It must never repeat under the same key. A repeat reveals the XOR of the two
+      plaintexts and leaks the key GCM uses for its tags, so forgeries follow. With random
+      nonces, NIST's limit is 2^32 messages per key, so high-volume systems rotate keys or use
+      a counter nonce managed carefully.
+
+      Passing `authTagLength: 16` matters: without it, Node still accepts shorter tags for
+      compatibility, which are easier to forge. And the key must be 32 random bytes. A
+      password is not a key; derive one with scrypt or Argon2 first. Where the keys come from
+      and how they rotate is the next lesson's subject.
+  - title: Why encryption alone doesn't stop tampering
+    body: |-
+      It's tempting to think that data nobody can read is data nobody can change. With a
+      stream-style mode such as AES-CTR, the ciphertext is the plaintext XORed with a keystream.
+      Flip a bit of the ciphertext and exactly that bit of the plaintext flips. Someone who
+      knows the format can edit the message without the key.
+
+      ```js
+      import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
+
+      const key = randomBytes(32);
+      const iv = randomBytes(16);
+      const c = createCipheriv('aes-256-ctr', key, iv);
+      const sealed = Buffer.concat([c.update('{"refund":10}'), c.final()]);
+
+      // On the path: no key, but the format is known.
+      const i = '{"refund":'.length;
+      sealed[i] ^= '1'.charCodeAt(0) ^ '9'.charCodeAt(0);
+
+      const d = createDecipheriv('aes-256-ctr', key, iv);
+      console.log(Buffer.concat([d.update(sealed), d.final()]).toString()); // {"refund":90}
+      ```
+
+      Decryption succeeded, silently, and the refund went from 10 to 90. CBC mode is malleable
+      too, in a blockier way, and its error behaviour enabled padding-oracle attacks that
+      recovered plaintext from servers that answered "bad padding" differently from "bad data".
+
+      The fix is authentication. AEAD modes build it in. If you are stuck with an older mode,
+      the safe composition is **encrypt-then-MAC**: encrypt, compute an HMAC over the nonce and
+      ciphertext with a separate key, and check the HMAC with `timingSafeEqual` before
+      decrypting anything. Every other order has had practical attacks. In new code there's no
+      reason to assemble this yourself: AES-256-GCM, or ChaCha20-Poly1305 on hardware without
+      AES instructions, does it in one call.
+  - title: How public-key encryption is really used
+    body: |-
+      Public-key operations are slow and can only handle small inputs, so nobody encrypts a
+      file with RSA directly. The pattern is **hybrid encryption**: use the key pair to agree
+      or wrap a fresh symmetric key, then encrypt the data with AES-GCM. With modern curves,
+      the agreement is a Diffie-Hellman exchange. The sender makes a throwaway key pair,
+      combines its private half with the recipient's public key, and gets a shared secret the
+      recipient can compute from the other side.
+
+      ```js
+      import {
+        createCipheriv, createDecipheriv, diffieHellman, generateKeyPairSync, hkdfSync, randomBytes,
+      } from 'node:crypto';
+
+      const recipient = generateKeyPairSync('x25519'); // publishes publicKey, keeps privateKey
+
+      const deriveKey = (shared) => Buffer.from(hkdfSync('sha256', shared, Buffer.alloc(0), 'seal v1', 32));
+
+      function sealFor(recipientPublicKey, plaintext) {
+        const ephemeral = generateKeyPairSync('x25519'); // new key pair per message
+        const key = deriveKey(diffieHellman({ privateKey: ephemeral.privateKey, publicKey: recipientPublicKey }));
+        const iv = randomBytes(12);
+        const cipher = createCipheriv('aes-256-gcm', key, iv);
+        const body = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
+        return { ephemeralPublic: ephemeral.publicKey, iv, tag: cipher.getAuthTag(), body };
+      }
+
+      function open(privateKey, box) {
+        const key = deriveKey(diffieHellman({ privateKey, publicKey: box.ephemeralPublic }));
+        const decipher = createDecipheriv('aes-256-gcm', key, box.iv, { authTagLength: 16 });
+        decipher.setAuthTag(box.tag);
+        return Buffer.concat([decipher.update(box.body), decipher.final()]).toString('utf8');
+      }
+
+      console.log(open(recipient.privateKey, sealFor(recipient.publicKey, 'meet at the library at six')));
+      // meet at the library at six
+      ```
+
+      The raw Diffie-Hellman output isn't used as a key directly. **HKDF** turns it into a
+      uniform 32-byte key, and its label (`'seal v1'`) keeps keys for different purposes apart.
+
+      This shows the mechanism. In production, use a vetted construction such as HPKE (RFC
+      9180) through a maintained library, or your cloud's key management service, which wraps
+      data keys for you. Note what's missing here: the recipient can't tell who sent the box.
+      Encryption gives privacy, not authorship, which is what signatures add.
+  - title: Signatures with Ed25519
+    body: |-
+      A signature is made with a private key and checked with the matching public key. It
+      proves two things: the holder of that private key produced it, and the message hasn't
+      changed since. Unlike an HMAC, the verifier can't create signatures, so you can hand
+      the public key to anyone.
+
+      ```js
+      import { createPublicKey, generateKeyPairSync, sign, verify } from 'node:crypto';
+
+      const { privateKey, publicKey } = generateKeyPairSync('ed25519');
+      const publicPem = publicKey.export({ type: 'spki', format: 'pem' }); // publish this
+
+      const release = Buffer.from(JSON.stringify({ version: '2.4.1', sha256: 'c0ffee' }));
+      const signature = sign(null, release, privateKey); // null: Ed25519 picks its own hash
+      console.log(signature.length); // 64
+
+      const checker = createPublicKey(publicPem);
+      console.log(verify(null, release, checker, signature)); // true
+      const altered = Buffer.from(JSON.stringify({ version: '2.4.1', sha256: 'bad' }));
+      console.log(verify(null, altered, checker, signature)); // false
+      ```
+
+      **Ed25519** is the modern default: 32-byte keys, 64-byte signatures, fast, and
+      deterministic, so it doesn't depend on a good random number at signing time. Older ECDSA
+      does, and a repeated or biased nonce there has leaked private keys in real products. RSA
+      signatures are still everywhere, with 2048-bit keys as the floor.
+
+      You meet signatures as an engineer in three places. **Tokens**: an identity provider
+      signs ID tokens and publishes its public keys as a JWKS, so every app can verify and
+      none can mint. **Software**: packages, container images and app updates are signed so a
+      compromised mirror can't serve altered code. **Webhooks and APIs** where many receivers
+      mustn't share a forging secret.
+
+      Two habits carry over everywhere. Sign exact bytes, not a re-serialised object, because
+      two JSON encoders can order keys differently. And plan rotation from day one: tag each
+      signature with a key id, publish old and new public keys during the overlap, and retire
+      the old one afterwards.
+  - title: The TLS 1.3 handshake and certificate checks
+    body: |-
+      A TLS 1.3 handshake takes one round trip before application data flows.
+
+      ```text
+      client -> ClientHello: supported ciphers, a key share (an ephemeral public key), SNI hostname
+      server -> ServerHello: chosen cipher and its own key share
+             both sides now compute the same secret; everything below is encrypted
+      server -> Certificate: its certificate chain
+      server -> CertificateVerify: a signature over the handshake so far, with the cert's private key
+      server -> Finished: an HMAC over the whole handshake
+      client -> Finished, then HTTP requests
+      ```
+
+      The key shares are fresh for every connection, so recording traffic today and stealing
+      the server's key next year decrypts nothing. That's **forward secrecy**, and TLS 1.3
+      requires it. `CertificateVerify` proves the server holds the private key for the
+      certificate it sent, and the `Finished` messages catch anyone who altered the handshake.
+
+      You can inspect a live connection from Node:
+
+      ```js
+      import tls from 'node:tls';
+
+      const socket = tls.connect({ host: 'example.com', port: 443, servername: 'example.com' }, () => {
+        const cert = socket.getPeerCertificate();
+        console.log(socket.getProtocol());         // TLSv1.3
+        console.log(socket.getCipher().name);      // TLS_AES_256_GCM_SHA384
+        console.log(socket.authorized);            // true: chain and hostname checked
+        console.log(cert.subjectaltname);          // DNS:example.com, DNS:*.example.com
+        console.log(socket.getEphemeralKeyInfo()); // the key exchange group, e.g. X25519MLKEM768
+        socket.end();
+      });
+      socket.on('error', (err) => console.log(err.code));
+      ```
+
+      When this ran, the key exchange was `X25519MLKEM768`, a hybrid of classic X25519 and a
+      post-quantum algorithm, now common between current clients and large providers.
+
+      The client's certificate checks are: the chain leads to a root in its trust store, each
+      signature in it is valid, every certificate is within its dates, and the hostname
+      appears in the **subject alternative names**. A mismatch fails with
+      `ERR_TLS_CERT_ALTNAME_INVALID`. Certificate Transparency logs make every publicly trusted
+      certificate visible, so you can monitor for certificates issued for your domains that
+      you didn't request. Public certificate lifetimes are shrinking in stages under CA/Browser
+      Forum rules, to 47 days by 2029, so renewal must be automated, usually with ACME.
+
+      One caveat for TLS 1.3's optional **0-RTT** mode: data sent in the first flight can be
+      replayed by an attacker, so servers should accept it only for idempotent requests.
+  - title: HSTS, and where HTTPS stops
+    body: |-
+      A user types `shop.example` and the browser tries `http://` first. Your server answers
+      with a redirect to HTTPS, but that first plain request can be intercepted on a hostile
+      network and the redirect never delivered. **HSTS** tells the browser to skip `http://`
+      for your domain from then on.
+
+      ```http
+      HTTP/1.1 200 OK
+      Strict-Transport-Security: max-age=63072000; includeSubDomains; preload
+      ```
+
+      `max-age` is in seconds, two years here. `includeSubDomains` covers every subdomain,
+      which also stops a forgotten `http://` subdomain being used to set cookies for the
+      parent. Browsers ignore the header when it arrives over plain HTTP, so send it on HTTPS
+      responses. While HSTS is active, a certificate error can't be clicked through, which is
+      the point.
+
+      The first visit is still exposed. The **preload list**, built into browsers, closes it:
+      submit the domain at hstspreload.org once the header has a `max-age` of at least one
+      year, `includeSubDomains` and `preload`, and HTTP redirects to HTTPS. Removal takes months
+      to reach users, so roll out in steps: a short `max-age` first, then longer, then preload,
+      once you're sure every subdomain serves HTTPS.
+
+      Then remember the boundary. TLS protects bytes between two endpoints, and often the
+      endpoint is a load balancer or CDN, not your app. Traffic from there to your servers is
+      plain unless you re-encrypt it, which zero-trust networks do with TLS between every
+      service, sometimes with client certificates (mutual TLS). And TLS says nothing about the
+      request's content: injection, broken access control and stolen sessions all arrive
+      through a perfectly valid HTTPS connection.
+pitfalls:
+  - '**Reusing a GCM nonce.** A fixed or counter-based `iv` that resets on restart repeats under the same key, which reveals plaintext and allows forgeries. Generate 12 random bytes per message, or manage a counter that never resets.'
+  - '**Using a password or a hex string as the AES key.** `"my-secret-key"` padded to 32 bytes has little entropy. Generate keys with `randomBytes(32)`, or derive them with HKDF or a password hash.'
+  - '**Decrypting without authentication.** CBC or CTR alone lets an attacker change the plaintext and sometimes read it through error messages. Use AES-256-GCM, or encrypt-then-MAC.'
+  - '**Signing a re-serialised object.** `JSON.stringify` on the receiver may not reproduce the sender''s bytes, so valid signatures fail or the wrong bytes get trusted. Sign and verify the exact raw bytes.'
+  - '**Turning off certificate checks to fix an error.** `rejectUnauthorized: false` or `NODE_TLS_REJECT_UNAUTHORIZED=0` accepts any impostor. Add the right CA with the `ca` option instead.'
+  - '**Preloading HSTS before every subdomain serves HTTPS.** Browsers will refuse the plain ones, and removal from the list takes months. Ramp up `max-age` first and preload last.'
+interview:
+  - question: When would you use symmetric encryption, asymmetric encryption, an HMAC and a signature?
+    answer: >-
+      Pick by who holds which key. Symmetric encryption, AES-256-GCM in practice, is for data
+      where the same service encrypts and decrypts: a database column, a backup, a session
+      blob. Asymmetric encryption is for when senders mustn't be able to read what others
+      sent, and in practice it wraps a symmetric key, as in HPKE or a KMS envelope. An HMAC
+      proves integrity and origin between parties who share a secret, such as a webhook
+      between two services. A signature is for when many parties must verify but none may
+      forge, such as identity tokens verified by many apps or signed software releases, and
+      it also gives non-repudiation. The trade-off is key management: shared secrets are
+      simpler but every holder can forge.
+  - question: What is authenticated encryption, and why does it matter?
+    answer: >-
+      It's encryption that also detects any change to the ciphertext, and it matters because
+      confidentiality alone doesn't stop tampering. AES-CTR, for example, lets an attacker
+      flip bits of the plaintext by flipping bits of the ciphertext, turning a refund of 10
+      into 90 without the key. CBC had padding-oracle attacks where error differences leaked
+      plaintext. AEAD modes, AES-GCM and ChaCha20-Poly1305, produce a tag over the ciphertext
+      and optional associated data, and decryption fails if anything changed. I use the
+      associated data to bind context, such as a record id, so ciphertexts can't be moved
+      between rows. The main operational risk with GCM is nonce reuse under one key, which
+      is catastrophic, so nonces are random per message and keys rotate.
+  - question: Walk me through what happens in a TLS 1.3 handshake.
+    answer: >-
+      One round trip agrees a fresh key, authenticates the server and confirms nobody
+      tampered. The client's hello offers cipher suites, the hostname via SNI, and an
+      ephemeral key share. The server picks a suite and replies with its own share; both sides
+      derive the same secrets, and everything afterwards is encrypted. The server then sends
+      its certificate chain, a `CertificateVerify` signature over the handshake transcript
+      proving it holds the certificate's key, and a `Finished` MAC. The client validates the
+      chain to a trusted root, the dates and the hostname against the subject alternative
+      names, checks `Finished`, and starts sending HTTP. Ephemeral keys give forward secrecy.
+      The optional 0-RTT resumption saves a round trip but its data can be replayed.
+  - question: What does HSTS protect against, and what are the risks of turning it on?
+    answer: >-
+      It protects against SSL stripping: an attacker on the network intercepting the first
+      plain `http://` request and keeping the user on HTTP. With `Strict-Transport-Security`,
+      the browser rewrites every later request to HTTPS itself and refuses click-through on
+      certificate errors. The preload list extends that to the very first visit. The risks
+      are all about commitment. A long `max-age` with `includeSubDomains` breaks any
+      subdomain that still serves only HTTP, such as an old internal tool, and preloading is
+      slow to undo. So I roll it out with a short `max-age`, fix every subdomain, raise it to
+      a year or two, and only then add `preload`.

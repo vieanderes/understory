@@ -1,0 +1,378 @@
+summary: >-
+  Pythonic code uses the language's own shapes instead of translating habits from another
+  one. It loops over items rather than indexes, unpacks rather than indexing into tuples,
+  builds collections with comprehensions, opens resources with `with`, and reaches for the
+  standard library before writing a helper. Every one of those swaps removes a place where a
+  bug could hide, and every Python reviewer reads them faster.
+
+
+  The lesson covers the idioms, `itertools.batched`, module loggers and EAFP. These notes add
+  what sits underneath: when a comprehension becomes a generator and why that saves memory,
+  how `with` works so you can write your own context managers, dataclasses in place of loose
+  dicts, `pathlib`, f-string format specs, and the handful of traps that catch experienced
+  developers new to Python: the mutable default argument, `is` against `==`, truthiness and
+  late-binding closures.
+
+
+  Pythonic is not the same as clever. A three-level nested comprehension is legal and
+  unreadable. The goal is the plainest code a Python developer expects, which is usually the
+  shortest correct version, and sometimes an ordinary loop.
+remember:
+  - Default argument values are evaluated once, when the function is defined, so a mutable default such as `[]` is shared between calls; use `None` and create it inside.
+  - '`==` compares values and `is` compares identity, so use `is` only for singletons such as `None`, `True` and `False`.'
+  - EAFP means try the operation and catch the one specific exception you expect, which avoids check-then-act races and double lookups.
+  - A list comprehension builds the whole list now, while a generator expression in parentheses yields items one at a time and can be consumed only once.
+  - '`with` calls `__enter__` on the way in and `__exit__` on the way out, even when an exception is raised, so the resource is always released.'
+  - Use `@dataclass` for records with named fields, and `field(default_factory=list)` for a mutable default.
+  - Empty containers, `0`, `0.0`, `""` and `None` are all falsy, so write `is None` when zero or empty is a valid value.
+  - Use `zip(..., strict=True)` when the lists must be the same length, because plain `zip` stops silently at the shortest.
+sections:
+  - title: Comprehensions, generator expressions and generators
+    body: |-
+      A list comprehension is a loop that builds a list, in one expression. Dict and set
+      comprehensions use braces. Swap the brackets for parentheses and you get a **generator
+      expression**: nothing is computed until something asks for the next item.
+
+      ```python
+      prices = [120, 450, 80, 3000]
+
+      total = sum(p for p in prices if p > 100)       # 3570, no list built
+      has_big = any(p > 1000 for p in prices)          # True, stops at 3000
+
+      books = [{"title": "Dune", "year": 1965}, {"title": "Emma", "year": 1815}]
+      year_by_title = {b["title"]: b["year"] for b in books}
+
+      gen = (p for p in prices)
+      print(list(gen), list(gen))  # [120, 450, 80, 3000] []
+      ```
+
+      When a generator is a function's only argument, it needs no extra
+      parentheses, as with `sum` above. `any` and `all` short-circuit, so a generator lets
+      them stop early. The second `list(gen)` is empty because a generator is an iterator: once
+      exhausted, it stays exhausted. Keep a list if you need two passes.
+
+      A function containing `yield` is a **generator function**. It pauses at each `yield`
+      and resumes on the next request, which is ideal for streaming a file too big for memory:
+
+      ```python
+      def read_orders(lines):
+          for line in lines:
+              line = line.strip()
+              if not line or line.startswith("#"):
+                  continue
+              order_id, amount = line.split(",")
+              yield order_id, int(amount)
+
+      lines = ["# id,amount", "A1,500", "", "A2,250"]
+      for order_id, amount in read_orders(lines):
+          print(order_id, amount)   # A1 500, then A2 250
+      ```
+
+      Pass it an open file instead of a list and it reads one line at a time. When should
+      you keep a plain loop? When the body has side effects, several statements, or
+      `try`/`except`. A comprehension is for building a value. Using one only for its side
+      effects, such as `[print(x) for x in items]`, builds a throwaway list of `None`s and
+      reads as a mistake.
+  - title: Unpacking, zip and f-strings in real code
+    body: |-
+      Unpacking works anywhere you assign, including in a `for` header, and a starred name
+      collects the rest into a list.
+
+      ```python
+      first, *middle, last = [1, 2, 3, 4, 5]
+      print(first, middle, last)        # 1 [2, 3, 4] 5
+
+      names = ["Ana", "Bo", "Cal"]
+      scores = [90, 72]
+      print(list(zip(names, scores)))   # [('Ana', 90), ('Bo', 72)]: Cal vanished
+
+      try:
+          list(zip(names, scores, strict=True))
+      except ValueError as e:
+          print(e)                      # zip() argument 2 is shorter than argument 1
+
+      for rank, (name, score) in enumerate(zip(names[:2], scores), start=1):
+          print(f"{rank}. {name:<5}{score:>4}")
+      ```
+
+      Plain `zip` stops at the shortest input without a word, which hides data bugs. Since
+      Python 3.10, `strict=True` raises instead. Note the brackets in `(name, score)`: each
+      item from `enumerate` is a pair whose second part is itself a pair.
+
+      f-strings take a **format spec** after a colon. `{name:<5}` pads left-aligned to five
+      characters, `{score:>4}` right-aligns, `{price:.2f}` gives two decimals, `{n:,}` adds
+      thousands separators and `{ratio:.0%}` shows a percentage. `{price=}` prints the
+      expression and its value, `price=4.5`, which is handy while debugging. The one place not
+      to use an f-string is a logging call, where `logger.info("Saved %d rows", n)` defers the
+      formatting, as the lesson's deep dive explains.
+  - title: How `with` works, and writing your own
+    body: |-
+      `with` is a guarantee: set something up, run the block, tear it down whatever happens.
+      Any object with `__enter__` and `__exit__` methods is a **context manager**.
+
+      ```python
+      import time
+      from contextlib import contextmanager, suppress
+      from pathlib import Path
+
+      class Timer:
+          def __enter__(self):
+              self.start = time.perf_counter()
+              return self                     # bound to the name after "as"
+
+          def __exit__(self, exc_type, exc, tb):
+              self.elapsed = time.perf_counter() - self.start
+              return False                    # a true value would swallow the exception
+
+      with Timer() as t:
+          sum(range(100_000))
+      print(f"{t.elapsed:.3f}s")
+
+      @contextmanager
+      def timer(label):
+          start = time.perf_counter()
+          try:
+              yield
+          finally:
+              print(f"{label}: {time.perf_counter() - start:.3f}s")
+
+      with suppress(FileNotFoundError):
+          Path("old-draft.txt").unlink()
+      ```
+
+      `__exit__` receives the exception, if any. Returning a true value swallows it, which is
+      almost never what you want, so return `False` or nothing. The `contextlib.contextmanager`
+      decorator turns a generator into a context manager: code before `yield` is the set-up,
+      code after it is the tear-down. Without the `try`/`finally`, an exception in the block
+      would skip the tear-down. `suppress` is the tidy form of `try`/`except`/`pass` for one
+      expected error.
+
+      Real uses: files, database transactions that commit or roll back, locks, temporary
+      directories, and patching in tests.
+
+      `pathlib` pairs well with this. `Path` objects join with `/`, so `root / "notes" /
+      "today.md"` works on every operating system. `.name`, `.stem` and `.suffix` split the
+      file name, `.parent.mkdir(parents=True, exist_ok=True)` creates folders, and `.rglob("*.md")`
+      searches recursively. Pass `encoding="utf-8"` to `read_text` and `write_text`, because
+      the default depends on the machine.
+  - title: Dataclasses instead of loose dicts
+    body: |-
+      A dict with fixed keys, passed around a codebase, is a record without a type. Typos
+      such as `order["totl"]` fail only at runtime, and nobody can see which keys exist. A
+      **dataclass** writes `__init__`, `__repr__` and `__eq__` for you from annotated fields.
+
+      ```python
+      from dataclasses import dataclass, field
+
+      @dataclass
+      class Basket:
+          owner: str
+          items: list[str] = field(default_factory=list)
+
+          def add(self, item: str) -> None:
+              self.items.append(item)
+
+      a = Basket("ana")
+      b = Basket("bo")
+      a.add("tea")
+      print(a, b)  # Basket(owner='ana', items=['tea']) Basket(owner='bo', items=[])
+
+      @dataclass(frozen=True, slots=True)
+      class Money:
+          pence: int
+          currency: str = "GBP"
+
+          def __post_init__(self):
+              if self.pence < 0:
+                  raise ValueError("pence must not be negative")
+
+      price = Money(450)
+      print({Money(450), Money(450)})  # one item: frozen dataclasses are hashable
+      ```
+
+      `default_factory=list` makes a new list per instance. Writing `items: list = []`
+      raises `ValueError: mutable default <class 'list'> for field items is not allowed`,
+      because dataclasses refuse the trap described in the next section. `frozen=True`
+      makes assignment raise `FrozenInstanceError` and makes instances hashable, so they can
+      be dict keys and set members. `slots=True` saves memory and stops attributes being
+      added by typo. `__post_init__` is the place for validation.
+
+      Choose by need. A dataclass is the default for internal records. `typing.NamedTuple`
+      suits small immutable tuples that also need to unpack. For data crossing a trust
+      boundary, such as a JSON request body, use a validating library like Pydantic, because
+      dataclasses do not check types at runtime.
+  - title: Four traps that catch experienced developers
+    body: |-
+      **The mutable default argument.** Defaults are evaluated once, when `def` runs, and
+      the same object is reused on every call.
+
+      ```python
+      def add_item(item, basket=[]):
+          basket.append(item)
+          return basket
+
+      print(add_item("tea"))    # ['tea']
+      print(add_item("milk"))   # ['tea', 'milk']: the same list
+
+      def add_item_fixed(item, basket=None):
+          if basket is None:
+              basket = []
+          basket.append(item)
+          return basket
+      ```
+
+      **`is` against `==`.** `==` asks "equal value?", `is` asks "the same object?". Two lists
+      `[1, 2]` are `==` but not `is`. `int("1000") is int("1000")` is `False`, while small
+      integers can appear identical because CPython caches them, which makes `is` bugs pass
+      tests. Use `is` for `None`, `True` and `False`, and `==` for everything else.
+
+      **Truthiness.** `if not discount:` treats `0.0` the same as `None`.
+
+      ```python
+      def describe(discount):
+          if discount is None:          # not "if not discount", or 0% reads as none
+              return "no discount"
+          return f"{discount:.0%} off"
+
+      print(describe(0.0))              # 0% off
+      ```
+
+      `if items:` is the idiomatic empty check for a list. The trap is only when zero or
+      empty is a real value that differs from missing.
+
+      **Late binding in closures.** A lambda looks names up when it runs, not when it's made.
+
+      ```python
+      callbacks = [lambda: i for i in range(3)]
+      print([f() for f in callbacks])   # [2, 2, 2]
+
+      callbacks = [lambda i=i: i for i in range(3)]
+      print([f() for f in callbacks])   # [0, 1, 2]
+      ```
+
+      The default `i=i` captures the value at creation time, the one time the evaluate-once
+      rule for defaults helps you.
+  - title: EAFP in full, and when to look first
+    body: |-
+      The complete `try` statement has four parts, and the two rarely used ones make EAFP
+      precise.
+
+      ```python
+      import json
+
+      def load_theme(text):
+          try:
+              data = json.loads(text)
+          except json.JSONDecodeError as err:
+              raise ValueError(f"settings are not valid JSON: {err.msg}") from err
+          else:
+              return data.get("theme", "light")
+          finally:
+              print("parsed attempt")
+
+      print(load_theme('{"theme": "dark"}'))  # parsed attempt, then dark
+      ```
+
+      Keep the `try` block to the one line that can fail in the expected way. `else` runs only
+      when nothing was raised, so a bug in that code isn't caught by the `except` meant for
+      bad JSON. `finally` always runs. `raise ... from err` keeps the original exception as
+      `__cause__`, so the traceback shows both.
+
+      A broad `except Exception` is where EAFP goes wrong. A function that returns 0 on any
+      error will return 0 for `price_of(["list"])` too, hiding a `TypeError` that should have
+      crashed loudly.
+
+      LBYL, "look before you leap", is still right in some places. Validate user input
+      before starting side effects, so you don't half-complete a job. Check something cheap
+      and local where no race is possible. And prefer an API that already handles absence:
+      `stock.get("coffee", 0)` beats both the `in` check and a `try`/`except KeyError`. The
+      rule of thumb: EAFP when the world can change between the check and the act, such as
+      files, network and other processes, and whichever reads more clearly otherwise.
+pitfalls:
+  - "**Using `[]` or `{}` as a default argument.** The object is created once and shared by every call, so data leaks between calls. Default to `None` and create the container inside, or use `field(default_factory=list)` in a dataclass."
+  - "**Comparing with `is` for numbers or strings.** It can pass for small values because CPython caches them, then fail in production for larger ones. Use `==` for values and keep `is` for `None`."
+  - "**Writing `if not value` when 0 is valid.** A price of 0 or an empty string gets treated as missing. Write `if value is None` when you mean missing."
+  - "**Iterating a generator twice.** The second loop sees nothing, with no error. Build a list with `list(...)` if you need more than one pass."
+  - "**Catching `Exception` to be safe.** It turns typos and wrong types into quiet defaults. Catch the specific error you expect, and let the rest crash where you can see them."
+  - "**A comprehension for side effects.** `[send(email) for email in emails]` builds a list you throw away. Use a `for` loop when the point is the action, not the value."
+  - "**Opening files without an encoding.** The default depends on the operating system and locale, so a file that reads fine on a Mac breaks on a server. Pass `encoding=\"utf-8\"`."
+interview:
+  - question: What's wrong with `def add(item, items=[])`?
+    answer: >-
+      The default list is created once, when the function is defined, so every call that
+      relies on the default shares and mutates the same list. Call `add("tea")` then
+      `add("milk")` and the second returns `['tea', 'milk']`. It happens because a default is
+      an expression evaluated when `def` runs and stored on the function, in
+      `add.__defaults__`. The fix is `items=None` and `if items is None: items = []` inside.
+      The same rule has a legitimate use: a default argument such as `lambda i=i: i` captures
+      a loop variable's current value. Dataclasses refuse a bare mutable default and make you
+      write `field(default_factory=list)`, and linters such as ruff flag the pattern with rule
+      `B006`.
+  - question: Explain EAFP and LBYL. Which do you prefer in Python?
+    answer: >-
+      EAFP is "easier to ask forgiveness than permission": do the operation and catch the
+      specific exception. LBYL is "look before you leap": check first, then act. I default to
+      EAFP for anything shared with the outside world, because a check-then-act on a file,
+      a network resource or a row another process can change has a race: the file can vanish
+      between `exists()` and `read_text()`. EAFP also avoids doing the lookup twice. Two
+      conditions keep it honest: a narrow `except` naming the expected error, and a small
+      `try` block, with follow-on code in `else`. I still look first when validating input
+      before side effects, and I prefer APIs that handle absence, like `dict.get`, over
+      either.
+  - question: When would you use a generator instead of a list?
+    answer: >-
+      When the data is large, possibly infinite, or only needed once in order. A generator
+      produces items on demand, so memory stays constant: `sum(order.total for order in
+      orders)` never builds the list, and a generator function that yields parsed lines can
+      stream a multi-gigabyte file. It also composes: one generator reads, the next filters,
+      the next batches, like a pipeline. The costs are that it can be consumed only once,
+      you can't index it or take `len()`, and an error surfaces where it's consumed rather
+      than where it was made, which can confuse debugging. If I need two passes, random
+      access or the length, I materialise a list.
+  - question: What is a context manager, and when have you written one?
+    answer: >-
+      An object that sets something up on entry to a `with` block and guarantees tear-down on
+      exit, even on an exception. The protocol is `__enter__` and `__exit__`. `__exit__` gets
+      the exception details and can suppress the exception by returning a true value, which
+      you almost never want. The quickest way to write one is `contextlib.contextmanager` on a
+      generator: set-up before `yield`, tear-down in a `finally` after it. I'd use one for a
+      database transaction that commits on success and rolls back on error, a timer that logs
+      how long a block took, or temporarily changing configuration in tests. The value is that
+      callers can't forget the clean-up, which a pair of `open` and `close` calls can't
+      promise.
+  - question: When is `is` the right comparison, and why is `x is 1000` a bug?
+    answer: >-
+      Use `is` only to ask whether two names point at the same object, which in practice means
+      comparing with singletons: `None`, `True`, `False`, or a sentinel you created with
+      `object()`. `==` compares values by calling `__eq__`. `x is 1000` checks identity, and
+      two equal integers built at runtime are usually different objects, so it can be `False`
+      even when `x == 1000`. It sometimes looks fine because CPython caches small integers and
+      some strings, so the bug passes tests with small values. Python itself warns with a
+      `SyntaxWarning` for `is` against a literal. `x is None` is preferred over `x == None`
+      because a class can override `__eq__`, but nothing can override identity.
+terms:
+  - term: Pythonic
+    say: Clever one-liners.
+    means: "Using the language's own shapes: looping over items, unpacking, comprehensions, `with` and
+      the standard library. The aim is fewer places for bugs, not shorter code."
+  - term: Mutable default argument
+    say: A default of `[]` gives each call a fresh list.
+    means: Defaults are evaluated once, when the function is defined, so every call shares one list. Use
+      `None` and create the list inside.
+  - term: EAFP
+    say: Wrap everything in `try`.
+    means: Try the operation and catch the one specific exception you expect. It avoids check-then-act
+      races and double lookups; looking first (LBYL) suits cheap checks where nothing can change in
+      between.
+  - term: Context manager
+    say: The way you open files.
+    means: An object whose `__enter__` runs on the way into a `with` block and whose `__exit__` runs on
+      the way out, even after an exception, so the resource is always released.
+  - term: "`x is 1000`"
+    say: It checks that x equals 1000.
+    means: "`is` compares identity, and whether two equal ints are one object is an implementation
+      detail. Use `==` for values and `is` only for `None`, `True` and `False`."
+  - term: "`if not x`"
+    say: It checks that x is missing.
+    means: It's also true for `0`, `0.0`, `''` and empty containers. Write `if x is None` when zero or
+      empty is a valid value.

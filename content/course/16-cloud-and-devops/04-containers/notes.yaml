@@ -1,0 +1,193 @@
+summary: >-
+  A container image packs your app with its runtime and libraries into one file that never
+  changes after it's built. A container is that image running as an ordinary Linux process
+  that the kernel fences off: it sees its own files, its own network and its own processes,
+  within limits on memory and CPU. That's why a container starts in about a second and a
+  virtual machine takes far longer.
+
+
+  Containers solved "works on my machine" by shipping the machine's contents, and they
+  became the unit almost every platform runs: a server with Docker, Kubernetes, and managed
+  services that take an image and give you a URL. If you can build an image, you can deploy
+  to nearly anything.
+
+
+  These notes go under the lesson's commands: what isolation is made of, why a container
+  loses its files, the process ID 1 trap that makes `docker stop` hang for ten seconds, the
+  two ways to write `CMD`, the run options production needs, and when a virtual machine is
+  still the right tool.
+remember:
+  - An image is an unchanging, layered package of files and settings; a container is one running instance of it, and one image can run as many containers.
+  - A container is a process on the host's kernel, isolated with namespaces and limited with cgroups, which is why it starts fast and why its walls are weaker than a VM's.
+  - Files a container writes live in a thin writable layer that is deleted with the container, so data that must survive goes in a volume.
+  - Write `CMD` in exec form, `CMD ["node", "server.js"]`, so your app receives the stop signal directly.
+  - '`docker stop` sends `SIGTERM`, waits 10 seconds, then sends `SIGKILL`, and Node running as process ID 1 ignores `SIGTERM` unless it handles it.'
+  - '`RUN` executes while the image is built; `CMD` is what each container runs when it starts.'
+  - Pass secrets and settings at run time with `-e` or `--env-file`, never in the image.
+sections:
+  - title: What isolation is made of
+    body: |-
+      Docker doesn't add a new kind of machine. It asks the Linux kernel for features that
+      already exist, and starts your program inside them.
+
+      **Namespaces** change what a process can see. The PID namespace gives it its own
+      process list, where it's process 1 and the host's hundreds of processes are
+      invisible. The network namespace gives it its own interfaces and ports, which is why
+      publishing with `-p` is needed. The mount namespace gives it its own file tree, built
+      from the image. Others give it its own host name and its own users.
+
+      **cgroups** limit what it can use. `--memory 512m` caps memory, and when the process
+      goes over, the kernel kills it, which Docker reports as exit code 137 and
+      `OOMKilled: true` in `docker inspect`. `--cpus 1.5` caps CPU time.
+
+      **Layered file systems** build the file tree. An image is a stack of read-only layers.
+      A container adds one thin writable layer on top. When the process changes a file, the
+      file is copied up into that layer. Delete the container and the layer goes with it.
+      That's why an app that writes uploads into its own folder loses them on every deploy,
+      and why lesson 6 uses volumes.
+
+      Because all of this is one kernel, the container's walls are only as strong as that
+      kernel. A kernel bug can let a process escape. Running as a non-root user inside the
+      container, which the next lesson sets up, makes an escape much harder.
+  - title: Process ID 1 and the ten-second stop
+    body: |-
+      Inside its container, your app is **process ID 1**. Linux treats PID 1 specially: a
+      signal it hasn't set a handler for is ignored, rather than killing it. On a normal
+      machine, `SIGTERM` stops a Node process at once. As PID 1, Node without a handler
+      ignores it.
+
+      We measured it with `node:24-slim` and a server with no handler. `docker stop` took 10
+      seconds and the exit code was 137: Docker waited out its grace period, then sent
+      `SIGKILL`. With a `SIGTERM` handler that closes the server, the stop took about a
+      second and the exit code was 0.
+
+      ```ts
+      import { createServer } from "node:http";
+
+      const server = createServer((req, res) => res.end("ok\n"));
+      server.listen(Number(process.env.PORT ?? 3000));
+
+      process.on("SIGTERM", () => {
+        server.close(() => process.exit(0));
+      });
+      ```
+
+      Ten seconds of every deploy is annoying. Worse, `SIGKILL` cuts off requests halfway,
+      and a platform with a shorter grace period kills sooner. Two fixes exist. Handle
+      `SIGTERM` in the app, which you want anyway to finish requests in flight. Or run with
+      `docker run --init`, which starts a tiny init program as PID 1 that forwards signals and
+      reaps finished child processes. With `--init` and no handler, the stop was immediate,
+      but requests in flight are still cut off, so the handler is the real fix.
+  - title: Exec form, shell form, ENTRYPOINT and CMD
+    body: |-
+      `CMD` can be written two ways, and they behave differently.
+
+      ```text
+      CMD ["node", "server.js"]    exec form: Node is PID 1
+      CMD node server.js           shell form: /bin/sh -c "node server.js" is PID 1
+      ```
+
+      In shell form, the shell is PID 1 and Node is its child. The shell doesn't pass
+      `SIGTERM` on. We tested it: with a perfectly good `SIGTERM` handler in the app, the
+      shell-form image still took 10 seconds to stop and exited 137. `docker build --check`
+      warns about it: "JSON arguments recommended for CMD to prevent unintended behavior
+      related to OS signals". Use exec form.
+
+      The same reasoning argues for `node server.js` over `npm start` as the command: one
+      process, not a chain of them, and the signal reaches the app.
+
+      `ENTRYPOINT` is the other half. When both are set, the container runs `ENTRYPOINT`
+      with `CMD` as its arguments, and `docker run image other args` replaces only the
+      `CMD`. That suits images that wrap one tool:
+
+      ```text
+      ENTRYPOINT ["node", "cli.js"]
+      CMD ["--help"]
+      ```
+
+      `docker run tool` prints help, and `docker run tool import data.csv` runs the import.
+      For a web service, a plain `CMD` is enough, and you can override it with a shell for
+      debugging: `docker run -it image sh`.
+  - title: Running a container like production does
+    body: |-
+      `docker run -d -p 8080:3000 image` gets you started. A container you rely on usually
+      needs a few more options, each with a reason.
+
+      ```bash
+      docker run -d --name todo-api \
+        --restart unless-stopped \
+        --env-file /srv/todo/.env \
+        --memory 512m --cpus 1 \
+        -p 127.0.0.1:8080:3000 \
+        todo-api:3f2a91c
+      ```
+
+      `--restart unless-stopped` starts it again after a crash or a reboot of the Docker
+      daemon, like systemd's `Restart=` in lesson 2. `--env-file` reads variables from a file
+      that stays on the server, so keys never appear in your shell history or in the image.
+      `--memory` and `--cpus` stop one container starving its neighbours. Publishing on
+      `127.0.0.1` means only a reverse proxy on the same machine can reach it, and the image
+      tag names an exact build.
+
+      The commands for looking inside are worth knowing by heart. `docker logs -f todo-api`
+      follows what the app prints; containers should log to standard output, not to files.
+      `docker exec -it todo-api sh` opens a shell in the running container, where `sh` exists
+      in the image. `docker inspect todo-api` shows its full state, including why it last
+      exited. `docker stats` shows live memory and CPU per container.
+  - title: Containers or virtual machines
+    body: |-
+      A virtual machine runs its own kernel on virtual hardware, provided by a hypervisor.
+      That gives it a harder wall: a bug in one guest's kernel doesn't reach the others. It
+      can run a different operating system from the host. It also costs a full boot and the
+      memory of a whole operating system for each one.
+
+      In practice the two are stacked, not rivals. Cloud servers are virtual machines, and
+      you run containers on them. The VM separates you from other customers, and the
+      containers separate your services from each other cheaply.
+
+      Some platforms want both at once, for code they don't trust, such as serverless
+      functions from thousands of customers. They use **micro-VMs**, very small virtual
+      machines that boot in a fraction of a second. AWS Lambda runs on one of these,
+      Firecracker. You get a VM's wall at close to a container's speed.
+
+      So pick a container for packaging and running your own services. Pick a VM when you
+      need a different kernel or operating system, such as a Windows-only tool, or when you
+      run code from people you don't trust and a shared kernel is too thin a wall.
+pitfalls:
+  - '**Starting the server with `RUN`.** `RUN` waits for the command to finish, and a server never finishes, so the build hangs. Use `CMD`.'
+  - '**Shell-form `CMD`.** The shell becomes PID 1 and swallows `SIGTERM`, so every stop takes the full grace period. Write `CMD ["node", "server.js"]`.'
+  - '**No `SIGTERM` handler.** Node as PID 1 ignores the signal, and `SIGKILL` cuts requests off after 10 seconds. Close the server on `SIGTERM`.'
+  - '**Writing data inside the container.** It lives in the writable layer and vanishes on the next deploy. Mount a volume or use object storage.'
+  - '**Listening on `127.0.0.1` inside the container.** Published ports arrive on the container''s own interface, not its loopback. Listen on `0.0.0.0`.'
+  - '**Treating a container as a security boundary for hostile code.** Every container shares the host kernel. Use VMs or micro-VMs for untrusted code.'
+interview:
+  - question: What's the difference between a container and a virtual machine?
+    answer: >-
+      A container is an isolated process on the host's kernel; a VM runs its own kernel on
+      virtual hardware. Docker uses namespaces to give the process its own view of files,
+      network and processes, and cgroups to cap its memory and CPU. So a container starts in
+      about a second and costs little more than the process itself, but every container
+      shares one kernel, and a kernel bug can break the wall. A VM boots a whole operating
+      system, costs more memory and time, and gives stronger isolation plus a choice of
+      operating system. In practice they stack: cloud servers are VMs, and we run containers
+      on them. For untrusted code, micro-VMs such as Firecracker give both.
+  - question: Why does `docker stop` sometimes take ten seconds, and how do you fix it?
+    answer: >-
+      Because the app never received or never acted on `SIGTERM`, so Docker waited out its
+      grace period and sent `SIGKILL`. Two causes are common. Shell-form `CMD` makes `/bin/sh`
+      PID 1, and it doesn't forward the signal. And Node as PID 1 ignores `SIGTERM` unless it
+      has a handler, because the kernel doesn't apply default signal actions to PID 1. The
+      fix is exec-form `CMD` plus a `SIGTERM` handler that closes the server and exits once
+      requests finish. `--init` adds a small init process that forwards signals, which helps
+      with the delay, but the handler is what saves requests in flight. The exit code, 137
+      instead of 0, gives it away.
+  - question: A container keeps restarting with exit code 137. What's happening?
+    answer: >-
+      137 means the process was killed with signal 9, `SIGKILL`, so something outside the app
+      ended it. The usual cause is the memory limit: the kernel's out-of-memory killer
+      stopped it, and `docker inspect` shows `OOMKilled: true`. The other is a stop that ran
+      past its grace period. For memory, I'd look at `docker stats` to see usage climb, then
+      decide whether the limit is too low for the workload or the app leaks. Node's heap
+      size limit should also sit below the container limit, so Node fails with a clear heap
+      error rather than being killed silently. Raising the limit without finding a leak only
+      delays the next kill.

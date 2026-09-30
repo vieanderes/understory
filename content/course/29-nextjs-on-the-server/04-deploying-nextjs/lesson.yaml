@@ -1,0 +1,321 @@
+id: nextserver.deploying
+title: Deploying a Next.js app
+objective: Run a Next.js app on your own server with standalone output, and list what a managed host does for you.
+level: advanced
+minutes: 10
+concepts: [nextserver.next-start, nextserver.standalone-output, nextserver.platform-services]
+prerequisites: [cloud.containers, cloud.reverse-proxies, next.rendering-spectrum]
+opening:
+  text: >-
+    You'll run a Next.js app on a server you control, from one small folder in a container.
+    And you'll know what a managed host was quietly doing, so nothing breaks when you leave it.
+
+steps:
+  - type: prose
+    id: build-then-start
+    body: |
+      So far you've used `npm run dev`. A real server runs the built app instead: `next build`
+      makes it once, and `next start` runs it as a Node server on a port.
+
+      ```text
+      $ npm run build
+      $ npm start
+      ▲ Next.js 16.3.6
+      - Local:         http://localhost:3000
+      ✓ Ready in 1173ms
+      ```
+
+      Put your reverse proxy in front of that port, and it's live.
+
+  - type: predict-output
+    id: predict-start-without-build
+    concept: nextserver.next-start
+    difficulty: 1
+    language: bash
+    code: |
+      npm run build
+      npm start
+      # you change the heading in app/page.tsx and save
+      # you stop the server, then run:
+      npm start
+    question: Which heading does the site show now?
+    choices:
+      - text: The old one
+        correct: true
+        feedback: >-
+          Right. `next start` serves the last build. Build again to ship a change.
+      - text: The new one
+        feedback: >-
+          That's the dev server's habit. `next start` never reads your source files, only
+          the last build.
+      - text: An error, because the source changed
+        feedback: >-
+          Nothing checks your files at start. It happily serves the older build.
+
+  - type: prose
+    id: standalone-folder
+    body: |
+      `next start` needs the whole project and every package: 444 MB in our cinema app. Set `output: 'standalone'` in `next.config.ts`, and the build also
+      writes **standalone output**, one folder with only what the server uses:
+
+      ```text
+      $ ls .next/standalone
+      .next  node_modules  package.json  server.js
+      ```
+
+      That's 40 MB. Run it with `node server.js`. It leaves out two folders the browser
+      downloads, so copy them in: `public` beside `server.js`, and `.next/static` into its
+      `.next`. `cp -r` copies a folder and everything in it.
+
+  - type: parsons
+    id: arrange-standalone-run
+    concept: nextserver.standalone-output
+    difficulty: 2
+    language: bash
+    prompt: >-
+      Build, copy in the two folders the browser needs, and start on port 8080.
+    blocks:
+      - id: build
+        code: npm run build
+        subgoal: Build once
+      - id: copy-public
+        code: cp -r public .next/standalone/
+        subgoal: Add what the browser downloads
+      - id: copy-static
+        code: cp -r .next/static .next/standalone/.next/
+      - id: start
+        code: PORT=8080 node .next/standalone/server.js
+        subgoal: Start the server
+    distractors:
+      - id: install-again
+        code: cd .next/standalone && npm install
+        feedback: >-
+          The folder already holds the packages it needs. That's the point of standalone.
+
+  - type: fill-blank
+    id: fill-dockerfile
+    concept: nextserver.standalone-output
+    difficulty: 3
+    language: text
+    prompt: >-
+      Finish the second stage of this image. It copies the standalone folder and the two
+      folders it leaves out. Forget `static`, and pages arrive with no styles.
+    template: |
+      FROM node:24-slim AS build
+      WORKDIR /app
+      COPY package.json package-lock.json ./
+      RUN npm ci
+      COPY . .
+      RUN npm run build
+
+      FROM node:24-slim
+      WORKDIR /app
+      COPY --from=build /app/.next/{{1}} ./
+      COPY --from=build /app/{{2}} ./public
+      COPY --from=build /app/.next/{{3}} ./.next/static
+      USER node
+      CMD ["node", "{{4}}"]
+    blanks:
+      - key: '1'
+        answer: standalone
+      - key: '2'
+        answer: public
+      - key: '3'
+        answer: static
+      - key: '4'
+        answer: server.js
+    bank: [standalone, public, static, server.js, node_modules, src, next start]
+
+  - type: prose
+    id: what-a-host-did
+    body: |
+      A managed host such as Vercel did several jobs for you. It served your static files from
+      a **CDN**, servers around the world that keep copies near visitors. It kept one cache
+      for every copy of the app, and started more copies when traffic grew.
+
+      On your own servers, each copy has its own memory. We ran two copies of one build and
+      saved a result through the first:
+
+      ```text
+      copy 1   Rovers: 36 points
+      copy 2   Rovers: 33 points
+      ```
+
+  - type: ai-review
+    id: review-memory-limit
+    concept: nextserver.platform-services
+    difficulty: 4
+    language: ts
+    request: Allow 5 sign-in attempts per email each minute.
+    flawClass: security
+    code: |
+      const attempts = new Map<string, number[]>();
+
+      export async function POST(request: Request) {
+        const { email } = await request.json();
+        const now = Date.now();
+        const recent = (attempts.get(email) ?? []).filter((t) => now - t < 60_000);
+        if (recent.length >= 5) return Response.json({ error: 'Try again soon' }, { status: 429 });
+        attempts.set(email, [...recent, now]);
+        return signIn(email, request);
+      }
+    prompt: >-
+      An assistant wrote this route handler. Its test sends six requests to one server, and the
+      sixth gets `429`. Production runs three copies. Tap the line at fault.
+    lines: [1]
+    reasons:
+      - text: Each copy counts in its own memory
+        correct: true
+        feedback: >-
+          Yes. Three copies keep three counts, so an attacker gets 15 tries a minute.
+      - text: '`60_000` should be `60`'
+        feedback: >-
+          `Date.now()` counts in milliseconds, so `60_000` is one minute. The window is right.
+      - text: '`429` is the wrong status'
+        feedback: >-
+          `429 Too Many Requests` is exactly right here. The count behind it is what's wrong.
+    fix: |
+      // Keep the counts in a store every copy shares, such as Redis.
+      export async function POST(request: Request) {
+        const { email } = await request.json();
+        const count = await sharedStore.increment(`signin:${email}`, { ttlSeconds: 60 });
+        if (count > 5) return Response.json({ error: 'Try again soon' }, { status: 429 });
+        return signIn(email, request);
+      }
+
+  - type: prose
+    id: build-once
+    body: |
+      One more job the host did: it built your app once and ran that build everywhere.
+
+      Two builds of the same code aren't the same. Each build makes its own ids and keys, for
+      example the key that lets a form find its Server Action. A form rendered by one build
+      can't post to another. So build once, then copy that one build to every server.
+
+  - type: bug-hunt
+    id: hunt-build-per-server
+    concept: nextserver.platform-services
+    difficulty: 3
+    language: bash
+    code: |
+      # deploy.sh runs on each of the three servers
+      git pull
+      npm ci
+      npm run build
+      cp -r public .next/standalone/
+      cp -r .next/static .next/standalone/.next/
+      PORT=3000 node .next/standalone/server.js
+    prompt: >-
+      After this deploy, some form posts fail with `Failed to find Server Action`, but only
+      sometimes. Tap the line at fault.
+    lines: [4]
+    reasons:
+      - text: Each server makes its own, different build
+        correct: true
+        feedback: >-
+          Yes. A form from one build lands on a server running another. Build once.
+      - text: '`git pull` fetched different code on each server'
+        feedback: >-
+          They all pulled the same commit. Even so, two builds of the same code don't match.
+      - text: '`npm ci` should be `npm install`'
+        feedback: >-
+          `npm ci` installs exactly what the lockfile says, which is what a server wants.
+    fix: |
+      # on one machine: build once
+      npm ci
+      npm run build
+      cp -r public .next/standalone/
+      cp -r .next/static .next/standalone/.next/
+      # copy .next/standalone to all three servers, then on each:
+      PORT=3000 node server.js
+
+  - type: explain-back
+    id: explain-leaving-the-host
+    concept: nextserver.platform-services
+    difficulty: 4
+    prompt: >-
+      You move an app from a managed host to three servers behind a load balancer. What must
+      you now provide yourself, and why?
+    rubric:
+      - Something to serve `public` and `.next/static`, such as a CDN or the copied folders.
+      - One build copied to every server, so they all serve the same version.
+      - A shared cache and shared state, because each copy's memory is its own.
+    modelAnswer: >-
+      The host hid three jobs. Someone has to serve the static files. I copy them into
+      the standalone folder or put a CDN in front. Every server must run the same build. So
+      I build one image and ship that everywhere. And each copy's memory is separate,
+      so caches and counters need a store they all share.
+
+recap:
+  - Run the built app with `next start`, and rebuild to ship a change.
+  - "Ship a small server with `output: 'standalone'`, plus `public` and `.next/static`."
+  - Share cache and state across copies, because each has its own memory.
+
+recall:
+  - id: card-start-serves-build
+    concept: nextserver.next-start
+    front: You edit a page and restart `next start`. Why is the change missing?
+    back: >-
+      `next start` serves the last build. Run `next build` again first.
+  - id: card-standalone-leaves-out
+    concept: nextserver.standalone-output
+    front: Which two folders does standalone output leave out?
+    back: >-
+      `public` and `.next/static`. A CDN usually serves them, or you copy them in beside
+      `server.js`.
+  - id: card-memory-per-copy
+    concept: nextserver.platform-services
+    front: Why does a `Map` in a route handler fail as a rate limit on three servers?
+    back: >-
+      Each server has its own memory, so each keeps its own count. The limit becomes three
+      times higher.
+  - id: card-host-jobs
+    concept: nextserver.platform-services
+    front: Name two jobs a managed host does that your own servers don't.
+    back: >-
+      Serving static files from a CDN, and one cache shared by every copy. Scaling is a third.
+
+references:
+  - kind: docs
+    title: How to self-host your Next.js application
+    authors: Vercel
+    venue: Next.js documentation, version 16
+    url: https://nextjs.org/docs/app/guides/self-hosting
+    note: What works with `next start`, and what several instances need in common.
+    primary: true
+    verified: true
+  - kind: docs
+    title: output
+    authors: Vercel
+    venue: Next.js documentation, version 16
+    url: https://nextjs.org/docs/app/api-reference/config/next-config-js/output
+    note: How standalone output traces files, and why it leaves out `public` and `.next/static`.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Deploying
+    authors: Vercel
+    venue: Next.js documentation, version 16
+    url: https://nextjs.org/docs/app/getting-started/deploying
+    note: A Node server, a Docker container, a static export and platform adapters compared.
+    verified: true
+
+deepDive: |
+  **Build once.** Every build makes its own keys for Server Actions. If each server builds
+  for itself, a form rendered by one can post to another and fail with "Failed to find
+  Server Action". Build one image and run it everywhere, or give every server the same
+  `NEXT_SERVER_ACTIONS_ENCRYPTION_KEY`.
+
+  **Version skew.** During a rolling deploy, a browser may hold the old build while servers
+  run the new one. Set a `deploymentId`, and Next.js spots the mismatch and does a full page
+  load instead of a broken navigation.
+
+  **A shared cache.** `'use cache'` keeps results in each server's memory. A custom cache
+  handler with `'use cache: remote'` stores them somewhere every copy can reach, and its
+  `refreshTags()` spreads an `updateTag` to all of them.
+
+  **Streaming through a proxy.** nginx buffers responses by default, so a streamed page
+  arrives all at once. Send the `X-Accel-Buffering: no` header, or turn buffering off.
+
+  **Runtimes.** Server code runs in the Node.js runtime. The older Edge runtime, a smaller
+  set of web APIs, is deprecated for pages and routes in Next.js 16.

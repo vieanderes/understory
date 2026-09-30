@@ -1,0 +1,209 @@
+summary: >-
+  SQL says what you want, not how to get it. The **planner** decides how: which index to use,
+  in what order to join tables, whether to hash or sort. It chooses by estimating the cost of
+  many possible plans from statistics about your data. `EXPLAIN` shows the plan it picked,
+  and `EXPLAIN ANALYZE` runs the query and puts what really happened beside each estimate.
+
+
+  Reading plans is how you stop guessing about performance. A slow page usually comes down to
+  one node: a sequential scan that throws away almost every row, a nested loop that runs its
+  inner side thousands of times, a sort that spills to disk, or an estimate that's off by a
+  factor of a hundred, which leads the planner to the wrong join. The plan names the table and
+  the condition, so the fix is usually obvious once you've found the line.
+
+
+  Use it whenever a query is slower than you expect, and before adding an index, to check the
+  index will be used. Remember that `ANALYZE` executes: writes are real unless you wrap them in
+  a transaction you roll back.
+remember:
+  - "`EXPLAIN` shows the planner's estimates without running the query; `EXPLAIN ANALYZE` runs it and adds actual rows and times per node."
+  - Read a plan from the most indented node outwards, since each node feeds rows to its parent.
+  - A node's actual time and rows are averages per loop, so multiply by `loops` to get the total.
+  - A `Seq Scan` with a large `Rows Removed by Filter` on a big table points at a missing index on the filtered column.
+  - When estimated rows and actual rows differ by ten times or more, the planner is working from bad statistics; run `ANALYZE` or add extended statistics.
+  - "`cost` is in arbitrary units (a sequential page read is 1.0), used to compare plans, never milliseconds."
+  - "`EXPLAIN ANALYZE` executes the statement, so measure writes between `BEGIN` and `ROLLBACK`."
+  - Find which queries to read first with `pg_stat_statements`, ordered by total time, not by the slowest single call.
+sections:
+  - title: Every number on a node line
+    body: |-
+      Here is the plan from the lesson in full, as Postgres 18 prints it:
+
+      ```text
+      Nested Loop  (cost=0.28..367.39 rows=10 width=21) (actual time=0.083..2.158 rows=10.00 loops=1)
+        Buffers: shared hit=112
+        ->  Index Scan using customers_pkey on customers  (cost=0.28..8.29 rows=1 width=17) (actual time=0.026..0.028 rows=1.00 loops=1)
+              Index Cond: (id = 42)
+              Index Searches: 1
+              Buffers: shared hit=3
+        ->  Seq Scan on orders  (cost=0.00..359.00 rows=10 width=12) (actual time=0.021..2.078 rows=10.00 loops=1)
+              Filter: (customer_id = 42)
+              Rows Removed by Filter: 19990
+              Buffers: shared hit=109
+      Planning:
+        Buffers: shared hit=55
+      Planning Time: 0.314 ms
+      Execution Time: 2.235 ms
+      ```
+
+      The first brackets are estimates. `cost=0.28..367.39` is the startup cost (before the
+      first row) and the total cost, in units where one sequential page read is 1.0 and one
+      random page read is 4.0 by default. `rows` is the estimated row count and `width` the
+      average row size in bytes.
+
+      The second brackets are measured. `actual time=0.021..2.078` is milliseconds to the
+      first row and to the last. `rows=10.00` is rows produced; since Postgres 18 it shows two
+      decimals because it's an average per loop. `loops` is how many times the node ran.
+
+      `Buffers` (on by default with `ANALYZE` since Postgres 18) counts 8 kB pages: `hit`
+      from Postgres's cache, `read` from the operating system or disk. The orders scan touched
+      109 pages to return 10 rows, which is the waste in numbers. Buffers are often a steadier
+      measure than time, because time changes with cache warmth and machine load.
+
+      `Planning Time` is the time spent choosing the plan; `Execution Time` is the run,
+      without the cost of sending rows to the client. A query that's fast here but slow in the
+      app may be sending too many rows, or waiting on the network or a lock.
+  - title: Loops, and the nested loop trap
+    body: |-
+      Inner nodes of a nested loop run once per outer row, and their numbers are per run:
+
+      ```text
+      Nested Loop  (actual rows=30.00 loops=1)
+        ->  Index Scan using customers_pkey on customers  (actual rows=3.00 loops=1)
+              Index Cond: (id <= 3)
+        ->  Bitmap Heap Scan on orders  (actual time=0.007..0.016 rows=10.00 loops=3)
+              Recheck Cond: (customers.id = customer_id)
+              ->  Bitmap Index Scan on orders_customer_id_idx  (actual rows=10.00 loops=3)
+                    Index Cond: (customer_id = customers.id)
+      ```
+
+      The orders node produced 10 rows three times, 30 in total, and spent about 0.016 ms
+      each time. That's the right plan for three customers. The same shape becomes a disaster
+      when the outer side is far bigger than the planner guessed: it expected 3 rows, got
+      30,000, and ran the inner side 30,000 times. The line to look for is an inner node with
+      a large `loops` value multiplied by a non-trivial time.
+
+      Postgres has three join methods, and each suits a situation:
+
+      - **Nested Loop**: for each outer row, look up matches on the inner side. Best when the
+        outer side is small and the inner side has an index.
+      - **Hash Join**: build a hash table from the smaller input (the `Hash` node), then probe
+        it with each row of the other. Best for large, unsorted inputs with an equality
+        condition. `Batches: 1` means the hash table fitted in memory.
+      - **Merge Join**: walk two inputs sorted on the join key side by side. Best when both are
+        already sorted, for example by an index.
+
+      A bad join method is rarely the root problem. It usually follows from a wrong row
+      estimate further down.
+  - title: When estimates are wrong
+    body: |-
+      The planner estimates rows from statistics that `ANALYZE` collects: the most common
+      values per column, a histogram of the rest and the number of distinct values. Two things
+      make estimates go wrong.
+
+      **Stale statistics.** After a bulk load or a big delete, the numbers describe a table
+      that no longer exists. Autovacuum analyses tables in the background, but not instantly.
+      Run `ANALYZE table_name` after loading data in a migration or a test.
+
+      **Correlated columns.** By default the planner assumes conditions are independent and
+      multiplies their selectivities. When one column predicts another, that underestimates
+      badly. In this table the city decides the postcode area:
+
+      ```sql
+      EXPLAIN (ANALYZE, TIMING OFF, BUFFERS OFF, SUMMARY OFF)
+      SELECT * FROM addresses WHERE city = 'City 7' AND postcode_area = 'Area 7';
+      -- Seq Scan on addresses  (cost=0.00..2137.00 rows=11 width=18) (actual rows=1000.00 loops=1)
+
+      CREATE STATISTICS addresses_city_area (dependencies) ON city, postcode_area FROM addresses;
+      ANALYZE addresses;
+      -- same query now: (cost=0.00..2137.00 rows=893 width=18) (actual rows=1000.00 loops=1)
+      ```
+
+      An estimate of 11 against an actual 1,000 is the kind of error that makes a planner
+      choose a nested loop over a hash join. Extended statistics told it the columns move
+      together, and the estimate came within about 10%.
+
+      Memory shows up in plans too. `Sort Method: external merge  Disk: 464kB` means the sort
+      didn't fit in `work_mem` and spilled to disk; with the default setting the same sort
+      ran as `quicksort  Memory: 1138kB`. Raise `work_mem` for one heavy query with `SET
+      LOCAL` inside its transaction rather than for the whole server, because every sort and
+      hash node in every connection may use that much.
+  - title: Reading plans in production
+    body: |-
+      Start from data, not hunches. The `pg_stat_statements` extension records every
+      normalised query with its call count and timing:
+
+      ```sql
+      SELECT calls, round(total_exec_time) AS total_ms, round(mean_exec_time::numeric, 2) AS mean_ms, query
+      FROM pg_stat_statements
+      ORDER BY total_exec_time DESC
+      LIMIT 10;
+      ```
+
+      Order by total time. A 2 ms query called a million times an hour costs more than a
+      two-second report run once a day, and an N+1 shows up as a cheap query with a huge
+      `calls` count.
+
+      A few habits make `EXPLAIN ANALYZE` safe and useful on real systems:
+
+      - Wrap writes in `BEGIN` and `ROLLBACK`. A `SELECT` that calls a function with side
+        effects also runs those effects.
+      - Set `statement_timeout` first when the query might run for minutes.
+      - Use `(ANALYZE, TIMING OFF)` when timing overhead distorts a plan with millions of
+        rows; row counts and buffers are still reported.
+      - Queries from application logs have `$1` placeholders. `EXPLAIN (GENERIC_PLAN)`, added
+        in Postgres 16, plans them without values. Prepared statements behave the same way
+        after a while: the first five runs get plans for their actual values, and then
+        Postgres may switch to one generic plan, which can be worse for skewed data.
+      - For queries that are slow only sometimes, the `auto_explain` module logs the plan of
+        any statement over a threshold, so you see the plan that was actually slow.
+
+      Plans from a laptop with a thousand rows tell you little about production. Compare
+      plans on a copy of production data, or at least with realistic row counts.
+pitfalls:
+  - "**Running `EXPLAIN ANALYZE` on a write outside a transaction.** It executes, so the rows are really deleted or changed. Use `BEGIN`, then `ROLLBACK`."
+  - "**Reading `cost` as milliseconds.** It's an abstract unit for comparing plans for the same query. Use `actual time` and buffers for what really happened."
+  - "**Forgetting to multiply by `loops`.** A node showing 0.5 ms with `loops=20000` took ten seconds in total."
+  - "**Blaming the join method first.** A nested loop over 50,000 rows usually means the planner expected 50. Find the estimate that's wrong and fix the statistics or the query."
+  - "**Tuning from a tiny development database.** The planner rightly chooses sequential scans on small tables, so the plan you see isn't the one production runs."
+  - "**Raising `work_mem` for the whole server to fix one spilled sort.** Each sort or hash node in each connection may use that much. Set it for the one transaction that needs it."
+  - "**Chasing the slowest single query.** The biggest win is usually the query with the largest total time in `pg_stat_statements`."
+interview:
+  - question: A query is slow in production. How do you investigate it?
+    answer: >-
+      I get the plan with `EXPLAIN (ANALYZE, BUFFERS)`, on production or a copy with
+      realistic data, and read it from the innermost nodes out looking for where time and
+      pages go. The usual suspects are a sequential scan with a large `Rows Removed by Filter`
+      (a missing or unusable index), an inner node with a huge `loops` count, a sort or hash
+      spilling to disk, and estimates far from actual rows. For a write I wrap it in `BEGIN`
+      and `ROLLBACK`. Before that I'd check `pg_stat_statements` to confirm it's the query
+      costing the most total time, and after a fix I compare the new plan and buffer counts,
+      not only a single timing, since caches make timings noisy.
+  - question: What does it mean when estimated rows and actual rows are very different?
+    answer: >-
+      The planner's statistics don't describe the data, so it may have picked the wrong plan:
+      a nested loop where a hash join fits, or an index scan over most of a table. Causes
+      include stale statistics after a bulk change, fixed with `ANALYZE`; correlated columns,
+      where the planner multiplies selectivities that aren't independent, fixed with `CREATE
+      STATISTICS`; and conditions it can't estimate, such as a function of a column or a value
+      only known at run time. I look for the lowest node where the error starts, because
+      everything above inherits it. Small differences don't matter; an order of magnitude
+      usually does.
+  - question: What are the join algorithms Postgres can choose, and when does each win?
+    answer: >-
+      Nested loop, hash join and merge join. A nested loop runs the inner side once per outer
+      row, so it wins when the outer side is small and the inner side has an index, like one
+      customer's orders. A hash join builds a hash table from the smaller input and probes it
+      with the other, so it wins for large unsorted inputs joined on equality, as long as the
+      hash fits in `work_mem`. A merge join walks two inputs sorted on the key, which suits
+      inputs already ordered by an index or large range joins. The choice depends on row
+      estimates, so a bad join choice usually points back to a bad estimate.
+  - question: Why might a query plan differ between your laptop and production?
+    answer: >-
+      Because the planner chooses by cost, and costs depend on data size, distribution and
+      settings. On a small table, reading it all is cheapest, so an index is ignored that
+      production would use, and the reverse. Statistics differ, settings like `work_mem` and
+      `random_page_cost` differ, and prepared statements in production may run a generic plan
+      after five executions while my ad hoc query gets a custom one. So I test with realistic
+      row counts, run `ANALYZE` after loading data, and when it matters I capture the real
+      plan with `auto_explain` or run `EXPLAIN` on a replica.

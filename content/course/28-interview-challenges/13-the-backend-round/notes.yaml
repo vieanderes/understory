@@ -1,0 +1,365 @@
+summary: >-
+  The backend round asks for one resource done properly: a handler that validates its
+  input, does plain work on clean data, pages through lists with a cursor, answers every
+  failure in one format, and survives a client retrying. None of these pieces is hard alone.
+  The round tests whether you do all of them without being prompted, and whether you can
+  explain each choice.
+
+
+  The shape to aim for is a thin edge and a plain core. At the edge, parse and validate the
+  request and map every failure to a problem details response (RFC 9457). In the core,
+  ordinary functions work on typed data and know nothing about HTTP. That keeps the logic
+  testable without a server and makes the interviewer's follow-ups (a new field, a new
+  status, a different framework) small changes.
+
+
+  The follow-ups are predictable: retries (idempotency keys, including two retries at once),
+  paging that stays correct while rows are added (cursors), and concurrency on a scarce
+  resource (a unique constraint or a conditional update). Prepare a short, correct answer for
+  each.
+remember:
+  - >-
+    A handler validates at the edge, runs plain logic on clean data, and sends every failure out
+    in one format.
+  - >-
+    Problem details (RFC 9457) is the standard error body: `type`, `title`, `status` and
+    `detail`, sent as `application/problem+json`.
+  - >-
+    An idempotency key stores the first response, status and body, so a retry gets exactly what
+    it missed and nothing runs twice.
+  - >-
+    Claim the key before the first `await`, or two simultaneous retries both pass the check and
+    both do the work.
+  - >-
+    The same key with a different body is a client error (422 in the IETF draft), and a key whose
+    first request is still running gets 409.
+  - >-
+    A cursor holds the position of the last item returned, so pages do not skip or repeat rows
+    when data changes; for a non-unique sort it must include a tie-breaker such as the id.
+  - >-
+    Query values arrive as strings, so validate `limit` and `after` with a pattern before
+    converting them.
+  - >-
+    A 405 response must include an `Allow` header listing the methods the resource supports.
+sections:
+  - title: A playbook for a 45 to 60 minute backend round
+    body: |-
+      1. **Pin the contract (5 minutes).** The resource, its fields and their rules, the
+         routes, the status for each outcome, the error format. Write it as a comment.
+      2. **Write the helpers first.** `problem(status, title, detail)` and `json(status,
+         body)`, so every later branch is one line.
+      3. **Route**: unknown path 404, known path with the wrong method 405 with `Allow`.
+      4. **Validate** in one function that returns the first problem or `null`. Check types
+         before ranges, because `'2'` is not a number.
+      5. **Happy path**: create and list, with 201 for a create.
+      6. **Tests for the failure paths**, not only the happy one: bad body, bad query, unknown
+         route, wrong method.
+      7. **Extensions** in the order the interviewer raises them: idempotency, pagination,
+         concurrency, auth, rate limiting.
+
+      The status codes to have ready:
+
+      - **200** for a read, **201** for a create (a `Location` header naming the new resource
+        is a nice touch).
+      - **400** for a malformed request: bad JSON, a missing field, a wrong type.
+      - **404** for an unknown resource, **405** for a method the resource does not support.
+      - **409** for a conflict with current state: a double booking, or an idempotent request
+        still in flight.
+      - **415** when the content type is not one you accept.
+      - **422** (Unprocessable Content) for a well-formed request the server will not process,
+        such as a reused idempotency key with a different body. Teams differ on 400 versus 422
+        for validation; pick one, document it and be consistent.
+
+      An ideal answer is short: a router of a few lines, one validator, one create, one list,
+      every failure through `problem`, and tests that name the rule each one checks.
+  - title: Idempotency that survives concurrent retries
+    body: |-
+      The lesson's handler stores the response after the work. Two retries sent together can
+      both miss the store and both book. The fix is to claim the key before any `await`, record
+      a fingerprint of the body, and decide what a second request sees while the first is
+      still running.
+
+      ```ts
+      import { createHash } from 'node:crypto';
+
+      type Res = { status: number; body: unknown };
+      type KeyRecord =
+        | { state: 'in-flight'; fingerprint: string }
+        | { state: 'done'; fingerprint: string; response: Res };
+
+      // Keys are scoped to the caller, and the body's fingerprint catches a reused key.
+      const records = new Map<string, KeyRecord>();
+
+      const fingerprint = (body: unknown) =>
+        createHash('sha256').update(JSON.stringify(body)).digest('hex');
+
+      const problem = (status: number, title: string, detail: string): Res => ({
+        status,
+        body: { type: 'about:blank', title, status, detail },
+      });
+
+      async function idempotent(
+        caller: string,
+        key: string,
+        body: unknown,
+        work: () => Promise<Res>,
+      ): Promise<Res> {
+        const id = `${caller}:${key}`;
+        const print = fingerprint(body);
+        const seen = records.get(id);
+        if (seen && seen.fingerprint !== print) {
+          return problem(422, 'Key reused', 'This idempotency key was used with a different body.');
+        }
+        if (seen?.state === 'in-flight') {
+          return problem(409, 'Request in progress', 'The first request with this key has not finished.');
+        }
+        if (seen?.state === 'done') return seen.response;
+
+        // Claimed before the first await, so a concurrent retry sees it.
+        records.set(id, { state: 'in-flight', fingerprint: print });
+        try {
+          const response = await work();
+          records.set(id, { state: 'done', fingerprint: print, response });
+          return response;
+        } catch (error) {
+          // Nothing was stored, so the client may retry with the same key.
+          records.delete(id);
+          throw error;
+        }
+      }
+
+      let bookings = 0;
+      const book = async (): Promise<Res> => {
+        await new Promise((r) => setTimeout(r, 20)); // the database insert
+        bookings++;
+        return { status: 201, body: { id: bookings } };
+      };
+
+      const body = { room: 'Oak', date: '2026-10-01', guests: 2 };
+      const [first, second] = await Promise.all([
+        idempotent('client-a', 'k1', body, book),
+        idempotent('client-a', 'k1', body, book),
+      ]);
+      console.log(first.status, second.status); // 201 409
+      console.log((await idempotent('client-a', 'k1', body, book)).status); // 201, replayed
+      console.log((await idempotent('client-a', 'k1', { ...body, guests: 3 }, book)).status); // 422
+      console.log((await idempotent('client-b', 'k1', body, book)).status, bookings); // 201 2
+      ```
+
+      Four decisions are visible here. **Scope**: the key is combined with the caller, so two
+      clients cannot collide. **Fingerprint**: a hash of the body detects a reused key with a
+      different request; hash a canonical form (sorted keys) in real code, since
+      `JSON.stringify` follows property order. **In flight**: answering 409 is what the IETF
+      draft suggests; waiting on the first request's promise is a friendlier alternative.
+      **Failures**: if the work throws, the claim is released so a retry can run. Stripe
+      instead stores the first result even when it is a server error, and some teams prefer
+      that for predictability; state which you chose.
+
+      With a database, the claim is a row in a table with a primary key on the caller and the
+      key, inserted with `INSERT ... ON CONFLICT DO NOTHING RETURNING`. The insert that returns
+      a row owns the key; the other sees none. Write the booking and the stored response in
+      the same transaction, and expire old keys after a window such as 24 hours.
+  - title: Cursors for any sort order
+    body: |-
+      The lesson's cursor is a bare id, which works because ids only grow and the list is
+      sorted by id. For a list sorted by something else, such as newest first, the cursor must
+      hold the sort value and a unique tie-breaker, and it should be opaque so clients pass it
+      back rather than build their own.
+
+      ```ts
+      // A cursor for a list sorted by created_at, newest first. The id breaks ties, and the
+      // whole thing is base64url encoded so clients pass it back without reading it.
+      type Booking = { id: number; createdAt: string; room: string };
+
+      const encode = (b: Booking) =>
+        Buffer.from(JSON.stringify([b.createdAt, b.id])).toString('base64url');
+
+      function decode(cursor: string): [string, number] | null {
+        try {
+          const value = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8'));
+          const ok = Array.isArray(value) && typeof value[0] === 'string' && Number.isInteger(value[1]);
+          return ok ? [value[0], value[1]] : null;
+        } catch {
+          return null;
+        }
+      }
+
+      // Newest first: later createdAt first, and the higher id first on a tie.
+      const before = (b: Booking, [t, id]: [string, number]) =>
+        b.createdAt < t || (b.createdAt === t && b.id < id);
+
+      function page(all: Booking[], limit: number, after?: string) {
+        const sorted = [...all].sort((a, b) =>
+          a.createdAt === b.createdAt ? b.id - a.id : a.createdAt < b.createdAt ? 1 : -1,
+        );
+        const position = after === undefined ? null : decode(after);
+        if (after !== undefined && position === null) return { error: 'invalid cursor' };
+        const rest = position ? sorted.filter((b) => before(b, position)) : sorted;
+        const items = rest.slice(0, limit);
+        const nextCursor = rest.length > limit ? encode(items[items.length - 1]) : null;
+        return { items: items.map((b) => b.id), nextCursor };
+      }
+
+      const all: Booking[] = [
+        { id: 1, createdAt: '2026-09-01T10:00:00Z', room: 'Oak' },
+        { id: 2, createdAt: '2026-09-01T10:00:00Z', room: 'Elm' }, // same moment as id 1
+        { id: 3, createdAt: '2026-09-02T09:00:00Z', room: 'Ash' },
+      ];
+      const p1 = page(all, 2);
+      console.log(p1);
+      const p2 = page(all, 2, p1.nextCursor!);
+      console.log(p2);
+      console.log(page(all, 2, 'not-a-cursor'));
+      ```
+
+      Bookings 1 and 2 share a timestamp. Without the id in the cursor, the second page would
+      either repeat one of them or skip one. In SQL the same idea is a row comparison, which
+      an index on the same columns serves directly:
+
+      ```sql
+      CREATE INDEX booking_newest ON booking (created_at DESC, id DESC);
+
+      SELECT id, room FROM booking
+      WHERE (created_at, id) < ($1, $2)
+      ORDER BY created_at DESC, id DESC
+      LIMIT 21;  -- one more than the page size, to know whether a next page exists
+      ```
+
+      Offset paging (`LIMIT 20 OFFSET 40`) is simpler and supports jumping to page 3, but it
+      skips or repeats rows when rows are inserted or deleted between requests, and the
+      database still reads and discards every skipped row. Cursors are the default for feeds
+      and APIs; offsets suit small admin tables with page numbers.
+  - title: 'A thin adapter: fetch-style Request and Response'
+    body: |-
+      Node 18 and later, Deno, Bun and Next.js route handlers all speak the fetch API's
+      `Request` and `Response`. The adapter's job is to turn those into plain data, call the
+      core, and turn the result back. A malformed JSON body throws from `req.json()`, so the
+      read sits in a `try`.
+
+      ```ts
+      // The adapter: turn a fetch-style Request into plain data, and plain data into a Response.
+      // Everything between is ordinary functions you can test without HTTP.
+      type Plain = { status: number; body: unknown; headers?: Record<string, string> };
+
+      function problem(status: number, title: string, detail: string): Plain {
+        return {
+          status,
+          headers: { 'content-type': 'application/problem+json' },
+          body: { type: 'about:blank', title, status, detail },
+        };
+      }
+
+      async function readJson(req: Request): Promise<{ ok: true; value: unknown } | { ok: false }> {
+        try {
+          return { ok: true, value: await req.json() };
+        } catch {
+          return { ok: false };
+        }
+      }
+
+      async function handle(req: Request): Promise<Response> {
+        const url = new URL(req.url);
+        let result: Plain;
+        if (url.pathname !== '/bookings') {
+          result = problem(404, 'Not found', `No route for ${url.pathname}.`);
+        } else if (req.method === 'POST') {
+          const parsed = await readJson(req);
+          result = parsed.ok
+            ? { status: 201, body: { received: parsed.value, key: req.headers.get('idempotency-key') } }
+            : problem(400, 'Invalid request', 'The body is not valid JSON.');
+        } else {
+          result = problem(405, 'Method not allowed', `${req.method} is not allowed on /bookings.`);
+          // HTTP requires a 405 to list the methods the resource does allow.
+          result.headers = { ...result.headers, allow: 'GET, POST' };
+        }
+        const res = Response.json(result.body, { status: result.status });
+        for (const [name, value] of Object.entries(result.headers ?? {})) res.headers.set(name, value);
+        return res;
+      }
+
+      const ok = await handle(new Request('http://localhost/bookings', {
+        method: 'POST',
+        headers: { 'Idempotency-Key': 'k-1', 'content-type': 'application/json' },
+        body: JSON.stringify({ room: 'Oak' }),
+      }));
+      console.log(ok.status, await ok.json());
+
+      const bad = await handle(new Request('http://localhost/bookings', { method: 'POST', body: '{oops' }));
+      console.log(bad.status, bad.headers.get('content-type'));
+
+      const wrong = await handle(new Request('http://localhost/bookings', { method: 'DELETE' }));
+      console.log(wrong.status, wrong.headers.get('allow'));
+      ```
+
+      Everything between the adapter's first and last lines can be a plain function tested
+      without HTTP, which is the property interviewers look for when they ask "how would you
+      test this?". The `Allow` header on the 405 is required by HTTP semantics and is a detail
+      most candidates miss.
+pitfalls:
+  - >-
+    **Trusting types from the network.** A form or query string sends `'2'`, not `2`. Check types
+    first, then ranges, and never cast an unchecked body to your type.
+  - >-
+    **One error shape per branch.** Clients then need a parser for each failure. Send every
+    failure through one `problem` helper.
+  - >-
+    **Storing the key after the work.** Two concurrent retries both pass the check. Claim the key
+    before the first `await`, or with an atomic insert in the database.
+  - >-
+    **Storing a "seen" flag instead of the response.** The retry then has nothing to return.
+    Store the status and body of the first response.
+  - >-
+    **Ignoring a reused key with a different body.** Replaying the old response hides a client
+    bug. Fingerprint the body and answer 422 on a mismatch.
+  - >-
+    **A cursor without a tie-breaker.** Rows with equal sort values are skipped or repeated at
+    page boundaries. Put the sort value and the id in the cursor.
+  - >-
+    **405 without `Allow`.** HTTP requires the header, and clients use it. List the supported
+    methods.
+interview:
+  - question: >-
+      How would you make `POST /bookings` safe for clients to retry?
+    answer: >-
+      With an idempotency key. The client sends a unique `Idempotency-Key` header and reuses it
+      on every retry of the same request. The server claims the key atomically before doing
+      any work, stores a fingerprint of the body, does the work, then stores the full response
+      under the key. A retry with the same key and body gets the stored response, so the
+      booking happens once and the client still gets its booking id. A reused key with a
+      different body gets 422, and a key whose first request is still running gets 409 or
+      waits. Keys are scoped per client and expire after a window, often 24 hours. With a
+      database I claim the key with a unique constraint in the same transaction as the booking.
+  - question: >-
+      Offset or cursor pagination: which would you choose, and why?
+    answer: >-
+      Cursor pagination for most APIs. A cursor encodes the position of the last item
+      returned, the sort value plus a unique tie-breaker such as the id, and the next query
+      asks for rows after it. Pages stay correct when rows are inserted or deleted between
+      requests, and with a matching index the database seeks straight to the position. Offset
+      pagination skips or repeats rows when data changes, and large offsets make the database
+      read and discard every skipped row. Offsets do allow jumping to an arbitrary page and
+      showing a total, so I would use them for a small admin table with page numbers. I make
+      cursors opaque, for example base64url, so clients cannot depend on their contents.
+  - question: >-
+      Two clients try to book the last room for the same night at the same moment. What
+      happens in your design?
+    answer: >-
+      In the in-memory version nothing interleaves inside one synchronous handler, but with a
+      database both requests can check availability, see the room free, and both insert. I
+      would prevent that in the database, not in application code. Either a unique constraint,
+      or an exclusion constraint for date ranges, so the second insert fails and I map that
+      error to 409 Conflict. Or a conditional update, such as decrementing an availability
+      count only where it is above zero, and checking that one row changed. A lock with
+      `SELECT ... FOR UPDATE` also works but holds rows longer. The constraint is my default
+      because it stays correct whatever code path writes the data.
+  - question: >-
+      How do you structure a handler so you can test it without a server?
+    answer: >-
+      I keep HTTP at the edge and plain functions in the middle. A thin adapter turns the
+      request into typed data, parsing the body in a `try` and reading the query and headers,
+      then calls a core function, then turns its result into a response. Validation is one
+      function that returns the first problem or null. The core takes its dependencies, such as
+      the store or a clock, as arguments. Tests can then call the core directly with plain
+      objects, and a few adapter tests cover parsing and status mapping. The trade-off is a
+      little more structure than one long handler, which pays off as soon as the interviewer
+      adds a requirement.

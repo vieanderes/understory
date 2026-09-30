@@ -1,0 +1,243 @@
+id: sysdesign.case-news-feed
+title: "Case study: a news feed"
+objective: Design a feed with fan-out on write and on read, handle accounts with millions of followers, and spread hot keys.
+level: advanced
+minutes: 10
+concepts: [sysdesign.fan-out-on-write, sysdesign.fan-out-on-read, sysdesign.hot-keys]
+prerequisites: [sysdesign.case-url-shortener, sysdesign.message-brokers]
+opening:
+  text: >-
+    You'll design the feed of a social app, where one post can reach ten million people.
+    It's the classic question of when to do the work: when you write, or when you read.
+
+steps:
+  - type: prose
+    id: name-two-fan-outs
+    body: |-
+      A feed shows posts from everyone you follow, newest first. There are two ways to build
+      it.
+
+      **Fan-out on write** pushes each post into every follower's stored feed, such as a
+      Redis list per user. Reading is one lookup. Posting costs one write per follower.
+
+      **Fan-out on read** stores each post once, and builds a feed when it's opened. Posting
+      is cheap; reading does the work.
+
+  - type: multiple-choice
+    id: pick-celebrity-writes
+    concept: sysdesign.fan-out-on-write
+    difficulty: 1
+    question: With fan-out on write, a 10-million-follower account posts once. How many copies?
+    choices:
+      - text: 10 million
+        correct: true
+        feedback: >-
+          Yes. One copy per follower, all from a single post.
+      - text: One, shared by all followers
+        feedback: >-
+          That's the other strategy. Copying into each stored feed means one write per follower.
+      - text: One per follower who is online
+        feedback: >-
+          Offline followers still need the post waiting when they open the app.
+
+  - type: multiple-choice
+    id: pick-pull-pain
+    concept: sysdesign.fan-out-on-read
+    difficulty: 3
+    question: Where does fan-out on read hurt most?
+    choices:
+      - text: Opening the feed of someone following 5,000 accounts
+        correct: true
+        feedback: >-
+          Yes. Every open gathers and merges posts from 5,000 accounts.
+      - text: A celebrity posting to 10 million followers
+        feedback: >-
+          That's the pain of pushing. On read, a post is stored once.
+      - text: A new user with an empty feed
+        feedback: >-
+          Following nobody means nothing to gather. It's the cheapest read there is.
+
+  - type: prose
+    id: name-hybrid-and-hot-keys
+    body: |-
+      Big systems mix both. Push for ordinary accounts. Skip the push for accounts with
+      millions of followers, and pull their recent posts when a feed opens, then merge.
+
+      Those accounts create **hot keys**. A big cache is split into **shards**, servers that
+      each hold some keys. A hot key gets far more reads than the rest, all on one shard.
+
+  - type: ai-review
+    id: review-hot-key
+    concept: sysdesign.hot-keys
+    difficulty: 3
+    language: ts
+    request: Cache each post in Redis so feeds load fast.
+    flawClass: performance
+    code: |
+      async function getPost(postId: string) {
+        const cached = await redis.get(`post:${postId}`);
+        if (cached) return JSON.parse(cached);
+        const post = await db.posts.find(postId);
+        await redis.set(`post:${postId}`, JSON.stringify(post), { EX: 60 });
+        return post;
+      }
+    prompt: >-
+      An assistant wrote this. It was fine for months. Then a celebrity posted, and one Redis
+      shard hit 100% CPU while the rest idled. Tap the line at fault.
+    lines: [2]
+    reasons:
+      - text: Every read of one post hits one key
+        correct: true
+        feedback: >-
+          Yes. Spread a hot post over several copies, or keep it in local memory.
+      - text: Sixty seconds is too short a TTL
+        feedback: >-
+          A longer TTL keeps it cached, but every read still lands on one shard.
+      - text: '`JSON.parse` is too slow'
+        feedback: >-
+          Parsing runs on the app server. The overloaded machine is the Redis shard.
+    fix: |
+      const copy = Math.floor(Math.random() * 8); // 8 copies, on different shards
+      const cached = await redis.get(`post:${postId}:${copy}`);
+
+  - type: code-challenge
+    id: write-merge-feed
+    concept: sysdesign.hot-keys
+    difficulty: 4
+    language: ts
+    prompt: >-
+      Write `mergeFeed(stored, pulled, limit)`. `stored` is the follower's pushed feed.
+      `pulled` holds one array of recent posts per followed celebrity. Each post has an `id`,
+      an `author` and a time `at`.
+
+
+      Return one list, newest first, with each post id once, and at most `limit` posts.
+    hints:
+      - Put every post from both sources into one list before sorting.
+      - A post can arrive both ways. A set of ids you've kept catches it.
+      - Sort with `(a, b) => b.at - a.at` for newest first, then cut it to `limit`.
+
+  - type: prose
+    id: feed-failure-modes
+    body: |-
+      Now the failures, before anyone asks. Pushing runs in queue workers, not the request,
+      so a big post causes lag, not a slow button. Deleted posts must leave every stored feed.
+
+      And if the feed store is lost? It's a cache of posts. Rebuild it from the posts table.
+
+  - type: ai-review
+    id: review-fanout-in-request
+    concept: sysdesign.fan-out-on-write
+    difficulty: 4
+    language: ts
+    request: When someone posts, add the post to each follower's feed.
+    flawClass: performance
+    code: |
+      async function createPost(authorId: string, text: string) {
+        const post = await db.posts.insert({ authorId, text, at: Date.now() });
+        const followers = await db.follows.followersOf(authorId);
+        for (const f of followers) await feeds.push(f, post.id);
+        return post;
+      }
+    prompt: >-
+      An assistant wrote this. It passed with a test account of 50 followers. A popular
+      account posted, and the request timed out after 30 seconds. Tap the line at fault.
+    lines: [4]
+    reasons:
+      - text: It pushes to every follower inside the request
+        correct: true
+        feedback: >-
+          Yes. Millions of awaited writes can't fit in one request. Queue the fan-out.
+      - text: It should read followers after pushing
+        feedback: >-
+          The order doesn't change the cost. The loop itself is the problem.
+      - text: '`Date.now()` is the wrong clock for posts'
+        feedback: >-
+          The timestamp is fine for this. The time goes into the loop on line 4.
+    fix: |
+      async function createPost(authorId: string, text: string) {
+        const post = await db.posts.insert({ authorId, text, at: Date.now() });
+        await queue.add('fan-out', { postId: post.id, authorId }); // workers push in batches
+        return post;
+      }
+
+  - type: explain-back
+    id: explain-hybrid
+    concept: sysdesign.fan-out-on-write
+    difficulty: 4
+    prompt: >-
+      Why do large feeds push ordinary accounts' posts but pull the posts of accounts with
+      millions of followers?
+    rubric:
+      - Pushing makes reads a single lookup, which suits the many ordinary accounts.
+      - One celebrity post would mean millions of writes, which is slow and wasteful.
+      - Pulling only those few accounts at read time keeps writes bounded and reads cheap.
+    modelAnswer: >-
+      Most accounts have a few hundred followers, so pushing their posts is cheap and makes
+      each feed one lookup. A celebrity with millions of followers would turn one post into
+      millions of writes and a long backlog. So we skip the push for them. When a feed opens,
+      we pull their few recent posts and merge them in. Both paths stay cheap.
+
+recap:
+  - Compare fan-out on write and on read for your load.
+  - Push for ordinary accounts, and pull for the few with huge followings.
+  - Spread hot keys, queue the fan-out, and name the failure modes.
+
+recall:
+  - id: card-push
+    concept: sysdesign.fan-out-on-write
+    front: What does fan-out on write cost, and what does it make cheap?
+    back: >-
+      Posting costs one write per follower. Reading a feed becomes a single lookup.
+  - id: card-pull
+    concept: sysdesign.fan-out-on-read
+    front: When does fan-out on read become expensive?
+    back: >-
+      When users open their feeds often or follow many accounts, since every open gathers and
+      merges posts from all of them.
+  - id: card-hot-key
+    concept: sysdesign.hot-keys
+    front: Why don't more cache shards fix a hot key?
+    back: >-
+      One key lives on one shard. You have to copy it to several keys or cache it locally.
+  - id: card-queue-fanout
+    concept: sysdesign.fan-out-on-write
+    front: Where should fan-out on write run, and why?
+    back: >-
+      In queue workers, not the posting request, so a big account's post causes feed lag
+      instead of a timed-out request.
+
+references:
+  - kind: book
+    title: Designing Data-Intensive Applications
+    authors: Martin Kleppmann
+    year: 2017
+    venue: O'Reilly Media
+    note: Chapter 1 describes home timelines, fan-out on write against read, and the hybrid for celebrities.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Redis lists
+    authors: Redis
+    venue: Redis documentation
+    url: https://redis.io/docs/latest/develop/data-types/lists/
+    note: Capped lists with LPUSH and LTRIM, a common store for pushed feeds.
+    verified: true
+
+deepDive: >-
+  The daily numbers ran in Node with made-up but plausible inputs: 10 million users, two
+  posts and ten feed opens a day each, 200 followers and 200 followed accounts. Pushing is
+  4 billion writes a day, about 46,000 a second. Pulling is 20 billion lookups a day. Change
+  the inputs and the answer can flip, which is why the estimate comes before the choice.
+
+
+  Ranking sits on top. A chronological feed is a sort by time. A ranked feed scores
+  candidates by predicted interest, usually with a model, over a few hundred candidates
+  gathered by the fan-out. Candidate gathering and ranking are separate steps, so each can
+  change without the other.
+
+
+  Pagination matters too. Use a cursor on time and id, not page numbers, so new posts at the
+  top don't shift the pages a user is scrolling. The celebrity threshold is a tuning knob,
+  often a follower count, and some systems also skip pushing to followers who haven't opened
+  the app in weeks.

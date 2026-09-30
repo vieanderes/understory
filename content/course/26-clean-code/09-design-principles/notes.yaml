@@ -1,0 +1,364 @@
+summary: >-
+  Design principles are compressed experience about what makes code hard to change. **SOLID**
+  collects five of them, popularised by Robert C. Martin: single responsibility, open-closed,
+  Liskov substitution, interface segregation and dependency inversion. Around them sit
+  older ideas: prefer composition to inheritance, keep coupling low and cohesion high, talk
+  only to your immediate collaborators (the law of Demeter), keep it simple (KISS), and
+  don't build what nobody has asked for (YAGNI).
+
+
+  Each principle prevents a specific kind of pain, and each one, overapplied, causes a
+  different kind. Single responsibility taken too far scatters one idea over ten files.
+  Dependency inversion everywhere gives you interfaces with one implementation. The senior
+  skill isn't reciting the letters. It's naming the concrete change a principle makes
+  cheaper, and knowing when that change is unlikely enough to skip the principle.
+
+
+  These notes show all five SOLID principles in TypeScript, where TypeScript's type
+  checker helps with Liskov and where it doesn't, how composition stacks behaviour without
+  a class tree, what coupling, cohesion and Demeter mean in code, and how to argue YAGNI
+  without sounding careless.
+remember:
+  - Single responsibility means a module has one reason to change, which Martin later phrased as being responsible to one actor.
+  - Open-closed means you add behaviour by adding code, such as a new strategy or entry, instead of editing code that works.
+  - Liskov substitution means a subtype keeps every promise of its parent, so code written for the parent works unchanged.
+  - Interface segregation means clients depend only on the methods they use, so small role interfaces beat one wide one.
+  - Dependency inversion means business rules depend on interfaces they own, and details such as databases implement them.
+  - Prefer composition, holding an object and delegating, because inheritance ties a subclass to its parent's internals.
+  - High cohesion keeps things that change together in one place, and low coupling means changing one module rarely forces changes in another.
+  - YAGNI says to build today's need plainly, because speculative flexibility costs building, carrying and often repairing.
+sections:
+  - title: SOLID in TypeScript, one example each
+    body: |-
+      **Single responsibility.** The lesson's `Report` class loaded data, calculated totals
+      and emailed a PDF. Split by actor: `loadSales` for whoever owns the data, a pure
+      `totals` for finance, `sendReport` for whoever owns email. Each changes alone.
+
+      **Open-closed.** Checkout shouldn't be edited every time marketing invents a discount.
+      Make discounts data that checkout loops over.
+
+      ```ts
+      // Open-closed: a new rule is a new entry, and checkout doesn't change.
+      interface Cart {
+        totalPence: number;
+        itemCount: number;
+      }
+      type DiscountRule = (cart: Cart) => number; // pence off
+
+      const discountRules: DiscountRule[] = [
+        (cart) => (cart.totalPence >= 10_000 ? 1_000 : 0),
+        (cart) => (cart.itemCount >= 5 ? 500 : 0),
+      ];
+
+      function bestDiscount(cart: Cart, rules: DiscountRule[]): number {
+        return Math.max(0, ...rules.map((rule) => rule(cart)));
+      }
+
+      console.log(bestDiscount({ totalPence: 12_000, itemCount: 6 }, discountRules)); // 1000
+      console.log(bestDiscount({ totalPence: 3_000, itemCount: 6 }, discountRules)); // 500
+      console.log(bestDiscount({ totalPence: 3_000, itemCount: 1 }, [])); // 0
+      ```
+
+      **Liskov substitution** is the next section.
+
+      **Interface segregation.** The lesson's read-only store broke because it was forced to
+      claim `save`. Split the role: a `Readable` with `read`, a `Writable` with `save`. The
+      demo page asks for a `Readable`, the backup job for a `Writable`, and a real store
+      implements both. TypeScript's structural typing makes this cheap: any object with a
+      `read` method already satisfies `Readable`, no `implements` needed.
+
+      **Dependency inversion.** The booking rule declares the interfaces it needs, and the
+      database and clock plug in from outside.
+
+      ```ts
+      interface Clock {
+        now(): Date;
+      }
+      interface BookingStore {
+        countForRoom(roomId: string, day: string): Promise<number>;
+        add(roomId: string, day: string): Promise<void>;
+      }
+
+      class BookingService {
+        constructor(
+          private readonly store: BookingStore,
+          private readonly clock: Clock,
+          private readonly capacity: number,
+        ) {}
+
+        async book(roomId: string, day: string): Promise<'booked' | 'full' | 'past'> {
+          if (day < this.clock.now().toISOString().slice(0, 10)) return 'past';
+          if ((await this.store.countForRoom(roomId, day)) >= this.capacity) return 'full';
+          await this.store.add(roomId, day);
+          return 'booked';
+        }
+      }
+
+      class MemoryStore implements BookingStore {
+        private rows: string[] = [];
+        async countForRoom(roomId: string, day: string) {
+          return this.rows.filter((row) => row === `${roomId}|${day}`).length;
+        }
+        async add(roomId: string, day: string) {
+          this.rows.push(`${roomId}|${day}`);
+        }
+      }
+
+      const service = new BookingService(new MemoryStore(), { now: () => new Date('2026-05-01T09:00:00Z') }, 1);
+      console.log(await service.book('r1', '2026-05-02')); // booked
+      console.log(await service.book('r1', '2026-05-02')); // full
+      console.log(await service.book('r1', '2026-04-30')); // past
+      ```
+
+      The word "inversion" refers to ownership. The interface belongs to the business rule,
+      not to the database module, so source dependencies point inwards towards the rules.
+      (Real code would also make count-then-add atomic, for example with a database
+      constraint. That's outside this example.)
+  - title: Liskov in practice, and where the compiler stops
+    body: |-
+      Liskov substitution is a behavioural contract. A subtype may not demand more than its
+      parent: no stronger preconditions, such as refusing inputs the parent accepted. It may
+      not deliver less: no weaker postconditions, such as returning `null` where the parent
+      always returned a value. It must keep the parent's invariants. And it may not throw
+      new kinds of errors callers weren't told to expect, which is how the lesson's
+      read-only store failed.
+
+      TypeScript checks some of this and not the rest. It can't see behaviour at all: a
+      method that throws has the same type as one that saves. And for method parameters it
+      is deliberately loose.
+
+      ```ts
+      class Formatter {
+        format(value: string | number): string {
+          return String(value);
+        }
+      }
+
+      class UpperFormatter extends Formatter {
+        // Narrower parameter than the parent. TypeScript accepts it for methods.
+        format(value: string): string {
+          return value.toUpperCase();
+        }
+      }
+
+      function printAll(formatter: Formatter) {
+        return [formatter.format('mug'), formatter.format(42)];
+      }
+
+      console.log(printAll(new Formatter())); // [ 'mug', '42' ]
+      try {
+        console.log(printAll(new UpperFormatter()));
+      } catch (error) {
+        console.log((error as Error).message); // value.toUpperCase is not a function
+      }
+      ```
+
+      This compiles under `--strict`. Methods declared with method syntax have **bivariant**
+      parameters, a pragmatic choice in TypeScript's design. The `strictFunctionTypes`
+      option only checks parameters contravariantly for function-typed properties, such as
+      `format: (value: string | number) => string`. Written that way, the narrower
+      implementation is rejected.
+
+      So Liskov is enforced by tests and review. A useful habit is a shared contract test
+      suite: one set of tests written against the interface, run against every
+      implementation. If the in-memory store and the Postgres store both pass it, callers can
+      swap them safely. The classic rectangle and square case fails exactly such a test.
+  - title: Composition that stacks
+    body: |-
+      Inheritance gives you one axis of variation. Add caching and logging to a price source
+      by subclassing, and you need `CachedPriceSource`, `LoggedPriceSource` and
+      `CachedLoggedPriceSource`. With composition, each behaviour is a wrapper that holds a
+      source and is one, so they stack in any combination. This is the decorator pattern.
+
+      ```ts
+      interface PriceSource {
+        priceOf(sku: string): Promise<number>;
+      }
+
+      const calls: string[] = [];
+      const catalogue: PriceSource = {
+        async priceOf(sku) {
+          calls.push(sku);
+          return sku.length * 100;
+        },
+      };
+
+      function cached(source: PriceSource): PriceSource {
+        const seen = new Map<string, Promise<number>>();
+        return {
+          priceOf(sku) {
+            let price = seen.get(sku);
+            if (!price) {
+              price = source.priceOf(sku);
+              seen.set(sku, price);
+            }
+            return price;
+          },
+        };
+      }
+
+      function logged(source: PriceSource, log: string[]): PriceSource {
+        return {
+          async priceOf(sku) {
+            log.push(`price ${sku}`);
+            return source.priceOf(sku);
+          },
+        };
+      }
+
+      const log: string[] = [];
+      const prices = logged(cached(catalogue), log);
+      await prices.priceOf('mug');
+      await prices.priceOf('mug');
+      console.log(calls, log); // [ 'mug' ] [ 'price mug', 'price mug' ]
+      ```
+
+      Swap the order, `cached(logged(catalogue, log))`, and only the first lookup is logged.
+      Each wrapper depends only on the `PriceSource` interface, never on another wrapper's
+      insides, so none of them can suffer the fragile base class problem from the lesson.
+      Caching the promise rather than the number also means two lookups made at the same
+      moment share one request.
+
+      Inheritance still has its place. It fits a true "is a" relation where the subclass
+      keeps every promise, a base class designed for extension with documented hooks, and
+      frameworks that expect it, such as extending `Error` for your own error types. Keep
+      hierarchies shallow, one level where you can.
+  - title: Coupling, cohesion and the law of Demeter
+    body: |-
+      **Coupling** is how much one module must know about another. **Cohesion** is how
+      closely the things inside one module belong together. You want low coupling and high
+      cohesion, because then a change lands in one module and stops there. Most of the other
+      principles are ways to get there.
+
+      The **law of Demeter** is a concrete coupling rule: a method should call methods on
+      itself, its arguments, objects it creates and its own fields, not on objects those
+      return. The informal version is "only talk to your friends".
+
+      ```ts
+      interface Address { postcode: string }
+      interface Customer { name: string; address: Address }
+
+      // Before: checkout walks through order to customer to address.
+      class OrderBefore {
+        constructor(public customer: Customer) {}
+      }
+      function canDeliverBefore(order: OrderBefore): boolean {
+        return !order.customer.address.postcode.startsWith('ZE');
+      }
+
+      // After: the order answers the question, so its structure can change.
+      class Order {
+        constructor(private customer: Customer) {}
+        shippingPostcode(): string {
+          return this.customer.address.postcode;
+        }
+      }
+      function canDeliver(order: Order): boolean {
+        return !order.shippingPostcode().startsWith('ZE');
+      }
+
+      const sam: Customer = { name: 'Sam', address: { postcode: 'ZE1 0AA' } };
+      console.log(canDeliverBefore(new OrderBefore(sam)), canDeliver(new Order(sam))); // false false
+      ```
+
+      If orders gain a separate delivery address, only `shippingPostcode` changes. With the
+      chain, every caller that walked it changes too, which is shotgun surgery.
+
+      Apply Demeter to objects with behaviour, not to data. Reading `response.data.items` from
+      a parsed JSON body or chaining `rows.filter(...).map(...)` isn't a violation in spirit,
+      because you're navigating data or a fluent API, not reaching into another object's
+      collaborators. Over-applied, Demeter creates a class full of one-line forwarding
+      methods, which is the middle man smell.
+  - title: YAGNI and KISS without being careless
+    body: |-
+      YAGNI comes from Extreme Programming. Martin Fowler's essay on it counts the costs of
+      building a feature before it's needed: the **cost of build**, the effort spent now; the
+      **cost of delay**, the useful work not done instead; the **cost of carry**, the extra
+      complexity everyone reads and works around; and the **cost of repair**, because when the
+      need finally arrives it's often different from the guess.
+
+      YAGNI is about features and speculative flexibility, not about quality. Tests, clear
+      names and refactoring are what make adding the flexibility later cheap, and YAGNI
+      depends on them. "We'll add a plugin system when a second channel exists" is only safe
+      if the code is clean enough to add it then.
+
+      Where change is genuinely expensive, think ahead more:
+
+      - Public APIs and SDKs, where callers you don't control depend on the shape.
+      - Data formats and database schemas, where migrations on live data are costly.
+      - Security and privacy boundaries, which are hard to retrofit.
+
+      Inside a module you own, the lesson's stub senders for SMS and push are the classic
+      violation: they add a type, a map and two throwing branches that someone must read,
+      test and keep compiling, for a need that may never come.
+
+      **KISS** asks for the simplest design that meets today's need. A useful test in review
+      is to ask what the extra layer buys today. An interface with one implementation buys
+      nothing unless it marks a real boundary, such as the database or a payment provider,
+      where a test double or a second implementation is likely. AI assistants often add
+      exactly this kind of speculative structure, so it's worth asking the question every
+      time.
+pitfalls:
+  - "**Reading single responsibility as do one thing.** A function doing one small thing is a different rule. SRP is about reasons to change: group code by the actor or rule that drives its changes, not into the smallest possible pieces."
+  - "**An interface for every class.** One implementation behind an interface adds a file and an indirection and inverts nothing useful. Introduce the interface at a real boundary, or when a second implementation or test double appears."
+  - "**Subclassing to reuse a method.** Inheriting for code reuse ties you to the parent's internals and promises you may not keep. Hold the object in a private field and delegate the calls you need."
+  - "**Overriding a method to throw.** An override that throws where the parent worked breaks every caller written for the parent. If the subtype can't keep the promise, it isn't a subtype: split the interface instead."
+  - "**Trusting TypeScript to enforce Liskov.** Method parameters are bivariant, and behaviour isn't typed at all. Run one shared contract test suite against every implementation of an interface."
+  - "**Using YAGNI as a reason to skip tests or clean code.** YAGNI defers features, not quality. Clean code and tests are what make adding the feature later cheap."
+  - "**Forwarding methods everywhere in the name of Demeter.** A class that is mostly one-line delegates is the middle man smell. Apply the rule to objects with behaviour, and let data structures be navigated."
+interview:
+  - question: Walk me through SOLID with a concrete example of each.
+    answer: >-
+      SOLID is five heuristics for keeping code cheap to change. Single responsibility: a
+      report class that loads data, calculates totals and emails a PDF has three reasons to
+      change, so I'd split it by who asks for the change. Open-closed: discounts as a list of
+      rule functions, so a new promotion is a new entry and checkout stays untouched. Liskov:
+      a read-only store that extends a writable one and throws on `save` breaks every caller
+      of the parent. Interface segregation: split that store into `Readable` and `Writable` so
+      each client asks only for what it uses. Dependency inversion: the booking service
+      depends on a `BookingStore` interface it owns, and Postgres implements it. I apply them
+      where change is likely, not everywhere.
+  - question: Why prefer composition over inheritance?
+    answer: >-
+      Because inheritance couples a subclass to how its parent works inside, while
+      composition only relies on public behaviour. The classic failure is the fragile base
+      class: a counting subclass overrides both `add` and `addMany`, and when the parent's
+      `addMany` calls `add`, every item is counted twice. Composition also combines better.
+      With wrappers such as `logged(cached(source))`, behaviours stack in any order without a
+      class for every combination. Inheritance is still right for a true is-a relation that
+      keeps every promise, a base designed for extension, or framework types like custom
+      `Error` subclasses. The cost of composition is some forwarding boilerplate, which I
+      accept for the looser coupling.
+  - question: What's the Liskov substitution principle, and how do you catch violations?
+    answer: >-
+      Code written against a type must keep working with any subtype, so a subtype can't
+      demand more, deliver less or break the parent's invariants. Concretely: no stronger
+      preconditions, no weaker postconditions, no new surprise exceptions. The textbook case
+      is a square whose width setter also changes its height, breaking code that resizes a
+      rectangle. In practice I've seen it as a read-only implementation that throws on write.
+      The compiler won't catch it. TypeScript checks signatures, not behaviour, and even
+      allows narrower method parameters because methods are bivariant. So I catch it with a
+      shared contract test suite that every implementation must pass, and in review by asking
+      whether the subtype can honour every method it inherits.
+  - question: How do you balance YAGNI against designing for the future?
+    answer: >-
+      I design for change I can see and defer flexibility for change I'm guessing at.
+      Speculative features cost the build, delay other work, add complexity everyone carries,
+      and are often wrong when the real need arrives. So inside code I own, I build today's
+      case plainly and keep it clean and tested, which makes adding flexibility later cheap.
+      I think further ahead where change is expensive: public APIs, data formats, database
+      schemas and security boundaries, since those are hard to migrate. A good review
+      question is what an abstraction buys today. An interface with one implementation at the
+      payment boundary is worth it. The same interface around an internal helper usually
+      isn't.
+  - question: What is the law of Demeter, and when would you break it?
+    answer: >-
+      It says a method should only call methods on itself, its fields, its arguments and
+      objects it creates, not on the objects those return. `order.customer.address.postcode`
+      in checkout couples checkout to the whole shape of order, customer and address, so a
+      new delivery address means changing every caller. Asking `order.shippingPostcode()`
+      keeps that knowledge in one place. I relax it for data and fluent APIs: navigating a
+      parsed JSON response or chaining array methods isn't reaching into another object's
+      collaborators. Over-applied, it fills classes with one-line forwarding methods, the
+      middle man smell, so I apply it where the chain crosses objects that have behaviour and
+      are likely to change.

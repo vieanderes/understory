@@ -1,0 +1,256 @@
+summary: >-
+  Retrieval works on pieces, not documents. A long document embedded as one vector averages
+  every topic it covers, so no question lands near it. **Chunking** cuts documents into
+  passages small enough to mean one thing and large enough to make sense alone, with an
+  overlap so a sentence cut at an edge is whole somewhere.
+
+
+  Once you have chunks, you need to find the right ones. Vector search matches meaning, so
+  "my money back" finds the refunds page. It's weak on exact strings: error codes, order
+  numbers, surnames, version numbers. Keyword search, usually BM25, is the reverse. **Hybrid
+  search** runs both and merges the two rankings, most often with reciprocal rank fusion,
+  which needs only ranks and no score tuning.
+
+
+  Reach for chunking whenever documents are longer than a few paragraphs, and for hybrid
+  search whenever users type identifiers or domain terms. You can skip both for a small,
+  fixed set of short documents that fit in the prompt whole. And whatever sizes you pick
+  are guesses until an evaluation set of real questions says otherwise.
+remember:
+  - A chunk should mean one thing and make sense alone, typically a few hundred tokens, because a vector of a mixed passage matches nothing well.
+  - Overlap exists so a sentence cut at a chunk edge is whole in at least one chunk, and a chunker must never drop the short last chunk.
+  - Vector search finds paraphrases but blurs exact codes and names, while keyword search finds exact strings but misses different wording.
+  - Hybrid search runs keyword and vector search separately and merges the rankings, so both kinds of question work.
+  - Reciprocal rank fusion scores each chunk as the sum of `1 / (60 + rank)` over the lists it appears in, using ranks only, so the two score scales never need to agree.
+  - BM25 ranks a chunk higher for query words that are rare across the collection and frequent in the chunk, and lower for long chunks.
+  - Split on the document's structure first (headings, paragraphs), fall back to word counts, and keep the title and heading with each chunk.
+  - Chunk size, overlap and the fusion mix are hyperparameters, chosen by measuring hit rate on labelled questions, not by taste.
+sections:
+  - title: How BM25 and fusion work, and where fusion still fails
+    body: |-
+      **BM25** scores a chunk for a query by summing, over each query word in it, two
+      factors. The first is inverse document frequency: a word in few chunks, like `e-4417`,
+      counts far more than one in many, like `error`. The second is term frequency with
+      saturation and length normalisation: repeating a word helps less each time, and a long
+      chunk is discounted so it can't win by containing everything. The usual defaults are
+      `k1` around 1.2 and `b` around 0.75.
+
+      ```python
+      import math
+      import re
+      from collections import Counter, defaultdict
+
+      CHUNKS = {
+          "c1": "Error E-4417: payment declined by the bank.",
+          "c2": "Error E-4471: printer offline. Check the cable.",
+          "c3": "To get your money back, request a refund within 30 days.",
+          "c4": "Common errors and what they mean.",
+      }
+
+      def tokens(text):
+          return re.findall(r"[a-z0-9]+(?:-[a-z0-9]+)*", text.lower())
+
+      def bm25(query, docs, k1=1.2, b=0.75):
+          toks = {cid: tokens(t) for cid, t in docs.items()}
+          avg_len = sum(len(t) for t in toks.values()) / len(toks)
+          df = Counter(term for t in toks.values() for term in set(t))
+          n = len(docs)
+          scores = {}
+          for cid, doc in toks.items():
+              tf = Counter(doc)
+              score = 0.0
+              for term in tokens(query):
+                  if tf[term] == 0:
+                      continue
+                  idf = math.log(1 + (n - df[term] + 0.5) / (df[term] + 0.5))
+                  norm = tf[term] * (k1 + 1) / (tf[term] + k1 * (1 - b + b * len(doc) / avg_len))
+                  score += idf * norm
+              if score > 0:
+                  scores[cid] = score
+          return sorted(scores, key=scores.get, reverse=True)
+
+      def rrf(*rankings, k=60):
+          scores = defaultdict(float)
+          for ranking in rankings:
+              for rank, cid in enumerate(ranking, start=1):
+                  scores[cid] += 1 / (k + rank)
+          return sorted(scores, key=scores.get, reverse=True)
+
+      by_meaning = ["c2", "c4", "c1", "c3"]  # a vector ranking that blurred the codes
+      print(bm25("error code E-4417", CHUNKS))              # ['c1', 'c2']
+      print(rrf(bm25("error code E-4417", CHUNKS), by_meaning))  # ['c2', 'c1', 'c4', 'c3']
+      ```
+
+      Look at the last line. Fusion put the wrong code first, because `c2` was second on
+      the keyword list (it contains "error") and first on the vector list. RRF rewards
+      agreement, and here the two lists agreed on the wrong chunk. Fusion is a good default,
+      not a guarantee. Real systems add weights per list, a reranker, or an exact-match rule
+      for identifiers, next.
+  - title: Exact identifiers deserve their own path
+    body: |-
+      When a query contains something shaped like an identifier, the user almost always
+      wants the chunk with that exact string. A cheap, predictable fix is to detect the
+      pattern and put exact matches first, then fall back to the fused order. Continuing the
+      code above:
+
+      ```python
+      CODE = re.compile(r"\b[A-Z]-\d{4}\b")
+
+      def hybrid(query, docs, by_meaning):
+          fused = rrf(bm25(query, docs), by_meaning)
+          codes = set(CODE.findall(query))
+          if not codes:
+              return fused
+          # Chunks that contain the exact code go first, in fused order.
+          exact = [cid for cid in fused if codes & set(CODE.findall(docs[cid]))]
+          return exact + [cid for cid in fused if cid not in exact]
+
+      print(hybrid("error code E-4417", CHUNKS, by_meaning))  # ['c1', 'c2', 'c4', 'c3']
+      ```
+
+      The same idea appears in production as metadata: store order numbers, SKUs and error
+      codes as their own fields at ingestion, and filter on them in the database rather
+      than hoping either ranking finds them. Your tokeniser matters too. A keyword index
+      that splits `E-4417` into `e` and `4417` has thrown away the very thing that made the
+      query precise, so check how your search engine tokenises codes before trusting it.
+
+      The trade-off is maintenance: every pattern is a rule someone owns. Keep the list
+      short and driven by what users type, which your search logs show.
+  - title: Chunking on structure, with context attached
+    body: |-
+      Fixed word windows ignore the document. A chunk can start mid-list or merge the end of
+      one section with the start of the next. Better chunkers split on headings first, then
+      paragraphs, then sentences, and only cut by count when a single block is too long.
+      They also prepend the document title and section heading, so a chunk that says
+      "They take five working days" still says what "they" are.
+
+      ```python
+      def chunk_by_paragraph(title, text, max_words=60):
+          chunks, current, heading = [], [], ""
+
+          def flush():
+              if current:
+                  body = " ".join(current)
+                  chunks.append(f"{title} > {heading}\n{body}" if heading else f"{title}\n{body}")
+                  current.clear()
+
+          for block in text.split("\n\n"):
+              block = block.strip()
+              if not block:
+                  continue
+              if block.startswith("# "):
+                  flush()
+                  heading = block[2:]
+                  continue
+              words = block.split()
+              # A paragraph that would overflow the chunk starts a new one.
+              if current and len(" ".join(current).split()) + len(words) > max_words:
+                  flush()
+              current.append(block)
+          flush()
+          return chunks
+
+      HANDBOOK = "# Refunds\n\nRefunds go back to the card you paid with.\n\nThey take five working days.\n\n# Returns\n\nReturn an item within 30 days, unused and in its box."
+      for c in chunk_by_paragraph("Help centre", HANDBOOK):
+          print(repr(c))
+      # 'Help centre > Refunds\nRefunds go back to the card you paid with. They take five working days.'
+      # 'Help centre > Returns\nReturn an item within 30 days, unused and in its box.'
+      ```
+
+      One gap remains: a single paragraph longer than `max_words` becomes one oversized
+      chunk. Pass such blocks through the lesson's `chunk_words` as a fallback. Tables and
+      code need their own rules, since splitting a table row from its header loses its
+      meaning. A richer variant asks a model to write one sentence of context per chunk
+      before embedding. It improves retrieval but costs a model call per chunk at ingestion.
+  - title: Choosing sizes, and what they cost
+    body: |-
+      There is no correct chunk size, only a trade-off you measure. Smaller chunks give
+      sharper vectors and let you fit more distinct passages in the prompt, but each one
+      carries less context and the index holds more rows. Larger chunks keep context but
+      blur, and every retrieved chunk spends more prompt tokens. Overlap adds recall at the
+      edges and costs storage and embedding in proportion: an overlap of 20 on chunks of 200
+      words embeds about 11% more text.
+
+      Sensible starting points are a few hundred tokens with an overlap of around 10 to 20
+      percent, then tune on an evaluation set: for each labelled question, does the right
+      chunk appear in the top k? Change one variable at a time.
+
+      Two operational points matter in production. First, chunk ids should be stable, for
+      example a document id plus a content hash, so re-ingesting an unchanged page does not
+      re-embed it and old citations still resolve. Second, changing the chunker or the
+      embedding model means re-embedding the whole collection, because vectors from
+      different models or chunkings don't mix in one index. Plan it as a migration: build
+      the new index beside the old one, compare hit rates, then switch.
+
+      Hybrid search roughly doubles query work, since two searches run, but both are fast
+      next to a model call. Retrieving 20 from each list and fusing to 5 is a common shape.
+pitfalls:
+  - "**Dropping the last chunk.** A loop bound such as `range(0, len(words) - size, step)` stops before the tail, and short documents vanish. Loop while `start < len(words)` and stop once a chunk reaches the end, then test with a document shorter than one chunk."
+  - "**Allowing overlap equal to size.** The step becomes zero and the loop never advances. Validate `0 <= overlap < size` up front."
+  - "**Embedding whole documents.** It feels simpler, but a long document's vector is an average of its topics and matches nothing sharply. Chunk first, and store the document id on each chunk for citations."
+  - "**Adding raw scores from the two searches.** BM25 scores and cosine similarities live on different scales, so a weighted sum silently favours one list. Fuse on ranks with RRF, or normalise scores per query if you must combine them."
+  - "**Assuming fusion always surfaces the exact match.** RRF rewards agreement between lists, and they can agree on the wrong chunk. Detect identifiers and match them exactly, or store them as filterable fields."
+  - "**Chunks with no context.** A passage that says \"it takes five days\" can't be matched to a question about refunds. Prepend the title and section heading to each chunk before embedding and indexing."
+  - "**Mixing embeddings after a change.** Vectors from a new model or chunker aren't comparable with the old ones. Re-embed the whole collection into a new index and switch when it measures better."
+interview:
+  - question: How would you choose a chunk size for a RAG system?
+    answer: >-
+      I'd start from the document structure and a few hundred tokens, then let an evaluation
+      set decide. Chunks should follow headings and paragraphs, carry their title and section,
+      and overlap by around 10 to 20 percent so a sentence cut at an edge survives. Then I
+      build labelled questions from real user queries, each with the chunk that answers it,
+      and measure hit rate at k for a few sizes, changing one variable at a time. Smaller
+      chunks give sharper matches and leave room for more sources in the prompt but lose
+      context; larger ones keep context but blur and cost tokens. Changing the chunker means
+      re-embedding everything, so I'd treat it as a migration, built beside the live index.
+  - question: Why use hybrid search instead of vector search alone?
+    answer: >-
+      Because users search in two ways and each method fails one of them. Vector search
+      matches meaning, so "get my money back" finds the refunds page, but embeddings blur
+      exact strings: `E-4417` and `E-4471` land almost together. Keyword search with BM25
+      nails exact and rare terms but misses paraphrases. Hybrid runs both, typically taking
+      the top 20 from each, and fuses the rankings with reciprocal rank fusion. The cost is
+      a second index to keep in sync and a little more query time, which is small next to
+      the model call. If users only type natural questions over prose, vector search alone
+      can be enough, and the evaluation set tells me whether it is.
+  - question: Explain reciprocal rank fusion. Why not add the scores?
+    answer: >-
+      RRF gives each chunk `1 / (k + rank)` from every list it appears in and sums them,
+      with `k` usually 60. It uses only ranks, so it doesn't care that BM25 scores are
+      unbounded while cosine similarity sits between minus one and one. Adding raw scores
+      would let whichever scale is larger dominate, and the balance would shift from query
+      to query. The constant flattens the curve, so first place is not worth vastly more
+      than fifth, and a chunk that is high on both lists beats one that tops only one. The
+      limitation is that fusion rewards agreement, and two lists can agree on the wrong
+      chunk, so for identifiers I add an exact-match path or a reranker.
+  - question: Users report that search for order numbers returns the wrong orders. How do you debug it?
+    answer: >-
+      First, I'd check whether the order number survives tokenisation and whether a keyword
+      path exists at all. Pure vector search blurs near-identical numbers, and some keyword
+      tokenisers split `A-10293` into pieces, which destroys the exact match. I'd reproduce
+      with logged queries and look at each ranking separately, before fusion. The fix is
+      usually structural: extract order numbers at ingestion into their own field and filter
+      on it exactly, or detect the pattern in the query and put exact matches first. Then I
+      add those queries to the evaluation set so the bug can't come back. Relying on the
+      model to pick the right order from blurred results is the fix to avoid.
+terms:
+  - term: Chunk
+    say: A fixed number of characters.
+    means: A passage that means one thing and reads on its own, typically a few hundred tokens. Split on
+      headings and paragraphs first, and keep the title and heading with it.
+  - term: Chunk overlap
+    say: Duplicate text that wastes space.
+    means: Text repeated at the edges of neighbouring chunks, so a sentence cut at a boundary is whole
+      in at least one of them.
+  - term: BM25
+    say: Keyword search that counts matching words.
+    means: A ranking that scores a chunk higher for query words that are rare in the collection and
+      frequent in the chunk, with diminishing returns for repeats, and lower for long chunks.
+  - term: Hybrid search
+    say: Vector search with a keyword filter.
+    means: Running keyword and vector search separately and merging the two rankings, so both
+      paraphrased questions and exact strings like order numbers find their chunk.
+  - term: Reciprocal rank fusion
+    say: Add up the two scores.
+    means: Each chunk scores the sum of `1 / (60 + rank)` over the lists it appears in. It uses ranks
+      only, so the two score scales never need to agree.

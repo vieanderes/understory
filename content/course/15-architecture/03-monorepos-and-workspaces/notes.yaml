@@ -1,0 +1,183 @@
+summary: >-
+  A monorepo keeps several apps and shared packages in one Git repository, so a change that
+  crosses them lands in one commit and one review. Workspaces are the package manager's
+  half of the idea: each folder stays a real package with its own `package.json`, and the
+  manager links them together so `import '@shop/ui'` finds the copy in the repository.
+
+
+  The lesson's main point is that a package boundary is only as real as its `exports` field
+  and its declared dependencies. Moving files into `packages/` changes paths, not coupling.
+  These notes add how the linking works on disk, what `exports` can express beyond a single
+  entry, how to run work across packages in dependency order, and the honest costs that
+  make a monorepo the wrong choice for some teams.
+
+
+  Reach for a monorepo when two or more apps really share code and change it together.
+  One app with feature folders doesn't need one, and many independent services owned by
+  separate teams with separate release cycles can be happier in separate repositories.
+remember:
+  - A monorepo puts related apps and packages in one repository so a breaking change and all its fixes land in one pull request.
+  - 'A workspace links the repository''s own packages, and `"@shop/ui": "workspace:*"` means "use the copy in this repository".'
+  - A package's `exports` field is its public API, and Node refuses any path it doesn't list with `ERR_PACKAGE_PATH_NOT_EXPORTED`.
+  - Relative imports across packages bypass `exports` and hide the dependency from tools, so ban them with a lint rule.
+  - Moving code into packages reduces coupling only when what imports what changes.
+  - Dependencies between packages should point one way, from apps to shared packages, never back.
+  - Task runners can skip unaffected packages only when every dependency is declared in `package.json`.
+sections:
+  - title: What a workspace does on disk
+    body: |-
+      With pnpm, a `pnpm-workspace.yaml` lists the package folders:
+
+      ```yaml
+      packages:
+        - apps/*
+        - packages/*
+      ```
+
+      After `pnpm install`, each app's `node_modules` holds a **symbolic link** to the
+      package folder, not a copy. On the lesson's shop, `apps/web/node_modules/@shop/ui`
+      points to `../../../../packages/ui`. Edit a file in `packages/ui` and the app sees it
+      at once, with no publish or reinstall.
+
+      Node then resolves `@shop/ui` exactly as it would a downloaded package: it follows the
+      link, reads that folder's `package.json` and applies its `exports`. That's why the
+      boundary rules you'd get from the registry also apply inside the repository.
+
+      Two details matter in practice. First, `workspace:*` is only for inside the
+      repository. If you publish the package with `pnpm publish`, pnpm rewrites
+      `workspace:*` to the exact version being published, so consumers outside get a normal
+      version. Second, pnpm gives each package a `node_modules` that contains the
+      dependencies it declared, rather than one flat folder of everything. So code that
+      imports a package it forgot to declare usually fails, instead of working by accident
+      because a neighbour installed it. That strictness is what keeps the declared graph
+      true, and the declared graph is what the rest of the tooling trusts.
+
+      npm and Yarn support workspaces too, listed under `workspaces` in the root
+      `package.json`. The linking idea is the same.
+  - title: What `exports` can say
+    body: |-
+      The lesson used `exports` as a single entry. It can express more, and each form is a
+      deliberate promise.
+
+      ```json
+      {
+        "name": "@shop/ui",
+        "version": "1.4.0",
+        "type": "module",
+        "exports": {
+          ".": {
+            "types": "./src/index.ts",
+            "import": "./src/index.js"
+          },
+          "./icons/*": "./src/icons/*.js",
+          "./package.json": "./package.json"
+        }
+      }
+      ```
+
+      The `"."` key is the main entry. Inside it are **conditions**: `types` for
+      TypeScript, `import` for ES modules, and there's also `require` for CommonJS and
+      `default` as a fallback. Node picks the first condition it recognises, in the order
+      written, so put `types` first and `default` last.
+
+      The `"./icons/*"` entry is a **subpath pattern**. `import cart from
+      '@shop/ui/icons/cart'` maps to `./src/icons/cart.js`. It exposes one folder on
+      purpose, without exposing the rest.
+
+      Everything unlisted is closed. On Node 24, with this file,
+      `import('@shop/ui/src/internal/format.js')` rejects with the code
+      `ERR_PACKAGE_PATH_NOT_EXPORTED`, while `@shop/ui` and `@shop/ui/icons/cart` both load.
+      Some tools read `package.json` directly, which is why many packages export it
+      explicitly.
+
+      Pointing `exports` at source files, as here, suits internal packages that are never
+      published: no build step, and the app's own bundler or TypeScript setup compiles
+      them. A published package points at built files in `dist/` instead.
+  - title: Running tasks across packages
+    body: |-
+      Once packages depend on each other, the order of work matters: `@shop/ui` has to
+      build before the apps that use it. pnpm reads the declared dependencies and runs in
+      that order.
+
+      ```bash
+      pnpm -r build                    # every package, dependencies first
+      pnpm --filter web test           # one package
+      pnpm --filter "web..." build     # web and everything it depends on
+      pnpm --filter "...@shop/ui" test # @shop/ui and everything that depends on it
+      ```
+
+      The last form answers the question a reviewer cares about: "I changed the button, what
+      could break?" Run in the lesson's shop, it selected `packages/ui` and `apps/web`.
+
+      Task runners such as Turborepo and Nx go further. They hash each package's inputs,
+      its files, its dependencies' outputs and its configuration, and reuse cached results
+      when nothing changed. In a large repository, that turns a 30-minute CI run into a few
+      minutes for most pull requests.
+
+      All of this depends on the graph being honest. A relative import from admin into
+      `packages/ui/src` is invisible to it: change the button, and admin's tests may be
+      skipped as "unaffected" even though admin will break. That's the practical reason to
+      ban cross-package relative imports, on top of the design reason.
+  - title: Monorepo or many repositories
+    body: |-
+      A monorepo is a trade, not an upgrade.
+
+      What you gain:
+
+      - **Atomic changes.** A breaking change to a shared package and every fix to its
+        callers merge together. With separate repositories you publish a version, then
+        update each consumer, and for a while they disagree.
+      - **One set of tools.** One lint config, one TypeScript version, one CI pipeline.
+      - **Visible impact.** Search and the dependency graph show every caller of a function.
+
+      What it costs:
+
+      - **CI and install time grow with the repository** unless you invest in caching and
+        affected-only runs.
+      - **A shared trunk.** A broken build on the main branch blocks everyone.
+      - **Access control is coarser.** Everyone who can read the repository reads all of it,
+        and ownership has to come from a `CODEOWNERS` file and review rules.
+      - **Coupling gets cheaper to create.** Importing a neighbour's package is one line, so
+        boundaries need tooling to stay real.
+
+      Separate repositories suit components with independent owners and release cycles,
+      such as a public SDK or a service another company consumes, where a version number is
+      the right contract. A monorepo suits code that changes together and is released
+      together. Many organisations mix the two.
+pitfalls:
+  - '**Importing across packages with relative paths.** It bypasses `exports` and hides the dependency from pnpm and task runners, so affected tests get skipped. Import by package name and add a lint rule against `../` paths that leave the package.'
+  - '**Treating a move into `packages/` as decoupling.** Same imports, new paths. Check what each package imports and exports, and whether a change still spreads.'
+  - '**A `shared` package that re-exports app code.** It creates a dependency from a package back to an app, a hidden cycle in the graph. Move the rules out of the app into their own package.'
+  - '**Forgetting to declare a dependency.** It may work by accident until the install layout changes. Declare every package you import in that package''s own `package.json`.'
+  - '**Exporting everything with `"./*": "./src/*"`.** It reopens every internal file as public API. Export the entry and the few subpaths you mean to support.'
+  - '**No affected-only CI.** Every pull request runs every package''s tests and CI time grows without limit. Use `--filter` with dependents or a caching task runner.'
+interview:
+  - question: When would you choose a monorepo, and when would you avoid one?
+    answer: >-
+      I'd choose one when apps share code that changes together, like a web app, an admin
+      app and a design system, because a breaking change and its fixes merge atomically and
+      one toolchain covers everything. I'd avoid it when components have independent owners
+      and release cycles, or external consumers, where a published version is the right
+      contract. The costs are real: CI time grows unless you cache and run only affected
+      packages, one broken main branch blocks everyone, and coupling becomes one import
+      away, so boundaries need `exports` and lint rules. Plenty of small teams are better
+      off with one app and feature folders until a second consumer of shared code actually
+      appears.
+  - question: How do you stop packages in a monorepo becoming tangled?
+    answer: >-
+      By making every dependency declared and every entry point deliberate. Each package
+      has a short `exports` field, so Node refuses internal paths. A lint rule bans relative
+      imports that leave a package, since those bypass `exports` and hide the edge from
+      tooling. Dependencies point one way: apps depend on packages, packages never depend
+      on apps. I'd check the graph in CI for cycles and review new edges like any API
+      change. The trade-off is friction when someone needs an internal function, but that
+      moment is exactly when the team should decide whether it belongs in the public API.
+  - question: A teammate moved sixty files into packages and says coupling went down. How do you check?
+    answer: >-
+      I'd look at dependencies, not locations. Coupling is about what imports what, and a
+      move keeps every edge, only with new paths. First I'd read each package's `exports`
+      and its imports: a `shared` package that re-exports app files means the app is still a
+      dependency. Then I'd run `pnpm --filter "...<package>"` to see what depends on each
+      package, and replay a change that used to hurt, such as a checkout rule, to see how
+      many packages it touches now. Real improvement shows as short `exports` lists, edges
+      pointing one way, and past changes that now stay inside one package.

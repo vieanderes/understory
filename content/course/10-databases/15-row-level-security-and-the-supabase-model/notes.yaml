@@ -1,0 +1,273 @@
+summary: >-
+  Row-level security (RLS) lets Postgres filter rows per user. You enable it on a table and
+  write **policies**: conditions that Postgres adds to every query on that table, whoever
+  wrote the query. A forgotten `WHERE owner_id = ...` in one endpoint then leaks nothing,
+  because the database applies the rule itself.
+
+
+  It solves the "one missing check" problem of authorisation in app code, and it's what
+  makes the Supabase model possible, where the browser queries tables directly with a
+  publishable key. There, policies aren't a second layer: they're the only thing between one
+  user and another user's data.
+
+
+  Reach for RLS in multi-tenant apps, where every row belongs to a user or an organisation,
+  and whenever clients talk to the database without your server in between. It needs care:
+  the table owner and superusers skip it by default, views can skip it, pooled connections
+  can leak the current user between requests, and policies run on every row, so they must
+  be cheap. These notes cover those edges and the checks a reviewer should make.
+remember:
+  - With RLS enabled and no policy, an ordinary role sees no rows and can write none; access exists only where a policy grants it.
+  - '`USING` filters which existing rows a command can see, update or delete, and `WITH CHECK` tests every new or changed row, raising an error when it fails.'
+  - Superusers, roles with `BYPASSRLS` and the table's owner skip policies, so the app connects as a plain role and tests run as that role.
+  - Permissive policies combine with `OR` and restrictive policies with `AND`, so a restrictive policy suits a rule every access must meet, such as "same organisation".
+  - Set the current user per request with `set_config('app.user_id', $1, true)` inside a transaction, so the value can't leak to the next request on a pooled connection.
+  - In Supabase, requests run as `anon` or `authenticated`, `auth.uid()` returns the signed-in user's id from the JWT, and the secret key bypasses every policy, so it stays on the server.
+  - Write `(select auth.uid())` rather than `auth.uid()` in policies, and index the owner column, because the policy runs for every row the query scans.
+  - An ordinary view runs with its owner's rights and can skip RLS; create it `WITH (security_invoker = true)` so the caller's policies apply.
+sections:
+  - title: How Postgres applies policies to each command
+    body: |-
+      Postgres rewrites each query to include the policy conditions, much as if you had typed
+      them into the `WHERE`. Which clause applies depends on the command:
+
+      - **`SELECT`**: `USING` filters the rows returned.
+      - **`INSERT`**: `WITH CHECK` tests each new row.
+      - **`UPDATE`**: `USING` picks which rows can be targeted, and `WITH CHECK` tests the row
+        after the change. A policy with only `USING` uses it for both.
+      - **`DELETE`**: `USING` picks which rows can be deleted.
+
+      The two clauses fail differently. A row that fails `USING` is invisible, so an update
+      aimed at someone else's note changes zero rows without an error. A row that fails `WITH
+      CHECK` raises `new row violates row-level security policy`, SQLSTATE `42501`. That's
+      what stops a user changing `owner` to someone else and giving the row away.
+
+      A full set of per-command policies, run on PostgreSQL 18:
+
+      ```sql
+      CREATE TABLE notes (
+        id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        owner text NOT NULL,
+        body text NOT NULL
+      );
+      CREATE INDEX notes_owner_idx ON notes (owner);
+      CREATE ROLE app_user;
+      GRANT USAGE ON SCHEMA public TO app_user;
+      GRANT SELECT, INSERT, UPDATE, DELETE ON notes TO app_user;
+      ALTER TABLE notes ENABLE ROW LEVEL SECURITY;
+
+      CREATE POLICY notes_select ON notes FOR SELECT TO app_user
+        USING (owner = current_setting('app.user_id', true));
+      CREATE POLICY notes_insert ON notes FOR INSERT TO app_user
+        WITH CHECK (owner = current_setting('app.user_id', true));
+      CREATE POLICY notes_update ON notes FOR UPDATE TO app_user
+        USING (owner = current_setting('app.user_id', true))
+        WITH CHECK (owner = current_setting('app.user_id', true));
+      CREATE POLICY notes_delete ON notes FOR DELETE TO app_user
+        USING (owner = current_setting('app.user_id', true));
+      ```
+
+      The second argument `true` to `current_setting` means "missing is fine": it returns
+      NULL instead of an error when the setting was never set. NULL matches no owner, so a
+      request that forgot to set the user sees nothing rather than failing open.
+
+      Several permissive policies for one command combine with `OR`. Policies created `AS
+      RESTRICTIVE` combine with `AND` on top, and at least one permissive policy must pass
+      too. With `own_docs` and `shared_docs` permissive and `same_org` restrictive, a user
+      sees their own and shared documents, but only inside their organisation.
+
+      `EXPLAIN` shows the policy inside the plan, as `Index Cond: (owner =
+      current_setting('app.user_id'::text, true))`, which is how you check a policy can use
+      an index.
+  - title: Who skips RLS, and the tests that lie
+    body: |-
+      Three kinds of role bypass policies:
+
+      - **Superusers**, always, even with `FORCE ROW LEVEL SECURITY`.
+      - **Roles with the `BYPASSRLS` attribute.** Supabase's `service_role`, used by the
+        secret key, has it.
+      - **The table's owner**, unless the table has `ALTER TABLE ... FORCE ROW LEVEL
+        SECURITY`.
+
+      Run as a non-superuser owner, the test table showed all 3 rows; after `FORCE ROW LEVEL
+      SECURITY` with no user set, it showed 0. Migrations usually run as the owner, and so do
+      many test suites, which is how policies that are broken, or missing, pass in CI. Run
+      policy tests as the role the app uses, and connect the app as a role that owns nothing.
+
+      **Views** are the quieter bypass. An ordinary view checks permissions and policies as
+      the view's owner, not as the person querying it:
+
+      ```sql
+      CREATE VIEW all_notes AS SELECT * FROM notes;
+      CREATE VIEW all_notes_safe WITH (security_invoker = true) AS SELECT * FROM notes;
+      GRANT SELECT ON all_notes, all_notes_safe TO app_user;
+      ```
+
+      Queried as `app_user` with the user set to `ana`, and the views owned by a superuser,
+      `all_notes` returned every row and `all_notes_safe` only Ana's. `security_invoker`
+      exists since Postgres 15. `SECURITY DEFINER` functions behave the same way: they run
+      with their owner's rights, so a function that reads a protected table must filter by
+      the caller itself.
+  - title: Setting the user safely with a connection pool
+    body: |-
+      Your server knows who is signed in; Postgres doesn't. The server passes the identity in
+      a setting, and policies read it. The trap is connection pooling. A plain `SET
+      app.user_id = 'ana'` lasts for the whole session, and a pooled connection's session
+      outlives the request. The next request that borrows it runs as Ana.
+
+      Set it transaction-locally instead, with `set_config(name, value, true)`, and do the
+      request's queries inside that transaction:
+
+      ```ts
+      import type { Pool, PoolClient } from 'pg';
+
+      // Runs work as one signed-in user. The setting is transaction-local (the `true`),
+      // so it vanishes at COMMIT and can't leak to the next request that borrows this connection.
+      export async function asUser<T>(
+        pool: Pool,
+        userId: string,
+        work: (client: PoolClient) => Promise<T>,
+      ): Promise<T> {
+        const client = await pool.connect();
+        try {
+          await client.query('BEGIN');
+          await client.query("SELECT set_config('app.user_id', $1, true)", [userId]);
+          const result = await work(client);
+          await client.query('COMMIT');
+          return result;
+        } catch (err) {
+          await client.query('ROLLBACK');
+          throw err;
+        } finally {
+          client.release();
+        }
+      }
+      ```
+
+      Run with `pg` against the notes table, `asUser(pool, 'ana', ...)` returned notes 1 and
+      3, `'ben'` returned note 2, and a query on the same connection afterwards saw no rows.
+      An insert as Ana with `owner = 'ben'` failed with `42501`.
+
+      One detail from that run: after a transaction-local setting ends, `current_setting(...,
+      true)` returns an empty string, not NULL. An empty string matches no owner either, so
+      the policy still denies. Take the user id only from your verified session, never from
+      a request parameter.
+  - title: The Supabase model underneath
+    body: |-
+      Supabase puts an API server in front of Postgres. For each request it verifies the JWT
+      from the client, switches to the role named in it (`anon` when signed out,
+      `authenticated` when signed in) for that transaction, and exposes the JWT's claims in a
+      transaction-local setting. `auth.uid()` reads the `sub` claim from there. It's the same
+      pattern as `asUser`, done for you.
+
+      To run the policies on plain Postgres, a stand-in for the auth schema is enough:
+
+      ```sql
+      CREATE ROLE anon;
+      CREATE ROLE authenticated;
+      CREATE SCHEMA auth;
+      GRANT USAGE ON SCHEMA auth TO anon, authenticated;
+      CREATE FUNCTION auth.uid() RETURNS uuid LANGUAGE sql STABLE AS $$
+        SELECT nullif(current_setting('request.jwt.claims', true)::jsonb ->> 'sub', '')::uuid
+      $$;
+
+      CREATE TABLE orders (
+        id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        owner_id uuid NOT NULL,
+        total_pence integer NOT NULL
+      );
+      CREATE INDEX orders_owner_id_idx ON orders (owner_id);
+      GRANT SELECT, INSERT ON orders TO anon, authenticated;
+      ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
+
+      CREATE POLICY read_own ON orders FOR SELECT TO authenticated
+        USING (owner_id = (SELECT auth.uid()));
+      CREATE POLICY insert_own ON orders FOR INSERT TO authenticated
+        WITH CHECK (owner_id = (SELECT auth.uid()));
+      ```
+
+      With `SET LOCAL ROLE authenticated` and the claims set to one user's id, the `SELECT`
+      returned only that user's order, and `anon` saw none.
+
+      Three details make these policies fast. `TO authenticated` means the policy isn't even
+      evaluated for `anon`. `(SELECT auth.uid())` becomes an `InitPlan` in `EXPLAIN`,
+      computed once per query instead of once per row. And the index on `owner_id` lets the
+      policy condition drive an index scan.
+
+      Supabase has two kinds of API key. The **publishable** key identifies your project and
+      obeys every policy, so it's safe in a browser. The **secret** key uses a role that
+      bypasses RLS and belongs only in server code and scheduled jobs. Older projects call
+      these the anon key and the service role key.
+  - title: What RLS doesn't hide
+    body: |-
+      RLS filters rows. It isn't a complete confidentiality boundary, and a reviewer should
+      know its gaps.
+
+      **Constraint errors reveal existence.** Ana can't see Ben's note 2, but inserting a note
+      with `id = 2` fails with `duplicate key value violates unique constraint`, which tells
+      her the row exists. The Postgres docs call this a covert channel. Use keys that carry
+      no meaning, such as generated ids or UUIDs, and don't let users choose them.
+
+      **Columns aren't covered.** A policy decides which rows, not which columns. To hide a
+      column, such as an internal note on an order, grant column privileges
+      (`GRANT SELECT (id, total_pence) ON orders TO authenticated`) or move it to a separate
+      table with its own policy.
+
+      **Cost is per row.** A policy with a subquery into a membership table runs that check
+      for every candidate row. Keep policy expressions simple, index what they compare, and
+      look at `EXPLAIN` for the queries that matter. A common pattern is a `SECURITY DEFINER`
+      function that returns the caller's organisation ids once, used as `org_id IN (SELECT
+      my_org_ids())`.
+
+      **Policies don't replace authorisation logic** that isn't about rows: "only admins may
+      refund", rate limits, and workflow rules still live in the server. RLS guarantees that
+      whatever the server or client asks for, it can't cross from one owner's rows to
+      another's.
+pitfalls:
+  - '**Testing policies as the table owner or a superuser.** Every test passes because policies are skipped. Run tests as the app''s role, or `FORCE ROW LEVEL SECURITY`.'
+  - '**Enabling RLS and shipping no policy.** Ordinary roles see nothing, the page is empty, and someone "fixes" it with the secret key. Write the policy in the same migration that enables RLS.'
+  - '**The secret key in client code.** It bypasses every policy for anyone who opens dev tools. Keep it on the server; fix access with a policy.'
+  - '**A session-level `SET` on a pooled connection.** The next request inherits the previous user. Use `set_config(..., true)` inside a transaction.'
+  - '**`USING` without thinking about `WITH CHECK` on updates.** With a loose or missing check, a user can move a row to another owner. Give update policies a `WITH CHECK` that pins the owner.'
+  - '**A view that silently bypasses policies.** It runs as its owner. Create views with `security_invoker = true`.'
+  - '**Bare `auth.uid()` on a big table.** It may be evaluated per row. Wrap it as `(select auth.uid())` and index the owner column.'
+interview:
+  - question: Why use row-level security when the API already checks ownership?
+    answer: >-
+      Defence in depth against the most common authorisation bug: one query that forgot the
+      ownership filter. Handler checks have to be right in every endpoint, every job and
+      every future query; one miss leaks data. A policy is enforced by Postgres on every
+      query against the table, whoever wrote it, so the miss becomes an empty result instead
+      of a breach. When clients query the database directly, as with Supabase, policies are
+      the only protection. The trade-offs: policies must be tested as the app's role, since
+      owners bypass them, they add per-row cost, and they don't cover column-level or
+      business rules, which stay in the server.
+  - question: How does your server tell Postgres who the current user is, given connection pooling?
+    answer: >-
+      Inside a transaction, with `set_config('app.user_id', $1, true)`, and policies read it
+      with `current_setting('app.user_id', true)`. The `true` makes the setting
+      transaction-local, so it disappears at `COMMIT` or `ROLLBACK`. A session-level `SET`
+      would survive on the pooled connection and the next request would run as the previous
+      user, and in PgBouncer transaction mode the session isn't even stable across
+      transactions. The id comes from the verified session, never from input. The app
+      connects as a role that doesn't own the tables, so policies can't be skipped. Supabase
+      does the same with the JWT claims and `SET LOCAL ROLE`.
+  - question: What's the difference between USING and WITH CHECK in a policy?
+    answer: >-
+      `USING` decides which existing rows a command can see or target; `WITH CHECK` decides
+      whether a new or modified row may be written. They fail differently: a row failing
+      `USING` is silently filtered, so an update of someone else's row affects zero rows,
+      while a row failing `WITH CHECK` raises an error. `SELECT` and `DELETE` use only
+      `USING`, `INSERT` only `WITH CHECK`, and `UPDATE` both, the first on the old row and
+      the second on the new one. Without a proper `WITH CHECK` on updates, a user could
+      reassign their row to another owner or organisation, so I always pin the owner there.
+  - question: In a Supabase app, what can go wrong with security, and how do you review for it?
+    answer: >-
+      The main risks are a table without RLS, a table with RLS but a policy that's too
+      loose, and the secret key reaching the browser. I check that every table in an exposed
+      schema has RLS enabled and policies per command, with `TO authenticated` where signed
+      out users shouldn't reach it, `WITH CHECK` pinning the owner on insert and update, and
+      `(select auth.uid())` with an index for speed. I search the client bundle for the
+      secret key, check that views use `security_invoker` and that `SECURITY DEFINER`
+      functions filter by the caller. Finally I test as `anon` and as two different users,
+      because a policy is only proven by a request that should fail.

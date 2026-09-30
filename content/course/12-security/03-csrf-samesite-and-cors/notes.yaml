@@ -1,0 +1,245 @@
+summary: >-
+  Cross-site request forgery abuses **ambient authority**: the browser attaches a site's
+  cookies to every request sent there, whichever page started it. A page on another site
+  can therefore make a signed-in visitor's browser post a form, and the server sees a
+  genuine session. The attacker can't read the answer. They don't need to: the transfer, the
+  cancelled booking or the changed email address has already happened.
+
+
+  The modern defence is layered. `SameSite` cookies stop most cross-site requests carrying
+  the session at all. A CSRF token, either stored in the session or signed and bound to it,
+  proves a request came from your own pages. Fetch Metadata headers such as
+  `Sec-Fetch-Site` let the server see, in one header, whether a request started on another
+  site, and refuse it before any route code runs. An `Origin` check covers browsers that
+  don't send them.
+
+
+  You need CSRF protection whenever a browser authenticates automatically: cookies, HTTP
+  basic auth, client certificates. An API that only accepts a token the page adds to an
+  `Authorization` header isn't open to classic CSRF, because no browser adds that header
+  on its own. CORS, the next lesson, controls who may read responses; it does nothing to
+  stop a forged request arriving.
+remember:
+  - CSRF works because browsers attach cookies to requests another site starts, so any cookie-authenticated request that changes state needs a defence.
+  - '`SameSite=Lax` still sends the cookie on top-level GET navigations, so state changes belong only on POST, PUT, PATCH and DELETE.'
+  - SameSite protects against other sites, not sibling subdomains, so XSS or a takeover on any subdomain of the same site bypasses it.
+  - A CSRF token must be unpredictable, tied to the user's session and compared in constant time, and the signed double-submit cookie is the stateless way to do that.
+  - '`Sec-Fetch-Site` tells the server whether a request came from the same origin, the same site, another site or the user directly, and the browser sets it so pages can''t forge it.'
+  - A Fetch Metadata policy refuses cross-site requests except top-level GET navigations, and falls back to token and `Origin` checks when the header is missing.
+  - An API authenticated only by an `Authorization` header set in code isn't exposed to classic CSRF, because browsers never add that header automatically.
+  - Give session cookies the `__Host-` prefix, which forces `Secure`, `Path=/` and no `Domain`, so a subdomain can't plant or overwrite them.
+sections:
+  - title: Where SameSite stops, and what gets past it
+    body: |-
+      `SameSite` is decided by **site**, not origin. That one fact explains most of its
+      gaps.
+
+      **Sibling subdomains are same-site.** A request from `blog.shop.example` to
+      `app.shop.example` is same-site, so even a `Strict` cookie rides along. If an attacker
+      finds XSS on the blog, or takes over a forgotten subdomain whose DNS still points at a
+      deleted cloud resource, SameSite offers no protection for the app. Tokens and
+      Fetch Metadata still do, because the request is cross-origin.
+
+      **Lax allows top-level GET navigations.** Any GET route that changes state is open,
+      and so is a framework feature that lets a GET pretend to be a POST, such as a
+      `_method=POST` query parameter. Turn method override off for GET, or accept it only
+      from a form body.
+
+      **Cookies without SameSite are browser-dependent.** Chromium treats them as `Lax`.
+      Other engines have taken different paths, so a missing attribute is a behaviour you
+      don't control. Set it explicitly on every cookie.
+
+      **Scheme counts.** Chromium treats `http://shop.example` and `https://shop.example` as
+      different sites for SameSite, which stops a network attacker injecting a request from
+      the plain HTTP version of your site. HSTS closes that route in every browser.
+
+      **Some flows need cross-site cookies.** A payment provider that posts back to your
+      site, a single sign-on flow using a form POST, or a widget embedded on customers' sites
+      all break under `Lax` or `Strict`. They need `SameSite=None; Secure`, and then CSRF
+      protection rests entirely on tokens and origin checks. Keep such cookies separate from
+      the main session where you can.
+
+      A common production recipe is two cookies: a `Lax` session cookie so links into the
+      site arrive signed in, and actions that change state checked by a token as well. Using
+      `Strict` for the session is safer but means a visitor clicking a link from their email
+      lands signed out, which many products won't accept.
+  - title: CSRF tokens done properly
+    body: |-
+      There are two sound token designs. The **synchroniser token** stores a random value in
+      the server-side session and embeds it in forms. The **signed double-submit cookie**
+      needs no server state: the token is a random value plus an HMAC over the session id and
+      that value, sent both as a cookie and in the form or a header. OWASP recommends the
+      signed version over naive double-submit, where the cookie and field only have to
+      match. A naive token can be planted: an attacker who can set a cookie for your site,
+      from a sibling subdomain for example, sets both halves to a value they know.
+
+      ```ts
+      import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
+
+      const SECRET = randomBytes(32); // in production, from your secret store
+
+      // Token = random value + HMAC over session id and value.
+      // Binding to the session stops an attacker planting a token of their own.
+      export function issueToken(sessionId: string): string {
+        const random = randomBytes(16).toString('base64url');
+        const mac = createHmac('sha256', SECRET).update(`${sessionId}!${random}`).digest('base64url');
+        return `${random}.${mac}`;
+      }
+
+      export function verifyToken(sessionId: string, token: string | undefined): boolean {
+        if (!token) return false;
+        const [random, mac] = token.split('.');
+        if (!random || !mac) return false;
+        const expected = createHmac('sha256', SECRET).update(`${sessionId}!${random}`).digest();
+        const given = Buffer.from(mac, 'base64url');
+        // timingSafeEqual throws on different lengths, so compare lengths first.
+        return given.length === expected.length && timingSafeEqual(given, expected);
+      }
+
+      const token = issueToken('sess-A');
+      console.log(verifyToken('sess-A', token)); // true
+      console.log(verifyToken('sess-B', token)); // false: another session's token
+      console.log(verifyToken('sess-A', token.slice(0, -2) + 'xx')); // false: tampered
+      console.log(verifyToken('sess-A', undefined)); // false
+      ```
+
+      Three details carry the security. `timingSafeEqual` takes the same time whatever the
+      input, so response times don't leak how much of a guess was right. The HMAC binds the
+      token to one session, so a token copied from the attacker's own account is useless in
+      the victim's. And the token never goes in a URL, where it would leak through logs,
+      history and the `Referer` header.
+
+      Single-page apps usually read the token from a cookie or a meta tag and send it in a
+      custom header such as `X-CSRF-Token`. That adds a second barrier: a cross-origin
+      request with a custom header needs a CORS preflight, which your API refuses for
+      origins it doesn't trust. Rotate the token when the user signs in, so a token issued
+      before login can't be carried across.
+  - title: Fetch Metadata, one header that names the caller
+    body: |-
+      Modern browsers attach **Fetch Metadata** headers to every request, and pages can't
+      set or change them. The one that matters most for CSRF is `Sec-Fetch-Site`:
+
+      ```text
+      same-origin   started by a page on exactly your origin
+      same-site     started by another origin on your site, such as a sibling subdomain
+      cross-site    started by a page on another site
+      none          started by the user: typed address, bookmark, opened from another app
+      ```
+
+      `Sec-Fetch-Mode` says what kind of request it is (`navigate`, `cors`, `no-cors`,
+      `same-origin`, `websocket`), `Sec-Fetch-Dest` where the response goes (`document`,
+      `image`, `script`, `empty` for `fetch`), and `Sec-Fetch-User: ?1` marks a navigation
+      the user triggered. A server can combine them into a **resource isolation policy**
+      that runs before any route:
+
+      ```ts
+      type Headers = Record<string, string | undefined>;
+
+      export function allowRequest(method: string, h: Headers): boolean {
+        const site = h['sec-fetch-site'];
+        if (site === undefined) return true; // older browser: rely on tokens and Origin checks
+        if (site === 'same-origin' || site === 'same-site' || site === 'none') return true;
+        // Cross-site: allow plain navigations, so links to the site keep working.
+        const isNavigation = h['sec-fetch-mode'] === 'navigate' && method === 'GET';
+        const dest = h['sec-fetch-dest'];
+        return isNavigation && dest !== 'object' && dest !== 'embed';
+      }
+
+      const forged = { 'sec-fetch-site': 'cross-site', 'sec-fetch-mode': 'navigate', 'sec-fetch-dest': 'document' };
+      console.log(allowRequest('POST', forged)); // false: a forged form on another site
+      console.log(allowRequest('GET', forged)); // true: a link from a search engine
+      console.log(allowRequest('POST', { 'sec-fetch-site': 'same-origin' })); // true
+      ```
+
+      OWASP's CSRF cheat sheet now treats Fetch Metadata as a primary defence for modern
+      browsers, with a fallback to origin checks required for those that don't send the
+      headers. If you have no sibling subdomains that need to post to you, drop
+      `same-site` from the allowed values: that closes the subdomain gap from the first
+      section too. Endpoints meant to be called from other sites, such as a webhook or a
+      public API, are exempt by design and authenticate some other way.
+
+      For the fallback, check `Origin` on requests that change state. Treat a missing or
+      `null` origin as untrusted: browsers send `Origin: null` from sandboxed iframes, local
+      files and some cross-origin redirects, and an attacker can arrange all three.
+  - title: Which apps need what
+    body: |-
+      CSRF defence depends on how the browser proves who the user is. Match the defence to
+      that, rather than adding every mechanism everywhere.
+
+      ```text
+      cookie session, server-rendered forms   SameSite=Lax + token in each form + Fetch Metadata
+      cookie session, SPA on the same site    SameSite=Lax + token in a custom header + Fetch Metadata
+      token in Authorization header           no classic CSRF; protect the token from XSS instead
+      cookie that must be cross-site          SameSite=None; Secure + token + strict Origin allow-list
+      ```
+
+      The `Authorization` header case needs care. It's safe from CSRF because JavaScript has
+      to add the header, and only your own pages can read the token to do so. But if the
+      token lives in `localStorage`, any XSS can read it and use it from anywhere, for as
+      long as it's valid. An `HttpOnly` cookie keeps the token away from script at the price
+      of needing CSRF defence again. Both designs are defensible; what isn't defensible is
+      picking one without knowing which risk you took on.
+
+      Two cases catch teams out. **Login CSRF**: an attacker submits your sign-in form with
+      their own credentials, so the victim ends up signed into the attacker's account and
+      saves their card or search history there. The login form needs a token too, tied to a
+      pre-session. **JSON endpoints**: a cross-site form can't send
+      `Content-Type: application/json`, and a `fetch` with that type needs a preflight. That
+      helps, but it's a side effect, not a control: an endpoint that also accepts
+      `text/plain` or form bodies, or parses JSON whatever the content type says, is open.
+      Check the content type strictly, and keep the token.
+
+      Frameworks bundle most of this. Use the framework's own protection, check it covers
+      every method that changes state, and test it: a forged POST from another origin in an
+      end-to-end test should get a `403`.
+pitfalls:
+  - '**Changing state on GET.** A "quick action" link that deletes or pays works under `SameSite=Lax`, because a top-level GET carries the cookie. Make every state change a POST, PUT, PATCH or DELETE, and keep GET safe.'
+  - '**Naive double-submit tokens.** A cookie and a form field that only have to match can both be set by anyone who can write a cookie for your site. Sign the token with a server secret and bind it to the session.'
+  - '**Comparing tokens with `===`.** A plain comparison can return faster the earlier it finds a difference, which leaks the token a character at a time in theory. Use `crypto.timingSafeEqual` on equal-length buffers.'
+  - '**Trusting every subdomain because SameSite is on.** Sibling subdomains are the same site, so one vulnerable marketing page or dangling DNS record reaches your app with cookies attached. Use tokens or Fetch Metadata, which see the different origin.'
+  - '**Accepting `Origin: null`.** It looks like "no origin, probably fine", but sandboxed iframes send it on purpose. Refuse state changes from a `null` or missing origin unless a valid token is present.'
+  - '**Assuming CORS blocks forged requests.** CORS decides who reads a response. The forged request still arrives and runs. Defend writes with SameSite, tokens and Fetch Metadata.'
+interview:
+  - question: How would you protect a cookie-based web app against CSRF today?
+    answer: >-
+      With layers, each covering another's gap. The session cookie is `__Host-` prefixed,
+      `Secure`, `HttpOnly` and `SameSite=Lax`, which stops most cross-site requests carrying
+      it. Every state change uses a non-GET method, because Lax allows top-level GETs. A
+      middleware reads `Sec-Fetch-Site` and refuses cross-site requests that aren't top-level
+      GET navigations, falling back to an `Origin` check when the header is missing. And the
+      framework's CSRF token, signed and bound to the session, goes in every form or a custom
+      header, compared in constant time. Endpoints that other sites legitimately call, like
+      webhooks, are exempt and verify signatures instead. The trade-off is complexity, so I
+      use the framework's built-in protection rather than writing my own.
+  - question: Isn't SameSite=Lax enough on its own?
+    answer: >-
+      It's a strong default, but not enough on its own. First, Lax still sends the cookie on
+      top-level GET navigations, so any GET that changes state, or a method-override feature,
+      is exploitable. Second, SameSite works by site, so every sibling subdomain counts as
+      same-site: XSS on the blog subdomain or a subdomain takeover gets cookies attached even
+      under `Strict`. Third, behaviour for cookies without the attribute varies by browser,
+      and some flows force `SameSite=None`, such as payment callbacks. A token or a Fetch
+      Metadata check covers all three, because they look at the actual origin of the request.
+      For a low-risk internal tool, Lax plus POST-only changes may be an acceptable,
+      documented risk.
+  - question: Does a single-page app that sends a JWT in the Authorization header need CSRF protection?
+    answer: >-
+      Not against classic CSRF, because the browser never attaches that header by itself.
+      Only script on a page that can read the token can add it, and the same-origin policy
+      keeps other sites from reading it. The trade-off moves to XSS. If the token sits in
+      `localStorage`, one XSS bug lets an attacker read it and replay it from their own
+      machine until it expires. Storing it in an `HttpOnly` cookie hides it from script,
+      but then the browser sends it automatically, and you need CSRF defences again. I'd
+      choose based on the threat model, and in either case keep tokens short-lived and invest
+      in XSS prevention and a strict CSP.
+  - question: What are Fetch Metadata headers, and how would you use them?
+    answer: >-
+      They're request headers the browser adds and pages can't forge, describing where a
+      request came from. `Sec-Fetch-Site` says `same-origin`, `same-site`, `cross-site` or
+      `none`; `Sec-Fetch-Mode` and `Sec-Fetch-Dest` say whether it's a navigation, a `fetch` or
+      an image load. I'd add a resource isolation middleware: allow same-origin and
+      user-initiated requests, allow cross-site top-level GET navigations so links work, and
+      refuse everything else cross-site. That blocks CSRF and cross-site leaks through script
+      or image tags before any route runs, with one header. Browsers that don't send it fall
+      through to token and `Origin` checks. The cost is maintaining exemptions for
+      endpoints other sites are meant to call.

@@ -1,0 +1,270 @@
+id: sysdesign.replication
+title: Replication
+objective: Scale reads with replicas, let users read their own writes despite replica lag, and fail over without split brain.
+level: advanced
+minutes: 10
+concepts: [sysdesign.leader-follower, sysdesign.replica-lag, sysdesign.failover]
+prerequisites: [sysdesign.sql-or-nosql, db.storage-and-pooling, cloud.backups]
+opening:
+  text: >-
+    You'll run a database on several machines and know what each copy can promise. It's how
+    you survive a dead server without losing the orders it took a moment ago.
+
+steps:
+  - type: prose
+    id: name-leader-follower
+    body: |-
+      You met read replicas when scaling one app in the Cloud chapter. The pattern is
+      **leader and followers**. One server, the leader or **primary**, takes every write. It
+      streams each change to followers, or **replicas**, which serve reads.
+
+      Streaming can be **synchronous**, where a commit waits for a follower to confirm, or
+      **asynchronous**, where it doesn't. Async is faster, and followers fall behind.
+
+  - type: predict-output
+    id: predict-replica-behind
+    concept: sysdesign.leader-follower
+    difficulty: 2
+    language: sql
+    code: |
+      -- on the primary
+      INSERT INTO orders VALUES (1, 'kettle');
+
+      -- on the replica, straight after
+      SELECT count(*) FROM orders;
+    question: This replica applies changes 5 seconds late, a delay we set to make lag visible. What does the count return?
+    choices:
+      - text: '`0`'
+        correct: true
+        feedback: >-
+          Right. We ran it on PostgreSQL 17. Six seconds later it said 1.
+      - text: '`1`'
+        feedback: >-
+          The primary has the row. The replica hasn't applied it yet, so it can't see it.
+      - text: An error, replicas refuse reads
+        feedback: >-
+          Replicas serve reads. They refuse writes: ours answered "cannot execute INSERT in a read-only transaction".
+
+  - type: prose
+    id: name-read-your-writes
+    body: |-
+      That gap is **replica lag**: usually milliseconds, sometimes seconds under load.
+
+      Here's where users feel it. Someone renames their profile, the page reloads from a
+      replica, and the old name comes back. The fix is **read-your-writes**: for a short
+      while after a user writes, send that user's reads to the primary.
+
+  - type: code-challenge
+    id: write-pick-connection
+    concept: sysdesign.replica-lag
+    difficulty: 2
+    language: ts
+    prompt: >-
+      Write `pickConnection(lastWriteAt, now, lagMs)`. Times are in milliseconds.
+      `lastWriteAt` is when this user last wrote, or `undefined` if they never did.
+
+
+      Return `'primary'` while less than `lagMs` has passed since their write. Otherwise
+      return `'replica'`.
+
+
+      A write 100 ms ago with a lag of 2,000 ms gives `'primary'`.
+    hints:
+      - A user who never wrote has nothing to miss.
+      - Compare the time since the write with the lag.
+      - 'Start with `if (lastWriteAt === undefined) return ''replica'';`'
+
+  - type: ai-review
+    id: review-invented-lag-function
+    concept: sysdesign.replica-lag
+    difficulty: 3
+    language: ts
+    request: After a user edits their profile, read it from the primary until the replica catches up.
+    flawClass: hallucinated-api
+    code: |
+      async function readProfile(userId: string, justEdited: boolean) {
+        const lag = await replica.query('SELECT pg_replication_lag() AS seconds');
+        const useReplica = !justEdited || lag.rows[0].seconds === 0;
+        const db = useReplica ? replica : primary;
+        return db.query('SELECT * FROM profiles WHERE id = $1', [userId]);
+      }
+    prompt: >-
+      An assistant wrote this. Its unit test mocked the database, so it passed. Against real
+      Postgres every profile read fails. Tap the line at fault.
+    lines: [2]
+    reasons:
+      - text: '`pg_replication_lag()` doesn''t exist in Postgres'
+        correct: true
+        feedback: >-
+          Right. Ours said "function pg_replication_lag() does not exist".
+      - text: It should read everything from the primary
+        feedback: >-
+          That throws away the replica. Reading your own write from the primary is the right idea.
+      - text: Lag of exactly zero never happens
+        feedback: >-
+          True, it's a weak test. But the call fails before any comparison runs.
+    fix: |
+      const lag = await replica.query(
+        'SELECT extract(epoch FROM now() - pg_last_xact_replay_timestamp()) AS seconds',
+      );
+
+  - type: prose
+    id: name-failover
+    body: |-
+      When the leader dies, a follower is promoted. That's **failover**. With async streaming,
+      writes the old leader confirmed but never shipped are gone.
+
+      Worse, the old leader may come back still thinking it leads. Two nodes then take
+      writes, which is **split brain**. So real setups **fence** the old leader: they make
+      sure it can't accept writes, for example by cutting it off the network.
+
+  - type: predict-output
+    id: predict-split-brain
+    concept: sysdesign.failover
+    difficulty: 4
+    language: sql
+    code: |
+      -- the replica is promoted, and the old primary keeps running
+      SELECT pg_promote();
+
+      -- one app instance writes to the new primary
+      INSERT INTO orders VALUES (3, 'lamp');
+      -- another still writes to the old one
+      INSERT INTO orders VALUES (3, 'rug');
+    question: What does each server now hold as order 3?
+    choices:
+      - text: A lamp on one, a rug on the other
+        correct: true
+        feedback: >-
+          Yes, that's what we saw. Two histories, and no automatic way to merge them.
+      - text: A lamp on both
+        feedback: >-
+          After promotion they no longer replicate. The old primary never hears of the lamp.
+      - text: The second insert fails with a duplicate key
+        feedback: >-
+          Each server checks only its own table. Neither knows the other has order 3.
+
+  - type: ai-review
+    id: review-hardcoded-primary
+    concept: sysdesign.failover
+    difficulty: 3
+    language: ts
+    request: Connect the orders service to the primary database for writes.
+    flawClass: edge-case
+    code: |
+      import { Pool } from 'pg';
+
+      const primary = new Pool({ host: '10.0.4.17', database: 'orders' });
+
+      export async function saveOrder(id: number, item: string) {
+        await primary.query('INSERT INTO orders VALUES ($1, $2)', [id, item]);
+      }
+    prompt: >-
+      An assistant wrote this. It passed every test. After the first failover, orders kept
+      arriving at the old primary, which had come back. Tap the line at fault.
+    lines: [3]
+    reasons:
+      - text: It pins writes to one machine's address
+        correct: true
+        feedback: >-
+          Yes. After failover the primary moves. Use a name that follows the current primary.
+      - text: The insert should name its columns
+        feedback: >-
+          Good practice, but it doesn't send writes to the wrong server.
+      - text: A pool can't be used for writes
+        feedback: >-
+          Pools serve writes fine. The problem is which server the pool points at.
+    fix: |
+      const primary = new Pool({ host: 'orders-primary.internal', database: 'orders' });
+      // the name is moved to the new primary on failover, and the old one is fenced
+
+  - type: explain-back
+    id: explain-async-failover-loss
+    concept: sysdesign.failover
+    difficulty: 4
+    prompt: >-
+      With asynchronous replication, a failover can lose orders the customer was told were
+      saved. Why?
+    rubric:
+      - With async replication the primary confirms a commit before any follower has it.
+      - Writes still in flight when the primary dies never reach the follower.
+      - The promoted follower starts from its own, older state, so those writes are gone.
+    modelAnswer: >-
+      An asynchronous primary says "saved" as soon as the order is on its own disk. It ships
+      the change to followers a moment later. If it dies in that moment, the follower never
+      gets the order. We promote that follower, and it carries on from what it had. The
+      customer's confirmed order isn't there. Synchronous replication closes the gap,
+      at the cost of slower commits.
+
+recap:
+  - Send writes to one leader and spread reads over followers.
+  - Expect replica lag, and read your own writes from the leader.
+  - Point writes at a name that follows the primary, and fence the old leader on failover.
+recall:
+  - id: card-sync-vs-async
+    concept: sysdesign.leader-follower
+    front: What does synchronous replication buy, and what does it cost?
+    back: >-
+      A commit survives losing the primary, because a follower confirmed it. Each commit waits
+      for that round trip.
+  - id: card-read-your-writes
+    concept: sysdesign.replica-lag
+    front: How do you stop a user missing their own change because of replica lag?
+    back: >-
+      Send their reads to the primary for a short time after they write.
+  - id: card-split-brain
+    concept: sysdesign.failover
+    front: What is split brain?
+    back: >-
+      After a failover, two nodes both believe they lead and both accept writes, so the data
+      diverges.
+  - id: card-async-loss
+    concept: sysdesign.failover
+    front: Why can a failover lose writes the customer was told were saved?
+    back: >-
+      With async replication the primary confirms before any follower has the change, so a
+      crash in that gap loses it.
+
+references:
+  - kind: docs
+    title: Log-Shipping Standby Servers
+    authors: The PostgreSQL Global Development Group
+    venue: PostgreSQL Documentation
+    url: https://www.postgresql.org/docs/current/warm-standby.html
+    note: Streaming replication, synchronous standbys and failover in Postgres.
+    primary: true
+    verified: true
+  - kind: paper
+    title: "Dynamo: Amazon's Highly Available Key-value Store"
+    authors: Giuseppe DeCandia et al.
+    year: 2007
+    venue: "SOSP '07, ACM SIGOPS Operating Systems Review 41(6)"
+    url: https://doi.org/10.1145/1323293.1294281
+    note: Leaderless replication with quorums, for the deep dive.
+    primary: true
+    verified: true
+  - kind: docs
+    title: System Administration Functions
+    authors: The PostgreSQL Global Development Group
+    venue: PostgreSQL Documentation
+    url: https://www.postgresql.org/docs/current/functions-admin.html
+    note: pg_last_xact_replay_timestamp, pg_promote and the other recovery functions.
+    verified: true
+
+deepDive: >-
+  The runs used PostgreSQL 17.11 in Docker: a primary, and a streaming replica made with
+  `pg_basebackup -R`, with `recovery_min_apply_delay = '5s'` added to make lag visible.
+  After `pg_promote()` on the replica, both servers accepted a different order 3.
+
+
+  `now() - pg_last_xact_replay_timestamp()` is a rough measure. When the primary is idle it
+  keeps growing, since no new change arrives to replay. Ours read 7.2 seconds with nothing
+  to catch up on. On the primary, `pg_stat_replication` shows each standby's `replay_lag`,
+  which is better for alerts.
+
+
+  Leaderless stores take another route, **quorums**. Keep N copies, write to W of them and
+  read from R. If W plus R is more than N, every read overlaps the latest write. Quorums have
+  their own edge cases: sloppy quorums, clock-based
+  last-write-wins that silently drops writes, and concurrent writes that need version
+  vectors. The Dynamo paper covers them.

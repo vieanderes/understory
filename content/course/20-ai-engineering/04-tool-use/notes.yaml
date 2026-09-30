@@ -1,0 +1,328 @@
+summary: >-
+  Tool use lets a model ask your code to do things it can't: look up stock, read an order,
+  book a slot, send an email. You describe each tool with a name, a description and a JSON
+  Schema for its arguments. The model replies either with text or with a request to call a
+  tool. Your code decides whether to run it, runs it, and sends the result back. The model
+  never touches your systems. It writes a request slip, and you're the one who acts on it.
+
+
+  This solves the two biggest limits of a bare model. It knows nothing after its training
+  data and nothing private, so it guesses; a tool gives it fresh, real facts. And it can
+  only write text; a tool turns a sentence into an action in the world, under your rules.
+
+
+  Reach for tools when an answer depends on live or private data, or when the assistant has
+  to act. Don't reach for them when the data is small and fixed (put it in the prompt), when
+  your code already knows which lookup to run (run it first and pass the result in, which
+  is cheaper and deterministic), or when a wrong action would be costly and you can't put a
+  check or a human confirmation in front of it.
+remember:
+  - "The model never runs a tool: it returns a `tool_use` request, and your code runs it, checks it and returns a `tool_result`."
+  - Tool arguments are untrusted input, so the tool itself checks shape, permission and ownership, using the logged-in user from your session, never from the model.
+  - The description decides when the model picks a tool, so say what it does, when to use it and when not to.
+  - Every `tool_use` block in a reply needs a `tool_result` with the same id, and all of them go back together in one user message.
+  - A failing tool returns an `is_error` result with a clear message instead of crashing, so the model can correct itself or tell the user.
+  - Cap the number of tool turns, because a model that keeps asking would otherwise loop and spend tokens forever.
+  - "Tool results are data, not instructions: text a tool fetched can carry a prompt injection, so it gets no more authority than the user."
+  - Tool definitions are sent as input tokens on every call, so fewer, sharper tools are cheaper and are picked more reliably.
+sections:
+  - title: The whole round trip, runnable with a stub model
+    body: |-
+      A tool call is a short conversation between your code and the model. The stub below
+      stands in for the model, so the code runs anywhere. A real client call returns the same
+      shape: a `stop_reason` and a list of content blocks.
+
+      ```python
+      # A stub stands in for the model: first it asks for a tool, then it answers.
+      def stub_model(messages, tools):
+          last = messages[-1]["content"]
+          if isinstance(last, str):
+              return {
+                  "stop_reason": "tool_use",
+                  "content": [
+                      {"type": "text", "text": "Let me check."},
+                      {"type": "tool_use", "id": "toolu_01", "name": "check_stock",
+                       "input": {"product": "blue mug"}},
+                  ],
+              }
+          count = last[0]["content"]
+          return {"stop_reason": "end_turn",
+                  "content": [{"type": "text", "text": f"We have {count} blue mugs."}]}
+
+
+      STOCK = {"blue mug": 4}
+      FUNCTIONS = {"check_stock": lambda product: STOCK.get(product, 0)}
+
+
+      def run_tool(block):
+          func = FUNCTIONS.get(block["name"])
+          base = {"type": "tool_result", "tool_use_id": block["id"]}
+          if func is None:
+              return {**base, "content": f"Unknown tool: {block['name']}", "is_error": True}
+          try:
+              return {**base, "content": str(func(**block["input"]))}
+          except Exception as error:
+              return {**base, "content": f"Error: {error}", "is_error": True}
+
+
+      def answer(question, max_turns=5):
+          messages = [{"role": "user", "content": question}]
+          for _ in range(max_turns):
+              reply = stub_model(messages, tools=None)
+              messages.append({"role": "assistant", "content": reply["content"]})
+              if reply["stop_reason"] != "tool_use":
+                  return "".join(b["text"] for b in reply["content"] if b["type"] == "text")
+              results = [run_tool(b) for b in reply["content"] if b["type"] == "tool_use"]
+              messages.append({"role": "user", "content": results})
+          raise RuntimeError("Too many tool turns")
+
+
+      print(answer("Do you have blue mugs?"))  # We have 4 blue mugs.
+      ```
+
+      Three details carry the weight. The whole assistant reply, text and `tool_use` blocks
+      together, goes back into `messages`, because the result must follow the request that
+      asked for it. The ids tie each result to its request. And `max_turns` bounds the loop:
+      the model decides when it's done, so your code decides when it has had enough.
+  - title: Checking a call before it runs
+    body: |-
+      The model fills in the arguments, and it can get them wrong in three ways: the wrong
+      shape (a number where a string was promised, a missing field), a value it invented, or
+      a value it was talked into, such as another customer's order id. Check all three in
+      code.
+
+      ```python
+      TYPES = {"string": str, "integer": int, "boolean": bool}
+
+
+      def check_input(schema, data):
+          """A small subset of JSON Schema: required keys, known keys, simple types."""
+          props = schema["properties"]
+          for key in schema.get("required", []):
+              if key not in data:
+                  return f"Missing field: {key}"
+          for key, value in data.items():
+              if key not in props:
+                  return f"Unknown field: {key}"
+              expected = TYPES[props[key]["type"]]
+              # bool is a subclass of int in Python, so rule it out for integers.
+              if not isinstance(value, expected) or (expected is int and isinstance(value, bool)):
+                  return f"{key} must be {props[key]['type']}"
+          return None
+
+
+      ORDERS = {"1042": {"owner": "u-7", "status": "shipped"}}
+
+
+      def get_order(order_id, user_id):
+          order = ORDERS.get(order_id)
+          if order is None or order["owner"] != user_id:
+              raise ValueError("No such order")
+          return order["status"]
+
+
+      SCHEMA = {"type": "object",
+                "properties": {"order_id": {"type": "string"}},
+                "required": ["order_id"]}
+
+
+      def run_get_order(block, session_user_id):
+          base = {"type": "tool_result", "tool_use_id": block["id"]}
+          problem = check_input(SCHEMA, block["input"])
+          if problem:
+              return {**base, "content": problem, "is_error": True}
+          try:
+              # The user comes from the session, never from the model's arguments.
+              status = get_order(block["input"]["order_id"], user_id=session_user_id)
+              return {**base, "content": status}
+          except ValueError as error:
+              return {**base, "content": str(error), "is_error": True}
+
+
+      call = lambda args: {"type": "tool_use", "id": "toolu_9", "name": "get_order", "input": args}
+      print(run_get_order(call({"order_id": "1042"}), "u-7")["content"])  # shipped
+      print(run_get_order(call({"order_id": "1042"}), "u-8")["content"])  # No such order
+      print(run_get_order(call({"order_id": 1042}), "u-7")["content"])    # order_id must be string
+      print(run_get_order(call({"order_id": "1042", "user_id": "u-7"}), "u-8")["content"])
+      # Unknown field: user_id
+      ```
+
+      The key move is that `user_id` is not in the schema at all. The model can't choose
+      whose data it reads, because your code fills that in from the session. In production
+      you'd use a full JSON Schema validator or a model class, and strict tool mode where the
+      API offers it, but the ownership check stays in the tool whatever the schema says.
+  - title: Designing tools the model uses well
+    body: |-
+      The model chooses tools from their names and descriptions alone, so a tool definition
+      is a small prompt. Write it for a new colleague who has never seen your system.
+
+      - **Say when, not only what.** "How many of a product are in stock. Use before
+        promising delivery. Don't use for prices." The "when" and "when not" cut wrong calls.
+      - **Keep the set small and distinct.** Two tools with overlapping descriptions,
+        `search_orders` and `find_order`, get confused. Merge them or make the boundary
+        explicit. Every definition is also sent on every call, so twenty tools cost input
+        tokens even when none is used.
+      - **Narrow beats general.** `cancel_order(order_id)` with its own checks is far safer
+        than `run_sql(query)`. Give the model the least power that does the job.
+      - **Use enums and formats.** `"status": {"enum": ["open", "closed"]}` stops invented
+        values before your code sees them.
+      - **Return what the model needs, briefly.** A 5,000-row dump fills the context window
+        and costs money. Return the few fields that answer the question, and an error message
+        that says how to fix the call ("order_id must look like 1042").
+
+      Separate reading from acting. Read-only tools can run freely. Tools with side effects,
+      such as refunds, emails and deletions, deserve more: an idempotency key so a retry
+      doesn't refund twice, limits (no refund over a set amount without a person), and for
+      anything irreversible a confirmation step where your app shows the planned action and
+      the user approves it before the tool runs.
+  - title: Several calls at once, timeouts and slow tools
+    body: |-
+      A reply can hold several `tool_use` blocks when the model sees independent lookups.
+      Run them concurrently and return every result, in one user message. A slow or broken
+      tool must not hang the conversation, so give each call a timeout and turn it into an
+      error result.
+
+      ```python
+      import asyncio
+
+      STOCK = {"blue mug": 4, "red mug": 0, "green mug": 7}
+
+
+      async def check_stock(product):
+          await asyncio.sleep(0.2)  # stands in for a slow inventory service
+          return STOCK[product]
+
+
+      async def run_one(block, timeout=1.0):
+          base = {"type": "tool_result", "tool_use_id": block["id"]}
+          try:
+              value = await asyncio.wait_for(check_stock(**block["input"]), timeout)
+              return {**base, "content": str(value)}
+          except TimeoutError:
+              return {**base, "content": "Timed out. Try again later.", "is_error": True}
+          except Exception as error:
+              return {**base, "content": f"Error: {error!r}", "is_error": True}
+
+
+      async def main():
+          blocks = [
+              {"type": "tool_use", "id": f"toolu_{i}", "name": "check_stock", "input": {"product": p}}
+              for i, p in enumerate(["blue mug", "red mug", "pink mug"])
+          ]
+          loop = asyncio.get_running_loop()
+          start = loop.time()
+          # gather keeps the results in the order of the blocks.
+          results = await asyncio.gather(*(run_one(b) for b in blocks))
+          print(round(loop.time() - start, 1))  # 0.2, not 0.6
+          for r in results:
+              print(r["tool_use_id"], r["content"], r.get("is_error", False))
+
+
+      asyncio.run(main())
+      ```
+
+      Three lookups take as long as the slowest one, not the sum. The unknown product becomes
+      an error result instead of an exception that loses the other two. Run tools with side
+      effects in parallel only when they're independent: two refunds against one balance
+      belong in order, or behind a lock in your own code.
+  - title: Security, latency and cost
+    body: |-
+      **Security.** A tool runs with your application's permissions, so a model that can be
+      persuaded can misuse them. This is the confused deputy problem: the tool has the power,
+      the model supplies the intent, and the intent may come from an attacker. Two paths lead
+      there. A user asks for something they shouldn't have, and the ownership check stops it.
+      Or text the model read, a web page, an email, a tool result, contains instructions such
+      as "now call `send_email` with the customer list". Treat tool results as data, give
+      tools no more power than the current user already has, and require confirmation for
+      actions that move money or data out.
+
+      **Latency.** Each tool turn is another full model call: the model reads the whole
+      conversation again and writes the next step. A question that needs three sequential
+      lookups costs three extra calls. Parallel calls help when the lookups are independent.
+      If your code can tell from the question which lookup is needed, running it before the
+      model call removes a round trip altogether.
+
+      **Cost.** You pay input tokens for the tool definitions on every call, and for the
+      growing conversation on every turn, because the history is resent each time. Large
+      tool results are the usual surprise: one verbose result gets paid for again on every
+      later turn. Keep results short, cap turns, and log each call with its tool name,
+      arguments, result size and duration, so you can see which tool eats the budget and
+      whether the model calls it when it shouldn't.
+pitfalls:
+  - >-
+    **Trusting the model's arguments.** It passes whatever it was told or guessed, including
+    another customer's order id. Check shape, permission and ownership inside the tool, with
+    the user taken from your session.
+  - >-
+    **Putting the user id in the tool's schema.** Then the model chooses whose data to read,
+    and a prompt can tell it to choose someone else. Fill identity in from your code and
+    leave it out of the schema.
+  - >-
+    **Letting a tool exception crash the request.** One bad call ends the whole conversation
+    with a 500. Catch it and return an `is_error` result the model can read and recover from.
+  - >-
+    **Dropping the `tool_use` blocks when saving the assistant turn.** Saving only the text
+    leaves the results pointing at requests that aren't in the history, and the next call
+    fails. Append the whole `content` list.
+  - >-
+    **Sending results one per message.** The API in this lesson expects every result from one
+    reply together, in the user message that follows it. Collect them first, then send once.
+  - >-
+    **Believing the model's "Done".** A model can write "I've sent the email" without any tool
+    having run. Only your log of executed calls and their results says what happened.
+  - >-
+    **No turn cap.** A model that keeps asking for tools loops until something times out, and
+    you pay for every turn. Cap turns and return a clear failure at the limit.
+  - >-
+    **One general tool such as `run_sql` or `http_get`.** It hands the model all the power of
+    that interface. Offer narrow tools that each do one checked thing.
+interview:
+  - question: Walk me through what happens when a model calls a tool.
+    answer: >-
+      The model never runs anything: it asks, my code runs the tool, and the result goes
+      back as a message. I send the conversation with tool definitions, each a name, a
+      description and a JSON Schema. If the model wants one, the reply stops with a
+      `tool_use` reason and holds a block with an id, the tool name and arguments. I append
+      that whole reply as the assistant turn, validate the arguments, check permission, run
+      the function and return a `tool_result` with the same id, all results in one user
+      message. Then I call the model again, and it either answers or asks for more. I cap
+      the number of turns and log every call. The cost is latency: each tool turn is another
+      full model call over the whole history.
+  - question: How do you stop a support bot's tools leaking one customer's data to another?
+    answer: >-
+      Authorisation lives in the tool, using identity from the session, never from the
+      model. The model will pass whatever order id the user typed or a document suggested,
+      so `get_order` checks that the order belongs to the logged-in user and says "no such
+      order" otherwise, which also avoids confirming that the order exists. The user id is
+      not a tool argument at all: my code injects it. I keep tools narrow, so there's no
+      general query tool to abuse, and I treat tool results as data that can't grant new
+      permissions. Asking the model to refuse doesn't work, because it can't know whose
+      order it is and it can be talked round. The trade-off is more code per tool.
+  - question: A tool call fails. What should your code do?
+    answer: >-
+      Return the failure to the model as an error result instead of throwing, so the
+      conversation continues. The result keeps the `tool_use_id` and carries `is_error` with
+      a message that says what went wrong and ideally how to fix it, such as "order_id must
+      be a string". The model usually retries with corrected arguments or explains the
+      problem to the user. For transient failures, like a timeout from the inventory service,
+      I retry in my own code first, with a timeout on every call. I still cap turns, because
+      a model can retry the same bad call repeatedly. What I don't do is send stack traces or
+      internal details, which cost tokens and can leak information.
+  - question: When would you not use tool calling?
+    answer: >-
+      When my code already knows what data the answer needs. If every question on a product
+      page needs that product's details, I fetch them and put them in the prompt: one model
+      call instead of two, deterministic, and cheaper. I also avoid tools for small fixed
+      data that fits in the system prompt, and for actions where a wrong call is expensive
+      and I can't put a check or a human confirmation in front. Tools earn their place when
+      the model has to decide what to look up, or when the set of possible lookups is too
+      large to prefetch. The trade-off is flexibility against latency, cost and predictability.
+  - question: How do you write tool descriptions so the model picks the right one?
+    answer: >-
+      Treat each description as a short prompt that says what the tool does, when to use it
+      and when not to. "How many of a product are in stock. Use before promising delivery.
+      Not for prices" beats "Stock tool". I keep the tool set small and non-overlapping,
+      because two tools with similar descriptions get confused, and every definition costs
+      input tokens on each call. Enums in the schema stop invented values. Then I measure
+      rather than guess: a set of test questions, each labelled with the tool it should
+      trigger or no tool at all, run before every change to the descriptions.

@@ -1,0 +1,318 @@
+summary: >-
+  Security logging records the facts you'd need to notice an attack and piece it together
+  afterwards: who signed in, who failed, who was refused, who changed a role, and which request
+  did it. Detection is the job those logs make possible. Prevention stops the attacks you
+  planned for; detection is how you learn about the one you didn't.
+
+
+  The lesson covers what belongs in a log, how to keep passwords and tokens out of it, and why
+  an alert fires on a pattern rather than on every failure. These notes add the rest of the
+  craft: correlation ids that follow a request across services, log injection and how
+  structured logs stop it, redaction that survives arrays and free text, alert rules for
+  attacks the per-account rule misses, and logs you can still trust after an intruder has had
+  a go at them.
+
+
+  Reach for this on every system that has users, money or personal data. The trap is doing it
+  by volume. Logging everything costs money, leaks secrets and buries the one line that
+  matters. Log a chosen set of security events with a fixed vocabulary, ship them off the box
+  quickly, and alert only on signals someone will act on.
+remember:
+  - Log authentication successes and failures, access denials, admin and role changes, and changes to credentials, each with who, what, when, where and the outcome.
+  - Never log passwords, tokens, session ids, API keys or full card numbers, and pick fields to log rather than dumping whole bodies or headers.
+  - Structured logs, one JSON object per line, stop newline forging because `JSON.stringify` escapes control characters inside strings.
+  - A correlation id generated at the edge and passed to every downstream call ties one request's lines together across services.
+  - An alert must be actionable, so alert on patterns such as many failures for one account, one address failing across many accounts, or a success after a run of failures.
+  - Alert fatigue is a security failure, because a channel that fires constantly gets muted and the real attack goes unread.
+  - Ship logs off the host fast, to append-only storage in a separate account, so an intruder with root on a server can't erase the trail.
+  - Logs hold personal data, so set a retention period that covers investigations and no longer.
+sections:
+  - title: What a security event looks like, and correlation ids
+    body: |-
+      A useful security event answers five questions: who (user id, service, source address),
+      what (a fixed event name), when (UTC, to the millisecond), where (service, route,
+      resource) and the outcome. OWASP's Application Logging Vocabulary gives fixed names
+      such as `authn_login_fail` and `authz_fail`. A fixed vocabulary matters more than the
+      exact names: an alert rule can only match an event whose name never drifts.
+
+      The events worth logging are the ones an investigator asks about first: sign-ins and
+      failures, password and MFA changes, access denied, role and permission changes, admin
+      actions, exports of bulk data, and changes to the logging itself.
+
+      A **correlation id** ties together every line one request wrote, across every service
+      it touched. Generate it at the edge, accept an incoming one only from your own proxy,
+      and send it on with every downstream call. The W3C Trace Context `traceparent` header,
+      which OpenTelemetry uses, is the standard way to carry it. Inside one Node process,
+      `AsyncLocalStorage` keeps the id available without passing it through every function:
+
+      ```ts
+      import { AsyncLocalStorage } from 'node:async_hooks';
+      import { randomUUID } from 'node:crypto';
+
+      const requestContext = new AsyncLocalStorage<{ requestId: string }>();
+
+      function log(level: 'info' | 'warn', event: string, fields: Record<string, unknown> = {}) {
+        const requestId = requestContext.getStore()?.requestId;
+        // Fixed fields go last, so a caller's field can't overwrite the level or the event.
+        const line = { ...fields, at: new Date().toISOString(), level, event, requestId };
+        process.stdout.write(JSON.stringify(line) + '\n');
+      }
+
+      async function viewOrder(user: string, orderId: string) {
+        log('info', 'order_view_requested', { user, orderId });
+        await new Promise((resolve) => setTimeout(resolve, Math.random() * 20));
+        log('warn', 'authz_fail', { user, orderId, reason: 'not_owner' });
+      }
+
+      // Two requests interleave, yet each line carries its own request's id.
+      await Promise.all(
+        [['ana', 'o-17'], ['ben', 'o-42']].map(([user, orderId]) =>
+          requestContext.run({ requestId: randomUUID() }, () => viewOrder(user, orderId)),
+        ),
+      );
+      ```
+
+      Run as an ES module, the four lines come out interleaved, and each `authz_fail` carries
+      the same id as its own request's first line. In an Express app the middleware calls
+      `requestContext.run({ requestId }, next)` once per request.
+  - title: Log injection and newline forging
+    body: |-
+      A log line built by pasting user input into text can be forged. If the input contains
+      a newline, the attacker writes a line of their own that looks exactly like one yours
+      wrote. This is **log injection**, also called CRLF injection after the carriage return
+      and line feed characters.
+
+      ```js
+      const user = 'ana\n2026-09-25T10:00:01.000Z INFO login_ok user=admin';
+
+      // Plain text: the attacker's newline starts a second, forged line.
+      console.log(`2026-09-25T10:00:00.000Z WARN login_failed user=${user}`);
+
+      // JSON: the newline becomes the two characters \n inside one string.
+      console.log(JSON.stringify({ at: '2026-09-25T10:00:00.000Z', event: 'login_failed', user }));
+
+      // If you must write text, escape control characters before they reach the line.
+      const escapeControl = (s) =>
+        s.replace(/[\u0000-\u001f\u007f]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`);
+      console.log(`2026-09-25T10:00:00.000Z WARN login_failed user=${escapeControl(user)}`);
+      ```
+
+      The first line prints two log entries, one of them a fake successful admin login. The
+      JSON line stays one entry, with the newline visible as `\n`. The third stays on one line
+      as `\u000a`.
+
+      Forged lines matter because investigators and alert rules trust the log. A fake
+      `login_ok` can hide an attack or frame someone. Two more forms of the same bug are
+      worth knowing. A log viewer that renders entries as HTML turns logged input into stored
+      XSS against your own support staff. And a logger that interprets its input is worse
+      still: Log4Shell (CVE-2021-44228) let a string such as `${jndi:ldap://...}` in a logged
+      header make Java's Log4j fetch and run remote code.
+
+      The rule is the one from injection generally. Treat logged input as data. Use a
+      structured logger that encodes values, put user input in fields rather than in the
+      message template, and escape it when a viewer renders it.
+  - title: Redaction that holds up
+    body: |-
+      The lesson's `redact` masks sensitive keys at any depth. Run on real entries, it has
+      three gaps. An array becomes a plain object, because `typeof [] === 'object'`:
+      `{ items: [{ password: 'x' }] }` comes back as `{ items: { 0: { password: '[redacted]' } } }`.
+      A circular reference, common in request objects, recurses until the stack overflows.
+      And secrets in values, such as a token in a URL or an error message, pass through.
+
+      ```ts
+      const SENSITIVE_KEY = /pass(word)?|secret|token|authorization|cookie|card|api[-_]?key/i;
+      const BEARER = /\b(Bearer\s+)[\w.~+/-]+=*/gi;
+      const JWT = /\beyJ[\w-]+\.[\w-]+\.[\w-]+/g;
+      const QUERY_SECRET = /([?&](?:token|code|key|password)=)[^&\s]+/gi;
+
+      const scrub = (text: string) =>
+        text
+          .replace(BEARER, '$1[redacted]')
+          .replace(JWT, '[redacted-jwt]')
+          .replace(QUERY_SECRET, '$1[redacted]');
+
+      export function redact(value: unknown, ancestors = new WeakSet<object>()): unknown {
+        if (typeof value === 'string') return scrub(value);
+        if (typeof value !== 'object' || value === null) return value;
+        if (ancestors.has(value)) return '[circular]';
+        ancestors.add(value);
+        let out: unknown;
+        if (Array.isArray(value)) {
+          out = value.map((item) => redact(item, ancestors));
+        } else {
+          const copy: Record<string, unknown> = {};
+          for (const [key, item] of Object.entries(value)) {
+            copy[key] = SENSITIVE_KEY.test(key) ? '[redacted]' : redact(item, ancestors);
+          }
+          out = copy;
+        }
+        ancestors.delete(value);
+        return out;
+      }
+      ```
+
+      Only the current path's objects sit in `ancestors`, so the same object referenced twice
+      is redacted twice rather than marked circular. The key pattern over-matches on purpose:
+      `tokenExpiresAt` gets masked, and losing a timestamp is cheaper than leaking a token.
+      `Error` and `Date` objects have no own enumerable keys, so serialise them first, for
+      example as `{ message: err.message, name: err.name }`.
+
+      Pattern matching is still a safety net. The stronger design is an allow-list: each
+      event logs named fields, and nothing else reaches the logger. In production, pino's
+      `redact` option takes paths such as `req.headers.authorization` and masks them before a
+      line is written, so the rule lives in one place.
+  - title: Alerts that catch what the per-account rule misses
+    body: |-
+      "Five failures for one account in a minute" catches someone guessing one password. It
+      misses the two attacks you're more likely to see. **Password spraying** tries one
+      common password against many accounts, staying under any per-account limit.
+      **Credential stuffing** replays username and password pairs leaked from other sites,
+      often from thousands of addresses. And the event that matters most is not a failure:
+      it's the success at the end of a run of failures.
+
+      ```ts
+      type AuthEvent = { type: 'login_failed' | 'login_ok'; user: string; ip: string; at: number };
+
+      // Password spraying: one address fails against many different accounts.
+      function sprayingIps(events: AuthEvent[], minUsers: number, windowMs: number, now: number): string[] {
+        const usersByIp = new Map<string, Set<string>>();
+        for (const e of events) {
+          if (e.type !== 'login_failed' || e.at > now || now - e.at > windowMs) continue;
+          const users = usersByIp.get(e.ip) ?? new Set<string>();
+          users.add(e.user);
+          usersByIp.set(e.ip, users);
+        }
+        return [...usersByIp].filter(([, users]) => users.size >= minUsers).map(([ip]) => ip);
+      }
+
+      // The alert worth waking for: a run of failures that ends in a success.
+      function successAfterFailures(events: AuthEvent[], minFailures: number): string[] {
+        const streak = new Map<string, number>();
+        const hits: string[] = [];
+        for (const e of [...events].sort((a, b) => a.at - b.at)) {
+          if (e.type === 'login_failed') {
+            streak.set(e.user, (streak.get(e.user) ?? 0) + 1);
+          } else {
+            if ((streak.get(e.user) ?? 0) >= minFailures) hits.push(e.user);
+            streak.delete(e.user);
+          }
+        }
+        return hits;
+      }
+      ```
+
+      With five accounts failing from `203.0.113.9` and one account failing five times before
+      a success, these return `['203.0.113.9']` and `['fay']`. Stuffing spread across many
+      addresses shows up only in the total: compare the failure rate across all accounts with
+      its normal level for that hour.
+
+      Every rule trades **precision**, the share of alerts that are real, against
+      **recall**, the share of attacks that raise one. Because attacks are rare, even a rule
+      that is right 99% of the time on each event can produce mostly false alarms. So route
+      by confidence: page a person only for high-precision signals, and send the rest to a
+      ticket queue or a dashboard. Give every paging alert a runbook, and review the noisy
+      ones monthly.
+  - title: Logs you can trust after a breach
+    body: |-
+      An intruder with root on a server can edit its log files. So the log that counts is the
+      copy that left the box. Ship lines to a central store within seconds, write them to
+      append-only storage (S3 Object Lock in compliance mode, for example, blocks deletion
+      until the retention date, even by the account's root user), and keep that store in a
+      separate account whose credentials no application server holds.
+
+      Tamper evidence is a second layer. Chain each entry to the one before with an HMAC, and
+      changing any line breaks every link after it:
+
+      ```js
+      import { createHmac } from 'node:crypto';
+
+      // In production the key lives in a secrets manager, never on the log host.
+      const KEY = 'demo-key-from-a-secrets-manager';
+      const GENESIS = '0'.repeat(64);
+
+      const macOf = (prev, line) => createHmac('sha256', KEY).update(prev).update(line).digest('hex');
+
+      function seal(lines) {
+        let prev = GENESIS;
+        return lines.map((line) => {
+          prev = macOf(prev, line);
+          return { line, mac: prev };
+        });
+      }
+
+      // The index of the first entry that doesn't match its chain, or -1.
+      function firstTampered(entries) {
+        let prev = GENESIS;
+        for (const [i, entry] of entries.entries()) {
+          if (macOf(prev, entry.line) !== entry.mac) return i;
+          prev = entry.mac;
+        }
+        return -1;
+      }
+
+      const log = seal(['login_ok ana', 'role_changed ana admin', 'export_orders ana']);
+      console.log(firstTampered(log)); // -1
+      log[1] = { ...log[1], line: 'role_changed ana viewer' };
+      console.log(firstTampered(log)); // 1
+      ```
+
+      A chain doesn't notice lines cut off the end. Publish the latest MAC somewhere else
+      every few minutes, and a truncated log no longer matches it.
+
+      Retention pulls two ways. Attackers often sit inside a network for weeks before anyone
+      notices, so short retention loses the start of the story. PCI DSS asks for a year of
+      audit logs, with the latest three months immediately available. But logs hold personal
+      data such as user ids and IP addresses, and GDPR's storage limitation principle says
+      keep it no longer than needed. Write the period down, with the reason, and delete on
+      schedule. Keep every server's clock synced and log in UTC, or the timeline won't line up.
+pitfalls:
+  - '**Logging whole requests "for debugging".** Headers carry cookies and bearer tokens, bodies carry passwords. Log named fields through an allow-list, and redact as a backstop.'
+  - '**Building log lines by string concatenation.** A newline in user input forges a second entry. Use a structured logger and keep input in fields, not in the message.'
+  - '**Alerting on every failure.** The channel fills with typos and gets muted. Alert on patterns with a threshold and a window, and page only for high-precision signals.'
+  - '**Keeping logs only on the server that wrote them.** The first thing an intruder with root does is clean up. Ship logs off the host to append-only storage in another account.'
+  - '**Watching only failures.** A failure means the defence held. Alert on the success that follows a run of failures, and on privilege changes.'
+  - '**Keeping logs forever.** Logs are personal data under GDPR and a prize in a breach. Set a retention period that covers investigations, then delete.'
+interview:
+  - question: What would you log for security in a web application, and what would you keep out?
+    answer: >-
+      I'd log the events an investigator asks about first, with a fixed vocabulary and no
+      secrets. That means sign-in successes and failures, MFA and password changes, access
+      denials, role and permission changes, admin actions and bulk exports. Each event carries
+      who, what, when in UTC, where, the outcome and a correlation id, as one JSON object per
+      line. I'd keep out passwords, tokens, session ids, API keys and full card numbers, and
+      I'd avoid dumping whole bodies or headers, because that's how secrets leak. Each event
+      logs named fields, with key and pattern redaction in the logger as a backstop. The
+      trade-off is detail against risk: every extra field helps debugging and adds personal
+      data you must protect and eventually delete.
+  - question: How would you detect credential stuffing on a login endpoint without drowning the team in alerts?
+    answer: >-
+      With several narrow rules routed by confidence, not one broad rule. Per-account failure
+      counts catch guessing. Distinct accounts failing from one address catch spraying.
+      Stuffing from a botnet spreads across thousands of addresses, so I'd compare the
+      global failure rate with its usual level for that hour. The signal that pages someone
+      is a success after a run of failures, or a success from a new device followed by a
+      payout or email change. Everything else goes to a queue or a dashboard. Base rates make
+      this necessary: attacks are rare, so even an accurate per-event rule produces mostly
+      false alarms. The trade-off is recall. Tighter thresholds miss slow, careful attacks,
+      so I'd review thresholds against real incidents regularly.
+  - question: What is log injection, and how do you prevent it?
+    answer: >-
+      It's writing attacker input into a log in a way that changes the log's structure. The
+      classic case is a newline in a username that starts a forged entry, such as a fake
+      successful admin login, in a plain-text log. Investigators and alert rules trust logs,
+      so a forged line can hide an attack or frame a user. Prevention is treating logged
+      input as data: a structured logger that writes JSON, where `JSON.stringify` escapes
+      newlines inside strings, and user input kept in fields rather than in the message
+      template. If a log viewer renders HTML, it must encode output too, or you get stored
+      XSS against your own staff. Log4Shell showed the extreme version, a logger that
+      interpreted its input and ran remote code.
+  - question: After a breach, how do you know the logs weren't tampered with?
+    answer: >-
+      By making sure the copy that matters never lived where the attacker had control. Logs
+      are shipped off each host within seconds to a central store, written to append-only
+      storage such as S3 Object Lock, in a separate account that no application credential
+      can reach. An intruder with root on a web server can edit local files, but not that
+      copy. As a second layer, I'd chain entries with an HMAC keyed from a secrets manager,
+      and publish the latest value elsewhere periodically so truncation shows too. The
+      trade-off is cost and complexity, so I'd apply the strongest controls to the audit
+      trail of security events rather than to every debug line.

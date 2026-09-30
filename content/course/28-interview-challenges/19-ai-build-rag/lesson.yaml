@@ -1,0 +1,333 @@
+id: interview.rag-build
+title: "AI build: RAG with citations"
+objective: "Build retrieval-augmented answers end to end: chunk with overlap, retrieve the top matches, cite sources and refuse when the context is not enough."
+level: advanced
+minutes: 10
+concepts: [interview.chunking, interview.grounded-answers]
+prerequisites: [ai.rag, interview.evals-first]
+opening:
+  text: >-
+    You'll build the most common AI take-home from scratch: answers over documents that cite
+    their sources and refuse when they can't. It's a chunker and one function, against a fake
+    model you control.
+
+steps:
+  - type: prose
+    id: what-you-need
+    body: >-
+      What you need, in four lines. **RAG** answers from your own documents: find the
+      passages that match the question, then let the model answer from those.
+
+
+      An **embedding** is a list of numbers for a text, where similar meanings sit close
+      together. **Cosine similarity** scores how closely two embeddings point the same way,
+      up to 1. **Top k** keeps the k best scores.
+
+  - type: prose
+    id: name-overlap
+    body: >-
+      First you split each document into **chunks** of a fixed number of words, each
+      embedded once. Neighbouring chunks share a few words: the **overlap**.
+
+
+      Without it, a fact that crosses a boundary gets cut in two, and neither half matches
+      the question well. A common choice is 10 to 20% overlap. Say your unit out loud:
+      words, characters or tokens.
+
+  - type: fill-blank
+    id: fill-chunk-loop
+    concept: interview.chunking
+    difficulty: 2
+    prompt: Complete the chunker. The last window stops at the end of the text.
+    language: js
+    template: |
+      function chunk(words, size, overlap) {
+        const chunks = [];
+        const step = {{1}};
+        for (let start = 0; start < words.length; start += step) {
+          chunks.push(words.slice(start, {{2}}));
+          if ({{3}}) break;
+        }
+        return chunks;
+      }
+    blanks:
+      - key: '1'
+        answer: size - overlap
+      - key: '2'
+        answer: start + size
+      - key: '3'
+        answer: start + size >= words.length
+    bank:
+      - size - overlap
+      - size + overlap
+      - start + size
+      - start + step
+      - start + size >= words.length
+      - start >= words.length
+
+  - type: code-challenge
+    id: write-chunk
+    concept: interview.chunking
+    difficulty: 3
+    language: ts
+    starter: chunk.starter.ts
+    solution: chunk.solution.ts
+    tests: chunk.tests.ts
+    twin:
+      language: python
+      starter: chunk.starter.py
+      solution: chunk.solution.py
+      tests: chunk.tests.py
+    prompt: >-
+      Write `chunk(docId, text, size, overlap)`. Split the text on whitespace into words.
+      Return windows of `size` words, each starting `size - overlap` words after the last.
+      Ids are `docId#0`, `docId#1` and so on.
+
+
+      Stop once a window reaches the end, so there's no leftover tail. Empty text gives `[]`.
+      Throw if `overlap` isn't below `size`.
+    hints:
+      - Look at where each window starts. The first at 0, the next at `size - overlap`.
+      - The last window is the one where `start + size` reaches the number of words.
+      - "`text.split(/\\s+/)` leaves empty strings at the edges. Filter them out, then loop with `start += step`."
+
+  - type: code-challenge
+    id: write-sentence-chunk
+    concept: interview.chunking
+    difficulty: 4
+    language: ts
+    starter: sentence.starter.ts
+    solution: sentence.solution.ts
+    tests: sentence.tests.ts
+    twin:
+      language: python
+      starter: sentence.starter.py
+      solution: sentence.solution.py
+      tests: sentence.tests.py
+    prompt: >-
+      Word windows can cut a sentence in half. Write `chunkSentences(text, maxChars)`, which
+      only cuts between sentences. `sentences(text)` is written for you.
+
+
+      Add sentences to the current chunk, joined by a space, while it stays within
+      `maxChars`. When the next one won't fit, save the chunk. Start the next with the last
+      sentence again, as overlap, if both fit together. If not, start with the new sentence
+      alone.
+
+
+      A sentence longer than `maxChars` becomes a chunk on its own, whole.
+    hints:
+      - Keep `current`, a list of sentences, and try `[...current, sentence].join(' ')` before adding.
+      - The overlap is `current[current.length - 1]`. Check its length plus the new sentence before reusing it.
+      - An empty `current` takes any sentence. That's what keeps a long one whole.
+
+  - type: prose
+    id: name-grounded
+    body: >-
+      Retrieval hands you scored chunks. A **grounded answer** uses only those and says which
+      ones it used.
+
+
+      Keep the top k and drop any below a threshold. If nothing's left, refuse with a fixed
+      line: "I don't have that information." Refuse in code, before calling the model. A
+      prompt that says "don't guess" is a request. An early return is a guarantee.
+
+  - type: ai-review
+    id: review-top-k-order
+    concept: interview.grounded-answers
+    difficulty: 3
+    language: js
+    request: Keep the k best chunks that reach the threshold, best first.
+    flawClass: logic
+    code: |
+      function retrieve(scored, k, threshold) {
+        const top = scored
+          .toSorted((a, b) => a.score - b.score)
+          .slice(0, k);
+        return top.filter((chunk) => chunk.score >= threshold);
+      }
+    prompt: >-
+      An assistant wrote this. The tests used five chunks and k = 5, and they passed. On the
+      real 200 chunks the bot refuses almost every question. Tap the line at fault.
+    lines: [3]
+    reasons:
+      - text: It sorts the lowest scores first
+        correct: true
+        feedback: >-
+          Yes. The slice keeps the five weakest. Sort with `b.score - a.score`.
+      - text: '`toSorted` changes `scored` in place'
+        feedback: >-
+          `toSorted` returns a sorted copy. That's the version you want here.
+      - text: The filter must run before the slice
+        feedback: >-
+          Either order works once the sort is right. Here the slice keeps the weakest.
+    fix: |
+      .toSorted((a, b) => b.score - a.score)
+
+  - type: ai-review
+    id: review-zero-vector
+    concept: interview.grounded-answers
+    difficulty: 4
+    language: ts
+    request: Score chunks with cosine similarity and refuse when nothing matches.
+    flawClass: edge-case
+    code: |
+      function cosine(a: number[], b: number[]): number {
+        let dot = 0, normA = 0, normB = 0;
+        for (let i = 0; i < a.length; i++) {
+          dot += a[i] * b[i];
+          normA += a[i] * a[i];
+          normB += b[i] * b[i];
+        }
+        return dot / (Math.sqrt(normA) * Math.sqrt(normB));
+      }
+
+      const top = rank(question, chunks).slice(0, k); // best first
+      if (top[0].score < THRESHOLD) return { text: REFUSAL, citations: [] };
+    prompt: >-
+      An assistant wrote this for a prototype that embeds text by counting known words. A user
+      typed `???`, and the bot answered anyway. Tap the line at fault.
+    lines: [8]
+    reasons:
+      - text: A zero vector gives a score of `NaN`
+        correct: true
+        feedback: >-
+          Yes. `???` has no known words, so its vector is all zeros. `NaN < THRESHOLD` is false.
+      - text: The threshold check should use `>`
+        feedback: >-
+          Flipping it would refuse the good matches. The comparison is fine; the score isn't a
+          number.
+      - text: The loop should stop at the shorter vector
+        feedback: >-
+          One embedder makes both vectors, so they're always the same length.
+    fix: |
+      if (normA === 0 || normB === 0) return 0; // no direction, so no match
+      return dot / (Math.sqrt(normA) * Math.sqrt(normB));
+
+  - type: code-challenge
+    id: write-answer
+    concept: interview.grounded-answers
+    difficulty: 4
+    language: ts
+    starter: answer.starter.ts
+    solution: answer.solution.ts
+    tests: answer.tests.ts
+    twin:
+      language: python
+      starter: answer.starter.py
+      solution: answer.solution.py
+      tests: answer.tests.py
+    prompt: >-
+      Write `answer(question, chunks, deps)`. The tests pass a fake embedder and a fake model
+      in `deps`, so nothing touches a network.
+
+
+      Score each chunk by cosine against the question. A zero vector scores 0. Keep the top
+      `deps.k` that reach `deps.threshold`, best first. None left? Return `REFUSAL` with no
+      citations, and don't call the model.
+
+
+      Otherwise the prompt is one `[id] text` line per kept chunk, a blank line, then
+      `Question: ` and the question. Return the model's trimmed text and the kept ids.
+    hints:
+      - Start with `Promise.all` over one `embed` call per text, the question included.
+      - Sort the scored chunks highest first, slice to k, and only then filter by threshold.
+      - Guard cosine first. If either vector has no length, return 0.
+
+  - type: explain-back
+    id: explain-refuse-in-code
+    concept: interview.grounded-answers
+    difficulty: 4
+    prompt: >-
+      The best score is under the threshold. Why is refusing in code safer than telling the
+      model to say it doesn't know?
+    rubric:
+      - The model answers from whatever it's given, or from memory, even when the chunks don't fit.
+      - A prompt instruction can be ignored, but an early return before the call can't.
+      - The threshold is a number you can tune and test against real questions.
+    modelAnswer: >-
+      Given weak chunks, the model still tends to produce a fluent answer, from those chunks
+      or from its own memory. An instruction not to guess is only a request. Returning the
+      refusal before the call means no wording can talk it round. And the threshold is a
+      number, so you can tune it against a set of real questions.
+
+recap:
+  - Chunk text into overlapping windows or whole sentences, and say the unit you chose.
+  - Keep the top k that clear a threshold, and cite their ids.
+  - Refuse in code, before the model runs, when nothing matches.
+recall:
+  - id: card-why-overlap
+    concept: interview.chunking
+    front: Why do neighbouring chunks overlap?
+    back: >-
+      So a fact that crosses a chunk boundary stays whole in at least one chunk and can still
+      match the question.
+  - id: card-chunk-step
+    concept: interview.chunking
+    front: With chunk size s and overlap o, how far apart do chunks start?
+    back: >-
+      s minus o. The last chunk is the one whose end reaches the end of the text.
+  - id: card-long-sentence
+    concept: interview.chunking
+    front: A sentence-aware chunker meets one sentence longer than the limit. What does it do?
+    back: >-
+      Keeps it whole, as a chunk of its own. Cutting it would split the fact it holds.
+  - id: card-when-refuse
+    concept: interview.grounded-answers
+    front: When should a grounded answer refuse, and where is that decided?
+    back: >-
+      When no chunk in the top k reaches the threshold. It's an early return in code, before
+      the model is called.
+  - id: card-zero-vector
+    concept: interview.grounded-answers
+    front: What does an unguarded cosine return for a zero vector, and why does it matter?
+    back: >-
+      `NaN`. Every comparison with `NaN` is false, so a "score below threshold" check never
+      refuses.
+
+references:
+  - kind: paper
+    title: Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks
+    authors: Lewis, Perez, Piktus et al.
+    year: 2020
+    venue: NeurIPS 2020
+    url: https://arxiv.org/abs/2005.11401
+    note: The paper that named RAG. Retrieval and generation as one pipeline.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Home Assignments, AI Engineering Field Guide
+    authors: Alexey Grigorev
+    venue: GitHub
+    url: https://github.com/alexeygrigorev/ai-engineering-field-guide/blob/main/interview/questions/06-home-assignments.md
+    note: An analysis of 100+ AI engineering take-homes. RAG with citations is the most common task.
+    primary: true
+    verified: true
+  - kind: essay
+    title: Introducing Contextual Retrieval
+    authors: Anthropic
+    year: 2024
+    url: https://www.anthropic.com/engineering/contextual-retrieval
+    note: Why chunks lose context, and adding a short description to each chunk before embedding.
+    verified: true
+
+deepDive: >-
+  In an analysis of over a hundred AI engineering take-homes, RAG appeared in more than 40%.
+  The common spec is this lesson: a chatbot over documents that cites its sources and says
+  "I don't have that information" when the context lacks the answer.
+
+
+  What reviewers look for beyond working code. The chunk size and overlap are stated and
+  justified. Retrieval is tested apart from generation. The refusal is a code path with a
+  test, not a line in the prompt. Citations point at real chunk ids that the UI can link.
+
+
+  Where it breaks, which is a favourite follow-up. Chunks cut mid-table or mid-list, so use
+  recursive splitting by paragraph, then sentence, then word. Keyword-heavy questions such
+  as part numbers do badly on embeddings alone, so add keyword search and merge the lists.
+  A threshold tuned on one embedding model is wrong for the next. And retrieved text is
+  data: a document that says "ignore your instructions" must not steer the model.
+
+
+  Cost and speed. Embed documents once at ingest, not per question. Batch embedding calls.
+  Cache the question's vector. Stream the answer so the first words show quickly.

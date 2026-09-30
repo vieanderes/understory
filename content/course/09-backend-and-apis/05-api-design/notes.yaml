@@ -1,0 +1,208 @@
+summary: >-
+  API design is choosing URLs, methods and response shapes so that a developer who has seen
+  two endpoints can guess the third. The resource style does this by naming things, not
+  actions: plural nouns at stable addresses, nested where one thing belongs to another, with
+  the HTTP method saying what to do. Filtering, sorting and paging then become query
+  parameters on a collection rather than new endpoints.
+
+
+  Lists are where designs break first. A list that grows needs paging, and the obvious scheme,
+  an offset, skips and repeats items when rows are added, and gets slower the deeper you go
+  because the database reads every skipped row. **Cursor pagination**, backed by a keyset
+  query in SQL, fixes both: it continues after a named item and uses an index to jump there.
+
+
+  An API is a contract you'll live with for years, because clients you don't control depend
+  on it. So consistency beats cleverness: the same naming, the same error shape, the same
+  paging style everywhere. Reach for the resource style for most public and internal APIs.
+  Reach for RPC-style endpoints or GraphQL when the operations don't map to resources, or when
+  clients need very different slices of a large graph.
+remember:
+  - URLs name resources with plural nouns, and the method says what to do, so `DELETE /orders/42`, never `POST /deleteOrder`.
+  - A missing filter means "don't filter on this", never "match nothing".
+  - Offset pagination repeats or skips items when rows are added above the page, and slows down at depth because skipped rows are still read.
+  - A cursor names the last item seen, and the next page is a keyset query such as `WHERE (created_at, id) < ($1, $2) ORDER BY created_at DESC, id DESC`.
+  - A cursor must include a unique tie-breaker such as the id, or rows sharing a timestamp get skipped.
+  - Make cursors opaque, for example base64url-encoded JSON, so clients pass them back without building or parsing them.
+  - An action that isn't create, read, update or delete becomes a sub-resource or a state change, such as `POST /orders/42/cancellation`.
+  - Consistency across endpoints matters more than any single naming choice.
+sections:
+  - title: Cursor pagination in SQL
+    body: |-
+      A cursor is only as good as the query behind it. For a feed ordered newest first, the
+      sort must be **total**: no two rows may tie. Timestamps tie, so add the id as a
+      tie-breaker, and index both columns in the same order.
+
+      ```sql
+      create table posts (
+        id bigint generated always as identity primary key,
+        created_at timestamptz not null,
+        title text not null
+      );
+      create index posts_feed on posts (created_at desc, id desc);
+
+      -- first page
+      select id, created_at, title from posts
+      order by created_at desc, id desc
+      limit 20;
+
+      -- next page: $1 and $2 are the last row's created_at and id
+      select id, created_at, title from posts
+      where (created_at, id) < ($1, $2)
+      order by created_at desc, id desc
+      limit 20;
+      ```
+
+      The row comparison `(created_at, id) < ($1, $2)` means "earlier timestamp, or the same
+      timestamp and a smaller id", which is exactly "after this row" in the sort. On
+      PostgreSQL 18, `EXPLAIN` shows it as an `Index Cond` on `posts_feed`, so the database
+      jumps straight to the right place however deep the page is. An `OFFSET 4000` query on
+      the same index still walks and discards 4,000 entries first.
+
+      Row comparison only works when every sort column goes the same direction. For
+      `created_at desc, title asc` you write the condition out by hand:
+      `created_at < $1 or (created_at = $1 and title > $2)`.
+
+      To know whether a next page exists, fetch `limit + 1` rows. If the extra row comes
+      back, drop it and return a cursor; if not, this is the last page. That avoids a separate
+      count query.
+  - title: Opaque cursors
+    body: |-
+      The lesson's cursor is a bare id. Real cursors often carry more, such as the sort key
+      and the id, and APIs encode them so clients treat them as a token:
+
+      ```ts
+      type Cursor = { createdAt: string; id: number };
+
+      const encodeCursor = (c: Cursor) => Buffer.from(JSON.stringify(c)).toString('base64url');
+
+      function decodeCursor(text: string): Cursor | null {
+        try {
+          const value = JSON.parse(Buffer.from(text, 'base64url').toString('utf8'));
+          if (typeof value?.createdAt === 'string' && Number.isInteger(value?.id)) return value;
+        } catch {
+          // a cursor the client made up or mangled
+        }
+        return null;
+      }
+
+      const cursor = encodeCursor({ createdAt: '2026-09-21T10:00:00.000Z', id: 3 });
+      console.log(cursor); // eyJjcmVhdGVkQXQiOiIyMDI2LTA5LTIxVDEwOjAwOjAwLjAwMFoiLCJpZCI6M30
+      console.log(decodeCursor(cursor)); // { createdAt: '2026-09-21T10:00:00.000Z', id: 3 }
+      console.log(decodeCursor('not-a-cursor')); // null
+      ```
+
+      `base64url` is safe in a query string without further escaping. Opacity is a promise
+      to yourself: you can change what's inside later without breaking clients. It is not
+      security, because anyone can decode it. If a cursor must not be tampered with, sign it
+      with an HMAC, and always validate a decoded cursor before it reaches a query. An
+      invalid one gets a `400`.
+
+      A cursor response usually looks like `{ "items": [...], "nextCursor": "..." }`, with
+      `nextCursor: null` on the last page. Total counts are tempting to add, but `count(*)`
+      over a large filtered table is slow in PostgreSQL, so offer them only where the UI
+      needs them.
+  - title: Modelling actions, relationships and queries
+    body: |-
+      Not everything is create, read, update and delete. Three patterns keep such operations
+      inside the resource style:
+
+      - **A state change as an update.** Archiving a ticket is `PATCH /tickets/9` with
+        `{"status":"archived"}`. It works when the change is a field and no extra rules
+        apply.
+      - **An action as a sub-resource.** Cancelling an order may refund money and email the
+        customer. Model the event itself: `POST /orders/42/cancellation` creates a
+        cancellation. Some APIs use a verb segment such as `POST /orders/42/cancel`, as
+        Stripe does. Either way, it's `POST`, because it isn't idempotent by nature.
+      - **A long job as a resource.** `POST /exports` answers `202` with
+        `Location: /exports/17`, and the client polls that until it says done.
+
+      Nest only one level for ownership, like `/orders/42/lines`. Deeper nesting such as
+      `/customers/3/orders/42/lines/7` couples clients to a hierarchy that may change. Give
+      each resource its own top-level address too, like `/lines/7`, when clients need it
+      directly.
+
+      For collections, pick conventions once: `?status=paid` for equality filters,
+      `?sort=-created_at` for ordering, `?limit=` capped at a maximum you enforce, and
+      unknown parameters either ignored or rejected, consistently. An unbounded `limit` is a
+      denial of service waiting to happen.
+  - title: REST, RPC and GraphQL
+    body: |-
+      Three styles dominate, and each fits a different situation.
+
+      **Resource style (REST)** maps nouns to URLs and verbs to methods. It uses HTTP fully:
+      caching of `GET`, status codes, conditional requests. It's the default for public APIs
+      because every developer and tool understands it. Its weakness is fetching related data:
+      a screen may need several round trips, or you add options like `?expand=customer`.
+
+      **RPC style** exposes operations: `POST /rpc/sendInvoice`, or gRPC with typed schemas.
+      It fits internal services where the operations don't map to resources, and gRPC is fast
+      between services. It gives up HTTP caching and the uniform interface.
+
+      **GraphQL** exposes one endpoint and a typed schema. Clients ask for exactly the fields
+      they need across related objects in one request, which suits many different frontends
+      over a rich data model. The costs are real: HTTP caching mostly doesn't apply, a single
+      query can be expensive, so you need depth and cost limits, and resolvers invite the
+      N+1 query problem unless you batch with a loader.
+
+      Choose by the clients. Many unknown third parties: resource style. A few internal
+      services: RPC. Several first-party frontends with different needs over one graph:
+      GraphQL can earn its complexity.
+pitfalls:
+  - '**Verbs in URLs.** `/getOrders` and `/createOrder` duplicate what methods already say. Use `/orders` with `GET` and `POST`.'
+  - '**Treating a missing filter as a filter on `null`.** Plain `/orders` then returns nothing. Apply a filter only when its parameter is present.'
+  - '**Sorting a cursor query by a column that ties.** Rows with the same timestamp are skipped or repeated. Add the id as a tie-breaker in both the sort and the cursor.'
+  - '**No cap on `limit`.** A client asks for a million rows and the server falls over. Enforce a maximum and a sensible default.'
+  - '**Deep offsets on large tables.** `OFFSET 100000` reads and throws away 100,000 rows. Use keyset pagination for anything a user can scroll far into.'
+  - '**Inconsistent naming.** `created_at` in one response and `createdAt` in another makes every client special-case. Pick one convention and apply it everywhere.'
+interview:
+  - question: Compare offset and cursor pagination. When would you use each?
+    answer: >-
+      Cursor pagination for anything that grows or gets large, offset for small, stable
+      lists that need page numbers. Offset counts positions, so rows inserted above the page
+      shift everything and the reader sees repeats or misses items, and `OFFSET n` makes the
+      database read and discard n rows, so deep pages get slower. A cursor names the last
+      row seen and turns into a keyset query like `WHERE (created_at, id) < ($1, $2)`, which
+      uses an index to start in the right place at any depth. The trade-off: cursors can't
+      jump to page 37 and make total counts awkward, so admin tables with page numbers often
+      keep offsets.
+  - question: Design the API for a library's loans system.
+    answer: >-
+      I'd start from resources: `/books`, `/members`, `/loans`. Borrowing is
+      `POST /loans` with a book and member id, answering `201` with `Location: /loans/88`.
+      Returning is a state change, so `PATCH /loans/88` with a returned date, or
+      `POST /loans/88/return` if it triggers fines and notifications. Listing a member's loans
+      is `GET /members/12/loans` or `GET /loans?member=12&status=active`, with cursor
+      pagination and a capped `limit`. Errors use one problem details shape: `409` when the
+      book is already on loan, `422` for invalid input. I'd enforce "one active loan per copy"
+      with a database constraint, not only in code, so concurrent requests can't both succeed.
+  - question: How do you model an operation that isn't CRUD, such as cancelling an order?
+    answer: >-
+      As a resource or a state transition, not a verb endpoint bolted on. If cancelling is
+      only a status change, it's `PATCH /orders/42` with the new status, validated against
+      allowed transitions. If it has side effects like refunds and emails, I model the event:
+      `POST /orders/42/cancellation`, which creates a record I can audit, return and query
+      later. A verb segment like `/orders/42/cancel` is a pragmatic alternative many big APIs
+      use. Either way it's a `POST`, so I accept an idempotency key, because a retried
+      cancellation must not refund twice.
+  - question: When would you choose GraphQL over REST?
+    answer: >-
+      When several first-party clients need different slices of a rich, connected data model
+      and round trips hurt, such as mobile and web apps showing the same entities in
+      different shapes. GraphQL lets each client ask for exactly the fields it needs in one
+      request, with a typed schema as the contract. I'd avoid it for public APIs used by many
+      third parties, and for simple CRUD, because you lose HTTP caching, you must guard
+      against expensive queries with depth and cost limits, and resolvers cause N+1 queries
+      unless you batch them with a data loader. REST with a few `expand` options covers most
+      needs more cheaply.
+  - question: What makes a good REST API?
+    answer: >-
+      Predictability. Resources are nouns in the path, such as `/conversations/42/messages`,
+      and the HTTP method says the action. Status codes carry meaning a client can act on:
+      201 for created, 400 or 422 for bad input, 401 for not signed in, 403 for not allowed,
+      404 for missing, 409 for a conflict, 429 for too many requests. Every error has one
+      consistent shape, so the client writes its error handling once. Long lists use cursor
+      pagination, so pages stay stable while rows are added. The API is versioned, and
+      changes are additive. A POST that must not happen twice, like a payment, takes an
+      idempotency key, so a retry after a timeout can't charge twice. The trade-off is
+      discipline up front; the payoff is clients that need no special cases.

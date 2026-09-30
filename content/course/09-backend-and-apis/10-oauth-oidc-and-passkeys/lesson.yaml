@@ -1,0 +1,299 @@
+id: backend.oauth-and-passkeys
+title: Signing in with another account
+objective: "Follow the \"Sign in with\" redirect flow, check its `state`, and say what PKCE, an ID token and a passkey add."
+level: advanced
+minutes: 10
+concepts: [backend.oauth, backend.pkce, backend.oidc, backend.passkeys]
+prerequisites: [backend.sessions-and-tokens]
+opening:
+  text: >-
+    You'll know what happens behind a "Sign in with Google" button, and why passkeys can't be
+    phished. You'll also write the check that stops a forged sign-in.
+
+steps:
+  - type: prose
+    id: sign-in-with
+    body: >-
+      You click "Sign in with Google" on a recipe site. Google's own page asks: "Allow Recipe
+      Box to see your name and email?" You press Allow and land back, signed in.
+
+
+      The recipe site never saw your password. Google, here the **authorisation server**,
+      checked it. The rules for this hand-over are **OAuth**, and a library does most of the
+      work.
+
+  - type: prose
+    id: the-code-flow
+    body: >-
+      A **redirect** is a 302 response whose `Location` sends the browser elsewhere.
+
+
+      1. The app redirects you to Google with a random `state` it saved.
+
+      2. You approve there.
+
+      3. Google redirects to the app's **callback** with a one-time `code` and that `state`.
+
+      4. Its server swaps the code for an **access token** and, with **OpenID Connect**,
+      an **ID token**.
+
+      5. It checks the `state` matches, then signs you in.
+
+  - type: parsons
+    id: arrange-the-dance
+    concept: backend.oauth
+    difficulty: 2
+    language: text
+    prompt: Put the "Sign in with" hops in order. One step doesn't belong.
+    blocks:
+      - id: to-provider
+        code: App redirects the browser to the provider with a state
+      - id: approve
+        code: User signs in and approves on the provider's page
+      - id: back-with-code
+        code: Provider redirects to /callback with a code and the state
+      - id: swap-code
+        code: App's server swaps the code for tokens
+      - id: session
+        code: App starts a session for the user
+    distractors:
+      - id: send-password
+        code: App sends the user's password to the provider
+        feedback: >-
+          The app never touches the password. The user types it on the provider's own page.
+
+  - type: multiple-choice
+    id: pick-id-token
+    concept: backend.oidc
+    difficulty: 2
+    language: json
+    code: |
+      {
+        "iss": "https://accounts.google.com",
+        "sub": "248289761001",
+        "aud": "recipe-box",
+        "email": "sam@example.com"
+      }
+    question: This is the payload of an ID token, a JWT. What is it for?
+    choices:
+      - text: Telling the app who signed in
+        correct: true
+        feedback: >-
+          Right. `sub` is the user's stable id, and the signature vouches for it.
+      - text: Calling the provider's API for the user
+        feedback: >-
+          That's the access token's job. The ID token is about who, not what the app may do.
+      - text: Storing the user's password for next time
+        feedback: >-
+          No token ever holds the password. This one only carries who the user is.
+
+  - type: ai-review
+    id: review-missing-state
+    concept: backend.oauth
+    difficulty: 3
+    language: js
+    request: Handle the OAuth callback and start a session for the user.
+    flawClass: security
+    code: |
+      // GET /callback?code=...&state=...
+      const query = new URL(request.url).searchParams;
+      const user = await exchangeCode(query.get("code"));
+      session.user = user;
+      return Response.json({ signedIn: true });
+    prompt: >-
+      An assistant wrote this. Sign-in works and the test passes. Then a victim clicks an
+      emailed link and lands signed in to the attacker's account. Tap the line at fault.
+    lines: [3]
+    reasons:
+      - text: It swaps any code without checking `state`
+        correct: true
+        feedback: >-
+          Right. The attacker's own code arrives with no matching `state`, and nothing notices.
+      - text: '`exchangeCode` should run in the browser'
+        feedback: >-
+          The swap belongs on the server. The gap is which codes it agrees to swap.
+      - text: '`session.user` should be set after responding'
+        feedback: >-
+          The order of those two lines changes nothing. Any code was accepted before them.
+    fix: |
+      // GET /callback?code=...&state=...
+      const query = new URL(request.url).searchParams;
+      if (!session.state || query.get("state") !== session.state) {
+        return Response.json({ error: "State does not match" }, { status: 400 });
+      }
+      const user = await exchangeCode(query.get("code"));
+      session.user = user;
+      return Response.json({ signedIn: true });
+
+  - type: code-challenge
+    id: write-check-callback
+    concept: backend.oauth
+    difficulty: 3
+    language: ts
+    editable: '24-25'
+    prompt: >-
+      `callback` signs in whoever's code arrives. Guard it.
+
+
+      If the session has no `state`, or the query's `state` differs, answer 400 with
+      `{ error: 'State does not match' }`. Then clear the saved state, so it works once. If
+      there's no `code`, answer 400 with `{ error: 'Missing code' }`. Otherwise sign the user
+      in and redirect as before.
+    hints:
+      - The two checks come before `exchange` runs, so a bad callback never swaps anything.
+      - A session with no saved state means the app never started this sign-in.
+      - 'Start with `if (session.state === undefined || query.state !== session.state)`.'
+
+  - type: prose
+    id: what-pkce-does
+    body: >-
+      One more guard, for a stolen code. Before step 1 the app makes a random secret, the
+      **code verifier**. The redirect carries only a scrambled form of it, its hash.
+
+
+      At the swap it sends the verifier itself. The provider scrambles it the same way and
+      compares. A thief with the code but no verifier gets nothing. That's **PKCE**.
+
+  - type: predict-output
+    id: predict-verifier-check
+    concept: backend.pkce
+    difficulty: 3
+    language: text
+    code: |
+      Redirect sent:  code_challenge = hash("k9f3...the app's verifier")
+      Code stolen:    c_m5ryo3wz
+      Thief swaps:    code=c_m5ryo3wz  code_verifier=attacker-guess
+    question: The thief has the code but not the verifier. What does the provider answer?
+    choices:
+      - text: 'An `invalid_grant` error'
+        correct: true
+        feedback: >-
+          Right. The guess hashes to something else, so the swap is refused.
+      - text: An access token
+        feedback: >-
+          That was the risk before PKCE. Now a code is useless without its verifier.
+      - text: A fresh code to try again
+        feedback: >-
+          The provider refuses the swap outright. It never hands out another code.
+
+  - type: prose
+    id: what-a-passkey-is
+    body: >-
+      Passwords can be typed into a fake page. A **passkey** can't. It's a pair of keys your
+      device makes for one site: the private key never leaves the device, and the site keeps
+      only the public key.
+
+
+      To sign in, the site sends a random challenge. Your device signs it after your
+      fingerprint or PIN. The browser only uses a passkey on the site it was made for.
+
+  - type: explain-back
+    id: explain-passkey-phishing
+    concept: backend.passkeys
+    difficulty: 3
+    prompt: >-
+      A fake page at `g00gle-login.example` copies Google's sign-in exactly. Why can't it
+      steal a passkey the way it steals passwords?
+    rubric:
+      - The browser ties each passkey to the site that created it, and the fake site's address differs.
+      - With no matching passkey for that address, the browser won't sign anything for it.
+      - The private key never leaves the device, so there's nothing for the user to type or give away.
+    modelAnswer: >-
+      A passkey belongs to one site. On `g00gle-login.example` the browser looks for a
+      passkey made for that address, finds none, and signs nothing. There's no secret to type
+      either. The private key stays on the device, and Google only holds the public key. The
+      fake page has nothing to collect.
+
+recap:
+  - Follow the "Sign in with" flow from redirect to callback to token swap.
+  - Refuse a callback whose `state` doesn't match, and know that PKCE makes a stolen code useless.
+  - Tell an ID token from an access token, and say why a passkey resists phishing.
+
+recall:
+  - id: card-code-not-token
+    concept: backend.oauth
+    front: Why does the redirect carry a code rather than the access token?
+    back: >-
+      A URL leaks, in history and logs. The code is one-time and useless alone, so the token
+      only travels server to server.
+  - id: card-state-check
+    concept: backend.oauth
+    front: What does the `state` check on the callback stop?
+    back: >-
+      A code the app never asked for, such as an attacker's, signing the victim in to the
+      attacker's account.
+  - id: card-pkce
+    concept: backend.pkce
+    front: What does PKCE add, and what does it stop?
+    back: >-
+      The app sends a hash first and the secret verifier at the swap. A stolen code can't be
+      swapped without the verifier.
+  - id: card-id-vs-access
+    concept: backend.oidc
+    front: What's the difference between an ID token and an access token?
+    back: >-
+      An ID token tells the app who the user is. An access token lets the app call an API for
+      the user.
+  - id: card-passkey-origin
+    concept: backend.passkeys
+    front: Why is a passkey phishing-resistant?
+    back: >-
+      It's bound to one site, so the browser won't use it on a look-alike, and no secret is
+      ever typed.
+
+references:
+  - kind: rfc
+    title: 'RFC 6749: The OAuth 2.0 Authorization Framework'
+    authors: D. Hardt (ed.)
+    year: 2012
+    venue: IETF
+    url: https://www.rfc-editor.org/rfc/rfc6749
+    note: The authorisation code grant, `state`, and why the code is swapped server to server.
+    primary: true
+    verified: true
+  - kind: rfc
+    title: 'RFC 7636: Proof Key for Code Exchange by OAuth Public Clients'
+    authors: N. Sakimura (ed.), J. Bradley and N. Agarwal
+    year: 2015
+    venue: IETF
+    url: https://www.rfc-editor.org/rfc/rfc7636
+    note: The `code_verifier`, `code_challenge`, the S256 method, and the attack it prevents.
+    primary: true
+    verified: true
+  - kind: spec
+    title: 'OpenID Connect Core 1.0 incorporating errata set 2'
+    authors: N. Sakimura, J. Bradley, M. Jones, B. de Medeiros and C. Mortimore
+    venue: OpenID Foundation
+    url: https://openid.net/specs/openid-connect-core-1_0.html
+    note: The ID token, the `openid` scope, `sub`, `iss`, `aud` and `nonce`.
+    verified: true
+  - kind: spec
+    title: 'Web Authentication: An API for accessing Public Key Credentials - Level 3'
+    authors: T. Cappalli, A. Kumar, E. Lundberg, M. Miller and others (eds)
+    venue: W3C Recommendation
+    url: https://www.w3.org/TR/webauthn-3/
+    note: The credential model behind passkeys, and how a credential is bound to its site.
+    verified: true
+
+deepDive: >-
+  In practice a library such as Auth.js, or the provider's own SDK, builds the redirect and
+  does the swap. The redirect URL carries `response_type=code`, `client_id`,
+  `redirect_uri`, `scope` (space-separated, for example `openid email`), `state`,
+  `code_challenge` and `code_challenge_method=S256`. The swap is a `POST` to the token
+  endpoint with `grant_type=authorization_code`, the `code`, the same `redirect_uri` and the
+  `code_verifier`.
+
+
+  PKCE's hash is SHA-256 of the verifier, base64url-encoded. It was made for apps that can't
+  keep a secret, such as mobile and single-page apps, and is now recommended for every
+  client.
+
+
+  Before trusting an ID token, check its signature against the provider's published keys,
+  that `iss` is the provider, that `aud` is your app, and that `exp` hasn't passed. Send a
+  `nonce` with the redirect and check it comes back in the token, so an old token can't be
+  replayed.
+
+
+  The attack the `state` check stops is called login CSRF: the victim is signed in to the
+  attacker's account, and anything they save lands there.

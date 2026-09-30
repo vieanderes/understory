@@ -1,0 +1,268 @@
+summary: >-
+  When two services talk over an API, each team's own tests use a fake of the other side,
+  and a fake keeps its old answers forever. The provider renames a field, every test on both
+  sides stays green, and production breaks. A contract test closes that gap by writing down
+  what the consumer relies on and checking it against the real provider, in the provider's
+  own build, before it deploys.
+
+
+  In consumer-driven contracts, each consumer records the requests it sends and only the
+  response fields it reads, with type matchers rather than exact values. Pact turns that
+  record into a contract file, a broker stores it, and the provider replays every
+  interaction against its real code, setting up data through named provider states. The
+  broker then answers one question for every release: can this version go to production
+  alongside the versions already there?
+
+
+  Schema-based contracts are the other family: the provider publishes an OpenAPI document or
+  a shared schema, and both sides check against it. They're simpler to run and suit public
+  APIs with unknown consumers, but they can't tell which fields anyone uses. Contract tests
+  sit in the middle of the pyramid and replace most cross-service end-to-end tests. They
+  check shape and meaning at the boundary, not whether the provider computes the right
+  answer.
+remember:
+  - A fake frozen at an old version of an API keeps both sides green while production breaks, and a contract test is what re-checks the fake against the real provider.
+  - In consumer-driven contracts, each consumer records only the requests it sends and the fields it reads, so the provider may add fields freely and remove the ones no consumer uses.
+  - Use type matchers such as `integer(1299)` and `like('GBP')` in a contract, because exact values make the provider's build fail on its own test data.
+  - Provider states, written with `given`, name the data an interaction needs, and the provider sets that data up before replaying it.
+  - The provider verifies every consumer's contract in its own pipeline, and a failing verification blocks the provider's deploy, not the consumer's.
+  - '`can-i-deploy` asks the broker whether a version has passed verification against the versions already in the target environment, and `record-deployment` keeps that picture current.'
+  - Contract tests check shape and meaning at the boundary, so the provider still needs its own tests for correct values.
+sections:
+  - title: The whole Pact workflow, run end to end
+    body: |-
+      Here is a consumer test in Pact JS 17. The client function is the consumer's real code,
+      and the test runs it against a Pact mock server that answers as the contract says.
+
+      ```js
+      import assert from 'node:assert/strict';
+      import path from 'node:path';
+      import { PactV3, MatchersV3 } from '@pact-foundation/pact';
+
+      const { integer, string, eachLike, regex } = MatchersV3;
+
+      async function getOrder(baseUrl, id) {
+        const res = await fetch(`${baseUrl}/orders/${id}`, { headers: { accept: 'application/json' } });
+        if (!res.ok) throw new Error(`order ${id}: ${res.status}`);
+        const body = await res.json();
+        return { id: body.id, total: body.total, currency: body.currency, lines: body.lines.length };
+      }
+
+      const pact = new PactV3({ consumer: 'checkout-web', provider: 'orders-api', dir: path.resolve('pacts') });
+
+      pact
+        .given('order 42 exists')
+        .uponReceiving('a request for order 42')
+        .withRequest({ method: 'GET', path: '/orders/42', headers: { accept: 'application/json' } })
+        .willRespondWith({
+          status: 200,
+          body: {
+            id: integer(42),
+            total: integer(1299),
+            currency: regex(/^[A-Z]{3}$/, 'GBP'),
+            lines: eachLike({ sku: string('KETTLE-1'), quantity: integer(1) }),
+          },
+        });
+
+      await pact.executeTest(async (server) => {
+        const order = await getOrder(server.url, 42);
+        assert.deepEqual(order, { id: 42, total: 1299, currency: 'GBP', lines: 1 });
+      });
+      ```
+
+      A passing test writes `pacts/checkout-web-orders-api.json`, holding the request, the
+      example response and the matching rules. The provider's build replays it:
+
+      ```js
+      import path from 'node:path';
+      import { Verifier } from '@pact-foundation/pact';
+      import { orders } from './store.js'; // the provider's own data store, a Map here
+
+      // the real provider app is already listening on port 8091
+      await new Verifier({
+        provider: 'orders-api',
+        providerBaseUrl: 'http://localhost:8091',
+        pactUrls: [path.resolve('pacts/checkout-web-orders-api.json')],
+        stateHandlers: {
+          'order 42 exists': async () => {
+            orders.set(42, {
+              id: 42, total: 1500, currency: 'EUR', status: 'paid',
+              lines: [{ sku: 'TOASTER-2', quantity: 2 }],
+            });
+          },
+        },
+      }).verifyProvider();
+      ```
+
+      Against a local provider, that verified: the provider's own data, a total of 1500 in
+      euros with an extra `status`, fits every matcher. Then the provider renamed `total` to
+      `amount`, and verification failed with the message a provider developer needs:
+
+      ```text
+      1.1) has a matching body
+             $ -> Actual map is missing the following keys: total
+      ```
+
+      In a real pipeline the file doesn't travel by path. The consumer publishes it to a
+      Pact Broker, tagged with its git commit and branch, and the provider fetches the
+      contracts it must honour from there.
+  - title: Writing contracts that don't over-promise
+    body: |-
+      A contract is a list of promises the provider must keep. Every extra promise is a
+      change the provider can no longer make, so write down only what the consumer's code
+      depends on.
+
+      - **Only fields you read.** If checkout never reads `status`, leave it out. The
+        provider can then change or drop it without asking.
+      - **Types, not values.** `integer(1299)` means "any whole number, for example 1299".
+        A plain `1299` means exactly 1299, which fails as soon as the provider's test data
+        differs. Use `regex` when the format matters, such as a currency code or a date, and
+        `eachLike` for arrays, which means "at least one item shaped like this".
+      - **Exact where it matters.** An enum value your code branches on, such as a status of
+        `'paid'`, deserves an exact match, because a new spelling would break you.
+      - **Errors too.** Add interactions for the 404 and the validation error your code
+        handles. A provider that changes its error format breaks consumers as surely as one
+        that renames a field.
+
+      **Provider states** keep interactions independent of whatever happens to be in a
+      database. `given('order 42 exists')` names a situation, and the provider's state
+      handler creates it before that interaction runs. States can take parameters, so one
+      handler can serve many interactions. The consumer names the state; the provider
+      decides how to make it true, through a repository, a fixture or a stubbed downstream.
+
+      The mirror rule applies on the consumer side. Be a **tolerant reader**: ignore fields
+      you don't know, and don't fail on extra ones. Pact's matching already allows extra
+      fields in a response, and consumer code should behave the same way, or the contract
+      promises a freedom the consumer can't really handle.
+  - title: The broker, can-i-deploy and the release pipeline
+    body: |-
+      The broker stores every contract and every verification result, keyed by application
+      version, ideally the git commit. That table of which consumer version works with which
+      provider version is called the **matrix**. A typical pipeline uses the Pact Broker CLI
+      like this:
+
+      ```bash
+      # consumer build: publish the contract for this commit
+      pact-broker publish ./pacts --consumer-app-version "$GIT_SHA" --branch "$GIT_BRANCH"
+
+      # any build, before deploying: is this version compatible with what's in production?
+      pact-broker can-i-deploy --pacticipant checkout-web --version "$GIT_SHA" --to-environment production
+
+      # after the deploy succeeds: tell the broker what now runs there
+      pact-broker record-deployment --pacticipant checkout-web --version "$GIT_SHA" --environment production
+      ```
+
+      On the provider side, the verifier fetches the contracts it must satisfy from the
+      broker rather than a file, and publishes its results back. The Pact JS `Verifier`
+      takes `pactBrokerUrl`, `providerVersion`, `providerVersionBranch`,
+      `publishVerificationResult: true` and `consumerVersionSelectors`. Selectors such as
+      `{ mainBranch: true }` and `{ deployedOrReleased: true }` mean "verify what's on the
+      consumers' main branches and what's already deployed", which is what the provider must
+      not break.
+
+      Two refinements keep teams from blocking each other. **Pending pacts**
+      (`enablePending: true`) let a brand-new contract fail the provider's verification
+      without failing its build, until the provider has passed it once. And a broker
+      **webhook** can trigger the provider's verification the moment a consumer publishes a
+      changed contract, so the consumer learns within minutes whether its new expectation is
+      met.
+
+      The result is independent deploys with a safety check: each service ships on its own
+      schedule, and `can-i-deploy` refuses any version that hasn't been verified against the
+      versions it will meet in the target environment.
+  - title: Schema-based contracts, and when to use which
+    body: |-
+      The alternative is to agree on a schema. The provider publishes an OpenAPI document,
+      a JSON Schema, a GraphQL schema or a shared validation library. The provider tests
+      that its responses match, and consumers generate clients from it or validate at
+      runtime. A shared Zod schema is the smallest version:
+
+      ```ts
+      import { z } from 'zod';
+
+      // Published by the orders team, imported by every consumer.
+      export const Order = z.object({
+        id: z.number().int(),
+        total: z.number().int().nonnegative(),
+        currency: z.string().regex(/^[A-Z]{3}$/),
+      });
+      export type Order = z.infer<typeof Order>;
+
+      Order.safeParse({ id: 42, total: 1299, currency: 'GBP', status: 'paid' }).success; // true
+      Order.safeParse({ id: 42, amount: 1299, currency: 'GBP' }).success; // false
+      ```
+
+      The failed parse reports `invalid_type` at path `total`, "expected number, received
+      undefined". `z.object` drops unknown keys by default, so the extra `status` is
+      tolerated, the same tolerant-reader rule as before.
+
+      Each family fits a different situation.
+
+      - **Consumer-driven contracts** fit services owned by teams in one organisation, where
+        consumers are known and the provider wants to know exactly which fields are in use
+        before changing them.
+      - **Schema-based contracts** fit public or partner APIs with consumers you can't
+        enlist, and any API where you already maintain an OpenAPI document. Their weakness
+        is that a schema lists everything the provider offers, so it can't say whether
+        removing a field breaks anyone. Pair them with breaking-change checks on the schema,
+        such as `buf breaking` for Protocol Buffers.
+      - **Neither** fits two modules deployed together from one repository. There, the type
+        checker and an integration test already catch a mismatch.
+
+      Either way, contracts don't test behaviour. A provider that returns a well-formed order
+      with the wrong total passes every contract. That's what the provider's own unit and
+      integration tests are for.
+pitfalls:
+  - '**Recording exact values.** A plain `1299` in the contract fails the provider on its own data. Use type matchers, and exact values only for fields your code branches on.'
+  - '**Copying the provider''s whole response into the contract.** Every field listed is a promise, so the provider can''t change anything. Record only the fields the consumer reads.'
+  - '**Writing the contract by hand instead of from the client code.** A contract that doesn''t exercise the real client can promise one thing while the code reads another. Generate it from a test that calls your real client function.'
+  - '**Depending on shared data instead of provider states.** An interaction that assumes order 42 happens to exist passes today and fails after a database reset. Name the state with `given` and let the provider create it.'
+  - '**Verifying only the latest contract.** A provider that checks only main can break the consumer version still in production. Use selectors for deployed or released versions, and run `can-i-deploy` before every deploy.'
+  - '**Treating contract tests as functional tests.** They prove the shape, not that the total is right. Keep the provider''s own tests for behaviour.'
+  - '**Keeping a full end-to-end environment as the main integration check.** It''s slow, flaky and hard to debug when five services run at once. Use contracts per pair, and a few end-to-end journeys on top.'
+interview:
+  - question: What is consumer-driven contract testing and why would you use it?
+    answer: >-
+      It's a way to check that two services agree on an API without running them together.
+      The consumer writes a test against a mock provider that records each request it sends
+      and the response fields it relies on, with type matchers. That record, the pact, is
+      published to a broker, and the provider replays every interaction against its real
+      code in its own pipeline, setting up data through provider states. If the provider
+      renames a field a consumer reads, the provider's build fails before deploy. I use it
+      for internal services with known consumers, because it replaces slow, flaky
+      multi-service end-to-end tests, and it tells the provider exactly which fields are in
+      use. The costs are the broker, the discipline of provider states, and buy-in from
+      both teams.
+  - question: How do contract tests fit with unit and end-to-end tests?
+    answer: >-
+      They sit in the middle of the pyramid, beside integration tests, and take over most of
+      the job cross-service end-to-end tests used to do. Unit tests with fakes check each
+      service's logic fast, but a fake can drift from the real API. Contract tests re-check
+      those fakes against the real provider, one consumer and provider pair at a time, in
+      seconds, and they name the pair that broke. On top, I keep a few end-to-end journeys
+      for the flows that matter most, because only they prove the deployed system works
+      together. What contracts don't cover is behaviour: a provider can return a correctly
+      shaped order with the wrong total, so its own tests still check values.
+  - question: What does can-i-deploy do?
+    answer: >-
+      It's the release gate that uses the broker's record of which versions work together.
+      Every consumer publishes its contracts tagged with its commit, every provider publishes
+      verification results for its commit, and every deploy is recorded against an
+      environment. Before deploying, a pipeline runs `can-i-deploy` for its version and
+      target environment, and the broker checks whether that version has passed verification
+      against every counterpart currently deployed there. If the new provider hasn't been
+      verified against the consumer version in production, or failed, the answer is no and
+      the deploy stops. That lets teams deploy independently without a shared staging
+      environment. It only works if `record-deployment` runs after every real deploy, or the
+      broker's picture goes stale.
+  - question: When would you choose schema-based contracts, such as OpenAPI, over Pact?
+    answer: >-
+      When I don't know or can't enlist the consumers. For a public or partner API, nobody
+      will write pacts for me, so the OpenAPI document is the contract: the provider tests
+      its responses against it in CI, consumers generate typed clients from it, and a
+      breaking-change check on the schema blocks removals and type changes. It's simpler to
+      run and doubles as documentation. The trade-off is that a schema says what the
+      provider offers, not what anyone uses, so every removal looks breaking and needs
+      versioning or deprecation. Inside one organisation, with known consumers, Pact's
+      consumer-driven approach gives the provider more freedom, because it knows exactly
+      which fields each consumer reads.

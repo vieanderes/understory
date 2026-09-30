@@ -1,0 +1,311 @@
+summary: >-
+  An agent is a model called in a loop with tools. Each turn the model either asks for tool
+  calls or gives a final answer; your code runs the tools, appends the results and calls
+  again. The model decides the next step, and your code decides everything else: which
+  tools exist, how many turns are allowed, what it may spend, and which actions need a
+  person to say yes.
+
+
+  Agents solve tasks whose steps can't be known in advance: debugging a failing test,
+  researching a question across sources, planning a trip where each search changes the next.
+  The price is predictability. Every extra model decision adds cost, latency and a chance
+  to go wrong, and a loop can repeat itself until something stops it.
+
+
+  So the senior default is the least autonomy that works. If the steps are fixed, write
+  them as plain code that calls the model where judgement is needed, a **workflow**. Reach
+  for an agent loop when the path depends on what each step finds, and then wrap it in
+  limits: a step cap, a token budget, repeat detection and approval for irreversible
+  actions. Memory across sessions and shared tools through MCP are both things your code
+  and infrastructure provide, not properties of the model.
+remember:
+  - An agent is a model in a loop with tools, and the loop ends when a reply has no tool call or when your limits stop it.
+  - Every agent loop needs a hard step cap, and production loops add a token budget, repeat detection and human approval before irreversible actions.
+  - Save each assistant reply whole, because every `tool_result` must answer a `tool_use` block in the message before it.
+  - Stop on any stop reason other than `tool_use`, since a cut-off or refusal is not a request for tools.
+  - Prefer a workflow of plain code when the steps are known, and an agent only when the next step depends on what the last one found.
+  - The model keeps nothing between calls, so working memory is the `messages` you send and long-term memory is a store your code writes and searches.
+  - Tool errors go back to the model as `is_error` results so it can recover, while limits your code enforces end the run.
+  - MCP is an open protocol that lets one server offer tools, resources and prompts to any compatible app, so a tool is written once and reused.
+sections:
+  - title: Guards beyond the step cap
+    body: |-
+      A step cap stops an endless loop, but a run can do harm well inside it: spend a
+      fortune in tokens, retry the same failing call, or book something nobody approved.
+      This version of the lesson's loop adds three guards. The replies are dicts shaped
+      like the lesson's, with a `usage` field added by the stub.
+
+      ```python
+      import json
+
+      class AgentStopped(Exception):
+          pass
+
+      def run_guarded(call_model, tools, messages, *, max_steps=8, max_tokens=20_000,
+                      needs_approval=frozenset(), approve=lambda name, args: False):
+          spent, seen_calls = 0, set()
+          for step in range(max_steps):
+              reply = call_model(messages)
+              spent += reply["usage"]["input_tokens"] + reply["usage"]["output_tokens"]
+              messages.append({"role": "assistant", "content": reply["content"]})
+              if reply["stop_reason"] != "tool_use":
+                  return "".join(b["text"] for b in reply["content"] if b["type"] == "text")
+              if spent > max_tokens:
+                  raise AgentStopped(f"token budget used up after {step + 1} steps")
+              results = []
+              for block in reply["content"]:
+                  if block["type"] != "tool_use":
+                      continue
+                  name, args = block["name"], block["input"]
+                  key = (name, json.dumps(args, sort_keys=True))
+                  if key in seen_calls:
+                      raise AgentStopped(f"repeated call to {name} with the same input")
+                  seen_calls.add(key)
+                  result = {"type": "tool_result", "tool_use_id": block["id"]}
+                  if name in needs_approval and not approve(name, args):
+                      result |= {"content": "A person declined this action.", "is_error": True}
+                  else:
+                      try:
+                          result["content"] = str(tools[name](**args))
+                      except Exception as error:
+                          result |= {"content": f"Error: {error}", "is_error": True}
+                  results.append(result)
+              messages.append({"role": "user", "content": results})
+          raise AgentStopped(f"no answer after {max_steps} steps")
+
+      def reply(stop, *blocks):
+          return {"stop_reason": stop, "content": list(blocks),
+                  "usage": {"input_tokens": 500, "output_tokens": 50}}
+
+      def use(call_id, name, **args):
+          return {"type": "tool_use", "id": call_id, "name": name, "input": args}
+
+      tools = {"find_slots": lambda day: f"{day}: 10:00, 14:30",
+               "book_slot": lambda day, time: f"Booked {day} {time}"}
+      script = iter([
+          reply("tool_use", use("t1", "find_slots", day="Friday")),
+          reply("tool_use", use("t2", "book_slot", day="Friday", time="10:00")),
+          reply("end_turn", {"type": "text", "text": "I found 10:00 but didn't book it."}),
+      ])
+      msgs = [{"role": "user", "content": "Book me a haircut on Friday"}]
+      print(run_guarded(lambda m: next(script), tools, msgs, needs_approval={"book_slot"}))
+      # I found 10:00 but didn't book it.
+      ```
+
+      Note the split. A declined action or a failing tool goes back to the model as an
+      error result, because the model can adapt. A broken limit raises, because the run
+      itself is the problem. Raising leaves a `tool_use` without its results at the end of
+      `messages`, so a run you intend to resume needs results added first.
+  - title: Workflows first, agents when the path is unknown
+    body: |-
+      Most production "agents" are workflows: fixed code paths that call a model at the
+      steps that need judgement. They are cheaper, faster, and testable like any other
+      function, because the control flow is yours.
+
+      ```python
+      def refund_reply(order_id, get_order, refund_allowed, ask_model):
+          order = get_order(order_id)        # plain code, always runs
+          allowed = refund_allowed(order)    # a rule in code, not a model guess
+          prompt = f"Order: {order}\nRefund allowed: {allowed}\nDraft a short reply."
+          return ask_model(prompt)           # the model does the one fuzzy step
+
+      print(refund_reply(
+          "A17",
+          get_order=lambda oid: {"id": oid, "days_since_delivery": 12},
+          refund_allowed=lambda order: order["days_since_delivery"] <= 30,
+          ask_model=lambda prompt: f"(draft based on: {prompt.splitlines()[1]})",
+      ))  # (draft based on: Refund allowed: True)
+      ```
+
+      The common workflow shapes have names worth knowing. **Prompt chaining** runs calls
+      in sequence, each on the last one's output, with checks in code between them.
+      **Routing** classifies the input first and sends it to a specialised prompt or model.
+      **Parallelisation** runs independent calls at once and combines them, or asks the
+      same question several times and votes. **Orchestrator and workers** has one model
+      split a task and others do the parts. **Evaluator and optimiser** loops a draft
+      through a critic until it passes.
+
+      An agent loop earns its place when you can't write the path down: the number and order
+      of steps depend on results. Even then, keep the tool set small and each tool
+      narrow, give the agent a clear stopping condition, and log every turn, because
+      debugging an agent means reading its trajectory.
+  - title: Working memory, trimming and long-term memory
+    body: |-
+      Everything an agent knows in a run is in `messages`, and each call resends all of it.
+      Input tokens grow with every turn, so a long run gets slower and dearer per step, and
+      eventually hits the context window. There are three standard responses.
+
+      **Trim** old turns, carefully. You can't cut between a `tool_use` and its
+      `tool_result`, or the next call fails. Cut only where a plain user message starts:
+
+      ```python
+      def is_tool_results(message):
+          content = message["content"]
+          return isinstance(content, list) and any(
+              isinstance(b, dict) and b.get("type") == "tool_result" for b in content
+          )
+
+      def trim_history(messages, keep_last):
+          """Keep about the last keep_last messages, starting on a plain user message,
+          so no tool result is left without the tool_use that asked for it."""
+          if len(messages) <= keep_last:
+              return list(messages)
+          start = len(messages) - keep_last
+          while start < len(messages) and (
+              messages[start]["role"] != "user" or is_tool_results(messages[start])
+          ):
+              start += 1
+          return messages[start:]
+      ```
+
+      Trimming drops the original goal, so keep the goal in the system prompt. In a single
+      long task there may be no plain user message to cut at, and then trimming returns
+      nothing useful.
+
+      **Summarise** instead: ask the model to condense older turns into a short note of
+      facts found and decisions made, and replace them with it. It keeps meaning at the
+      cost of one extra call, and it loses detail.
+
+      **Store** what must outlive the session. Long-term memory is a database your code
+      writes to, such as a customer's preferences or past bookings, and retrieves into the
+      prompt when relevant, exactly like RAG. Decide what may be stored, for how long, and
+      who can delete it, because memory holds personal data.
+  - title: MCP underneath
+    body: |-
+      The **Model Context Protocol** separates tools from the apps that use them. The
+      **host** is the AI application, such as a chat app, an editor or your agent. Inside
+      it, a **client** holds one connection to each **server**. A server offers three kinds
+      of thing: **tools**, functions the model can call; **resources**, data the app can
+      read into context, such as files or records; and **prompts**, reusable templates a
+      user can pick.
+
+      Messages are JSON-RPC 2.0. After an `initialize` handshake where both sides declare
+      what they support, the client asks for `tools/list` and gets names, descriptions and
+      JSON Schemas for inputs, the same shape as the tool definitions from the tool lesson.
+      When the model asks for a tool, the host sends `tools/call` and turns the answer into
+      a tool result. Servers run locally over stdio, as a child process, or remotely over
+      HTTP.
+
+      ```json
+      {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+       "params": {"name": "find_slots", "arguments": {"day": "Friday"}}}
+      ```
+
+      Your agent loop doesn't change: MCP only changes where the tool list and the
+      function behind each name come from.
+
+      The security model matters in interviews. A server's tool descriptions go into the
+      model's context, so an untrusted server can plant instructions there, and its results
+      are untrusted text like any web page. Install servers you trust, give each the
+      narrowest credentials, and keep approval for actions that write or spend. MCP
+      standardises the connection; it does not make a tool safe.
+pitfalls:
+  - "**No way out of the loop but the model.** `while True` with a break on `end_turn` runs until the bill stops it. Use `for step in range(max_steps)` and raise when the cap is reached."
+  - "**Saving only the text of a reply.** The next call fails because the `tool_result` has no matching `tool_use`. Append `reply.content` whole."
+  - "**Stopping only on `end_turn`.** A reply cut off at `max_tokens` or refused has no tool calls, so the loop spins or crashes. Stop on anything but `tool_use`."
+  - "**Letting a tool exception kill the run.** One bad argument ends the whole task. Catch it and return an `is_error` result, so the model can correct itself."
+  - "**Irreversible tools with no approval.** A model that misreads the task can pay, send or delete. Put those tools behind a confirmation step in code, and log who approved."
+  - "**Building an agent for a fixed process.** Three known steps in a loop add cost, latency and failure modes. Write the steps as code and call the model where judgement is needed."
+  - "**Assuming the model remembers the user.** Each call sees only what you send. Store what should persist and retrieve it into the prompt."
+  - "**Trimming history mid-pair.** Cutting between a `tool_use` and its result breaks the next call. Cut only at a plain user message, or summarise."
+interview:
+  - question: What is an AI agent, and how is it different from a single model call with tools?
+    answer: >-
+      An agent is a model in a loop with tools, choosing its own next step until it
+      answers or hits a limit. A single call with tools allows one round: the model asks for
+      a tool, you run it, it answers. An agent keeps going, so it can search, read the
+      results, search again and then act, with the number of steps decided at run time. The
+      loop itself is short: call, append the whole reply, run any tool calls, append the
+      results as one user message, repeat, and stop on any stop reason other than tool use.
+      The difference that matters in production is control: in an agent the model picks the
+      path, so the code must cap steps and spend and guard risky actions.
+  - question: How do you stop an agent from running away with cost or doing something harmful?
+    answer: >-
+      Layered limits in code, never instructions in the prompt. A hard step cap ends any
+      loop. A token or money budget per run stops an expensive one inside the cap. Repeat
+      detection catches the same tool called with the same input, which usually means the
+      agent is stuck. Tools are narrow, with the least privilege they need, and anything
+      irreversible, such as paying, sending or deleting, needs human approval before it
+      runs. Every turn is logged so a bad run can be replayed. Tool errors go back to the
+      model to recover from, while a broken limit ends the run. The trade-off is that tight
+      limits fail some legitimate long tasks, so I tune them from real trajectories.
+  - question: When would you not use an agent?
+    answer: >-
+      When the steps are known in advance, I write a workflow instead. Looking up an order,
+      applying a refund rule and drafting a reply is three fixed steps: code runs them in
+      order and calls the model only to draft. That is cheaper, faster, deterministic in its
+      control flow, and testable with ordinary unit tests. Agents earn their cost when the
+      path depends on intermediate results, like debugging or open-ended research. Even
+      then I start with the simplest thing, such as prompt chaining or routing, and add
+      autonomy only when evaluation shows the simpler version can't do the task.
+  - question: How does an agent remember things between sessions?
+    answer: >-
+      It doesn't, on its own. Your code gives it memory. Within a run, memory is the message
+      history you resend each call, trimmed or summarised as it grows, taking care never to
+      split a tool call from its result. Across sessions, memory is a store your code owns:
+      facts such as preferences or past bookings are written deliberately and retrieved into
+      the prompt when relevant, the same way RAG retrieves documents. That makes memory a
+      data design question: what is worth keeping, who can see and delete it, how long it
+      lasts. The risk is storing wrong or sensitive facts that then shape every future
+      answer.
+  - question: What is MCP and why would a team adopt it?
+    answer: >-
+      MCP, the Model Context Protocol, is an open standard for offering tools, resources
+      and prompts to AI applications through servers. A team writes a server once, say for
+      its ticket system, and any compatible host, a chat app, a code editor or their own
+      agent, can list and call its tools over JSON-RPC. That replaces one integration per app
+      with one per system. The agent loop is unchanged; only where the tool definitions come
+      from moves. The caution is trust: tool descriptions and results from a server enter
+      the model's context, so a malicious server can inject instructions. I'd only connect
+      servers we control or vet, with narrow credentials and approval on writes.
+  - question: What is ReAct?
+    answer: >-
+      ReAct, short for reason and act, is the pattern behind most agents: the model
+      alternates between reasoning about what to do next, taking an action such as a tool
+      call, and reading the observation that comes back, until it can answer. The original
+      paper had the model write "Thought", "Action" and "Observation" lines in plain text,
+      and code parsed the actions out. Modern tool-calling APIs build the pattern in: the
+      reply carries structured `tool_use` blocks, and your loop sends back `tool_result`
+      blocks. So when I write the agent loop in this lesson, I'm writing ReAct. Its
+      weakness is that each step is a full model call, so long tasks are slow and costly,
+      which is why step caps matter.
+  - question: What is A2UI, and what problem does it solve?
+    answer: >-
+      A2UI, Agent-to-User Interface, is an open project Google released in December 2025
+      for agents that answer with an interface, not only text. The agent sends a
+      declarative JSON description, such as a form with a date picker or a list of cards,
+      built from a catalogue of components the client has approved. The client renders it
+      with its own native components, in Flutter, Angular or web components, so it matches
+      the app's design. The key point is security: the UI travels as data, not executable
+      code, so even a remote agent can't inject scripts into your page. It complements
+      Google's agent-to-agent protocol, A2A, and streaming chat rather than replacing
+      them. The trade-off is flexibility: the agent can only use components you allow.
+terms:
+  - term: Agent
+    say: Autonomous AI.
+    means: A model called in a loop with tools. The model picks the next step; your code runs
+      the tools and sets the limits, such as the step cap, the budget and which actions need
+      approval.
+  - term: Workflow
+    say: A weaker kind of agent.
+    means: Plain code with fixed steps that calls a model where needed. It is cheaper, faster
+      and easier to test, so it is the default when the steps are known.
+  - term: ReAct
+    say: A framework you install.
+    means: "A prompting pattern from a 2022 paper, reason plus act: the model writes a thought,
+      takes an action, reads the observation and repeats. Modern tool-use loops grew from
+      it."
+  - term: Memory
+    say: The model remembers you.
+    means: The model keeps nothing between calls. Working memory is the `messages` you send;
+      long-term memory is a store your code writes to and searches.
+  - term: MCP
+    say: An agent framework.
+    means: The Model Context Protocol, an open protocol through which a server offers tools,
+      resources and prompts to any compatible app. A tool is written once and reused across
+      clients.
+  - term: A2UI
+    say: Letting the agent write your front end.
+    means: "Agent-to-User Interface, an open project from Google: the agent sends a declarative
+      JSON description of an interface, built from components the client has approved, and
+      the client renders it."

@@ -1,0 +1,309 @@
+summary: >-
+  `fetch` is the standard way to make HTTP requests from JavaScript, in browsers and in Node.
+  It returns a promise that fulfils with a `Response` as soon as the status and headers
+  arrive. The body comes later, through a second promise from `json()` or `text()`. That
+  two-step shape explains its best-known surprise: `fetch` does not reject on a 404 or a 500,
+  because the server did answer. It rejects only when there's no answer at all, or when you
+  cancel it.
+
+
+  So every real call needs a small amount of discipline. Check `response.ok` before reading
+  the body, turn a bad status into a thrown error, parse carefully, and give the request a
+  deadline. Most teams wrap this in one `fetchJson` helper, so the rules live in one place.
+
+
+  Cancellation is the other half. An `AbortController` gives you a signal to pass to `fetch`
+  and a switch to flip. `AbortSignal.timeout` gives a signal that flips itself, and
+  `AbortSignal.any` combines several. You cancel to stop stale answers from overwriting fresh
+  ones, to stop work when a person leaves a page, and to put a ceiling on slow calls such as
+  an AI model's reply. Aborting stops the waiting, not the work the server already started.
+remember:
+  - "`fetch` fulfils on any HTTP answer, including 404 and 500, and rejects only on a network failure, a CORS block or an abort."
+  - "`response.ok` is `true` only for statuses 200 to 299, so check it before reading the body and throw your own error when it's `false`."
+  - "Reading the body is a second async step, and it can fail on its own: `json()` throws a `SyntaxError` on non-JSON, and a body can be read only once."
+  - "Abort errors are identified by `error.name`: `AbortError` for `abort()`, `TimeoutError` for `AbortSignal.timeout`, and `TypeError` means the network failed."
+  - "`AbortSignal.any([a, b])` aborts when any of its signals does, which combines a person's cancel button with a deadline."
+  - "`Promise.race` against a timer gives up waiting but leaves the request running, while a signal actually cancels it."
+  - Aborting stops the client waiting and reading, but a request that reached the server may still complete there.
+  - To keep only the newest answer, abort the previous request before starting the next one, and ignore the `AbortError` it produces.
+sections:
+  - title: Every way a fetch can end
+    body: |-
+      A request can end in one of five ways, and your code should tell them apart. This runs
+      in Node 24 against a small local server; browsers behave the same, apart from the error
+      message text.
+
+      ```js
+      import { createServer } from "node:http";
+
+      // /slow answers after 200 ms; anything else is a 404.
+      const server = createServer((req, res) => {
+        const slow = req.url === "/slow";
+        setTimeout(() => {
+          res.writeHead(slow ? 200 : 404, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ path: req.url }));
+        }, slow ? 200 : 0);
+      });
+      await new Promise((resolve) => server.listen(0, resolve));
+      const base = `http://localhost:${server.address().port}`;
+
+      async function attempt(label, run) {
+        try {
+          const response = await run();
+          console.log(label, "fulfilled", response.status, response.ok);
+        } catch (error) {
+          console.log(label, "rejected", error.name);
+        }
+      }
+
+      await attempt("404:", () => fetch(`${base}/books/99`));
+      await attempt("no server:", () => fetch("http://localhost:1/"));
+
+      const controller = new AbortController();
+      const pending = attempt("aborted:", () => fetch(`${base}/slow`, { signal: controller.signal }));
+      controller.abort();
+      await pending;
+
+      await attempt("timeout:", () => fetch(`${base}/slow`, { signal: AbortSignal.timeout(50) }));
+
+      const userCancel = new AbortController();
+      const signal = AbortSignal.any([userCancel.signal, AbortSignal.timeout(5000)]);
+      setTimeout(() => userCancel.abort(), 20);
+      await attempt("any:", () => fetch(`${base}/slow`, { signal }));
+      server.close();
+
+      // 404: fulfilled 404 false
+      // no server: rejected TypeError
+      // aborted: rejected AbortError
+      // timeout: rejected TimeoutError
+      // any: rejected AbortError
+      ```
+
+      A CORS block in a browser also rejects with a `TypeError`, indistinguishable in code
+      from a dead network, on purpose: a page mustn't learn details about servers it can't
+      read. The console shows the real reason.
+
+      The body is a second stage. When the promise from `fetch` fulfils, only the status and
+      headers have arrived; the body may still be streaming. `json()` reads the whole stream
+      and parses it, so it can fail independently: a `SyntaxError` if the body isn't JSON, a
+      `TypeError` if you've already read the body once (`response.bodyUsed` is then `true`),
+      and an `AbortError` if the signal fires while the body is still downloading. A `204`
+      has no body at all, so skip parsing it.
+  - title: A fetch helper you'd ship
+    body: |-
+      Scattering `if (!response.ok)` across a codebase leads to places that forget it. One
+      helper keeps the rules together: a default deadline, a caller's signal combined with
+      it, an error that carries the status, and a body read as text on failure, since error
+      pages are often HTML.
+
+      ```js
+      class HttpError extends Error {
+        constructor(response, body) {
+          super(`HTTP ${response.status} for ${response.url}`);
+          this.name = "HttpError";
+          this.status = response.status;
+          this.body = body;
+        }
+      }
+
+      async function fetchJson(url, { timeoutMs = 5000, signal, ...options } = {}) {
+        const signals = [AbortSignal.timeout(timeoutMs)];
+        if (signal) signals.push(signal);
+        const response = await fetch(url, {
+          ...options,
+          headers: { Accept: "application/json", ...options.headers },
+          signal: AbortSignal.any(signals),
+        });
+        if (!response.ok) {
+          throw new HttpError(response, await response.text());
+        }
+        if (response.status === 204) return null;
+        return response.json();
+      }
+      ```
+
+      Run against a local server that answers `/books/12` with JSON, `/empty` with a 204,
+      `/broken` with an HTML 502, and everything else after 500 ms:
+
+      ```text
+      await fetchJson(`${base}/books/12`)                      -> { title: 'Emma' }
+      await fetchJson(`${base}/empty`)                         -> null
+      await fetchJson(`${base}/broken`)                        -> throws HttpError, status 502, body <h1>Bad gateway</h1>
+      await fetchJson(`${base}/slow`, { timeoutMs: 100 })      -> throws TimeoutError
+      controller.abort(new Error("user left the page"))        -> throws Error: user left the page
+      ```
+
+      The last line shows a useful detail: `abort(reason)` takes an optional reason, and the
+      fetch rejects with that reason instead of a generic `AbortError`. Callers can then tell
+      "I cancelled this" from "it timed out" from "the server said no" by the error they
+      catch, which is what good error messages and retry logic need.
+
+      Callers decide what each error means for the person. A `TimeoutError` or a 503 might
+      earn a retry; an `HttpError` with status 404 becomes "Not found"; an `AbortError` is
+      usually silent, because your own code asked for it.
+  - title: Signals beyond fetch
+    body: |-
+      `AbortSignal` isn't tied to `fetch`. Many APIs take one: `addEventListener` removes the
+      listener when its `signal` option aborts, and in Node the promise-based timers, streams
+      and `fs` functions such as `readFile` accept one too. You can make your own async functions cancellable the same way, which
+      lets one signal cancel a whole operation, waits included.
+
+      ```js
+      function sleep(ms, signal) {
+        return new Promise((resolve, reject) => {
+          signal?.throwIfAborted();
+          const timer = setTimeout(() => {
+            signal?.removeEventListener("abort", onAbort);
+            resolve();
+          }, ms);
+          function onAbort() {
+            clearTimeout(timer);
+            reject(signal.reason);
+          }
+          signal?.addEventListener("abort", onAbort, { once: true });
+        });
+      }
+
+      async function withRetry(task, { attempts = 3, baseMs = 100, signal } = {}) {
+        for (let attempt = 1; ; attempt++) {
+          try {
+            return await task(signal);
+          } catch (error) {
+            if (signal?.aborted || attempt >= attempts) throw error;
+            const delay = baseMs * 2 ** (attempt - 1);
+            console.log(`attempt ${attempt} failed, waiting ${delay} ms`);
+            await sleep(delay, signal);
+          }
+        }
+      }
+
+      let calls = 0;
+      const flaky = async () => {
+        calls++;
+        if (calls < 3) throw new Error("503 Service Unavailable");
+        return "booked";
+      };
+      console.log(await withRetry(flaky));
+
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(), 150);
+      try {
+        await withRetry(() => Promise.reject(new Error("down")), { signal: controller.signal });
+      } catch (error) {
+        console.log("gave up:", error.name);
+      }
+
+      // attempt 1 failed, waiting 100 ms
+      // attempt 2 failed, waiting 200 ms
+      // booked
+      // attempt 1 failed, waiting 100 ms
+      // attempt 2 failed, waiting 200 ms
+      // gave up: AbortError
+      ```
+
+      The pattern has three parts: check `throwIfAborted()` up front, listen for `abort`
+      once, and clean up whichever side finishes first. `signal.reason` holds whatever was
+      passed to `abort()`, or a `DOMException` named `AbortError` if nothing was. Production
+      retry code also adds random jitter to the delay, so many clients don't retry in step.
+  - title: Stale responses, and why "latest wins" needs code
+    body: |-
+      Responses don't arrive in the order requests were sent. A short search matches more
+      rows and takes longer; a mobile connection stalls; a server's cache serves one query
+      and not another. Any time a later request supersedes an earlier one, such as typing,
+      switching tabs or paging, the old answer can land last and overwrite the new one.
+
+      The fix is to make superseded requests unable to write. Cancelling them is the tidiest
+      way, and a small wrapper makes it reusable:
+
+      ```js
+      function latestOnly(task) {
+        let controller;
+        return (...args) => {
+          controller?.abort();
+          controller = new AbortController();
+          return task(controller.signal, ...args);
+        };
+      }
+
+      // A stand-in for fetch: slower for short queries, and it honours the signal.
+      function fakeSearch(signal, query) {
+        return new Promise((resolve, reject) => {
+          const timer = setTimeout(() => resolve(`results for ${query}`), 100 - query.length * 20);
+          signal.addEventListener("abort", () => {
+            clearTimeout(timer);
+            reject(signal.reason);
+          }, { once: true });
+        });
+      }
+
+      const search = latestOnly(fakeSearch);
+      const show = (promise) =>
+        promise.then(
+          (text) => console.log("show:", text),
+          (error) => {
+            if (error.name !== "AbortError") throw error;
+            console.log("ignored an aborted call");
+          },
+        );
+
+      await Promise.all([show(search("c")), show(search("co")), show(search("cof"))]);
+      // ignored an aborted call
+      // ignored an aborted call
+      // show: results for cof
+      ```
+
+      Aborting also saves bandwidth and frees the connection. But if your code awaits
+      something else after the fetch before writing to the page, check `signal.aborted` right
+      before the write, or the gap reopens. Component frameworks have the same problem: when
+      a component's input changes or it unmounts, abort in the cleanup step so a finished
+      request can't update something that's gone.
+pitfalls:
+  - "**Wrapping `fetch` in `try`/`catch` and calling it error handling.** A 404 or 500 fulfils, so the `catch` never runs and the code parses an error body as data. Check `response.ok` and throw when it's `false`."
+  - "**Calling `response.json()` on every response.** A 502 page from a proxy is HTML, so `json()` throws a `SyntaxError` that hides the real status. Check `ok` first, and read failures with `text()`."
+  - "**Reading the body twice.** Calling `text()` to log it and then `json()` throws a `TypeError`, because the stream is used up. Read it once as text and `JSON.parse` it, or call `response.clone()` before the first read."
+  - "**Timing out with `Promise.race`.** The race stops you waiting, but the request keeps running and holding a connection. Pass `signal: AbortSignal.timeout(ms)` so the request is really cancelled."
+  - "**Reporting aborts as failures.** An `AbortError` means your own code cancelled the request, so showing \"Something went wrong\" is misleading. Check `error.name` and stay quiet for `AbortError`, while still handling `TimeoutError`."
+  - "**Assuming an abort undoes the action.** Aborting a POST after it reached the server doesn't stop the server saving it. Design the server call to be idempotent, or confirm the outcome afterwards."
+interview:
+  - question: Why doesn't `fetch` reject on a 404, and how do you handle errors properly?
+    answer: >-
+      Because `fetch` models the network, not your application. A 404 is a complete, valid
+      HTTP response, so the promise fulfils; it rejects only when no response arrives, such
+      as DNS failure, a refused connection, a CORS block, or an abort. So proper handling has
+      two layers. I catch rejections for the network cases, and I check `response.ok`, which
+      covers 200 to 299, then throw a typed error carrying the status and body when it's
+      false. I read error bodies as text, because proxies return HTML. In practice I put
+      that in one `fetchJson` helper with a timeout, so no call site forgets the check.
+      Libraries like axios reject on non-2xx by default, which is the difference people trip
+      over.
+  - question: How do you cancel a fetch, and how do you add a timeout?
+    answer: >-
+      With an `AbortController`. I pass `controller.signal` in the fetch options and call
+      `controller.abort()` when I no longer need the result; the fetch, and any body read in
+      progress, rejects with an `AbortError`, or with the reason I passed to `abort`. For a
+      deadline I use `AbortSignal.timeout(ms)`, which rejects with a `TimeoutError`, so I can
+      tell a timeout from a deliberate cancel. When I need both, a cancel button and a
+      deadline, `AbortSignal.any` combines them. The older `Promise.race` with a timer only
+      stops me waiting; the request keeps running. And aborting doesn't roll anything back on
+      the server, so non-idempotent calls need care.
+  - question: A search shows results for an older query. What's going on, and how do you fix it?
+    answer: >-
+      It's a race condition: several requests are in flight and responses arrive out of
+      order, so a slow response for an older query lands last and overwrites the newer
+      results. Nothing in HTTP guarantees ordering. There are two standard fixes. The
+      preferred one is to abort the previous request whenever a new one starts, keeping the
+      last `AbortController` outside the handler and ignoring the resulting `AbortError`;
+      that also saves bandwidth. The other is a sequence number or "latest query" check,
+      where a response only renders if it belongs to the newest request, which works even
+      for APIs you can't cancel. In both cases I'd add a debounce so fewer requests race in
+      the first place.
+  - question: What's the difference between a `TypeError`, an `AbortError` and a `TimeoutError` from `fetch`?
+    answer: >-
+      They tell you who ended the request. A `TypeError` means the network layer failed: no
+      connection, DNS, a CORS block, or an invalid request such as a body on a GET. The
+      browser deliberately hides the detail, so the console is where you look. An
+      `AbortError` means your code called `abort()` on the signal, usually because the result
+      is no longer wanted, so the right reaction is often to do nothing. A `TimeoutError`
+      comes from `AbortSignal.timeout`, meaning the deadline passed, which is worth telling
+      the user about or retrying. I branch on `error.name`, and I keep HTTP errors as a
+      separate, custom error type thrown after checking `response.ok`.

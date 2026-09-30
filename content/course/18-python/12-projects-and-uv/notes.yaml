@@ -1,0 +1,249 @@
+summary: >-
+  A Python project is more than one file. Code splits into **modules** (one `.py` file each)
+  and **packages** (folders of modules), and a project depends on libraries other people
+  published. This lesson covers how those pieces find each other, and how uv keeps a
+  project's libraries in their own virtual environment with exact, repeatable versions.
+
+
+  The problem it solves is the one `package.json` and a lock file solve in JavaScript. Without
+  isolation, every project on a laptop shares one set of installed packages, so upgrading a
+  library for one project breaks another. Without a lock, two machines install different
+  versions from the same list, and "works on my machine" follows.
+
+
+  Reach for a uv project as soon as code needs a third-party package or will run anywhere
+  but your own terminal: a CI job, a container, a colleague's laptop. A single script with
+  only the standard library needs none of it. You'll still meet `pip`, `requirements.txt` and
+  Poetry in older repositories, and the ideas carry over.
+remember:
+  - Importing a module runs its top-level code once per process, and every later import reuses the cached module object in `sys.modules`.
+  - '`__name__` is `"__main__"` only in the file Python was asked to run, so the guard keeps script code from running on import.'
+  - A virtual environment is a folder with its own `python` and `site-packages`, and activating it only changes your shell's `PATH`.
+  - '`pyproject.toml` states the ranges you accept, `uv.lock` pins the exact version and hash of every package, and you commit both.'
+  - '`uv add` updates `pyproject.toml` and `uv.lock` and installs, `uv run` syncs the environment and then runs, and CI uses `uv sync --locked`.'
+  - One environment holds one version of each package, unlike nested `node_modules`, so the resolver must find versions that satisfy every dependency at once.
+  - Python searches `sys.path` in order, so a local file named `random.py` or `json.py` hides the real module.
+sections:
+  - title: What `import` does underneath
+    body: |-
+      `import cart` asks three questions. Is `cart` already in `sys.modules`, the cache of
+      loaded modules? If so, hand back that object. If not, search each folder in
+      `sys.path` for `cart.py` or a `cart` package. Then create a module object, run the
+      file's top level inside it, and store it in the cache.
+
+      That explains the lesson's surprise and one more. The file runs once per process, not
+      once per import. And `from cart import items` copies a reference into your namespace
+      at that moment. If the module later rebinds `items`, your name still points at the old
+      object.
+
+      ```python
+      import sys
+      import tempfile
+      from pathlib import Path
+
+      # Write a tiny module to a temporary folder, then import it twice.
+      folder = Path(tempfile.mkdtemp())
+      (folder / "cart.py").write_text(
+          'print("loading cart")\n'
+          "items = []\n"
+          "def add(item):\n"
+          "    items.append(item)\n"
+      )
+      sys.path.insert(0, str(folder))
+
+      import cart  # runs cart.py and prints "loading cart"
+      import cart as again  # cached, prints nothing
+
+      print(cart is again)  # True
+      print(sys.modules["cart"] is cart)  # True
+      print(cart.__name__)  # cart
+
+      from cart import add, items
+
+      add("tea")
+      print(cart.items)  # ['tea']
+      cart.items = ["coffee"]  # rebinds the name inside the module
+      print(items)  # ['tea'], your name still points at the old list
+      ```
+
+      The first entry of `sys.path` is the folder of the script you ran (or the current
+      folder with `python -m`). The rest are the standard library and the environment's
+      `site-packages`. Because your folder comes first, a file named `random.py` next to your
+      script hides the standard library's `random`. Python 3.13 spots this and adds a hint to
+      the error: `consider renaming '.../random.py' since it has the same name as the
+      standard library module named 'random'`.
+
+      The cache is also why a **circular import** fails. If `a` imports `b` and `b` does
+      `from a import f` before `a` has defined `f`, `b` finds a half-run `a` in the cache and
+      gets `ImportError: cannot import name 'f'`. The fix is structural: move the shared code
+      into a third module both can import.
+  - title: Packages, `python -m` and the src layout
+    body: |-
+      A package is a folder of modules. An `__init__.py` file marks it as a regular package
+      and runs on first import, which is where packages re-export their public names. Inside
+      a package, a **relative import** such as `from .pricing import price` means "the module
+      `pricing` next to me".
+
+      Relative imports only work when Python knows the file belongs to a package. Run the
+      file by path and it doesn't:
+
+      ```bash
+      $ python3 shop/cli.py
+      Traceback (most recent call last):
+        ...
+      ImportError: attempted relative import with no known parent package
+      $ python3 -m shop.cli
+      5
+      ```
+
+      `python -m shop.cli` imports `shop` first, then runs `cli` as `__main__`, so the
+      relative import resolves. That's the reason tools are started as `python -m pytest`
+      or `python -m http.server`.
+
+      Libraries and installable apps usually use the **src layout**, which `uv init
+      --package` creates:
+
+      ```text
+      bookings/
+        pyproject.toml
+        uv.lock
+        .python-version
+        src/
+          bookings/
+            __init__.py
+        tests/
+      ```
+
+      The code sits one level down, so the project folder on `sys.path` doesn't make
+      `import bookings` work by accident. Tests import the package the way users will: as
+      installed into `.venv`. uv installs your own project there in editable mode, so edits
+      show up without reinstalling. A plain `uv init` makes a flat app with `main.py`
+      instead, which is fine for scripts and services that nobody installs.
+  - title: A virtual environment is a folder, not magic
+    body: |-
+      Look inside `.venv` and you'll find `pyvenv.cfg`, a `bin` folder (`Scripts` on
+      Windows) holding a `python` that links to a real interpreter, and a
+      `lib/python3.13/site-packages` folder for installed libraries. When that `python`
+      starts, it reads `pyvenv.cfg`, sets `sys.prefix` to the environment and puts its
+      `site-packages` on `sys.path`.
+
+      ```python
+      import sys
+
+      print(sys.prefix != sys.base_prefix)  # True inside a virtual environment
+      print(sys.prefix)  # the environment folder, such as /path/to/project/.venv
+      ```
+
+      So `.venv/bin/python app.py` uses the environment without any activation. `source
+      .venv/bin/activate` only puts `.venv/bin` first on `PATH` and changes your prompt. `uv
+      run` skips activation entirely: it syncs the environment and runs the command with it.
+
+      The big difference from Node is how names resolve. Node looks for `node_modules`
+      folders, walking up from the importing file, so two libraries can each get their own
+      copy of a dependency at different versions. Python has one flat `sys.path` per
+      interpreter, and the first match wins. One environment holds **one version of each
+      package**. If one library needs `httpx<0.28` and another needs `httpx>=0.28`, there is
+      no nesting to fall back on: the resolver reports that no solution exists, and you
+      change a constraint or upgrade a library.
+
+      Never commit `.venv`. It holds absolute paths and platform-specific binaries. The lock
+      file is what you share, and anyone recreates the environment from it with `uv sync`.
+  - title: pyproject.toml, uv.lock and the npm equivalents
+    body: |-
+      `pyproject.toml` is the standard settings file for a Python project, read by uv, pip,
+      ruff, mypy and pytest alike. After `uv add httpx` and `uv add --dev pytest` in a
+      packaged project, it looks like this:
+
+      ```text
+      [project]
+      name = "bookings"
+      version = "0.1.0"
+      requires-python = ">=3.13"
+      dependencies = [
+          "httpx>=0.28.1",
+      ]
+
+      [project.scripts]
+      bookings = "bookings:main"
+
+      [dependency-groups]
+      dev = [
+          "pytest>=9.1.1",
+      ]
+
+      [build-system]
+      requires = ["uv_build>=0.9.15,<0.10.0"]
+      build-backend = "uv_build"
+      ```
+
+      `uv.lock` records the whole resolved tree: every package, its exact version, where it
+      came from and the hashes of its files. It is universal, resolved once for every
+      platform with markers, so a Mac laptop and a Linux CI runner read the same lock.
+
+      If you know pnpm, the commands map closely:
+
+      - `uv init` is `pnpm init`, and `uv add httpx` is `pnpm add`.
+      - `uv add --dev pytest` is `pnpm add -D`, written to `[dependency-groups]`.
+      - `uv sync` is `pnpm install`, and `uv sync --locked` is `pnpm install
+        --frozen-lockfile`: it fails if the lock no longer matches `pyproject.toml`.
+      - `uv run pytest` is `pnpm exec vitest`, and `uvx ruff` is `pnpm dlx`.
+      - `uv lock --upgrade-package httpx` is `pnpm update httpx`.
+      - `[project.scripts]` is the `bin` field: it installs a command. It is not npm's
+        `scripts`. uv has no task runner, so teams use a Makefile or plain `uv run` lines.
+
+      `uv sync` is exact: it also removes packages the lock doesn't list, so an environment
+      can't drift. In a container you'll often see `uv sync --locked --no-dev`, which skips
+      the dev group.
+pitfalls:
+  - '**Leaving test or demo code at the top level of a module.** Every import runs it, including the test runner''s. Put it in a `main()` and call that under `if __name__ == "__main__":`.'
+  - '**Naming your file after a library.** A `json.py`, `random.py` or `httpx.py` next to your script is found first and hides the real one. Rename the file.'
+  - '**Running a package module by path.** `python3 src/shop/cli.py` breaks relative imports. Run it as `python3 -m shop.cli`, or through an entry point with `uv run`.'
+  - '**Installing with `pip install` into the global Python.** Packages land outside any project and clash later. Newer systems refuse with `externally-managed-environment`. Use `uv add` inside a project, or `uvx` for a one-off tool.'
+  - '**Committing `.venv` or ignoring `uv.lock`.** The environment is machine-specific and rebuilt in seconds. The lock is what makes builds reproducible, so it belongs in Git.'
+  - '**Running plain `uv sync` or `uv lock` in CI.** They quietly update a stale lock, so CI tests versions no one reviewed. Use `uv sync --locked` so a stale lock fails the build.'
+  - '**Fixing a circular import with an import inside a function.** It works, but hides a tangled design. Move the shared code into a module both sides import.'
+interview:
+  - question: What does `if __name__ == "__main__":` do, and why do Python files have it?
+    answer: >-
+      It runs a block only when the file is the program being run, not when it's imported.
+      Python sets each module's `__name__` to its import name, except the entry file, which
+      gets `"__main__"`. Importing a file executes its whole top level, so without the guard,
+      a `main()` call or a demo `print` fires every time a test or another module imports
+      it. The idiom is to keep definitions at the top level and put the entry point under
+      the guard, often as `sys.exit(main())`. It also matters with `python -m`, which runs a
+      package module as `__main__`. The limit: it's a convention for scripts. For
+      installable tools I'd declare an entry point in `[project.scripts]` instead, which
+      calls `main` directly.
+  - question: Why commit a lock file when `pyproject.toml` already lists your dependencies?
+    answer: >-
+      Because `pyproject.toml` lists ranges and only direct dependencies, while the lock pins
+      the exact version and hash of everything. `httpx>=0.28.1` accepts any future release,
+      and says nothing about the dozen packages httpx pulls in. Two installs a month apart
+      can differ, and a breaking change in a transitive package breaks a build no one
+      touched. `uv.lock` records the full resolved tree with hashes, so laptops, CI and
+      production install the same bytes, and hashes stop a tampered file installing. In CI
+      I run `uv sync --locked`, which fails if the lock is stale. Upgrades then become
+      deliberate commits, with `uv lock --upgrade-package`. For a published library the lock
+      doesn't travel to users: they resolve your ranges, so ranges still need care.
+  - question: How is a Python virtual environment different from `node_modules`?
+    answer: >-
+      Both isolate a project's packages, but Python resolves names through one flat search
+      path, so an environment holds exactly one version of each package. Node walks up
+      `node_modules` folders from the importing file, so two libraries can each have their
+      own copy of a dependency. In Python, `sys.path` is per interpreter and the first match
+      wins. A virtual environment is a folder with a `python` that points at a real
+      interpreter and its own `site-packages`. Activation only edits `PATH`. The
+      consequence is that dependency conflicts can't be nested away: if two libraries need
+      incompatible versions, the resolver fails and I relax a constraint or upgrade one of
+      them. The upside is one copy of each package, and far smaller environments.
+  - question: You hit a circular import. What's happening, and how do you fix it?
+    answer: >-
+      Two modules import each other, and one of them asks for a name the other hasn't
+      defined yet. When `a` starts running, Python puts a half-built `a` into
+      `sys.modules`. If `a` imports `b`, and `b` does `from a import f` before `a` has
+      reached `def f`, `b` finds that half-built module and raises `ImportError: cannot
+      import name 'f'`. The real fix is structural: move the shared piece into a third
+      module that both import, so dependencies point one way. Quick fixes exist, such as
+      `import a` and using `a.f` at call time, or an import inside the function. I use
+      those only for type-only cycles, where `if TYPE_CHECKING:` imports work, because they
+      hide the tangle rather than remove it.

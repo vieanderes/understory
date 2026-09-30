@@ -1,0 +1,348 @@
+id: scale.overselling
+title: Holds that expire
+objective: Hold stock while a buyer pays, expire it safely, and check that no transition can oversell.
+level: advanced
+minutes: 10
+concepts: [scale.holds, scale.hold-expiry, scale.invariant-proof]
+prerequisites: [scale.locks, db.constraints, backend.payments]
+opening:
+  text: >-
+    You'll design a checkout that never sells a seat twice, even when payment takes minutes
+    or fails. And you'll be able to argue why it can't, not only hope.
+
+steps:
+  - type: prose
+    id: what-a-hold-is
+    body: |-
+      Payment can take minutes, or fail, as in the Stripe lesson. So you **hold** seats for
+      one buyer, for a limited time. The rule to protect is the **invariant**: sold plus
+      held never passes capacity.
+
+      Reserving is one **atomic** statement, one the database runs whole:
+
+      ```sql
+      UPDATE shows SET held = held + $2
+      WHERE id = $1 AND sold + held + $2 <= capacity;
+      ```
+
+      No seats left, and it changes no row.
+
+  - type: ai-review
+    id: review-reserve-ignores-held
+    concept: scale.holds
+    difficulty: 2
+    language: js
+    request: Write the reserve step. Create a hold only if seats are left, atomically.
+    flawClass: logic
+    code: |
+      async function reserve(showId, buyer, qty) {
+        const result = await db.query(
+          `UPDATE shows SET held = held + $2
+           WHERE id = $1 AND sold + $2 <= capacity`,
+          [showId, qty],
+        );
+        if (result.rowCount === 0) return 'sold out';
+        return createHold(showId, buyer, qty);
+      }
+    prompt: >-
+      It's one atomic statement, and the assistant's test with one buyer passes. On a show
+      with one seat left, two buyers both got holds. Tap the line at fault.
+    lines: [4]
+    reasons:
+      - text: The check counts sold seats but not held ones
+        correct: true
+        feedback: >-
+          Yes. It must be `sold + held + $2 <= capacity`. Held seats are promised too.
+      - text: The statement needs a transaction around it
+        feedback: >-
+          One `UPDATE` is already atomic. Wrapping it changes nothing. Read what the condition
+          counts.
+      - text: '`rowCount` should be compared with 1'
+        feedback: >-
+          Zero rows means the condition failed, which is the sold-out case. That check is
+          right.
+    fix: |
+      UPDATE shows SET held = held + $2
+      WHERE id = $1 AND sold + held + $2 <= capacity
+
+  - type: prose
+    id: expiry-and-confirm
+    body: >-
+      An unpaid hold must give its seats back, or one abandoned tab blocks them for ever.
+      So each hold has an `expiresAt` time, and a **sweep** job marks old holds expired.
+
+
+      A payment that arrives after the hold ran out is refunded. The seat may already be
+      someone else's.
+
+  - type: predict-output
+    id: predict-late-confirm
+    concept: scale.hold-expiry
+    difficulty: 2
+    language: js
+    code: |
+      function confirm(hold, now) {
+        if (hold.status !== 'active' || now >= hold.expiresAt) {
+          return 'refund';
+        }
+        return 'sold';
+      }
+
+      const hold = { buyer: 'ana', qty: 1, status: 'active', expiresAt: 100 };
+      console.log(confirm(hold, 130));
+    question: The sweep hasn't reached this hold yet. The bank answers at 130. What logs?
+    choices:
+      - text: '`sold`, the status still says active'
+        feedback: >-
+          The status hasn't been swept yet, true. But the clock decides as well, and 130 is
+          past 100.
+      - text: '`refund`'
+        correct: true
+        feedback: >-
+          Right. A late payment gets its money back, whether or not the sweep has run.
+      - text: An error, the hold is gone
+        feedback: >-
+          The hold is still there, and says active. Nothing throws. The time check turns her
+          away.
+
+  - type: lab
+    id: lab-abandoned-checkout
+    concept: scale.hold-expiry
+    lab: overselling-simulator
+    preset:
+      scenario: abandoned-checkout
+    intro: >-
+      Now the sweep and the late payment act on one hold at the same moment. Each reads the
+      status, then writes. Step through "Read, then write" and watch sold plus held pass
+      capacity. Then switch to "Guarded transition" and step again.
+    checkpoint:
+      question: With guarded transitions, the sweep reaches the hold first. What happens to A's late payment?
+      difficulty: 3
+      choices:
+        - text: It's refunded, its update matched no row
+          correct: true
+          feedback: >-
+            Right. The update names the status it expects. "Expired" doesn't match, so
+            nothing is sold.
+        - text: It's confirmed, A paid in good faith
+          feedback: >-
+            That's the broken version. B may hold that ticket now. A paid late, so A is
+            refunded.
+        - text: It waits until B's hold expires
+          feedback: >-
+            Nothing queues here. The update runs once, changes no row, and the code refunds.
+    fallback:
+      type: multiple-choice
+      id: pick-why-both-act
+      concept: scale.hold-expiry
+      difficulty: 3
+      language: js
+      code: |
+        // sweep
+        const hold = await findHold(id);
+        if (hold.status === 'active') await markExpired(id);
+
+        // payment arrives
+        const same = await findHold(id);
+        if (same.status === 'active') await markConfirmed(id);
+      question: Both run at once on a hold that ran out. Why can the seat be sold twice?
+      choices:
+        - text: Both read "active" before either wrote
+          correct: true
+          feedback: >-
+            Right. It's check-then-act again. One statement per transition closes the gap.
+        - text: The sweep runs too rarely
+          feedback: >-
+            A faster sweep narrows the window but can't close it. Both still read before
+            writing.
+        - text: '`findHold` returns a stale copy from a cache'
+          feedback: >-
+            Nothing here is cached. Both reads are true at the time. They go stale in the gap.
+
+  - type: prose
+    id: guarded-transition
+    body: >-
+      The fix: each transition is one `UPDATE` that names the status it expects, such as
+      `AND status = 'active'`. Only one of the sweep and the payment can match.
+
+
+      In code, the result's `rowCount` says how many rows the statement changed. One means
+      you won. Zero means the other got there first, so you refund.
+
+  - type: fill-blank
+    id: fill-guarded-confirm
+    concept: scale.hold-expiry
+    difficulty: 3
+    language: js
+    prompt: >-
+      Make confirm one statement that names the status it expects, and act on how many rows
+      it changed. Fill the gaps.
+    template: |
+      const result = await db.query(
+        `UPDATE holds SET status = 'confirmed'
+         WHERE id = $1 AND status = '{{1}}' AND expires_at > now()`,
+        [holdId],
+      );
+      if (result.rowCount === {{2}}) {
+        await markSold(holdId);
+      } else {
+        await {{3}}(holdId);
+      }
+    blanks:
+      - key: '1'
+        answer: active
+      - key: '2'
+        answer: '1'
+      - key: '3'
+        answer: refund
+    bank: [active, expired, confirmed, '1', '0', refund, retry]
+
+  - type: bug-hunt
+    id: hunt-unguarded-sweep
+    concept: scale.invariant-proof
+    difficulty: 3
+    language: sql
+    code: |
+      -- reserve: raises held, only if it fits
+      UPDATE shows SET held = held + $2
+      WHERE id = $1 AND sold + held + $2 <= capacity;
+
+      -- confirm: moves a hold from held to sold
+      UPDATE holds SET status = 'confirmed'
+      WHERE id = $1 AND status = 'active' AND expires_at > now();
+
+      -- expire: the sweep gives held seats back
+      UPDATE holds SET status = 'expired'
+      WHERE expires_at <= now();
+    prompt: >-
+      Only these three change the numbers, so check each one alone. Seats that were paid
+      for keep getting sold again. Tap the transition at fault.
+    lines: [11]
+    reasons:
+      - text: The sweep also expires holds that were already paid
+        correct: true
+        feedback: >-
+          Yes. It needs `AND status = 'active'`, or paid seats go back on sale.
+      - text: Confirm should check capacity again
+        feedback: >-
+          Confirm moves seats from held to sold, so the sum doesn't move. Reserve already checked.
+      - text: Reserve should count only sold seats
+        feedback: >-
+          Held seats are promised too. Counting only sold is the bug from earlier in this lesson.
+    fix: |
+      UPDATE holds SET status = 'expired'
+      WHERE status = 'active' AND expires_at <= now();
+
+  - type: code-challenge
+    id: write-hold-transitions
+    concept: scale.invariant-proof
+    difficulty: 4
+    language: ts
+    editable: '15-37'
+    prompt: >-
+      Write `reserve`, `confirm` and `expire` for an in-memory store. Change a hold's status
+      only through `transition`, which works like a guarded `UPDATE`.
+
+
+      Reserve fails when sold plus held plus `qty` would pass capacity. Confirm returns
+      `'refund'` for a hold that isn't active or has run out. Expire acts only on an active
+      hold whose time is up. A test makes 5,000 random moves and checks the invariant after
+      each.
+    hints:
+      - Reserve is one check against `sold + held + qty`, then the write.
+      - In confirm and expire, call `transition` first. If it returns `false`, change no counts.
+      - "Confirm: `if (hold === undefined || now >= hold.expiresAt) return 'refund';`, then try `transition(store, id, 'active', 'confirmed')`."
+
+  - type: explain-back
+    id: explain-any-interleaving
+    concept: scale.invariant-proof
+    difficulty: 4
+    prompt: >-
+      You can't test every order a thousand buyers might arrive in. Why does checking
+      reserve, confirm and expire one at a time show the rule holds for all of them?
+    rubric:
+      - Only three transitions change sold or held, and each is one atomic statement.
+      - Confirm and expire never raise the sum, and reserve raises it only when the result stays within capacity.
+      - Any order is some sequence of those steps, so if each keeps the rule, every sequence does.
+    modelAnswer: >-
+      Because every possible history is built from the same three moves. Each move is one
+      atomic statement, so the database runs them one at a time, in some order. Confirm moves
+      seats from held to sold, so the sum stays put. Expire only lowers it. Reserve is the
+      one move that raises it, and its own condition refuses when the result would pass
+      capacity. The rule starts true, and no move can break it, so it stays true.
+
+recap:
+  - Reserve stock with a hold that expires, counting held seats as taken.
+  - Make reserve, confirm and expire one guarded statement each, and refund a late payer.
+  - Check each transition keeps sold plus held within capacity, not each ordering.
+
+recall:
+  - id: card-hold
+    concept: scale.holds
+    front: What is a hold, and what must the reserve check count?
+    back: >-
+      Stock set aside for one buyer for a limited time while they pay. The check counts sold
+      plus held, not sold alone.
+  - id: card-expiry
+    concept: scale.hold-expiry
+    front: Why do holds need an expiry and a sweep?
+    back: >-
+      A buyer who never pays would keep the stock for ever. The sweep marks old holds
+      expired, which gives the stock back.
+  - id: card-guarded-transition
+    concept: scale.hold-expiry
+    front: How do you stop the sweep and a late payment both acting on one hold?
+    back: >-
+      Each is one `UPDATE` that names the status it expects, such as `AND status = 'active'`.
+      Only one can match. The loser sees zero rows.
+  - id: card-invariant-proof
+    concept: scale.invariant-proof
+    front: How do you argue that overselling is impossible in any order?
+    back: >-
+      List every transition that changes sold or held. Show each one, run atomically, keeps
+      sold plus held within capacity.
+
+references:
+  - kind: docs
+    title: UPDATE
+    authors: The PostgreSQL Global Development Group
+    venue: PostgreSQL 17 documentation
+    url: https://www.postgresql.org/docs/17/sql-update.html
+    note: One `UPDATE` with a `WHERE` condition, and the row count it reports.
+    primary: true
+    verified: true
+  - kind: docs
+    title: 13.2. Transaction Isolation
+    authors: The PostgreSQL Global Development Group
+    venue: PostgreSQL 17 documentation
+    url: https://www.postgresql.org/docs/17/transaction-iso.html
+    note: Why a second `UPDATE` on the same row waits, then re-checks its `WHERE` against the new row.
+    primary: true
+    verified: true
+  - kind: paper
+    title: What are race conditions?
+    authors: Robert H. B. Netzer and Barton P. Miller
+    year: 1992
+    venue: ACM Letters on Programming Languages and Systems, 1(1)
+    url: https://doi.org/10.1145/130616.130623
+    note: Why testing can't cover every ordering, which is the reason to argue from transitions.
+    verified: true
+
+deepDive: >-
+  We wrote the three transitions as pure functions and ran 10,000 seeded random orderings
+  in Node 24: one ticket, A's hold expired, then the sweep, A's late payment and buyer B.
+  With read-then-write steps, 369 orderings ended with sold plus held at 2. With guarded
+  single-step transitions, none did. Random runs find bugs. They don't prove there are
+  none. The argument from transitions does.
+
+
+  Why is one guarded `UPDATE` enough in PostgreSQL? The second writer waits on the row
+  lock. When the first commits, the waiter re-checks its `WHERE` against the new row.
+  `status = 'active'` is now false, so it changes nothing and reports zero rows. In a real
+  confirm, the status change and the `sold` and `held` change go in one transaction.
+
+
+  Two loose ends. Compare `expires_at` with the database's `now()`, not each server's
+  clock, or two servers can disagree about whether a hold is live. And refunding a late
+  payer is a product decision as much as a technical one. Some shops give a grace period by
+  running the sweep a little later than the deadline shown to the buyer.

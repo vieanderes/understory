@@ -1,0 +1,257 @@
+summary: >-
+  JavaScript frees memory for you, but only memory that nothing can reach. A memory leak in
+  a garbage-collected language is memory that stays reachable by mistake: a listener on
+  `document`, a running timer, a closure, or a list or cache that only grows. Each one keeps
+  alive everything it points at, and each repeat of the leaking action adds a little more.
+
+
+  In a browser tab, a leak shows as a page that gets slower the longer it stays open and
+  may eventually crash. On a Node server it's worse, because the process lives for days
+  and serves everybody: memory climbs until the container is killed for running out of
+  memory and restarts, often at the busiest time.
+
+
+  The lesson covers reachability, detached elements, comparing heap snapshots and removing
+  listeners. These notes add how the collector works underneath, how to prove and find a
+  leak in Node, the clean-up patterns that scale, and how bounded caches and weak
+  references keep memory in check.
+remember:
+  - The garbage collector frees only what can't be reached from a root, so a leak is always a reference you forgot about.
+  - Anything that starts something must stop it, so every listener, timer, observer and subscription needs its clean-up.
+  - Find a leak by snapshotting, repeating one action several times, snapshotting again and looking for objects that grew by the repeat count.
+  - A cache or list without a size limit or a lifetime is a leak that looks like a feature.
+  - A closure keeps alive every outer variable it uses, so copy out the small value you need instead of capturing a large object.
+  - '`removeEventListener` only removes the exact function that was added, so keep a reference to it or use an `AbortController` signal.'
+  - '`WeakMap` lets you attach data to an object without keeping that object alive, but `WeakRef` and `FinalizationRegistry` give no timing guarantees.'
+  - Measure memory after a forced collection, because garbage that hasn't been collected yet looks like growth.
+sections:
+  - title: How the collector decides, and why cycles are fine
+    body: |-
+      The collector starts from the **roots**: global variables, the variables of functions
+      that are running, and handles the engine keeps for pending work such as timers and
+      listeners. It marks everything reachable from them, following every reference, then
+      frees the rest. This is a **tracing** collector, and it's why a cycle is no problem:
+      two objects that point at each other but that no root reaches are freed together.
+
+      ```js
+      // Run with: node --expose-gc cycle.mjs
+      let cart = { items: new Array(1_000_000).fill("item") };
+      cart.self = cart; // a cycle is no problem for a tracing collector
+      const ref = new WeakRef(cart);
+      cart = null;
+
+      // A WeakRef target survives until the current job ends, so wait a turn first.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      global.gc();
+      console.log(ref.deref()); // undefined
+      ```
+
+      V8, the engine in Chrome and Node, splits the heap by age. New objects go to a small
+      **young generation** that's collected often and quickly, because most objects die
+      young. Objects that survive a couple of collections move to the **old generation**,
+      collected less often with a heavier mark-and-compact pass. Leaked objects survive every
+      collection, so they end up in the old generation, which is why a leak shows as a slowly rising floor rather
+      than a spike.
+
+      That rising floor is the thing to look for. Heap size naturally saws up and down as
+      garbage builds and gets collected. Growth that matters is a heap that, after each
+      collection, sits higher than it did after the last one.
+
+      Two memory measures confuse people in DevTools. **Shallow size** is the memory an
+      object holds itself. **Retained size** is what would be freed if that object went,
+      including everything only it keeps alive. A small closure can have a tiny shallow size
+      and a retained size of 40 MB, because it's the one thing holding an array of rows.
+  - title: Proving and finding a leak in Node
+    body: |-
+      Before hunting, prove the growth. Force a collection, measure, repeat the suspect
+      action, force a collection, measure again. The `--expose-gc` flag makes `global.gc()`
+      available for exactly this, in tests and experiments, not in production.
+
+      ```js
+      // Run with: node --expose-gc leak.mjs
+      const mb = () => (process.memoryUsage().heapUsed / 1024 / 1024).toFixed(1);
+
+      const listeners = [];
+      const bus = { on: (fn) => listeners.push(fn) }; // lives for the whole process
+
+      function openReport() {
+        const rows = new Array(100_000).fill(0).map((_, i) => ({ id: i, price: i % 50 }));
+        bus.on(() => rows.length); // the listener keeps every row reachable
+      }
+
+      global.gc();
+      console.log("before", mb(), "MB"); // before 3.5 MB
+      for (let i = 0; i < 10; i++) openReport();
+      global.gc();
+      console.log("after 10", mb(), "MB"); // after 10 49.4 MB
+      listeners.length = 0; // drop the listeners
+      global.gc();
+      console.log("after clean-up", mb(), "MB"); // after clean-up 3.7 MB
+      ```
+
+      Node warns about one common case on its own. Add an eleventh listener for the same
+      event to an `EventEmitter` and it prints `MaxListenersExceededWarning: Possible
+      EventEmitter memory leak detected`. Treat that warning as a bug report, not as a
+      reason to call `setMaxListeners`.
+
+      To find what's holding memory in a real service, take heap snapshots. Start Node with
+      `--inspect`, open `chrome://inspect` in Chrome, and use the same Memory panel as for a
+      page. Or call `writeHeapSnapshot()` from `node:v8`, which writes a `.heapsnapshot`
+      file you load into DevTools later. Writing a snapshot pauses the process and needs
+      memory of its own, so on a production server do it on one instance taken out of the
+      load balancer.
+
+      In the comparison view, sort by the delta, pick a row that grew, and open its
+      **Retainers**. That list is the chain of references from a root down to your object:
+      a `Map` in some module, a closure's context, an emitter's listener array. The first
+      link in that chain that belongs to your code is where the fix goes.
+  - title: Clean-up that scales
+    body: |-
+      Removing listeners one by one gets fragile when a widget adds five of them. An
+      `AbortController` removes them all with one call. Pass its `signal` to each
+      `addEventListener`, and `abort()` detaches every listener added with it. Node's
+      `EventTarget` supports it too, so this runs as it would in a browser:
+
+      ```js
+      const target = new EventTarget();
+      const controller = new AbortController();
+      let calls = 0;
+      target.addEventListener("resize", () => calls++, { signal: controller.signal });
+      target.addEventListener("scroll", () => calls++, { signal: controller.signal });
+
+      target.dispatchEvent(new Event("resize"));
+      controller.abort(); // removes both listeners at once
+      target.dispatchEvent(new Event("resize"));
+      target.dispatchEvent(new Event("scroll"));
+      console.log(calls); // 1
+      ```
+
+      The same signal can cancel a `fetch`, so one `abort()` on close also stops requests
+      whose answers nobody will read.
+
+      In React, the effect's clean-up function is where this lives. React calls it before
+      running the effect again and when the component unmounts.
+
+      ```tsx
+      useEffect(() => {
+        const controller = new AbortController();
+        window.addEventListener("resize", onResize, { signal: controller.signal });
+        const timer = setInterval(refresh, 5000);
+        const observer = new ResizeObserver(onBoxResize);
+        observer.observe(box);
+        return () => {
+          controller.abort();
+          clearInterval(timer);
+          observer.disconnect();
+        };
+      }, [box]);
+      ```
+
+      Other things that need stopping follow the same rule: `IntersectionObserver` and
+      `MutationObserver` need `disconnect()`, a WebSocket needs `close()`, and a store
+      subscription returns an unsubscribe function you must call. For one-shot listeners,
+      `{ once: true }` removes the listener after it first runs.
+
+      On servers, watch for per-request data stored at module level: a `Map` of sessions,
+      request ids or user objects that nothing ever deletes. The fix is always an owner and a
+      lifetime, such as deleting the entry when the request finishes or giving it a TTL.
+  - title: Bounded caches and weak references
+    body: |-
+      A cache trades memory for speed, so it needs a limit. A least recently used (LRU)
+      cache keeps the newest N entries. A `Map` remembers insertion order, which makes one
+      short:
+
+      ```js
+      class LruCache {
+        #entries = new Map();
+        constructor(maxEntries) {
+          this.maxEntries = maxEntries;
+        }
+        get(key) {
+          if (!this.#entries.has(key)) return undefined;
+          const value = this.#entries.get(key);
+          this.#entries.delete(key); // move to the back: most recently used
+          this.#entries.set(key, value);
+          return value;
+        }
+        set(key, value) {
+          this.#entries.delete(key);
+          this.#entries.set(key, value);
+          if (this.#entries.size > this.maxEntries) {
+            const oldest = this.#entries.keys().next().value;
+            this.#entries.delete(oldest);
+          }
+        }
+      }
+
+      const covers = new LruCache(2);
+      covers.set("isbn-1", "cover 1");
+      covers.set("isbn-2", "cover 2");
+      covers.get("isbn-1"); // isbn-1 is now the most recent
+      covers.set("isbn-3", "cover 3"); // evicts isbn-2
+      console.log(covers.get("isbn-2"), covers.get("isbn-1")); // undefined cover 1
+      ```
+
+      When the data belongs to an object, such as extra details for a DOM element or a
+      parsed version of a request, a `WeakMap` is often better. Its keys must be objects,
+      and it holds them weakly: once nothing else refers to the key, the entry can go. It has
+      no `size` and can't be iterated, because its contents depend on when the collector
+      runs.
+
+      `WeakRef` holds a single object weakly, and `FinalizationRegistry` runs a callback some
+      time after an object is collected. Both are for optimisations such as a cache of
+      large decoded images, never for correctness. The language makes no promise about when,
+      or whether, a callback runs, so closing a file or a connection in one is a bug. Close
+      resources explicitly instead.
+pitfalls:
+  - '**Removing a listener with a new function.** `removeEventListener("keydown", () => onKey())` removes nothing, because it isn''t the function that was added. Keep the original in a variable, or add it with an `AbortController` signal.'
+  - '**Starting a timer with no stop.** `setInterval` keeps its callback and everything it uses alive until `clearInterval`. Return a stop function, and in React clear it in the effect clean-up.'
+  - '**A module-level `Map` or array that only grows.** Sessions, request logs and memoised results pile up for the life of the process. Give every entry a size limit or a lifetime.'
+  - '**Capturing a large object in a closure that outlives it.** A label function that mentions `rows.length` keeps every row. Copy the small value out first.'
+  - '**Reading one memory number and calling it a leak.** Heap usage rises and falls with ordinary garbage. Compare readings after forced collections, over several repeats of one action.'
+  - '**Silencing `MaxListenersExceededWarning`.** Raising the limit hides the symptom. Find where listeners are added per request or per render without being removed.'
+  - '**Relying on `FinalizationRegistry` to release resources.** Its callbacks may run late or never. Close files, sockets and connections explicitly.'
+interview:
+  - question: How can a garbage-collected language leak memory?
+    answer: >-
+      Because the collector frees only unreachable memory, and a leak is memory that's still
+      reachable by mistake. The collector traces from roots such as globals, running
+      functions and pending timers and listeners, and keeps everything it reaches. If a
+      long-lived object points at data you're done with, that data stays. Typical culprits
+      are a listener on `window` or an emitter that refers to a removed component, an
+      interval never cleared, a closure capturing a large array, and a module-level cache
+      with no limit. Cycles aren't the problem, since tracing collectors free unreachable
+      cycles. The fix is ownership: whatever starts or stores something is responsible for
+      stopping or removing it.
+  - question: Memory on a Node service climbs until it's killed every few hours. How do you find the leak?
+    answer: >-
+      First I'd confirm it's a leak and not load: does memory after collections keep rising
+      while traffic is steady? Then I'd reproduce it outside production if I can, driving
+      one endpoint repeatedly with `--expose-gc` and measuring `heapUsed` after forced
+      collections to find which action grows it. To see what's retained, I'd take heap
+      snapshots, locally with `--inspect` or with `v8.writeHeapSnapshot()` on one instance
+      out of rotation, because writing one pauses the process. Comparing a snapshot before
+      and after many repeats shows which objects grew, and the retainers view shows the
+      reference chain holding them, usually a module-level map, an emitter's listeners or a
+      closure. After the fix I'd add a memory alert so a regression shows before the crash.
+  - question: When would you use a `WeakMap` instead of a `Map`?
+    answer: >-
+      When I want to attach data to an object without extending that object's life. A
+      `WeakMap` holds its keys weakly, so when nothing else refers to the key object, the
+      entry can be collected with it. A cache of computed layout per DOM node, or of parsed
+      data per request object, fits well: when the node or request goes, so does its entry,
+      with no clean-up code. The trade-offs are that keys must be objects, and you can't
+      iterate it or read its size, because its contents depend on the collector's timing.
+      For a cache keyed by strings, such as product ids, a `WeakMap` doesn't apply, and I'd
+      use a `Map` with a size limit and a TTL instead.
+  - question: What memory leaks are common in React apps, and how do you prevent them?
+    answer: >-
+      Effects that start something and never stop it. A `useEffect` that adds a listener to
+      `window`, starts an interval, opens a WebSocket or subscribes to a store must return a
+      clean-up function that undoes it, because React calls that clean-up before re-running
+      the effect and on unmount. Without it, each mount adds another listener that keeps the
+      old component's closure, state and DOM alive. I use one `AbortController` per effect
+      for listeners and fetches, and call `disconnect()` on observers. Strict Mode in
+      development mounts, unmounts and mounts again, which exposes a missing clean-up
+      quickly. Outside effects, watch for module-level caches that grow with every page
+      visited.

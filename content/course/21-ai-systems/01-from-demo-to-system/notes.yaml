@@ -1,0 +1,202 @@
+summary: >-
+  A demo asks one model call to do everything: understand the request, decide what to do,
+  act, and write the reply. That's fine for twenty hand-picked inputs. On real traffic the
+  same call meets spam, legal threats, pasted bank details, loops and a prompt edit on a
+  Friday afternoon, and it has nowhere to catch any of them.
+
+
+  A production pipeline splits the job. **Code owns the flow**: it redacts personal data,
+  routes with a classifier, runs a capped agent, checks every action, hands unsure cases to
+  a person, traces each call and gates every change with evals. The model still does the
+  hard part, reading and writing language, but it answers narrow questions whose answers
+  code can check.
+
+
+  This lesson is the map for the chapter and the first drawing a system design interviewer
+  asks for. Reach for the full pipeline when the output reaches customers or triggers an
+  action. A one-call prototype is still the right first step: build it to learn what the
+  task needs, then add a box for each failure you actually see.
+remember:
+  - In a production AI system the model proposes and code decides, so no word in free text ever triggers an action.
+  - Give each risk its own box and each box a planned fallback, so a wrong answer costs one branch, not the whole request.
+  - Redact personal data before the first model call, log line or trace, because anything that leaves raw can't be pulled back.
+  - 'Guards fail closed and classifiers fail to a person: an error must never turn into an approval or a confident guess.'
+  - Triage, guards and redaction sit on the request path and must be fast; evals and judge scoring run beside it, in CI or on a schedule.
+  - Every prompt, model or retrieval change runs the eval set in CI, and every response records the prompt version that produced it.
+  - Budgets cap steps, tokens, time and money per request, so a loop or a spike stops with a clear state instead of a large bill.
+sections:
+  - title: Workflows first, agents where the path is unknown
+    body: |-
+      The pipeline in this lesson is mostly a **workflow**: the path is fixed in code, and
+      model calls fill in answers along it. An **agent** lets the model choose the next step
+      in a loop. Workflows are cheaper, faster, easier to test and easier to explain to an
+      auditor. Agents earn their place only where you can't know the steps in advance, such
+      as investigating an order across several systems.
+
+      So the usual shape is a workflow around a small agent. Code triages, retrieves and
+      guards. The agent works inside one branch with a step cap, a fixed list of tools and a
+      guard on its actions. That keeps the open-ended part small and the rest predictable.
+
+      A useful test in design reviews: for each model call, write down the question it
+      answers and the type of its answer. "Which of four labels, with a probability" is a
+      good question. "What should we do?" is not, because code can't check the answer.
+      Narrow questions also let you pick a cheaper model per box: a small model for triage,
+      a large one only for the reply.
+  - title: A fallback for every box, decided before launch
+    body: |-
+      Each box can fail in two ways: it gives a wrong answer, or it gives no answer. The
+      second is the one people forget. Decide the fallback per box and write it in code, so the
+      incident at 2 a.m. has already been handled.
+
+      ```python
+      from dataclasses import dataclass
+
+
+      @dataclass
+      class Route:
+          label: str
+          p: float
+
+
+      class ClassifierDown(Exception):
+          pass
+
+
+      def triage(text: str) -> Route:
+          if "timeout" in text:
+              raise ClassifierDown("triage timed out")
+          return Route("refund", 0.95) if "broken" in text else Route("question", 0.7)
+
+
+      def guard(action: str) -> str:
+          if action == "explode":
+              raise RuntimeError("policy service unreachable")
+          return "approve" if action.startswith("refund") else "allow"
+
+
+      def safe_triage(text: str) -> Route:
+          try:
+              return triage(text)
+          except ClassifierDown:
+              return Route("unknown", 0.0)  # fail to a person, never to a guess
+
+
+      def safe_guard(action: str) -> str:
+          try:
+              return guard(action)
+          except Exception:
+              return "block"  # a guard that errors blocks: fail closed
+
+
+      def handle(text: str, proposed_action: str) -> str:
+          route = safe_triage(text)
+          if route.p < 0.6:
+              return "human-queue"
+          verdict = safe_guard(proposed_action)
+          if verdict == "block":
+              return "blocked"
+          if verdict == "approve":
+              return "awaiting-approval"
+          return "reply-sent"
+
+
+      print(handle("my kettle arrived broken", "refund:order-17"))  # awaiting-approval
+      print(handle("what are your hours?", "reply"))                 # reply-sent
+      print(handle("timeout on this one", "reply"))                   # human-queue
+      print(handle("what are your hours?", "explode"))               # blocked
+      ```
+
+      The pattern is **fail safe per box**. A failed classifier returns probability 0, which
+      the existing threshold already sends to a person. A failed guard returns "block". No
+      new branch was needed, because the fallback reuses the path for "unsure".
+  - title: What each box costs on the request path
+    body: |-
+      Every box adds latency and money, so in an interview you justify each one. Rough
+      orders of magnitude, to be measured on your own stack: pattern-based redaction and
+      rule checks take milliseconds, a small trained classifier milliseconds, a small
+      prompted model a few hundred milliseconds, a vector search tens of milliseconds, and a
+      large model writing a reply several seconds.
+
+      Two consequences follow. First, the cheap boxes are nearly free next to generation, so
+      skipping redaction or a guard to save time is a false economy. Second, the expensive
+      box is the agent, which is why the step cap matters: eight steps of a large model can
+      cost more than everything else combined.
+
+      Work that doesn't need to block the user moves off the path: judge scoring of a sample
+      of replies, eval runs, clustering of failures, relabelling. Streaming the reply lowers
+      the time to the first token the user sees, but the guard on any action still has to
+      finish before the action runs.
+  - title: Actions that are safe to retry
+    body: |-
+      A pipeline retries: a timeout, a crash between the payment and the reply, a user who
+      clicks twice. An action the model triggers should be **idempotent**, meaning running
+      it twice has the same effect as once. The usual tool is an idempotency key built from
+      the ticket and the action.
+
+      ```python
+      done: dict[str, str] = {}
+
+
+      def refund_once(ticket_id: str, order_id: str) -> str:
+          key = f"refund:{ticket_id}:{order_id}"
+          if key in done:
+              return done[key]  # a retry returns the first result, no second payment
+          result = f"refunded {order_id}"
+          done[key] = result
+          return result
+
+
+      print(refund_once("t-1", "o-9"))
+      print(refund_once("t-1", "o-9"))
+      print(len(done))  # 1
+      ```
+
+      In production the store is a database table with a unique constraint on the key, and
+      many payment APIs accept such a key themselves. The point for AI systems: an agent
+      that repeats a tool call, or a harness that replays a run, must never pay out twice.
+pitfalls:
+  - '**Branching on words in the reply.** `if "refund" in text` fires on "a refund is not possible". Ask a classifier for a label and a probability, and let code compare it with a threshold.'
+  - '**Logging before redacting.** A trace or debug log at the top of the handler captures the raw text, and the privacy leak sits in the observability store. Redact first, then log only the redacted text.'
+  - '**Failing open.** A `try` around the guard that returns "allow" on error turns every outage of the policy check into an unguarded system. Guards return "block" on error; classifiers return probability 0.'
+  - '**One call for everything.** Asking the large model "what should we do?" hides every decision in free text. Split it into narrow questions, each with a typed answer you can test.'
+  - '**Adding every box on day one.** A pipeline built before you know the failures guards the wrong things. Ship the prototype to a few users, read the traces, and add boxes for the failures you see.'
+  - '**Evals only in a notebook.** A score someone checked once doesn''t stop the Friday regression. Run the eval set in CI on every change to a prompt, model or retrieval setting.'
+interview:
+  - question: Our chatbot demo works. What would you add before real customers use it?
+    answer: >-
+      I'd stop one call from deciding everything and let code own the flow. Personal data is
+      redacted before any call or log. A small classifier routes each request with a
+      probability, and unsure ones go to a person. Retrieval is filtered by tenant. If the
+      model acts, it runs as a capped agent, every action passes a guard, and irreversible
+      ones wait for approval. Each call is traced with its prompt version, tokens, cost and
+      latency, and an eval set gates every prompt or model change in CI. I'd add these in
+      order of risk: redaction and action guards before launch, evals before the first
+      prompt change, and fancier routing once traces show where it's needed.
+  - question: When would you use an agent rather than a fixed workflow?
+    answer: >-
+      Only when the steps can't be known in advance. A workflow fixes the path in code and
+      uses model calls for narrow answers, so it's cheaper, faster, testable branch by branch
+      and easier to audit. An agent lets the model pick the next tool in a loop, which suits
+      open-ended tasks such as investigating an order across several systems. Even then I
+      keep the agent small: it runs inside one branch of a workflow, with a step cap, a fixed
+      tool list, validated arguments and a guard on actions. The cost of agents is
+      variance: runs differ in length, price and outcome, so they need tighter budgets and
+      more tracing.
+  - question: The classifier service times out. What should the pipeline do?
+    answer: >-
+      Fall back to a person, not to a guess. I'd treat a timeout as probability 0, which the
+      existing "unsure" branch already sends to the human queue, so no new path is needed.
+      The same principle holds for every box: a guard that errors blocks the action, and an
+      overloaded model falls back to another model or a short holding reply. I'd also put a
+      tight timeout and a circuit breaker on the call, so a slow classifier doesn't hold
+      every request open. The trade-off is load on the human queue during an outage, so the
+      queue needs an owner and an alert when it grows.
+  - question: How do you stop a prompt change from quietly breaking the product?
+    answer: >-
+      Treat the prompt as code and gate it with evals. Prompts live in the repository with
+      a version, and every change runs a labelled eval set in CI that fails the pull request
+      if a score drops below its threshold. Every response records the prompt version, so a
+      regression in production can be traced to the change that caused it and rolled back.
+      Offline sets miss new kinds of traffic, so I'd also score a sample of live replies and
+      add real failures to the set. The cost is maintenance: someone has to label cases and
+      keep the set current.

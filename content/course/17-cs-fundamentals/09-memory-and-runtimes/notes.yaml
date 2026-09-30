@@ -1,0 +1,296 @@
+summary: >-
+  A runtime is the machinery that runs your code and manages its memory for you. In
+  JavaScript that's an engine, V8 in Chrome and Node, plus a host that adds timers, I/O and
+  the event loop. You never call `malloc` or `free`, but memory is still managed by rules,
+  and knowing them turns "the server's memory climbs all day" into a search you can finish.
+
+
+  There are two regions to picture. The **stack** holds one frame per running call, and
+  frames vanish on return, so it's fast and needs no cleaning. The **heap** holds objects,
+  arrays, closures and anything that outlives a call, and a **garbage collector** frees what
+  nothing can reach any more. V8's collector is **generational**: it collects young objects
+  often and cheaply, because most die young, and old ones rarely.
+
+
+  Garbage collection prevents dangling pointers and double frees, but not leaks. A leak in JavaScript is memory that's still reachable though you'll never use it again.
+  Think of an unbounded cache, a listener nobody removed, a timer that never stops, or a
+  closure holding more than it needs. The fix is always to cut a reference, or to hold it weakly with
+  `WeakMap` or `WeakRef`. The event loop is the other half of the runtime picture: one
+  thread runs your code, so long synchronous work blocks everything else.
+remember:
+  - A tracing garbage collector keeps every object reachable from the roots and frees the rest, so a leak is an unneeded object that's still reachable.
+  - Each call gets a stack frame that's freed on return, while objects and captured variables live on the heap until nothing reaches them.
+  - V8 collects the young generation often with a fast copying scavenger and the old generation rarely with concurrent mark and compact.
+  - Reference counting can't free cycles, and tracing collectors like V8's can, because unreachable cycles aren't reached from any root.
+  - The common JavaScript leaks are unbounded caches, listeners and timers that are never removed, and closures that capture large objects.
+  - A `WeakMap` holds its keys weakly, so an entry disappears when its key object is otherwise unreachable, and a `WeakRef` lets you check whether a target still exists.
+  - The event loop runs one task at a time on one thread, and drains every microtask, such as promise callbacks, before the next task.
+  - Long synchronous work blocks the event loop, so no timer, request or click is handled until it finishes.
+sections:
+  - title: Frames, closures and what outlives a call
+    body: |-
+      A stack frame holds a call's parameters, locals and return address. It's allocated by
+      moving one pointer and freed by moving it back, which is why the stack needs no
+      collector. It's also small and fixed in size, so unbounded recursion fails fast.
+
+      ```js
+      try {
+        (function forever() {
+          forever();
+        })();
+      } catch (error) {
+        console.log(error instanceof RangeError, error.message); // true Maximum call stack size exceeded
+      }
+      ```
+
+      A **closure** is a function plus the variables it captured from the scope around it.
+      Captured variables can't live in the frame, because the frame dies on return and the
+      closure may run later. So V8 puts them in a **context** object on the heap, and the
+      closure points at it.
+
+      ```js
+      function makeCounter() {
+        let count = 0; // captured, so it lives on the heap, not in the frame
+        return () => ++count;
+      }
+      const next = makeCounter();
+      next();
+      console.log(next()); // 2
+      ```
+
+      There's a subtlety that causes real leaks. In V8, closures created in the same scope
+      **share one context**. If any of them captures a variable, every closure from that
+      scope keeps it alive, even one that never mentions it.
+
+      ```js
+      // Run with: node --expose-gc
+      const heapMB = () => {
+        globalThis.gc();
+        return Math.round(process.memoryUsage().heapUsed / 1e6);
+      };
+      function plain() {
+        const rows = new Array(1_000_000).fill(1);
+        return () => 'ok';
+      }
+      function sibling() {
+        const rows = new Array(1_000_000).fill(1);
+        const log = () => rows.length; // never called, but it captures rows
+        return () => 'ok';
+      }
+      const keep = [];
+      let base = heapMB();
+      for (let i = 0; i < 10; i++) keep.push(plain());
+      console.log('plain', heapMB() - base); // plain 0
+      base = heapMB();
+      for (let i = 0; i < 10; i++) keep.push(sibling());
+      console.log('sibling', heapMB() - base); // sibling 80
+      ```
+
+      Ten small handlers held 80 MB, because each kept its scope's `rows` array. The fix is
+      to keep large data out of scopes that create long-lived callbacks, or to copy out
+      only the small value the callback needs.
+  - title: How V8's generational collector works
+    body: |-
+      Every tracing collector does the same core job: mark everything reachable from the
+      roots, then reclaim the rest. The roots are the stack frames, globals and handles the
+      engine holds. The difference is in how often and how cleverly.
+
+      **Mark and sweep** marks live objects and then sweeps the heap, adding dead space to
+      free lists. Over time the free space fragments into small holes, so **mark and
+      compact** also moves live objects together. That's what V8 does for the **old
+      generation**.
+
+      The design rests on the **generational hypothesis**: most objects die young. A request
+      handler allocates dozens of temporary objects that are garbage a millisecond later. So
+      V8 splits the heap. New objects go into a small **young generation**, collected by the
+      **scavenger**. It copies the few live objects into an empty area and treats everything
+      left behind as free, so its cost depends on the survivors, not on the garbage. An
+      object that survives two scavenges is **promoted** to the old generation.
+
+      Two details make this work. A young collection must know about old objects pointing
+      at young ones, without scanning the whole old generation. A **write barrier**, a small
+      check on every pointer write, records those pointers in a remembered set. And pauses
+      are kept short: V8's Orinoco collector scavenges in parallel on helper threads, and it
+      marks the old generation **concurrently** and incrementally while your code runs.
+
+      Things you can observe in Node:
+
+      - `process.memoryUsage()` reports `heapUsed`, `heapTotal` and `rss`, the whole
+        process's resident memory, which includes buffers and native memory outside the heap.
+      - `--max-old-space-size=4096` raises the old generation limit, in megabytes. When the
+        heap can't grow further, the process dies with "JavaScript heap out of memory".
+      - A heap snapshot from Chrome DevTools or `node --inspect` shows each object's
+        **retainers**, the chain of references keeping it alive. That chain is the answer to
+        every leak hunt.
+
+      Reference counting frees an object when its count of references hits zero. Swift uses
+      it, and CPython uses it together with a separate cycle detector. It's immediate and predictable, but two objects that
+      point at each other never reach zero. Tracing handles cycles for free, which the
+      lesson's `garbage` exercise showed.
+  - title: The four common leaks, and weak references
+    body: |-
+      Leaks in JavaScript almost always fall into four shapes, and each has a standard fix.
+
+      - **Unbounded caches.** A module-level `Map` grows for ever. Cap it with a size limit
+        and evict the least recently used entry, or give entries a time to live.
+      - **Listeners never removed.** A component subscribes on mount and forgets to
+        unsubscribe. The emitter holds the listener, and the listener's closure holds the
+        component's data.
+      - **Timers never cleared.** A `setInterval` callback keeps its closure alive until
+        `clearInterval`.
+      - **Closures that capture too much**, as in the section above, and detached DOM
+        nodes in a browser that some JavaScript variable still references.
+
+      Node warns about the listener case once an emitter passes ten listeners for one event.
+
+      ```js
+      import { EventEmitter } from 'node:events';
+
+      const store = new EventEmitter();
+      function openPanel(roomId) {
+        const history = new Array(100_000).fill(roomId); // kept alive by the listener
+        const onMessage = (message) => history.push(message);
+        store.on('message', onMessage);
+        return () => store.off('message', onMessage); // the cleanup a caller must run
+      }
+
+      for (let room = 0; room < 11; room++) openPanel(room);
+      console.log(store.listenerCount('message')); // 11
+      // stderr: MaxListenersExceededWarning: Possible EventEmitter memory leak detected. ...
+      ```
+
+      In browsers and Node, an `AbortController` removes a group of listeners in one call:
+      pass `{ signal }` to `addEventListener` and call `abort()` on teardown.
+
+      **Weak references** let you attach data to an object without keeping it alive. A
+      `WeakMap` holds its keys weakly: once the key is unreachable elsewhere, the entry can be
+      collected. It isn't iterable and has no `size`, because its contents depend on when the
+      collector runs. A `WeakRef` wraps one object, and `deref()` returns it or `undefined`.
+
+      ```js
+      // Run with: node --expose-gc
+      const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+      let order = { id: 1, lines: new Array(1_000_000).fill(0) };
+      const notes = new WeakMap([[order, 'gift wrap']]);
+      const ref = new WeakRef(order);
+      console.log(notes.get(order), ref.deref() === order); // gift wrap true
+
+      order = null; // drop the only strong reference
+      await tick();
+      globalThis.gc();
+      await tick();
+      console.log(ref.deref()); // undefined
+      ```
+
+      The `await tick()` matters: a `WeakRef` target is kept alive until the current job
+      ends. Without `--expose-gc` you can't say when collection happens, so never build
+      logic that depends on it. `FinalizationRegistry` callbacks may run late or never, so
+      they suit cleanup hints, not correctness.
+  - title: The event loop, at the level you need
+    body: |-
+      JavaScript runs your code on **one thread**. The runtime keeps queues of work that's ready to run. The **event loop** repeats one
+      step. It takes the next **task**, such as a timer firing, an I/O callback or a click,
+      and runs it to completion. Then it runs every queued **microtask**: promise callbacks,
+      `queueMicrotask` and the code after an `await`. Only then does it take the next task.
+
+      ```js
+      console.log('1 sync');
+      setTimeout(() => {
+        console.log('4 first timer');
+        Promise.resolve().then(() => console.log('5 microtask queued by the first timer'));
+      }, 0);
+      setTimeout(() => console.log('6 second timer'), 0);
+      Promise.resolve().then(() => console.log('3 promise'));
+      console.log('2 sync');
+      // 1 sync
+      // 2 sync
+      // 3 promise
+      // 4 first timer
+      // 5 microtask queued by the first timer
+      // 6 second timer
+      ```
+
+      The microtask from the first timer runs before the second timer, even though both
+      timers were due. Microtasks always drain first, so a promise chain that keeps queuing
+      more promises can starve timers and I/O completely.
+
+      Two Node details trip people up. `process.nextTick` callbacks have their own queue,
+      and in a CommonJS script they run before promise callbacks. In an ES module the
+      module body itself runs as part of a promise job, so there the promise callbacks ran
+      first on Node 24. And `setTimeout(fn, 0)` versus `setImmediate(fn)` from the main
+      script has no fixed order: it came out both ways across runs.
+
+      Because there's one thread, a long synchronous loop blocks everything. A timer set
+      for 0 ms waited behind a 200 ms loop and fired after it. Node hands network I/O to the operating system. Other slow work goes to libuv's
+      thread pool, four threads by default: file system calls, `dns.lookup`, and parts of
+      `crypto` and `zlib`. Your
+      JavaScript still runs on one thread, so CPU-heavy work belongs in a `worker_threads`
+      worker or a separate process.
+pitfalls:
+  - '**Thinking garbage collection means no leaks.** The collector frees only what is unreachable, and a forgotten reference keeps an object reachable for ever. Look for the retainer chain in a heap snapshot, and cut the reference that should have gone.'
+  - '**Caching in a module-level `Map` with no limit.** Every key stays reachable, and if keys include a timestamp or request id they never repeat. Key by something that repeats, and cap the size with eviction or a time to live.'
+  - '**Subscribing without a cleanup.** Listeners, intervals and observers hold their callbacks, which hold whatever the callbacks close over. Return an unsubscribe function, call it on teardown, or register with an `AbortSignal` and abort once.'
+  - '**Using `WeakMap` as a cache keyed by strings.** Its keys must be objects or non-registered symbols, and `set` with a string key throws a `TypeError`. For string keys use a bounded `Map`.'
+  - '**Calling `global.gc()` in production to fix memory.** It forces a full, blocking collection and fixes nothing: reachable objects stay. It needs `--expose-gc` anyway. Find and cut the retaining reference instead.'
+  - '**Blocking the event loop with CPU work.** A long loop, a huge `JSON.parse` or a synchronous hash stalls every request on that process. Move it to a worker thread, split it into chunks, or use the async version of the API.'
+interview:
+  - question: What's the difference between the stack and the heap?
+    answer: >-
+      The stack holds one frame per active call, and the heap holds everything that must
+      outlive a call. A frame has the call's parameters and local variables, is allocated by
+      moving a pointer, and disappears on return, so the stack needs no garbage collection.
+      It's small, which is why deep recursion throws a `RangeError`. The heap holds objects,
+      arrays, closures' captured variables and strings, and a variable on the stack holds a
+      reference into it. That's why passing an object to a function shares it, while a
+      number behaves as a copy. The heap is large and flexible but needs a collector, and
+      allocation there is slower. It's a model rather than a law: V8 stores small integers
+      inside the reference and can keep an object off the heap when it proves the object
+      never escapes.
+  - question: How does garbage collection work in V8?
+    answer: >-
+      V8 uses a tracing, generational collector. Tracing means it marks every object
+      reachable from the roots, the stack, globals and engine handles, and frees the rest,
+      which also frees unreachable cycles. Generational means it splits the heap because
+      most objects die young. New objects go into a small young generation collected often
+      by a scavenger, which copies the few survivors into a fresh area, so its cost scales
+      with what's alive. Objects that survive two scavenges are promoted to the old
+      generation, collected less often with mark and compact. To keep pauses short, the
+      Orinoco collector scavenges in parallel and marks the old generation concurrently
+      while JavaScript runs, using write barriers to track pointers the mutator changes. The
+      trade-off is some CPU and memory overhead in exchange for short, rare pauses.
+  - question: How would you find and fix a memory leak in a Node service?
+    answer: >-
+      I confirm it's a leak, find what retains the memory, and cut that reference. First I
+      graph `heapUsed` over time under steady load. A sawtooth that returns to a flat
+      baseline is normal, and a rising baseline is a leak. Then I take two or three heap
+      snapshots, minutes apart, with `node --inspect` and Chrome DevTools, and compare them
+      to see which object types keep growing. For a growing type, the retainers view shows
+      the chain from a root, which usually ends in a module-level cache, an event emitter's
+      listener list, an interval or a closure. The fix is to bound the cache, remove the
+      listener on teardown, clear the timer, or hold the reference in a `WeakMap`. Snapshots
+      pause the process and can be large, so on a production box I'd take them from one
+      instance pulled out of rotation.
+  - question: When would you use a `WeakMap` or a `WeakRef`?
+    answer: >-
+      I use a `WeakMap` to attach data to objects I don't own, without extending their
+      lifetime. Examples are caching a computed value per DOM node or per request object,
+      or storing private data for class instances. When the key object becomes unreachable
+      elsewhere, the entry goes with it, so the map can't leak. The limits are that keys
+      must be objects or non-registered symbols, and the map isn't iterable and has no
+      size, because entries vanish whenever the collector runs. A `WeakRef` is rarer: it
+      suits a cache of large, re-creatable objects where losing one is fine, and `deref()`
+      tells me whether it's still there. I avoid putting correctness on `WeakRef` or
+      `FinalizationRegistry`, because collection timing isn't specified, and finalisers
+      may never run.
+  - question: Explain the event loop. Why does a resolved promise's callback run before a `setTimeout(fn, 0)`?
+    answer: >-
+      Because promise callbacks are microtasks, and the event loop drains all microtasks
+      before it takes the next task. JavaScript runs on one thread. The loop takes one task,
+      such as a timer callback, an I/O completion or a click, runs it to completion, then
+      runs every queued microtask, including any queued along the way. A zero-delay timer
+      is a task, so it waits until the current script and all its microtasks finish. The
+      practical consequences are that nothing preempts running code, so a long synchronous
+      computation blocks every request and repaint, and that an endless chain of microtasks
+      can starve timers and I/O. For CPU-heavy work in Node I'd use `worker_threads`, and in
+      the browser a Web Worker, rather than trying to schedule around the loop.

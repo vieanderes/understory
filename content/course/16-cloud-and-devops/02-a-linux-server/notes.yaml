@@ -1,0 +1,207 @@
+summary: >-
+  Under every cloud product sits a Linux machine. Knowing how to run one yourself means
+  knowing four things: how you get in (SSH with keys), who a program runs as (users and file
+  modes), what keeps it running (systemd), and what the outside world can reach (the
+  firewall). Managed platforms do all four for you, which is exactly why you need to know
+  what they are doing when something breaks.
+
+
+  The lesson sets up each piece. These notes add the parts that matter once the server holds
+  real data: how SSH proves you're talking to the right machine, how not to lock yourself
+  out, a service unit hardened beyond `User=`, why directories need permissions too, and how
+  the host firewall relates to the provider's.
+
+
+  The theme running through all of it is **least privilege**: every person, key, program and
+  port gets only the access it needs. When one layer fails, the next one limits the damage.
+remember:
+  - Log in with an SSH key, turn off password and root logins, and keep a second session open while you change SSH settings.
+  - Run each app as its own unprivileged user, so a bug in the app can't reach beyond that user's files.
+  - A secrets file belongs to the app's user with mode `600`, and to read a file you also need execute permission on every directory above it.
+  - systemd starts a service at boot, restarts it on failure and keeps its output, readable with `journalctl -u name`.
+  - Deny incoming traffic by default and open only what you serve, usually 22, 80 and 443.
+  - Docker's published ports can bypass ufw, so rely on the provider's firewall too and publish only what must be public.
+  - The first time you connect, SSH shows the server's host key fingerprint, and accepting a wrong one lets someone in the middle read everything.
+sections:
+  - title: How SSH keys work, both ways round
+    body: |-
+      SSH checks identity in both directions. The **server** proves itself with its host
+      key. The first time you connect, your client shows that key's fingerprint and asks
+      whether to trust it. Say yes and it's saved in `~/.ssh/known_hosts`. If the key ever
+      changes, SSH refuses loudly, because someone may be sitting in the middle. Compare the
+      fingerprint with the one your provider's console shows before you accept.
+
+      **You** prove yourself with your private key. The server holds your public key in
+      `~/.ssh/authorized_keys`. It sends a challenge only the private key can sign, so the
+      private key never crosses the network. Protect it with a passphrase, and let
+      `ssh-agent` hold it unlocked for the session.
+
+      ```bash
+      ssh-keygen -t ed25519 -C "laptop 2026"
+      ssh-copy-id -i ~/.ssh/id_ed25519.pub ana@203.0.113.10
+      ```
+
+      A short config file saves typing and mistakes:
+
+      ```text
+      # ~/.ssh/config
+      Host web-1
+        HostName 203.0.113.10
+        User ana
+        IdentityFile ~/.ssh/id_ed25519
+      ```
+
+      Now `ssh web-1` does the rest. Use one key per device, so a lost laptop means removing
+      one line from `authorized_keys`, not replacing every key. Never copy a private key onto
+      a server to reach another server; use a jump host with `ssh -J` instead, which keeps
+      the key on your laptop.
+  - title: Changing SSH without locking yourself out
+    body: |-
+      A bad SSH setting can shut the only door you have. Work in this order:
+
+      1. Add your key and check that a key login works in a new terminal.
+      2. Write the change into a file under `/etc/ssh/sshd_config.d/`.
+      3. Test the syntax with `sshd -t`, which prints nothing when the config is valid.
+      4. Reload with `systemctl reload ssh`. Existing sessions stay open.
+      5. Open a **second** session. Only close the first once the second gets in.
+
+      ```text
+      # /etc/ssh/sshd_config.d/10-keys-only.conf
+      PasswordAuthentication no
+      PermitRootLogin no
+      ```
+
+      The same care applies to the firewall: allow 22 before `ufw enable`, never after. If
+      you do lock yourself out, cloud providers offer a web console that attaches to the
+      machine's screen, which is the way back in.
+
+      Admin work then happens through your own user and `sudo`, which records each command
+      in the system log. Direct root logins leave no trace of who did what, which is one
+      reason to forbid them. For automated deploys, give the deploy user a narrow `sudo` rule
+      that allows one command, such as restarting the service, and nothing else.
+  - title: A service unit that assumes the app will be attacked
+    body: |-
+      `User=shop` is the first layer. systemd can fence the process in further, with a few
+      lines each worth knowing.
+
+      ```text
+      # /etc/systemd/system/shop.service
+      [Unit]
+      Description=Shop API
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      User=shop
+      WorkingDirectory=/srv/shop
+      EnvironmentFile=/srv/shop/.env
+      ExecStart=/usr/bin/node server.js
+      Restart=on-failure
+      RestartSec=2
+      NoNewPrivileges=yes
+      ProtectSystem=strict
+      ReadWritePaths=/srv/shop/uploads
+      PrivateTmp=yes
+
+      [Install]
+      WantedBy=multi-user.target
+      ```
+
+      `EnvironmentFile` loads the secrets into the process environment, so the app reads them
+      the way lesson 1's `loadConfig` expects. `NoNewPrivileges` stops the process gaining
+      rights through programs such as `sudo`. `ProtectSystem=strict` makes the whole file
+      system read-only for it, and `ReadWritePaths` opens only the folder it must write.
+      `PrivateTmp` gives it its own `/tmp`, invisible to other services. `RestartSec` waits
+      between restarts, so a crash loop doesn't spin the CPU.
+
+      After editing, run `systemctl daemon-reload`, then `systemctl restart shop`.
+      `systemd-analyze security shop` scores the unit and lists what else could be locked
+      down.
+
+      If the app must listen on port 80 without being root, add
+      `AmbientCapabilities=CAP_NET_BIND_SERVICE`. It grants that one privilege and nothing
+      else. Most setups avoid the need by putting a reverse proxy on 80 and 443.
+  - title: Permissions on directories, and where they bite
+    body: |-
+      The `rwx` letters mean something different on a directory. **Read** lists the names
+      in it. **Write** creates, renames and deletes entries in it. **Execute**, often called
+      search, lets you pass through it to reach what's inside.
+
+      So reading `/srv/shop/.env` needs execute on `/`, on `/srv` and on `/srv/shop`, and
+      read on the file itself. A file at `644` is still private if its folder is `700` and
+      owned by `shop`. The reverse surprises people: anyone with write on a directory can
+      delete a file in it, even a file they can't read.
+
+      ```bash
+      $ namei -l /srv/shop/.env
+      f: /srv/shop/.env
+      drwxr-xr-x root root /
+      drwxr-xr-x root root srv
+      drwx------ shop shop shop
+      -rw------- shop shop .env
+      ```
+
+      `namei -l` walks the path and prints each part's owner and mode, the quickest way to
+      find which step denies access. When an app gets `EACCES`, find that step and fix its
+      owner or mode. Resist `chmod 777`: it turns a permissions error into a security hole.
+
+      Groups help when two users share files. A deploy user and the app user can both
+      belong to a group that owns the release folder, with mode `750` on it, while everyone
+      else stays out.
+  - title: Two firewalls, and the one that goes round both
+    body: |-
+      A server usually sits behind two filters. The provider's firewall, called a security
+      group or a network firewall rule, drops traffic before it reaches the machine. `ufw`
+      filters inside the machine, as a friendly front for the kernel's packet filter. Use
+      both: the provider's one survives a mistake on the machine, and the machine's one
+      survives a mistake in the console.
+
+      Docker complicates this. When you publish a port with `-p 8080:3000`, Docker writes its
+      own packet filter rules. Traffic to the container is forwarded through those rules,
+      and ufw's usual rules, which guard the host itself, never see it. A port ufw says is
+      closed can then answer the internet. Two habits prevent it: publish
+      only on loopback when a local proxy is the only caller, as in `-p 127.0.0.1:8080:3000`,
+      and keep the provider's firewall closed to everything but 22, 80 and 443.
+
+      `ufw limit 22/tcp` slows repeated connection attempts to SSH from one address, which
+      thins out password-guessing bots even though they can't get in with keys-only login.
+      Check the result with `ufw status verbose`, and from outside, try the ports you closed.
+      Believing a port is closed and proving it are different things.
+pitfalls:
+  - '**Running the app as `root`.** Any code execution bug becomes full control of the machine. Create a user for the app and set `User=` in the unit.'
+  - '**`chmod 777` to fix a permission error.** It works by letting everyone in. Find the failing step with `namei -l` and fix that owner or mode, usually to `600` or `640`.'
+  - '**Enabling the firewall before allowing SSH.** The next connection is refused and you are locked out. Run `ufw allow 22/tcp` first, then `ufw enable`.'
+  - '**Closing your only session after an SSH change.** A typo in the config means no way back in. Test with `sshd -t`, reload, and prove a second session works first.'
+  - '**Trusting ufw with Docker ports.** Published container ports can bypass ufw rules. Bind them to `127.0.0.1` or rely on the provider firewall.'
+  - '**Starting the app by hand with `node server.js &`.** It dies when you log out and never comes back after a crash or reboot. Run it under systemd.'
+  - '**Forgetting `daemon-reload`.** systemd keeps using the old unit file. Reload after every edit, then restart the service.'
+interview:
+  - question: You've been given a fresh Linux VM for a small API. What do you do before putting it on the internet?
+    answer: >-
+      Lock down access, run the app with least privilege, and close every port I don't
+      serve. I add my SSH key, prove a key login works, then turn off password and root
+      logins. I create a dedicated user for the app, put its secrets in a file owned by that
+      user at mode `600`, and run it under systemd with `Restart=on-failure` and a few
+      hardening options such as `ProtectSystem=strict`. The firewall denies incoming by
+      default and allows 22, 80 and 443, both on the machine and in the provider's console.
+      I turn on automatic security updates. The trade-off is time: for one small API, a
+      managed platform may be the better answer, because it does all of this for me.
+  - question: What is least privilege, and how does it show up on a single server?
+    answer: >-
+      Every user, program and key gets only the access its job needs, so a compromise of one
+      piece is contained. On a server that means the app runs as its own user, not `root`,
+      and can write only its uploads folder. Its secrets are readable by that user alone. The
+      deploy account has a `sudo` rule for one command, restarting the service, not a full
+      shell as root. Only the ports visitors need are open. When an attacker finds a bug in
+      the app, they get a user who can read one folder and nothing else. The cost is
+      friction: tighter rules mean more permission errors to fix during setup.
+  - question: A service keeps crashing and restarting on a server. How do you find out why?
+    answer: >-
+      Read what systemd recorded before guessing. `systemctl status app` shows the state,
+      the last exit code and the last few log lines. `journalctl -u app -n 200` shows more,
+      and `journalctl -u app -b` everything since boot. The exit code tells a lot: `1` is
+      usually an unhandled error in the app, and a kill by signal 9 often means the kernel's
+      out-of-memory killer, which `journalctl -k` confirms. Then I'd reproduce with the same
+      user and environment, `sudo -u app` with the same variables, because many crashes are a
+      missing variable or a permission the app's user lacks. `RestartSec` stops a crash loop
+      from burning CPU while I investigate.

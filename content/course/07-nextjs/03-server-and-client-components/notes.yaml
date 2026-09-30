@@ -1,0 +1,277 @@
+summary: >-
+  React Server Components split one component tree across two module graphs. Server
+  Components run only on the server: they can read databases and secrets, and their code
+  never ships. Client Components run on the server for the first HTML and again in the
+  browser, where they can hold state, run effects and handle events. `'use client'` is the
+  line between the two graphs.
+
+
+  Two rules decide everything that crosses that line. **Code crosses through imports**:
+  whatever a `'use client'` file imports joins the browser bundle. **Data crosses through
+  props**: the server writes props down in the RSC payload, so they must be serialisable,
+  and anything you pass is readable by the visitor. Rendered elements count as data, which
+  is how a Server Component can sit inside a Client Component without its code shipping.
+
+
+  The practical skill is placing the boundary. Push `'use client'` down to the smallest
+  interactive leaf, pass it plain data, and let everything around it stay on the server.
+  Then keep the two renders of every Client Component identical, or hydration fails and
+  React throws the server HTML away.
+remember:
+  - >-
+    Components are Server Components by default; `'use client'` at the top of a file makes
+    it, and every module it imports, part of the browser bundle.
+  - >-
+    "Server-rendered" says how the HTML was made; "Server Component" says the code never
+    reaches the browser. Client Components are server-rendered too.
+  - >-
+    Props from a Server to a Client Component must be serialisable: primitives, plain
+    objects, arrays, `Date`, `Map`, `Set`, promises, JSX and Server Functions cross;
+    ordinary functions and class instances don't.
+  - >-
+    Every prop you pass to a Client Component is sent to the browser, so pass only the
+    fields it needs, never a whole database record.
+  - >-
+    A Client Component can't import a Server Component, but it can receive one as
+    `children` or another prop, already rendered on the server.
+  - >-
+    Hydration needs the server render and the first browser render to match; read clocks,
+    random values and browser-only APIs after hydration.
+  - >-
+    Context providers are Client Components; wrap them around `children` as deep in the tree
+    as possible so the rest can stay on the server.
+sections:
+  - title: What crosses the boundary, and what it looks like on the wire
+    body: |-
+      When a Server Component renders a Client Component, React doesn't send the Client
+      Component's result. It sends a reference to its code and the props, written in the
+      **RSC payload** format. We serialised a props object with the React Server renderer
+      that Next.js 16 bundles:
+
+      ```ts
+      const props = {
+        name: 'Lemon cake',
+        pence: 450,
+        bakedOn: new Date('2026-09-29T08:00:00Z'),
+        tags: new Set(['vegan']),
+        notes: undefined,
+      };
+      ```
+
+      ```text
+      1:["vegan"]
+      0:{"name":"Lemon cake","pence":450,"bakedOn":"$D2026-09-29T08:00:00.000Z","tags":"$W1","notes":"$undefined"}
+      ```
+
+      It's JSON with markers: `$D` revives a `Date`, `$W1` points at row 1 and revives a
+      `Set`, and `$undefined` keeps a key that plain JSON would drop. The exact format is
+      internal and can change, but the idea explains the rules. `BigInt`, `Map`, typed arrays,
+      promises, rendered JSX and symbols from `Symbol.for` all have markers. Some things
+      have none, and React stops with a clear error:
+
+      ```text
+      () => 1               Functions cannot be passed directly to Client Components unless
+                            you explicitly expose it by marking it with "use server".
+      new Money(450)        Only plain objects, and a few built-ins, can be passed to Client
+                            Components from Server Components. Classes or null prototypes
+                            are not supported.
+      new URL('https://…')  Only plain objects can be passed to Client Components from Server
+                            Components. URL objects are not supported.
+      Symbol('x')           Only global symbols received from Symbol.for(...) can be passed
+                            to Client Components.
+      ```
+
+      We produced each message by passing that value. The fix is always the same: convert to
+      plain data at the boundary. Pass `pence` and format it in the Client Component, pass
+      `url.href` instead of the `URL`, and pass a price object as `{ amount, currency }`.
+
+      Because the payload travels to the browser, it's also a security surface. A Server
+      Component that passes `user={user}` sends every field, including ones the UI never
+      shows. Pick the fields: `name={user.name}`.
+  - title: Putting server output inside a Client Component
+    body: |-
+      Everything a `'use client'` file imports becomes client code. So a Client Component
+      can't import a Server Component: the import would drag the server code, and its
+      secrets, into the bundle. It can receive one as a prop instead, because a rendered
+      element is data.
+
+      ```tsx
+      // app/basket/page.tsx: a Server Component
+      import { Drawer } from './drawer';
+      import { BasketSummary } from './basket-summary';
+
+      export default function BasketPage() {
+        return (
+          <Drawer title={<h2>Your basket</h2>}>
+            <BasketSummary />
+          </Drawer>
+        );
+      }
+      ```
+
+      ```tsx
+      // app/basket/drawer.tsx
+      'use client';
+
+      import { useState, type ReactNode } from 'react';
+
+      export function Drawer({ title, children }: { title: ReactNode; children: ReactNode }) {
+        const [open, setOpen] = useState(false);
+        return (
+          <section>
+            {title}
+            <button type="button" aria-expanded={open} onClick={() => setOpen(!open)}>
+              {open ? 'Hide items' : 'Show items'}
+            </button>
+            {open && children}
+          </section>
+        );
+      }
+      ```
+
+      `BasketSummary` can be `async` and query the database. It runs on the server, and
+      `Drawer` receives only its rendered output. React calls this the difference between
+      the **owner** and the **parent**: `BasketPage` owns both elements, since its source
+      contains their JSX, so it decides where they run. `Drawer` is only the parent that
+      places `children`.
+
+      The same idea explains a trap with compound components. If a Client Component file
+      exports `Menu` with `Menu.Item` as a static property, a Server Component that imports
+      it gets a client reference, not the function, so `Menu.Item` is `undefined` and React
+      throws "Element type is invalid". Export the pieces as named exports instead.
+  - title: The boundary lives in the module graph
+    body: |-
+      `'use client'` marks an entry point, not a single component. Every module reachable
+      through imports from that file joins the client graph, so you need the directive only
+      once at the top of a client subtree. A module imported from both graphs, such as a
+      price formatter, is compiled once for each environment.
+
+      Three habits keep the graph honest. First, mark modules that must never reach the
+      browser:
+
+      ```ts
+      // lib/orders.ts
+      import 'server-only';
+
+      export async function getOrders(customerId: string) {
+        const response = await fetch(`https://orders.internal/customers/${customerId}`, {
+          headers: { authorization: `Bearer ${process.env.ORDERS_TOKEN}` },
+        });
+        return response.json();
+      }
+      ```
+
+      If a Client Component ever imports this file, the build fails instead of quietly
+      shipping code that can't work in the browser. `client-only` does the opposite for
+      modules that touch `window`.
+
+      Second, wrap client-only libraries. A third-party carousel that uses `useState` but
+      has no directive breaks when a Server Component renders it. A two-line file fixes it:
+      `'use client'` followed by re-exporting the carousel.
+
+      Third, give context a home. `createContext` doesn't work in Server Components, so a
+      theme or basket provider is a Client Component that takes `children`. Render it around
+      `{children}` inside `<body>`, not around the whole document, so Next.js can still
+      optimise the static parts above it.
+  - title: Why hydration fails, and the three fixes
+    body: |-
+      Hydration reuses the server's HTML. React renders each Client Component in the browser
+      and expects the same output, then attaches handlers. When the text differs, React
+      reports "Hydration failed because the server rendered text didn't match the client"
+      and regenerates that tree on the client, which costs time and can flash.
+
+      Common causes: `Date.now()` or `Math.random()` in render, `typeof window` checks that
+      choose different output, formatting with the machine's locale or time zone, and HTML
+      nesting the browser repairs, such as a `<div>` inside a `<p>`. Browser extensions that
+      edit the page can cause it too.
+
+      Fix one: render a neutral value, then update after hydration in an effect, as the
+      lesson's clock does. Fix two, when many components need to know whether they're in
+      the browser, is a hook built on `useSyncExternalStore`, whose server snapshot is used
+      for the server render and for hydration:
+
+      ```tsx
+      'use client';
+
+      import { useSyncExternalStore } from 'react';
+
+      const subscribe = () => () => {};
+
+      export function useIsClient() {
+        return useSyncExternalStore(subscribe, () => true, () => false);
+      }
+
+      export function LocalTime({ iso }: { iso: string }) {
+        const isClient = useIsClient();
+        return <time dateTime={iso}>{isClient ? new Date(iso).toLocaleTimeString() : iso}</time>;
+      }
+      ```
+
+      We hydrated this in jsdom: no mismatch, and the local time appears right after
+      hydration. The same test with `Date.now()` in render reported the error.
+
+      Fix three is `suppressHydrationWarning` on one element whose text is expected to differ.
+      It works one level deep and hides the warning; it doesn't make the content match.
+pitfalls:
+  - >-
+    **Marking the page with `'use client'`.** The page and everything it imports ship to the
+    browser. Move the directive to the button, the input or the menu that needs it.
+  - >-
+    **Passing a formatter or handler as a prop.** Functions can't be serialised. Pass the
+    raw value and format it inside the Client Component, or pass a Server Function when the
+    call must run on the server.
+  - >-
+    **Passing class instances.** A `URL`, a money class or an ORM object stops the render.
+    Convert to plain objects and primitives at the boundary.
+  - >-
+    **Passing whole records to the browser.** Props are visible in the page's payload. Pass
+    only the fields the component displays.
+  - >-
+    **Importing a server module into a Client Component.** It either fails at runtime or
+    leaks code. Add `import 'server-only'` to modules that hold secrets or database access.
+  - >-
+    **Using `createContext` in a Server Component.** Context needs client code. Put the
+    provider in a `'use client'` file that wraps `children`.
+  - >-
+    **Silencing every mismatch with `suppressHydrationWarning`.** It hides the symptom on
+    one element. Find the value that differs and read it after hydration.
+interview:
+  - question: What's the difference between server-side rendering and React Server Components?
+    answer: >-
+      SSR is about how HTML is produced; Server Components are about where code runs and
+      whether it ships. With classic SSR, every component renders to HTML on the server and
+      then the same code downloads and hydrates in the browser. With RSC, Server Components
+      render only on the server into the RSC payload, and their code never reaches the
+      browser. Client Components are still server-rendered for the first HTML, then hydrate.
+      So a Next.js page uses both: RSC to cut client JavaScript and read data directly, and
+      SSR so the first response is real HTML. The trade-off is that Server Components can't
+      hold state or handle events, so interactive leaves stay Client Components.
+  - question: Where do you put `'use client'`, and why does its position matter?
+    answer: >-
+      On the smallest interactive component, because the directive marks a module-graph
+      boundary: the file and everything it imports join the browser bundle. Put it on a page
+      and the page's text, lists and helpers all ship and hydrate, even though only a button
+      needed state. Put it on the button and the rest stays as server output. When
+      interactive UI must wrap server content, such as a drawer around a basket summary, I
+      pass the server part as `children` so the client file never imports it. The cost of
+      pushing it down is more small files and props to thread, which is usually worth it.
+  - question: What can you pass from a Server Component to a Client Component?
+    answer: >-
+      Anything React can serialise into the RSC payload: strings, numbers, booleans,
+      `null`, `undefined`, BigInt, plain objects and arrays, `Date`, `Map`, `Set`, typed
+      arrays, promises, rendered JSX and Server Functions, which cross as references.
+      Ordinary functions, class instances such as a `URL`, and symbols that aren't from
+      `Symbol.for` throw. A pending promise is useful: the Client Component reads it with
+      `use` inside Suspense, so data streams without a client fetch. I also treat props as
+      public, because they're visible in the page. So I pass only the fields the UI needs
+      and never tokens or whole user records.
+  - question: A page logs a hydration error. How do you find and fix it?
+    answer: >-
+      A hydration error means a Client Component's first browser render differed from its
+      server render, so I look for values that differ between the two environments: the
+      current time, random ids, locale or time-zone formatting, `typeof window` branches, or
+      invalid nesting like a `div` inside a `p`. React's message and the dev overlay point
+      at the element. The fix is to render the same neutral output on both sides and change
+      it after hydration, with an effect or a `useSyncExternalStore` hook whose server
+      snapshot matches. For ids I use `useId`, which is stable across both renders.
+      `suppressHydrationWarning` is a last resort for one element, such as a timestamp.

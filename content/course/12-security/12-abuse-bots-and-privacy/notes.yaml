@@ -1,0 +1,334 @@
+summary: >-
+  Some attacks break nothing. They use your features exactly as designed, only at a scale or
+  with an intent you didn't plan for: a script trying leaked passwords on your login, a bot
+  buying the whole stock of a product launch, a crawler copying your catalogue, a form that
+  tells anyone which email addresses have accounts. Defending against abuse means raising the
+  cost of automation while keeping the cost for real people close to zero.
+
+
+  Privacy is the other half of the same thought. Every piece of personal data you keep is a
+  liability you guard for as long as you hold it. GDPR turns that into law in the EU and the
+  UK: have a purpose and a lawful basis, collect only what the purpose needs, keep it only
+  while needed, and let people see and remove what you hold.
+
+
+  The lesson covers the rate-limit key, a token bucket, server-side purchase limits and data
+  minimisation. These notes add the three kinds of login attack and a layered defence, breached
+  password checks, account enumeration and timing, the real trade-offs of CAPTCHAs, and the
+  GDPR ideas an engineer uses at work: lawful basis, rights, breach reporting, and
+  pseudonymisation versus anonymisation.
+remember:
+  - Credential stuffing replays leaked email and password pairs, so defend with per-account and per-IP limits, breached-password checks and MFA.
+  - Key login limits by the normalised account and by IP together, because spraying and stuffing each dodge one of them.
+  - Hard lockouts let anyone lock a victim out, so prefer throttling, step-up challenges and notifying the owner.
+  - Login, sign-up and password reset must answer the same way, in the same time, whether or not the account exists.
+  - A CAPTCHA costs every real user effort and accessibility, and solving services beat it for cents, so show one only when risk signals fire.
+  - GDPR data minimisation and storage limitation mean collecting only what a stated purpose needs and deleting it when that purpose ends.
+  - Pseudonymised data is still personal data under GDPR; only data that can no longer identify anyone is anonymous.
+  - A personal data breach must usually be reported to the supervisory authority within 72 hours of becoming aware of it.
+sections:
+  - title: Three login attacks, three shapes of traffic
+    body: |-
+      **Brute force** tries many passwords against one account. **Password spraying** tries a
+      few common passwords against many accounts, staying under any per-account limit.
+      **Credential stuffing** replays email and password pairs leaked from another site,
+      usually one try per account, spread across thousands of IP addresses. It works because
+      people reuse passwords across sites.
+
+      Each shape slips past a different single control. A per-account limit stops brute force
+      but not spraying. A per-IP limit slows spraying from one machine but not a botnet. Neither
+      notices stuffing, where every attempt is a first attempt with a plausible password. The
+      defence is layers:
+
+      - Per-account and per-IP limits together, with the account key normalised.
+      - A **breached password check** at sign-up and password change, so leaked passwords can't
+        be chosen in the first place. NIST's guidance asks for exactly this.
+      - **MFA**, which makes a correct password insufficient. Passkeys go further, since there's
+        no password to stuff.
+      - Signals across the whole login endpoint: the global failure rate, many accounts from one
+        device fingerprint, a sudden jump in logins from new countries.
+
+      The breached check doesn't need to send the password anywhere. The Have I Been Pwned
+      range API uses **k-anonymity**: you send the first five hex characters of the SHA-1 and
+      get back every known suffix that shares them.
+
+      ```js
+      import { createHash } from 'node:crypto';
+
+      // k-anonymity: only the first five hex characters of the SHA-1 leave your server.
+      function rangeQuery(password) {
+        const sha1 = createHash('sha1').update(password).digest('hex').toUpperCase();
+        return { prefix: sha1.slice(0, 5), suffix: sha1.slice(5) };
+      }
+
+      // The range endpoint answers with every known suffix for that prefix, as SUFFIX:COUNT lines.
+      function timesSeen(responseText, suffix) {
+        for (const line of responseText.split('\n')) {
+          const [s, count] = line.trim().split(':');
+          if (s === suffix) return Number(count);
+        }
+        return 0;
+      }
+
+      const { prefix, suffix } = rangeQuery('password123');
+      console.log(prefix); // CBFDA: the only part you would send
+      // A made-up response in the documented shape, so this runs offline.
+      const response = `0018A45C4D1DEF81644B54AB7F969B88D65:3\n${suffix}:251682\n00D4F6E8FA6EECAD2A3AA415EEC418D38EC:2`;
+      console.log(timesSeen(response, suffix) > 0 ? 'refuse: seen in breaches' : 'fine');
+      ```
+
+      SHA-1 is fine here. It isn't protecting anything; it's a lookup key agreed with the
+      service. Your stored passwords still use a slow hash such as scrypt, bcrypt or Argon2.
+  - title: A login that limits and doesn't leak
+    body: |-
+      This puts the pieces together: two buckets keyed differently, an account key normalised
+      so `Ana@Example.com ` and `ana@example.com` share one bucket, and the same answer and the
+      same work whether the account exists or not.
+
+      ```js
+      import { scryptSync, randomBytes, timingSafeEqual } from 'node:crypto';
+
+      // Token buckets as in the lesson, one map per key kind.
+      function limiter(capacity, refillPerSec) {
+        const buckets = new Map();
+        return (key, now) => {
+          const b = buckets.get(key) ?? { tokens: capacity, last: now };
+          const tokens = Math.min(capacity, b.tokens + ((now - b.last) / 1000) * refillPerSec);
+          const ok = tokens >= 1;
+          buckets.set(key, { tokens: ok ? tokens - 1 : tokens, last: now });
+          return ok;
+        };
+      }
+      const perAccount = limiter(5, 1 / 60); // 5 tries, then one a minute
+      const perIp = limiter(50, 1); // generous: offices and mobile networks share addresses
+
+      const normalise = (email) => email.trim().toLowerCase();
+
+      const hashPassword = (pw, salt = randomBytes(16)) => ({ salt, hash: scryptSync(pw, salt, 32) });
+      const users = new Map([['ana@example.com', hashPassword('correct horse battery staple')]]);
+      const DUMMY = hashPassword('never-matches'); // same cost when the account doesn't exist
+
+      function login(email, password, ip, now = Date.now()) {
+        const account = normalise(email);
+        if (!perIp(ip, now) || !perAccount(account, now)) return { status: 429 };
+        const user = users.get(account) ?? DUMMY;
+        const attempt = scryptSync(password, user.salt, 32);
+        const ok = timingSafeEqual(attempt, user.hash) && user !== DUMMY;
+        // One message for a wrong password and an unknown account.
+        return ok ? { status: 200 } : { status: 401, message: 'Email or password is wrong' };
+      }
+
+      console.log(login('Ana@Example.com ', 'correct horse battery staple', '203.0.113.9')); // { status: 200 }
+      console.log(login('nobody@example.com', 'guess', '203.0.113.9')); // { status: 401, ... }
+      const results = [];
+      for (let i = 0; i < 7; i++) results.push(login('ANA@example.com', `guess-${i}`, `198.51.100.${i}`).status);
+      console.log(results.join(' ')); // 401 401 401 401 429 429 429
+      ```
+
+      The last line shows the point: seven guesses from seven addresses, and the account bucket
+      still closes. It shows four failures, not five, because the successful sign-in spent a
+      token too.
+
+      Notice what this does not do: lock the account. A hard lockout after five failures hands
+      every attacker a way to lock out any user whose email they know. Throttling slows the
+      attacker to one guess a minute, which makes stuffing pointless, while the real user can
+      still get in, especially if a successful MFA or an emailed link resets their bucket. In
+      production the buckets live in Redis so every server shares them, as the rate limiting
+      lesson in the system design chapter shows.
+  - title: Account enumeration and its quieter channels
+    body: |-
+      **Account enumeration** is any way to learn whether an address has an account. It
+      matters because a list of confirmed accounts makes stuffing and targeted phishing far more
+      efficient, and because membership can itself be sensitive: think of a clinic's booking
+      system.
+
+      The obvious channel is the message: "no account with that email" versus "wrong
+      password". The quieter channels are the ones people miss:
+
+      - **Timing.** If unknown accounts return at once and known ones spend 100 ms hashing, a
+        stopwatch tells them apart. That's why the login above hashes against a dummy record.
+      - **Status codes and redirects.** A 404 for one case and a 401 for the other, or a
+        different page afterwards.
+      - **Password reset.** Always answer "If an account exists for that address, we've sent a
+        link", and send the email from a background job so the response time doesn't depend on
+        whether mail was sent.
+      - **Sign-up.** You can't hide that an address is taken without confusing people, so move
+        the answer out of band. Accept the form either way and send an email to the address:
+        a welcome link for a new user, "you already have an account" for an existing one.
+      - **Rate limits.** Limit unknown accounts exactly like known ones, or the `429` itself
+        reveals which exist.
+
+      Be honest about the trade-off. Some products decide that telling users "no account
+      found" is worth the leak, because support tickets from confused users cost more. That's a
+      legitimate choice when accounts aren't sensitive, as long as the endpoints are rate
+      limited and it's a decision, not an accident.
+  - title: CAPTCHAs, challenges and what bots really cost
+    body: |-
+      A **CAPTCHA** is a test meant to be quick for people and hard for programs. In practice it
+      is neither. Image puzzles are slow and frustrating, hard or impossible for people using
+      screen readers, and a known accessibility barrier; WCAG requires an alternative form for
+      any CAPTCHA. Meanwhile, solving services employ people and models to answer them for a
+      small fee per thousand, and models solve many image puzzles outright. A CAPTCHA raises
+      the cost of an attack; it doesn't stop one.
+
+      So use challenges as a **step-up**, not a gate. Let normal traffic through, and challenge
+      only when signals fire: many failures on one account, a new device on a sensitive action,
+      traffic from hosting provider ranges, a request pattern no browser produces. Invisible
+      challenges such as Cloudflare Turnstile or reCAPTCHA v3 score the browser in the
+      background, which is far kinder to people. They add a third party that sees your users'
+      traffic, which is a privacy question for your data protection notes. Always verify the
+      challenge token on the server; a client-side check stops nothing.
+
+      For bots that stay within your limits, such as scalpers, the useful controls are in
+      business logic, enforced server side:
+
+      - A purchase limit per account, per payment card and per delivery address, since
+        accounts are cheap and cards and addresses aren't.
+      - A queue or a draw on launch day, so speed stops being the advantage.
+      - Verified accounts or account age requirements for scarce items.
+      - Cancelling orders that break the rules after the fact.
+
+      None of this ends automation. It makes it cost more than it earns, which is the realistic
+      goal.
+  - title: GDPR for engineers, and pseudonymisation
+    body: |-
+      Engineers meet GDPR in a few concrete places. Processing personal data needs one of six
+      **lawful bases**: consent, contract, legal obligation, vital interests, public task or
+      legitimate interests. Delivering an order runs on contract; a marketing newsletter usually
+      needs consent. People have **rights** you implement as features: access (export what you
+      hold), rectification, erasure, restriction, portability and objection. A personal data
+      breach must usually be reported to the supervisory authority within 72 hours of becoming
+      aware of it, which is only possible if your logging tells you what leaked. Personal data
+      includes more than names: an email, a customer id, a device id and often an IP address.
+
+      **Pseudonymisation** replaces identifiers with values that can't be linked back without
+      extra information kept separately. It reduces risk, and GDPR rewards it, but pseudonymised
+      data is still personal data. **Anonymous** data, from which nobody can be identified by
+      any reasonable means, falls outside GDPR, and that bar is high: a postcode, a birth date
+      and a gender together identify most people.
+
+      A plain hash of an email is not a pseudonym, because anyone with a list of emails can
+      hash them and match. Use a keyed hash, with the key held apart from the data.
+
+      ```js
+      import { createHmac } from 'node:crypto';
+
+      // The key lives in the secrets manager, away from the analytics data.
+      const PSEUDONYM_KEY = process.env.PSEUDONYM_KEY ?? 'dev-only-key';
+      const pseudonym = (userId) => createHmac('sha256', PSEUDONYM_KEY).update(String(userId)).digest('base64url').slice(0, 22);
+
+      // What reaches the analytics store: no name, no email, no exact time or full IP.
+      function analyticsEvent(order) {
+        return {
+          user: pseudonym(order.userId),
+          event: 'order_placed',
+          day: order.placedAt.slice(0, 10),
+          country: order.country,
+          items: order.items.length,
+        };
+      }
+
+      console.log(analyticsEvent({
+        userId: 42,
+        email: 'ana@example.com',
+        placedAt: '2026-09-25T14:03:11Z',
+        ip: '203.0.113.9',
+        country: 'IE',
+        items: ['kettle', 'mugs'],
+      }));
+      // { user: '...22 characters...', event: 'order_placed', day: '2026-09-25', country: 'IE', items: 2 }
+      ```
+
+      Deleting the key later turns the pseudonyms into values nobody can link back, which is a
+      practical way to honour retention limits in an analytics store. Erasure has two more
+      corners: backups, which usually age out on their own schedule that you document, and
+      logs, which is why personal data shouldn't be in logs to begin with.
+pitfalls:
+  - '**Limiting logins by IP alone.** Stuffing and spraying come from thousands of addresses, each under the limit. Key by the normalised account as well, and add breached-password checks and MFA.'
+  - '**Locking accounts after a few failures.** It turns your defence into a way to lock out any user whose email is known. Throttle, step up to a challenge, and notify the owner instead.'
+  - '**Different answers for unknown accounts.** A distinct message, status code, response time or rate limit tells an attacker which emails are registered. Make every branch look and take the same.'
+  - '**A CAPTCHA on every form.** It taxes every real user, blocks some disabled users outright, and costs attackers cents. Challenge only when risk signals fire, and verify the token server side.'
+  - '**Hashing emails and calling the data anonymous.** A plain hash of a guessable value is reversible by hashing a list of candidates. Use a keyed HMAC, treat the result as personal data, and keep the key apart.'
+  - '**Collecting fields "in case".** Every stored field must be protected, disclosed and deleted on request. Collect what a stated purpose needs, and schedule deletion when it ends.'
+interview:
+  - question: How would you protect a login endpoint against credential stuffing?
+    answer: >-
+      With layers, because stuffing is designed to look like ordinary logins: one attempt per
+      account, from thousands of addresses, with real passwords. I'd limit per normalised
+      account and per IP together, in a shared store like Redis. I'd check new passwords
+      against a breached-password list at sign-up and change, using the k-anonymity range API
+      so the password never leaves us. I'd push MFA or passkeys, which make a correct password
+      insufficient. I'd watch global signals, such as the failure rate across the endpoint and
+      logins from many accounts on one device, and step up to a challenge when they spike. I'd
+      avoid hard lockouts, since they let attackers lock out real users. The trade-off is
+      friction, so every control is tuned to stay invisible for normal traffic.
+  - question: What is account enumeration, and how do you prevent it?
+    answer: >-
+      Account enumeration is learning whether an email has an account from how the system
+      responds. It feeds stuffing and phishing, and membership itself can be sensitive. The fix
+      is to make every branch indistinguishable: the same message and status for a wrong
+      password and an unknown user, a dummy password hash so timing matches, "if an account
+      exists, we've sent a link" for resets, with the email sent from a background job, and sign-up
+      that answers the same and tells the truth by email instead. Rate limits must treat
+      unknown accounts like known ones too. Some products accept the leak for usability, and
+      that's defensible when accounts aren't sensitive, but it should be a documented decision
+      with rate limiting behind it.
+  - question: What are the trade-offs of using a CAPTCHA?
+    answer: >-
+      A CAPTCHA taxes every real user to slow a minority of attackers, and it's weaker than it
+      looks. Image puzzles are an accessibility barrier, WCAG requires alternatives, and they
+      hurt conversion. Attackers pay solving services a small amount per thousand, and models
+      solve many puzzles outright, so the cost to them is low. I'd use challenges as a step-up
+      only when risk signals fire, such as repeated failures, a new device on a sensitive
+      action, or traffic from hosting ranges. Invisible scoring like Turnstile is gentler but
+      adds a third party that sees user traffic, which needs a privacy review. And the token is
+      always verified on the server. For scalpers, business rules such as per-card limits and
+      queues work better.
+  - question: What's the difference between pseudonymisation and anonymisation under GDPR, and why does it matter?
+    answer: >-
+      Pseudonymised data can still be linked to a person with extra information held
+      separately, so it remains personal data and all of GDPR applies. Anonymous data can't be
+      linked to anyone by reasonable means, so it falls outside GDPR. It matters because teams
+      often hash an email, call the result anonymous and stop protecting it. A plain hash of a
+      guessable value is reversible by hashing candidates, so I'd use a keyed HMAC with the key
+      in a secrets manager, and still treat the output as personal data. True anonymisation
+      usually needs aggregation or coarsening, such as counts per day and country, because
+      combinations like postcode and birth date re-identify people. Destroying the pseudonym
+      key later is a practical way to meet retention limits.
+  - question: A user asks you to delete their account and data. How do you implement that?
+    answer: >-
+      First I'd find everywhere their data lives, which is only quick if we kept a data map:
+      primary database, search index, caches, analytics, file storage, email and CRM tools, and
+      logs. Deletion runs as a job that removes or irreversibly anonymises each copy and records
+      that it ran. Some data must be kept for a legal obligation, such as invoices for tax, so
+      that's retained with access restricted and deleted when the period ends. Backups usually
+      aren't edited; they age out on a documented schedule, and a restore reapplies pending
+      deletions. Third-party processors get deletion requests through their APIs. The trade-off
+      is between hard deletes, which break foreign keys and history, and anonymising the row,
+      which keeps order totals without the person.
+terms:
+  - term: Credential stuffing
+    say: Brute-forcing passwords.
+    means: Replaying email and password pairs leaked from other sites, a try or two per account across
+      many accounts. It works because people reuse passwords, so per-account lockouts alone barely
+      slow it.
+  - term: Password spraying
+    say: The same as brute force.
+    means: Trying a few common passwords against many accounts, so no single account sees enough
+      failures to trip its limit. A limit keyed by IP catches what a per-account one misses.
+  - term: Account enumeration
+    say: Only a problem if you show 'user not found'.
+    means: Any difference that reveals whether an account exists, including response time and the reset
+      message. Login, sign-up and reset must answer the same way, in the same time.
+  - term: Rate-limit key
+    say: Limit requests per IP address.
+    means: The thing you count requests against. Key login limits by the normalised account and by IP
+      together, because spraying and stuffing each dodge one of them.
+  - term: Data minimisation
+    say: Delete data when people ask.
+    means: Collect only what a stated purpose needs. Together with storage limitation, it means deleting
+      data when that purpose ends, whether or not anyone asks.
+  - term: Pseudonymisation
+    say: Anonymising the data.
+    means: Replacing identifiers with tokens that a separately kept key can link back. Under GDPR it is
+      still personal data; only data that can no longer identify anyone is anonymous.

@@ -1,0 +1,277 @@
+id: sysdesign.caching-patterns
+title: Caching patterns
+objective: Choose cache-aside, read-through, write-through or write-behind, invalidate correctly, and stop a stampede.
+level: advanced
+minutes: 10
+concepts:
+  [
+    sysdesign.cache-aside,
+    sysdesign.write-through-and-behind,
+    sysdesign.cache-invalidation,
+    sysdesign.cache-stampede,
+  ]
+prerequisites: [sysdesign.estimation, perf.caching-layers, db.storage-and-pooling]
+opening:
+  text: >-
+    You'll pick how data moves between a cache and its database, and keep the two from
+    disagreeing. It's the part of caching that decides whether users see yesterday's price.
+
+steps:
+  - type: prose
+    id: cache-recap
+    body: |-
+      You've placed caches before, in Performance, and given Redis keys a **TTL**: a time to
+      live, after which the entry expires.
+
+      This lesson is about the harder half. Who fills the cache, who clears it, and what
+      users see in between. Watch a small cache in plain JavaScript first.
+
+  - type: predict-output
+    id: predict-stale-after-write
+    concept: sysdesign.cache-aside
+    difficulty: 2
+    language: js
+    code: |
+      const cache = new Map();
+      const db = new Map([['lamp', 40]]);
+      function getPrice(item) {
+        if (cache.has(item)) return cache.get(item);
+        const price = db.get(item);
+        cache.set(item, price);
+        return price;
+      }
+      getPrice('lamp');
+      db.set('lamp', 35);
+      console.log(getPrice('lamp'));
+    question: The price drops to 35. What does the last line show?
+    choices:
+      - text: '`40`'
+        correct: true
+        feedback: >-
+          Right. The cache answered, and nothing told it the price changed.
+      - text: '`35`'
+        feedback: >-
+          The database has 35, but the second read never reaches it. The cache hit first.
+      - text: '`undefined`'
+        feedback: >-
+          The first call filled the cache with 40, so the key is there.
+
+  - type: prose
+    id: name-cache-aside
+    body: |-
+      That's **cache-aside**, the most common pattern. The application checks the cache, reads
+      the database on a miss, and fills the cache itself. **Read-through** is the same, but
+      the cache library calls the database for you.
+
+      It suits read-heavy data that can be a little stale. The catch is the one you saw. A
+      write to the database leaves the old copy behind, so a write should delete the key.
+
+  - type: predict-output
+    id: predict-delete-race
+    concept: sysdesign.cache-invalidation
+    difficulty: 4
+    language: js
+    code: |
+      const cache = new Map();
+      const db = new Map([['lamp', 40]]);
+      // A reader and a writer, interleaved in this order:
+      const old = db.get('lamp'); // reader: cache miss, reads 40
+      db.set('lamp', 35); //         writer: saves the new price
+      cache.delete('lamp'); //       writer: invalidates the key
+      cache.set('lamp', old); //     reader: fills the cache
+      console.log(cache.get('lamp'));
+    question: The writer deleted the key, as it should. What does the last line show?
+    choices:
+      - text: '`40`'
+        correct: true
+        feedback: >-
+          Yes. The slow reader wrote back a price from before the change.
+      - text: '`35`'
+        feedback: >-
+          Nobody put 35 in the cache. The only fill came from the reader's old read.
+      - text: '`undefined`'
+        feedback: >-
+          The delete ran first. The reader's fill landed after it, so the key is back.
+
+  - type: ai-review
+    id: review-delete-before-update
+    concept: sysdesign.cache-invalidation
+    difficulty: 4
+    language: ts
+    request: When a price changes, update the database and invalidate the cache.
+    flawClass: race
+    code: |
+      async function updatePrice(item: string, price: number) {
+        await cache.del(`price:${item}`);
+        await db.query('UPDATE products SET price = $1 WHERE item = $2', [price, item]);
+      }
+    prompt: >-
+      An assistant wrote this. A test updated a price, then read it, and saw the new one. Under
+      load, old prices stay cached for the full TTL. Tap the line at fault.
+    lines: [2]
+    reasons:
+      - text: It deletes before the database has the new price
+        correct: true
+        feedback: >-
+          Yes. A read in between refills the old price. Update first, then delete.
+      - text: It should set the new price in the cache
+        feedback: >-
+          Setting it has its own race between writers. Deleting is fine, in the right order.
+      - text: The query should run in a transaction
+        feedback: >-
+          One statement is already atomic. The problem is when the cache is cleared.
+    fix: |
+      await db.query('UPDATE products SET price = $1 WHERE item = $2', [price, item]);
+      await cache.del(`price:${item}`);
+
+  - type: prose
+    id: name-write-patterns
+    body: |-
+      **Write-through** updates cache and database together. Reads are fresh, and each write
+      waits for both.
+
+      **Write-behind** updates the cache and writes the database later. It's fast, and a crash
+      before the flush loses those writes.
+
+      For **invalidation**, expire by TTL, delete on write, or put a version in the key, like
+      `price:lamp:v7`. Each leaves some window of staleness.
+
+  - type: ai-review
+    id: review-write-behind-balance
+    concept: sysdesign.write-through-and-behind
+    difficulty: 3
+    language: ts
+    request: Make wallet top-ups faster. The database is the bottleneck.
+    flawClass: edge-case
+    code: |
+      async function topUp(walletId: string, amount: number) {
+        const balance = await cache.incrBy(`wallet:${walletId}`, amount);
+        pendingWrites.push({ walletId, balance }); // flushed to the database every 5 s
+        return { balance };
+      }
+    prompt: >-
+      An assistant switched top-ups to write-behind. It's fast. Then a cache server
+      restarted. Tap the line that lost customers' money.
+    lines: [3]
+    reasons:
+      - text: Confirmed money sits only in memory for seconds
+        correct: true
+        feedback: >-
+          Yes. Write-behind suits data you can lose. Balances need the database first.
+      - text: '`incrBy` isn''t atomic under load'
+        feedback: >-
+          Redis runs `INCRBY` as one step. The loss came from the delayed flush.
+      - text: Five seconds is too slow a flush
+        feedback: >-
+          A faster flush shrinks the loss, but any delay can lose confirmed top-ups.
+    fix: |
+      async function topUp(walletId: string, amount: number) {
+        const balance = await db.wallets.addBalance(walletId, amount); // write-through
+        await cache.set(`wallet:${walletId}`, balance);
+        return { balance };
+      }
+
+  - type: prose
+    id: name-stampede
+    body: |-
+      One more failure. A hot key, read a thousand times a second, expires. Every request
+      misses at the same moment, and every one queries the database. That's a **stampede**.
+
+      The fix: let the first miss load the value, and make the others wait for that same
+      load. That's **request coalescing**.
+
+  - type: code-challenge
+    id: write-coalesce
+    concept: sysdesign.cache-stampede
+    difficulty: 4
+    language: ts
+    prompt: >-
+      Stop the stampede. Write `coalesce(load)`, which returns a new function with the same
+      shape. Concurrent calls for one key share a single `load`, and all get its result.
+
+
+      Once that load settles, forget it, whether it succeeded or failed. The next call then
+      loads again. Different keys never share.
+
+
+      Three calls for `'cafe'` at once give one call to `load`.
+    hints:
+      - You need to remember something per key, between calls.
+      - Store the promise itself, not its result, so later callers can wait on it too.
+      - "Start with `const inFlight = new Map<string, Promise<T>>();` outside the returned function."
+
+  - type: explain-back
+    id: explain-keep-a-ttl
+    concept: sysdesign.cache-invalidation
+    difficulty: 4
+    prompt: >-
+      Your code deletes the cache key on every write. Why should each entry still have a TTL?
+    rubric:
+      - A delete can be missed, for example when the process crashes between the write and the delete.
+      - A slow reader can put an old value back after the delete.
+      - A TTL puts an upper bound on how long any stale value can survive.
+    modelAnswer: >-
+      Deleting on write covers the normal case, but not every case. The process can crash
+      after the database write and before the delete. A slow reader can put an old value back
+      right after the delete, as in the race we ran. Without a TTL, those stale entries would stay
+      for ever. A TTL caps the damage at a few minutes.
+
+recap:
+  - Use cache-aside for read-heavy data, deleting the key after each database write.
+  - Choose write-through for fresh reads, write-behind for fast writes you can afford to lose.
+  - Keep a TTL on everything, and coalesce misses so a hot key can't stampede.
+recall:
+  - id: card-cache-aside
+    concept: sysdesign.cache-aside
+    front: In cache-aside, who fills the cache, and when?
+    back: >-
+      The application, on a miss. It reads the database, stores the result in the cache, and
+      returns it.
+  - id: card-write-behind-risk
+    concept: sysdesign.write-through-and-behind
+    front: What does write-behind risk that write-through doesn't?
+    back: >-
+      Losing writes. They sit in the cache until the flush, so a crash before it drops them.
+  - id: card-update-then-delete
+    concept: sysdesign.cache-invalidation
+    front: When a value changes, in which order do you touch the database and the cache?
+    back: >-
+      Update the database first, then delete the cache key. The other order lets a reader
+      refill the old value.
+  - id: card-stampede-fixes
+    concept: sysdesign.cache-stampede
+    front: How does request coalescing stop a stampede on a hot key?
+    back: >-
+      Concurrent misses for one key share a single load, so only the first reaches the
+      database.
+
+references:
+  - kind: paper
+    title: Scaling Memcache at Facebook
+    authors: Rajesh Nishtala et al.
+    year: 2013
+    venue: NSDI '13, USENIX
+    url: https://www.usenix.org/conference/nsdi13/technical-sessions/presentation/nishtala
+    note: Look-aside caching at scale, and leases that stop stale sets and thundering herds.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Caching patterns
+    authors: Amazon Web Services
+    venue: Database Caching Strategies Using Redis
+    url: https://docs.aws.amazon.com/whitepapers/latest/database-caching-strategies-using-redis/caching-patterns.html
+    note: Cache-aside and write-through compared, with their trade-offs.
+    verified: true
+
+deepDive: >-
+  The race in the timeline can't be fully closed with deletes alone. Facebook's memcache
+  paper solves it with leases: a miss hands the reader a token, a delete invalidates the
+  token, and a fill with a stale token is refused. The same lease also limits how often a
+  hot key can be refilled, which doubles as stampede protection.
+
+
+  Read-through is cache-aside moved into the cache layer: the cache itself calls the
+  database on a miss, so application code only ever talks to the cache. Early refresh, also
+  called probabilistic early expiration, lets one request refresh an entry shortly before
+  its TTL ends, so a hot key never truly expires. And a small random jitter on TTLs stops
+  thousands of keys written together from all expiring in the same second.

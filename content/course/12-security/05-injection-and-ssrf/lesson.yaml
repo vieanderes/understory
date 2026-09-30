@@ -1,0 +1,279 @@
+id: security.injection-and-ssrf
+title: Injection and SSRF
+objective: "Close every glued value with parameters, pick names such as a sort column from an allow-list, and stop your server fetching URLs it shouldn't."
+level: essential
+minutes: 10
+concepts: [security.sql-injection, security.parameterised-queries, security.ssrf, security.allow-lists]
+prerequisites: [security.same-origin-and-cors, db.from-code]
+opening:
+  text: >-
+    You'll close injection holes for good, and fix a query that breaks on a name like O'Brien.
+    Then you'll stop your own server fetching places it shouldn't.
+
+steps:
+  - type: prose
+    id: what-injection-is
+    body: >-
+      In the databases chapter, text typed into a login box rewrote the query. That's **SQL
+      injection**: input glued into SQL becomes part of the SQL.
+
+
+      It's worse than skipping a login. Glued input can add a whole second query. One
+      injectable search box can read any table the app can: emails, orders, password hashes. Every glued value is a door to the whole database.
+
+  - type: bug-hunt
+    id: find-glued-value
+    concept: security.sql-injection
+    difficulty: 1
+    language: js
+    code: |
+      async function searchBooks(author, year) {
+        const { rows } = await pool.query(
+          `SELECT title FROM books WHERE year = $1 AND author = '${author}'`,
+          [year],
+        );
+        return rows;
+      }
+    prompt: One value here can rewrite the query. Tap the line where it's glued in.
+    lines: [3]
+    reasons:
+      - text: '`author` is pasted into the SQL text'
+        correct: true
+        feedback: >-
+          Right. `year` travels as `$1`. `author` becomes SQL.
+      - text: '`year` is sent as `$1`'
+        feedback: >-
+          That's the safe half. The value goes separately and stays data.
+      - text: '`rows` returns every column'
+        feedback: >-
+          It returns only `title`. The hole is in how `author` gets in.
+    fix: |
+      async function searchBooks(author, year) {
+        const { rows } = await pool.query(
+          "SELECT title FROM books WHERE year = $1 AND author = $2",
+          [year, author],
+        );
+        return rows;
+      }
+
+  - type: prose
+    id: parameterisation
+    body: >-
+      A **parameterised query** sends the SQL and the values separately. Postgres reads the
+      SQL first, with `$1` as a hole, then drops the value in as data. Nothing in the value can
+      become SQL.
+
+
+      It also fixes an honest bug. Glue in the author O'Brien and the quote ends the string
+      early, so the query fails. With a parameter, O'Brien is only a name.
+
+  - type: sql
+    id: fix-obrien-search
+    concept: security.parameterised-queries
+    difficulty: 2
+    prompt: >-
+      Run it: the glued query breaks on O'Brien. Rewrite it as a prepared statement with `$1`,
+      then `EXECUTE` it with the name. (Inside quotes, `''` is one quote.)
+    setup: |
+      CREATE TABLE books (id integer PRIMARY KEY, title text NOT NULL, author text NOT NULL);
+      INSERT INTO books VALUES
+        (1, 'Night Rain', 'O''Brien'),
+        (2, 'Salt Roads', 'Okafor'),
+        (3, 'Tide Tables', 'O''Brien');
+    starter: |
+      -- What the app glued together for the author O'Brien:
+      SELECT title FROM books WHERE author = 'O'Brien';
+    solution: |
+      PREPARE by_author(text) AS SELECT title FROM books WHERE author = $1;
+      EXECUTE by_author('O''Brien');
+    checks:
+      ordered: false
+    showSchema: true
+    hints:
+      - '`PREPARE name(text) AS ...` writes the query once, with `$1` for the value.'
+      - Then `EXECUTE name('...')` runs it with the value in brackets.
+      - "`PREPARE by_author(text) AS SELECT title FROM books WHERE author = $1;`"
+
+  - type: code-challenge
+    id: write-sort-column
+    concept: security.allow-lists
+    difficulty: 3
+    language: ts
+    starter: sort.starter.ts
+    solution: sort.solution.ts
+    tests: sort.tests.ts
+    prompt: >-
+      Parameters hold values, not names, so a sort column can't be `$1`. Write
+      `orderByClause(sort)`: if `sort` is `'title'`, `'author'` or `'year'`, return
+      `` `ORDER BY ${sort}` ``. For anything else, return `'ORDER BY title'`.
+    hints:
+      - The safe names are a fixed list you write yourself.
+      - Check the list with `includes`, which compares whole strings.
+      - Only a name from your own list ever reaches the SQL.
+
+  - type: prose
+    id: what-ssrf-is
+    body: >-
+      Some features fetch a URL the user gives: "import a recipe from a link". The fetch runs
+      on your server, inside your network. That network can reach things the internet can't:
+      `localhost`, a database, and on cloud hosts a **metadata address**, `169.254.169.254`,
+      that hands out the server's cloud keys.
+
+
+      Tricking your server into fetching those is **server-side request forgery**, or SSRF.
+
+  - type: prose
+    id: allow-lists
+    body: >-
+      The fix is an **allow-list**: fetch only from hosts you named, compared exactly.
+
+
+      A block-list of bad addresses always misses one. `localhost` can also be written
+      `127.0.0.1`, `[::1]`, or a domain that points there. An allow-list refuses anything you
+      didn't name, including tricks nobody has thought of yet.
+
+  - type: ai-review
+    id: review-substring-allow-list
+    concept: security.allow-lists
+    difficulty: 3
+    language: ts
+    request: Only let the importer fetch from our approved partners.
+    flawClass: security
+    code: |
+      const ALLOWED = ['api.weather.com', 'feeds.partner.com'];
+      function hostOk(host: string): boolean {
+        return ALLOWED.some((name) => host.includes(name));
+      }
+    prompt: >-
+      An assistant wrote this, and the tests pass. Then it fetches from
+      `api.weather.com.attacker.net`. Tap the line at fault.
+    lines: [3]
+    reasons:
+      - text: '`includes` accepts a host that only contains the name'
+        correct: true
+        feedback: >-
+          Yes. The attacker's host contains `api.weather.com`. Compare whole hosts instead.
+      - text: The list should be a block-list
+        feedback: >-
+          A block-list can never name every bad host. The partial match is the flaw here.
+      - text: '`some` should be `every`'
+        feedback: >-
+          Then a host would have to match both names at once, so nothing passes.
+    fix: |
+      const ALLOWED = ['api.weather.com', 'feeds.partner.com'];
+      function hostOk(host: string): boolean {
+        return ALLOWED.includes(host);
+      }
+
+  - type: code-challenge
+    id: write-is-allowed-url
+    concept: security.ssrf
+    difficulty: 4
+    language: ts
+    prompt: >-
+      Write `isAllowedUrl(url, allowedHosts)`. Accept only `http://` or `https://`. The host is
+      the text after `://` up to the next `/`. Refuse it if it contains `@`. Drop a `:port`, then
+      allow it only if it's in `allowedHosts` exactly. So `https://evil.com/api.weather.com`
+      fails.
+    hints:
+      - Check the scheme first, and slice it off to get the rest.
+      - The host part is `rest.split('/')[0]`; refuse it if it holds an `@`.
+      - "Drop a port with `authority.split(':')[0]`, then check `allowedHosts.includes(host)`."
+
+  - type: explain-back
+    id: explain-allow-over-block
+    concept: security.allow-lists
+    difficulty: 4
+    prompt: >-
+      A teammate wants to stop SSRF by blocking `169.254.169.254` and `localhost`. Why is an
+      allow-list of permitted hosts safer?
+    rubric:
+      - A block-list must name every dangerous address, and there's always another way to write one.
+      - '`localhost` can also be `127.0.0.1`, `[::1]`, or a domain that points to it.'
+      - An allow-list refuses everything unlisted, including tricks nobody has thought of.
+    modelAnswer: >-
+      A block-list is a losing game. Block `169.254.169.254` and `localhost`, and someone uses
+      `127.0.0.1`. Then `[::1]`, then a domain that points at the server itself. There's always
+      one more spelling. An allow-list names the two or three hosts the importer needs. It
+      refuses the rest, so a trick nobody thought of is refused too.
+
+recap:
+  - Send every value as a parameter, so input stays data even when it has quotes.
+  - Pick names like a sort column from your own allow-list, never from the request.
+  - Fetch only from hosts you listed, compared exactly, so SSRF can't reach inside.
+
+recall:
+  - id: card-injection-cause
+    concept: security.sql-injection
+    front: What makes SQL injection possible?
+    back: >-
+      User input pasted into the query string, where a quote can end the value and turn the
+      rest into SQL.
+  - id: card-sort-column
+    concept: security.allow-lists
+    front: A user picks the sort column. Why can't it be a `$1` parameter, and what do you do?
+    back: >-
+      Parameters hold values, not names. Check the column against a fixed list of allowed names.
+  - id: card-parameterised
+    concept: security.parameterised-queries
+    front: How does a parameterised query stop injection?
+    back: >-
+      The query text and the values travel separately, so a value is parsed as data and never
+      as SQL.
+  - id: card-allow-list
+    concept: security.allow-lists
+    front: Why an allow-list rather than a block-list for SSRF?
+    back: >-
+      A block-list can never name every bad address. An allow-list accepts only the hosts you
+      named, refusing the rest.
+  - id: card-ssrf
+    concept: security.ssrf
+    front: Why can SSRF reach services the attacker can't reach directly?
+    back: >-
+      The server makes the request from inside the network, so it can fetch `localhost` and
+      private addresses.
+
+references:
+  - kind: docs
+    title: SQL Injection Prevention
+    authors: OWASP
+    venue: OWASP Cheat Sheet Series
+    url: https://cheatsheetseries.owasp.org/cheatsheets/SQL_Injection_Prevention_Cheat_Sheet.html
+    note: Parameterised queries as the primary defence, and why escaping is not it.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Server Side Request Forgery Prevention
+    authors: OWASP
+    venue: OWASP Cheat Sheet Series
+    url: https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html
+    note: Allow-listing hosts, and the addresses an attacker aims a fetch at.
+    primary: true
+    verified: true
+  - kind: docs
+    title: 'PostgreSQL: PREPARE'
+    authors: The PostgreSQL Global Development Group
+    venue: PostgreSQL 17 documentation
+    url: https://www.postgresql.org/docs/17/sql-prepare.html
+    note: How a prepared statement separates the query from its parameters.
+    verified: true
+
+deepDive: >-
+  Injection isn't only SQL. Any language built from strings has it: an OS command from user
+  input, an LDAP filter, a NoSQL query object. The cure is always the same: keep the code and
+  the data apart, with parameters or an API that never parses the data as code.
+
+
+  SSRF has a nastier variant. An attacker's host can pass an allow-list, then a DNS rebind
+  changes what it resolves to a moment later, landing on `169.254.169.254` at fetch time. So
+  resolve the host, check the resolved IP against private ranges, and fetch that IP.
+
+
+  On a cloud host, the metadata endpoint at `169.254.169.254` hands out temporary credentials
+  to anything that asks from the instance. IMDSv2 requires a token first, which blocks the
+  simplest SSRF. Turn it on, and still allow-list.
+
+
+  Prompt injection is the newest member of the family. A language model reads text that
+  contains instructions, and follows them as if you'd written them. Chapter 20 has a lesson on
+  it, and chapter 21 adds guardrails around it.

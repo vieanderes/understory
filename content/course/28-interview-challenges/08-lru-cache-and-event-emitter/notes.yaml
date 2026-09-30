@@ -1,0 +1,344 @@
+summary: >-
+  Utility rounds ask for small, familiar classes because they show a lot in twenty minutes:
+  whether you choose the right data structure, handle the edge cases without being asked,
+  state each method's cost and write a test or two. The LRU cache and the event emitter are
+  the two most common.
+
+
+  An **LRU cache** keeps a bounded number of entries and evicts the least recently used one.
+  In JavaScript a `Map` gets you most of the way, because it iterates in insertion order:
+  delete and re-set a key on every read or write, and the first key is always the oldest. The
+  classic answer, and the one to offer when asked about guaranteed O(1), is a hash map plus a
+  doubly linked list.
+
+
+  An **event emitter** maps event names to lists of listeners, with `on`, `off`, `once` and
+  `emit`. The trap is mutation during `emit`: a listener that removes itself shifts the array
+  under the loop and the next listener is skipped. Looping over a copy fixes it, and it is the
+  same choice Node's own `EventEmitter` makes.
+remember:
+  - >-
+    A `Map` iterates in insertion order, so deleting and re-setting a key on each access keeps
+    the least recently used key first.
+  - >-
+    Evict with `map.keys().next().value` once `size` exceeds capacity, and treat an update as an
+    access so it refreshes the key.
+  - >-
+    The textbook LRU is a hash map from key to node plus a doubly linked list, which makes get,
+    put and eviction O(1) with no hidden scans.
+  - >-
+    An emitter is a map from event name to a list of listeners; `on` returns an unsubscribe
+    function so callers never need to keep the original reference.
+  - >-
+    `emit` must loop over a copy of the listener list, so removals and additions during an emit
+    cannot make it skip or double-call a listener.
+  - >-
+    Store each registration as its own object (`{ fn, once }`), so `off(fn)` can remove a `once`
+    listener and two registrations of one function stay independent.
+  - >-
+    In Node, a listener that throws stops the emit and the error propagates to the caller, and an
+    `error` event with no listener throws.
+sections:
+  - title: An LRU with guaranteed O(1) operations
+    body: |-
+      The `Map` version is correct and short. Its weakness is that V8 leaves deleted entries as
+      holes until the table is rebuilt, so heavy churn at a large capacity makes the scan for
+      the first key slower. On Node 24, 200,000 put-and-get pairs at capacity 50,000 took about
+      3 seconds with the `Map` version and about 40 ms with the version below.
+
+      ```ts
+      interface Node<K, V> {
+        key: K;
+        value: V;
+        prev: Node<K, V> | null;
+        next: Node<K, V> | null;
+      }
+
+      // A Map finds the node, and a doubly linked list keeps the order: head is the most
+      // recently used, tail the least. Every operation is O(1), with no scans.
+      export class LinkedLRU<K, V> {
+        #capacity: number;
+        #nodes = new Map<K, Node<K, V>>();
+        #head: Node<K, V> | null = null;
+        #tail: Node<K, V> | null = null;
+
+        constructor(capacity: number) {
+          if (!Number.isInteger(capacity) || capacity < 1) throw new RangeError('capacity must be at least 1');
+          this.#capacity = capacity;
+        }
+
+        get size(): number {
+          return this.#nodes.size;
+        }
+
+        get(key: K): V | undefined {
+          const node = this.#nodes.get(key);
+          if (!node) return undefined;
+          this.#unlink(node);
+          this.#pushFront(node);
+          return node.value;
+        }
+
+        put(key: K, value: V): void {
+          const existing = this.#nodes.get(key);
+          if (existing) {
+            existing.value = value;
+            this.#unlink(existing);
+            this.#pushFront(existing);
+            return;
+          }
+          const node: Node<K, V> = { key, value, prev: null, next: null };
+          this.#nodes.set(key, node);
+          this.#pushFront(node);
+          if (this.#nodes.size > this.#capacity) {
+            const oldest = this.#tail!;
+            this.#unlink(oldest);
+            this.#nodes.delete(oldest.key);
+          }
+        }
+
+        // Most recent first, for tests and debugging.
+        keys(): K[] {
+          const out: K[] = [];
+          for (let n = this.#head; n; n = n.next) out.push(n.key);
+          return out;
+        }
+
+        #unlink(node: Node<K, V>): void {
+          if (node.prev) node.prev.next = node.next;
+          else this.#head = node.next;
+          if (node.next) node.next.prev = node.prev;
+          else this.#tail = node.prev;
+          node.prev = null;
+          node.next = null;
+        }
+
+        #pushFront(node: Node<K, V>): void {
+          node.next = this.#head;
+          if (this.#head) this.#head.prev = node;
+          this.#head = node;
+          if (!this.#tail) this.#tail = node;
+        }
+      }
+
+      const cache = new LinkedLRU<string, number>(2);
+      cache.put('a', 1);
+      cache.put('b', 2);
+      cache.get('a');
+      cache.put('c', 3);
+      console.log(cache.keys(), cache.get('b')); // [ 'c', 'a' ] undefined
+      cache.put('a', 10);
+      console.log(cache.keys(), cache.get('a')); // [ 'a', 'c' ] 10
+      ```
+
+      Why the node stores its key: on eviction you hold the tail node and must delete it from
+      the map, so the node has to know which key it belongs to. That detail is a common slip.
+      In a round, offer the `Map` version first, name its limit, and write this one if the
+      interviewer wants the classic structure.
+  - title: LRU edge cases and the extensions interviewers add
+    body: |-
+      Say these before the interviewer asks:
+
+      - **Updating a key counts as a use.** It refreshes the key and must not create a second
+        entry or trigger an eviction.
+      - **A missing key changes nothing.** `get` of an absent key returns `undefined` (or -1
+        if the task says so) and must not insert anything.
+      - **Capacity 1** evicts on every new key. **Capacity 0** is either rejected or a cache
+        that stores nothing: pick one and say it.
+      - **Falsy values.** A cached `0`, `''` or `false` is a hit. Check with `has` or with the
+        node, not with `if (value)`.
+
+      The extensions that follow:
+
+      - **Time to live.** Store `expiresAt` beside the value. On `get`, an expired entry is
+        deleted and treated as a miss. Take the current time as an argument or an injected
+        clock so tests can control it.
+      - **`peek`.** Read without refreshing: `get` without the move to the front.
+      - **Size in bytes.** Keep a running total of each entry's size and evict from the tail
+        while the total is over the limit. One large insert can evict several small entries.
+      - **Loading on a miss.** `getOrLoad(key, load)` calls an async loader once per key. Store
+        the pending promise in the cache so concurrent misses share one load, and remove it if
+        the load fails.
+
+      In Python the same class is an `OrderedDict` with `move_to_end(key)` on every use and
+      `popitem(last=False)` to evict the oldest. To cache a pure function's results rather
+      than build the class, the standard library already has `@functools.lru_cache(maxsize=...)`;
+      name it, then say you'd write the class when the interviewer asks for TTL or `peek`.
+  - title: A typed emitter, and what happens when a listener throws
+    body: |-
+      In TypeScript an event map names every event and its arguments, so a wrong payload
+      fails to compile. This version also makes a deliberate choice about errors.
+
+      ```ts
+      type Events = {
+        saved: [id: number, title: string];
+        deleted: [id: number];
+      };
+
+      // Inside the class the listener types are erased; the public methods keep them exact.
+      type Entry = { fn: (...args: any[]) => void; once: boolean };
+
+      class TypedEmitter<E extends Record<string, unknown[]>> {
+        #listeners = new Map<keyof E, Entry[]>();
+
+        on<K extends keyof E>(event: K, fn: (...args: E[K]) => void, once = false): () => void {
+          const entry: Entry = { fn, once };
+          const list = this.#listeners.get(event) ?? [];
+          list.push(entry);
+          this.#listeners.set(event, list);
+          return () => {
+            const current = this.#listeners.get(event) ?? [];
+            const index = current.indexOf(entry);
+            if (index !== -1) current.splice(index, 1);
+          };
+        }
+
+        once<K extends keyof E>(event: K, fn: (...args: E[K]) => void): () => void {
+          return this.on(event, fn, true);
+        }
+
+        emit<K extends keyof E>(event: K, ...args: E[K]): boolean {
+          const list = this.#listeners.get(event) ?? [];
+          if (list.length === 0) return false;
+          const errors: unknown[] = [];
+          for (const entry of [...list]) {
+            if (entry.once) list.splice(list.indexOf(entry), 1);
+            // One failing listener must not stop the others from hearing the event.
+            try {
+              entry.fn(...args);
+            } catch (error) {
+              errors.push(error);
+            }
+          }
+          if (errors.length > 0) throw new AggregateError(errors, `${String(event)} listener failed`);
+          return true;
+        }
+      }
+
+      const bus = new TypedEmitter<Events>();
+      bus.on('saved', (id, title) => console.log('saved', id, title));
+      bus.once('deleted', (id) => console.log('deleted', id));
+      bus.on('saved', () => { throw new Error('toast broke'); });
+      bus.on('saved', () => console.log('badge still updates'));
+      try {
+        bus.emit('saved', 7, 'Groceries');
+      } catch (error) {
+        console.log((error as AggregateError).errors.length, 'listener failed');
+      }
+      console.log(bus.emit('deleted', 7), bus.emit('deleted', 7)); // true false
+      // bus.emit('saved', 'seven'); would not compile: 'seven' is not a number
+      ```
+
+      Node makes the opposite choice: a throwing listener stops the loop, later listeners do
+      not run, and the error surfaces from `emit`. Both are defensible. Node's is simpler and
+      fails loudly; this one isolates listeners and still reports every failure. Saying which
+      you chose, and why, is the senior signal.
+  - title: Node's emitter semantics worth knowing
+    body: |-
+      Interview emitters imitate `node:events`, so interviewers often ask how yours differs.
+      These behaviours were checked on Node 24:
+
+      - `emit` works on a copy of the listener array. A listener removed during an emit still
+        runs in that emit; one added during an emit first runs on the next.
+      - `once` wraps the function and keeps the original on the wrapper, so `off(event, fn)`
+        removes a `once` listener before it fires.
+      - `emit` returns `true` if the event had listeners, otherwise `false`.
+      - An `error` event with no listener throws the error. This is how unhandled failures
+        surface instead of disappearing.
+      - More than 10 listeners on one event prints a possible memory leak warning. The limit
+        is a hint, not a cap, and `setMaxListeners` changes it.
+
+      The leak warning points at the most common real bug with emitters: subscribing in
+      something short-lived, such as a component or a request handler, and never
+      unsubscribing. Returning an unsubscribe function from `on` makes the cleanup a single
+      call, which is why React effects and most libraries follow that shape.
+pitfalls:
+  - >-
+    **Reading a key without refreshing it.** A plain `map.get` does not move the key, so the
+    cache evicts something that was used a moment ago. Delete and re-set on every successful
+    read.
+  - >-
+    **Checking for a hit with `if (value)`.** A cached `0` or empty string looks like a miss.
+    Use `has`, or check the node.
+  - >-
+    **Evicting before inserting on an update.** Updating a key in a full cache must not evict
+    another entry. Delete the old entry first, then set, then check the size.
+  - >-
+    **Looping over the live listener array in `emit`.** A listener that removes itself makes the
+    loop skip the next one. Loop over a copy.
+  - >-
+    **Wrapping `once` listeners without keeping the original.** `off(event, fn)` then cannot find
+    them. Store `{ fn, once }` entries, or keep `fn` on the wrapper.
+  - >-
+    **`splice(indexOf(fn), 1)` without checking for -1.** Removing an unknown listener then
+    deletes the last one. Check the index first.
+interview:
+  - question: >-
+      Why is a `Map` enough for an LRU cache in JavaScript, and when is it not?
+    answer: >-
+      Because a `Map` iterates in insertion order, deleting and re-setting a key on each
+      access moves it to the end, so the first key is always the least recently used, and
+      each operation is O(1) on average. It is not enough when you need guaranteed constant
+      time under heavy churn: engines keep deleted entries as holes until they rebuild the
+      table, so finding the first key can slow down at large capacities. The classic structure
+      is a map from key to node plus a doubly linked list, where moving a node and dropping
+      the tail are true O(1). I would write the `Map` version first because it is short and
+      hard to get wrong, then switch if profiling or the interviewer asks.
+  - question: >-
+      How would you add a time to live to your LRU cache?
+    answer: >-
+      I would store an expiry time beside each value, `expiresAt = now + ttl`, and check it on
+      every read. An expired entry is deleted and reported as a miss, so the cache never
+      returns stale data. I would take the clock as a constructor argument, so tests can move
+      time without waiting. That is lazy expiry: expired entries linger until they are read
+      or evicted, which costs memory but no background work. If memory matters, I would add a
+      periodic sweep or a min-heap ordered by expiry. I would also decide whether a read
+      refreshes the TTL, since sliding and fixed expiry are both common, and ask which is
+      wanted.
+  - question: >-
+      What happens in your emitter if one listener throws?
+    answer: >-
+      That is a design choice, and I would state mine. Node's `EventEmitter` lets the error
+      propagate: the loop stops, later listeners do not run, and `emit` throws. That fails
+      loudly, which is good in development. The alternative is to call each listener in its
+      own try block, collect the errors, let every listener run, and throw an
+      `AggregateError` at the end. That isolates unrelated features, so a broken toast does
+      not stop the badge updating, while still reporting the failure. I would pick isolation
+      for UI events and Node's behaviour for internal plumbing where a failure should stop
+      the flow.
+  - question: >-
+      How do event emitters cause memory leaks, and how do you prevent them?
+    answer: >-
+      A listener holds a reference to whatever its closure captures, and the emitter holds the
+      listener. If a short-lived object subscribes to a long-lived emitter and never
+      unsubscribes, the object can never be garbage collected, and its listener keeps running.
+      Node warns when an event passes ten listeners for this reason. I prevent it by making
+      `on` return an unsubscribe function and calling it in the cleanup path: a React effect's
+      return, a request's finally block, or an `AbortSignal` passed to the subscription. In
+      reviews I look for `on` calls without a matching cleanup, which is usually where the
+      leak is.
+terms:
+  - term: LRU cache
+    say: A cache that removes the oldest entry.
+    means: It evicts the least recently *used* entry, so a read refreshes a key. Evicting the oldest
+      inserted entry is FIFO, a different policy.
+  - term: "`Map` iteration order"
+    say: A hash map has no order.
+    means: A JavaScript `Map` iterates in insertion order. Deleting and re-setting a key on every access
+      keeps the least recently used key first, at `map.keys().next().value`.
+  - term: O(1) LRU
+    say: Keep the keys in an array, most recent last.
+    means: Moving a key inside an array is O(n). The textbook design pairs a hash map from key to node
+      with a doubly linked list, so get, put and eviction are all O(1).
+  - term: Event emitter
+    say: A list of callbacks.
+    means: A map from event name to listener registrations, with `on`, `off`, `once` and `emit`. `emit`
+      calls the listeners synchronously, in the order they were added, over a copy of the list.
+  - term: "`once`"
+    say: A listener that removes itself after it runs.
+    means: A registration that is removed *before* its first call, so it never runs twice, even if it
+      throws or emits the same event again.
+  - term: Listener leak
+    say: Garbage collection cleans up old listeners.
+    means: A registered listener, and everything its closure holds, stays alive as long as the emitter
+      does. Only `off`, or the unsubscribe function `on` returns, lets it be collected.

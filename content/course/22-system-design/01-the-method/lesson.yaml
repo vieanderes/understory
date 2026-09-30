@@ -1,0 +1,304 @@
+id: sysdesign.the-method
+title: A method for system design
+objective: Turn a vague brief into functional and scale requirements, sketch the standard shape, go deep on one part, and name failure modes before you are asked.
+level: essential
+minutes: 10
+concepts: [sysdesign.requirements, sysdesign.standard-shape, sysdesign.failure-modes]
+prerequisites: [cloud.scaling-and-cost]
+opening:
+  text: >-
+    You'll get a repeatable way to go from "design a booking app" to a design you can defend.
+    It works the same in a design review, a whiteboard interview and a real project.
+
+steps:
+  - type: prose
+    id: what-system-design-is
+    body: |-
+      **System design** means deciding the boxes, the data and the trade-offs before anyone
+      builds. Which servers, which stores, what talks to what, and what happens when a part
+      breaks.
+
+      In an interview you get a vague brief and about 45 minutes. In a real team it's a
+      design review. The method is the same.
+  - type: prose
+    id: name-requirements
+    body: |-
+      Start with **functional requirements**: what the system does. Guests search tables, book
+      one and cancel it. Restaurants set opening hours.
+
+      Then the **scale requirements**, in numbers:
+
+      - users, and requests per second at the peak
+      - how much data, and how fast it grows
+      - latency targets, such as search under 200 ms
+      - availability, such as 99.9%
+
+      Ask, or state an assumption out loud. Both are fine.
+
+  - type: ai-review
+    id: review-requirements
+    concept: sysdesign.requirements
+    difficulty: 1
+    language: yaml
+    request: List the requirements for a table booking app for restaurants.
+    flawClass: logic
+    code: |
+      functional: guests search free tables, book one and cancel it
+      functional: restaurants set opening hours and table sizes
+      scale: 2 million bookings a month, 50 searches a second at peak
+      scale: 95% of searches answer within 200 ms
+      storage: keep bookings in a NoSQL database for speed
+    prompt: >-
+      An assistant drafted the requirements. One line isn't a requirement at all. Tap it.
+    lines: [5]
+    reasons:
+      - text: It's a solution, chosen before the needs are known
+        correct: true
+        feedback: >-
+          Yes. The store follows from the data and load. Pick it later, with reasons.
+      - text: The latency target is too strict
+        feedback: >-
+          It's a number users feel, which is exactly what a scale requirement is.
+      - text: Opening hours aren't worth listing
+        feedback: >-
+          It's something the system does, so it belongs with the functional needs.
+    fix: |
+      functional: guests search free tables, book one and cancel it
+      functional: restaurants set opening hours and table sizes
+      scale: 2 million bookings a month, 50 searches a second at peak
+      scale: 95% of searches answer within 200 ms
+      data: a booking must never be given to two guests
+
+  - type: prose
+    id: name-standard-shape
+    body: |-
+      Most designs start from the same sketch, the **standard shape**. You scaled one app
+      this way in the Cloud chapter.
+
+      ```text
+      client → load balancer → stateless services → cache → database
+                                      ↓
+                                    queue → workers
+      ```
+
+      The balancer spreads requests over identical servers. Stateless means any server can
+      take any request. The cache absorbs repeated reads. The queue holds slow jobs, like
+      emails, for workers to run later.
+
+  - type: parsons
+    id: order-booking-path
+    concept: sysdesign.standard-shape
+    difficulty: 2
+    prompt: Put a booking request in order, from the phone to the confirmation email.
+    language: text
+    blocks:
+      - id: phone
+        code: The guest's app sends POST /bookings
+        subgoal: Reach a server
+      - id: balancer
+        code: The load balancer picks a healthy server
+      - id: service
+        code: A stateless booking service checks the slot
+        subgoal: Save the booking
+      - id: database
+        code: The database stores the booking in a transaction
+      - id: queue
+        code: The service puts "send confirmation" on a queue
+        subgoal: Confirm later
+      - id: worker
+        code: A worker takes the job and sends the email
+    distractors:
+      - id: cache-write
+        code: The cache stores the booking as the only copy
+        feedback: >-
+          A cache can lose data at any restart. The booking belongs in the database.
+
+  - type: ai-review
+    id: review-inline-resize
+    concept: sysdesign.standard-shape
+    difficulty: 2
+    language: ts
+    request: Resize each uploaded menu photo to three sizes.
+    flawClass: performance
+    code: |
+      async function uploadPhoto(restaurantId: string, file: Buffer) {
+        const id = await storage.save(file);
+        await resizeToThreeSizes(id); // about 4 seconds
+        await db.photos.insert({ id, restaurantId });
+        return { id };
+      }
+    prompt: >-
+      An assistant wrote this. At a busy hour, uploads queue up and some time out. Tap the
+      line at fault.
+    lines: [3]
+    reasons:
+      - text: Slow work runs inside the request
+        correct: true
+        feedback: >-
+          Yes. Put a job on a queue, answer at once, and let a worker resize.
+      - text: The photo is saved before it's resized
+        feedback: >-
+          Saving the original first is right. The resize can come later, from it.
+      - text: It should insert into the database first
+        feedback: >-
+          The order of the save and insert doesn't cost 4 seconds. The resize does.
+    fix: |
+      async function uploadPhoto(restaurantId: string, file: Buffer) {
+        const id = await storage.save(file);
+        await db.photos.insert({ id, restaurantId });
+        await queue.add('resize', { id }); // a worker resizes later
+        return { id };
+      }
+
+  - type: predict-output
+    id: predict-cache-down
+    concept: sysdesign.failure-modes
+    difficulty: 3
+    language: text
+    code: |
+      menu reads per second       2,000
+      cache hit rate              95%
+      database reads per second   100   (the 5% misses)
+      database capacity           400 reads per second
+    question: The cache restarts empty. How many reads a second now reach the database?
+    choices:
+      - text: '2,000'
+        correct: true
+        feedback: >-
+          Right. Twenty times the usual load, five times what it can serve.
+      - text: '400'
+        feedback: >-
+          That's its capacity, not what arrives. Every read misses, so all 2,000 go through.
+      - text: '100'
+        feedback: >-
+          That was the misses with a warm cache. An empty cache misses every time.
+
+  - type: prose
+    id: name-failure-modes
+    body: |-
+      That's a **failure mode**: what happens when one box is slow, down or wrong. Walk the
+      sketch and ask it of each one.
+
+      The cache is down, so the database drowns. The queue backs up, so emails arrive an hour
+      late. The primary database, the one that takes writes, dies. Writes stop until a
+      replica, its read-only copy, takes over.
+
+      Say these before anyone asks. It reads as experience.
+
+  - type: ai-review
+    id: review-cache-as-hard-dependency
+    concept: sysdesign.failure-modes
+    difficulty: 4
+    language: ts
+    request: Cache each restaurant's menu in Redis for five minutes.
+    flawClass: edge-case
+    code: |
+      async function getMenu(restaurantId: string) {
+        const cached = await redis.get(`menu:${restaurantId}`);
+        if (cached) return JSON.parse(cached);
+        const menu = await db.menus.find(restaurantId);
+        await redis.set(`menu:${restaurantId}`, JSON.stringify(menu), { EX: 300 });
+        return menu;
+      }
+    prompt: >-
+      An assistant wrote this. Tests ran with Redis up, and passed. During a Redis restart,
+      every menu page returned 500 while the database was fine. Tap the line at fault.
+    lines: [2]
+    reasons:
+      - text: A Redis error fails the whole request
+        correct: true
+        feedback: >-
+          Yes. Catch cache errors and read the database, so the cache stays optional.
+      - text: Five minutes is too long to cache a menu
+        feedback: >-
+          That's a freshness choice. The outage came from Redis being unreachable, not stale.
+      - text: '`JSON.parse` fails on a cached menu'
+        feedback: >-
+          The cached text came from `JSON.stringify`, so it parses. The error happened earlier.
+    fix: |
+      const cached = await redis.get(`menu:${restaurantId}`).catch(() => null);
+
+  - type: explain-back
+    id: explain-failure-modes-first
+    concept: sysdesign.failure-modes
+    difficulty: 3
+    prompt: >-
+      Why does a design earn more trust when it names its failure modes before anyone asks?
+    rubric:
+      - Real systems fail partly, one component at a time, and often.
+      - How the design behaves under those failures decides whether users notice.
+      - Raising them unprompted shows you have run systems, not only drawn them.
+    modelAnswer: >-
+      In production something is always slow or down: a cache restarts, a queue backs up, a
+      database fails over. A design is only as good as its behaviour on those days. So I walk
+      the sketch and say what each failure does to users, and how we degrade. That shows I've
+      operated systems. A design that only works when everything is up is half a
+      design.
+
+recap:
+  - Start with functional requirements, then scale in numbers.
+  - Sketch the standard shape, and use a queue for slow work.
+  - Walk each box and say what happens when it's slow, down or wrong.
+recall:
+  - id: card-two-kinds-of-requirement
+    concept: sysdesign.requirements
+    front: What are the two kinds of requirement you gather first?
+    back: >-
+      Functional: what the system does. Scale: users, requests per second, data size, latency
+      and availability, in numbers.
+  - id: card-standard-shape
+    concept: sysdesign.standard-shape
+    front: Name the boxes of the standard shape, from the client inwards.
+    back: >-
+      Client, load balancer, stateless services, cache, database, and a queue with workers for
+      slow work.
+  - id: card-why-stateless
+    concept: sysdesign.standard-shape
+    front: Why do the services behind a load balancer need to be stateless?
+    back: >-
+      So any server can take any request. Then you add or lose servers without losing
+      sessions.
+  - id: card-failure-mode-question
+    concept: sysdesign.failure-modes
+    front: What three questions do you ask of each box in a design?
+    back: >-
+      What happens when it's slow, when it's down, and when it returns something wrong.
+
+references:
+  - kind: book
+    title: Designing Data-Intensive Applications
+    authors: Martin Kleppmann
+    year: 2017
+    venue: O'Reilly Media
+    url: https://dataintensive.net/
+    note: Reliability, scalability and maintainability, and how to reason about each.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Addressing Cascading Failures
+    authors: Mike Ulrich
+    venue: Site Reliability Engineering, Google
+    url: https://sre.google/sre-book/addressing-cascading-failures/
+    note: How one overloaded component takes down the rest, and how to stop it.
+    primary: true
+    verified: true
+  - kind: source
+    title: The System Design Primer
+    authors: Donne Martin
+    venue: GitHub
+    url: https://github.com/donnemartin/system-design-primer
+    note: A structured tour of the building blocks, with worked designs.
+    verified: true
+
+deepDive: >-
+  A good session has four phases. Requirements take a few minutes and end with numbers on the
+  board. The high-level sketch comes next, drawn quickly from the standard shape. Then you go
+  deep on one or two parts, chosen by the requirements: the write path for a booking system,
+  the read path for a news site. Last, you walk the failure modes and name what you'd measure.
+
+
+  Two habits separate strong designs. First, every box is justified by a requirement, so a
+  cache appears because reads outnumber writes, not by reflex. Second, trade-offs are said
+  out loud: "a queue adds a second of delay to emails, and in return uploads stay fast".
+  The cascading-failures chapter in the SRE book is the best single read on why failure
+  modes matter.

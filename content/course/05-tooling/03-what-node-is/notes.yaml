@@ -1,0 +1,240 @@
+summary: >-
+  Node is a program that runs JavaScript outside the browser. It takes V8, the JavaScript engine
+  from Chrome, and adds what a page never had: files, the network, other processes, the
+  environment and exit codes. It drops what only makes sense with a page, so there's no
+  `document` or `window`.
+
+
+  Its defining design choice is that your JavaScript runs on one thread, and slow work such as
+  reading a file or waiting for a network reply happens in the background. When that work
+  finishes, a callback or a promise brings the result back onto the main thread. That's why one
+  Node process can hold thousands of open connections, and also why one long synchronous loop
+  freezes all of them.
+
+
+  A Node program is also an ordinary command-line program. It gets arguments in
+  `process.argv`, settings in `process.env`, reads and writes the three standard streams and
+  ends with an exit code. Everything from the last two lessons, pipes, redirection, `&&` and
+  exit codes, works on your own scripts too.
+remember:
+  - Node is V8 plus libuv plus a standard library, which lets JavaScript use files, the network and processes.
+  - Your JavaScript runs on one main thread, and a long synchronous task blocks every other callback, timer and request.
+  - I/O is non-blocking because the operating system or libuv's thread pool does the waiting, then queues your callback on the event loop.
+  - The libuv thread pool has 4 threads by default and handles file access, `dns.lookup`, and async `crypto` and `zlib` work.
+  - An uncaught exception or an unhandled promise rejection ends a Node process with exit code 1.
+  - Set `process.exitCode` to report failure and let pending work finish, and use `process.exit()` only when you mean to stop at once.
+  - '`console.log` writes to standard output and `console.error` to standard error, so the shell can redirect them separately.'
+  - Every value in `process.env` is a string, and `process.argv` holds the node binary and script path before your own arguments.
+sections:
+  - title: What Node is made of
+    body: |-
+      Three parts do the work:
+
+      - **V8** compiles and runs your JavaScript, and manages memory with a garbage collector.
+        It knows the language, and nothing about files or sockets.
+      - **libuv** is a C library that gives Node its event loop and non-blocking I/O on every
+        operating system. For network sockets it asks the operating system to report when data
+        is ready (epoll on Linux, kqueue on macOS). For work the operating system can't do that
+        way, such as file access, it keeps a small **thread pool**.
+      - **The standard library**, modules such as `node:fs`, `node:http`, `node:crypto` and
+        `node:child_process`, written partly in JavaScript and partly in C++ that calls into
+        V8 and libuv.
+
+      So "Node is single-threaded" is half true. Your JavaScript runs on one thread, but the
+      process also has V8's helper threads and libuv's pool. The order of a simple file read
+      shows the split:
+
+      ```js
+      const fs = require("node:fs");
+      console.log("1 start");
+      fs.readFile(__filename, "utf8", (err, text) => {
+        console.log("3 file read, length > 0:", text.length > 0);
+      });
+      setTimeout(() => console.log("4 timer"), 50);
+      console.log("2 end of script");
+
+      // 1 start
+      // 2 end of script
+      // 3 file read, length > 0: true
+      // 4 timer
+      ```
+
+      `readFile` hands the read to the pool and returns at once. The script finishes, and the
+      callback runs later on the main thread, when the event loop picks up the finished read.
+      The loop's phases and the order of timers, `setImmediate` and microtasks are covered in
+      the event loop lesson of the JavaScript chapter. The same rules apply here.
+  - title: The thread pool, seen from the outside
+    body: |-
+      The pool is 4 threads unless you set `UV_THREADPOOL_SIZE` before Node starts. You can
+      see it by queuing six slow hashes. `crypto.pbkdf2` is deliberately expensive, and its
+      async form runs in the pool:
+
+      ```js
+      const crypto = require("node:crypto");
+      const start = Date.now();
+      for (let i = 1; i <= 6; i++) {
+        crypto.pbkdf2("secret", "salt", 1_000_000, 64, "sha512", () => {
+          console.log(`hash ${i} done after ${Date.now() - start} ms`);
+        });
+      }
+      ```
+
+      On a machine with at least four cores, four hashes finish at roughly the same time and
+      the last two take about as long again, because they waited for a free thread. Run it
+      with `UV_THREADPOOL_SIZE=6 node pool.js` and all six finish together. The exact times
+      and the finishing order vary from run to run.
+
+      Why this matters in practice: file reads, `dns.lookup` (used by `fetch` and `http` to
+      turn a host name into an address), password hashing and compression all share those four
+      threads. A server that hashes passwords with `bcrypt` or `pbkdf2` under load can make its
+      file reads and DNS lookups queue up behind them. Network traffic itself doesn't use the
+      pool, which is why a Node server can hold many idle connections cheaply.
+  - title: Blocking the one thread
+    body: |-
+      Callbacks can only run when the main thread is free. Synchronous work, however long,
+      runs to the end first:
+
+      ```js
+      const start = Date.now();
+      setTimeout(() => {
+        const waited = Date.now() - start >= 1000 ? "at least 1000" : "under 1000";
+        console.log(`timer ran after ${waited} ms`);
+      }, 10);
+      const until = Date.now() + 1000;
+      while (Date.now() < until) {} // a second of synchronous work
+      console.log("loop finished");
+
+      // loop finished
+      // timer ran after at least 1000 ms
+      ```
+
+      In a server, that second is a second where no request gets an answer, from any user. The
+      usual culprits are synchronous APIs (`fs.readFileSync` inside a request handler),
+      `JSON.parse` of a very large body, a slow regular expression and heavy loops over big
+      arrays.
+
+      The fixes, from cheapest to most involved:
+
+      - Use the async version of an API in code that serves requests. The `Sync` versions are
+        fine in start-up code and short scripts, where nothing else is waiting.
+      - Split long loops into chunks and yield between them with `setImmediate`.
+      - Move CPU-heavy work to a worker thread with `node:worker_threads`, or to a separate
+        process. Each worker has its own V8 instance and event loop, and talks to the main
+        thread by messages.
+
+      Node suits I/O-heavy work such as APIs, proxies and chat servers well. For long number
+      crunching it isn't the best tool, unless that work moves off the main thread.
+  - title: A Node program as a command-line tool
+    body: |-
+      A script talks to the shell through the same channels as any program:
+
+      ```js
+      // todo.js
+      const [command, ...words] = process.argv.slice(2);
+
+      if (command === "add") {
+        console.log(`Added: ${words.join(" ")}`);
+      } else {
+        console.error(`Unknown command: ${command ?? "(none)"}`);
+        process.exitCode = 2; // report failure, but let pending work finish
+      }
+      ```
+
+      ```text
+      $ node todo.js add buy milk
+      Added: buy milk
+      $ node todo.js remove 2>/dev/null; echo $?
+      2
+      ```
+
+      `process.argv[0]` is the path to `node` and `process.argv[1]` the script, so your own
+      arguments start at index 2. The shell has already split and expanded them, so
+      `"buy milk"` in quotes arrives as one argument.
+
+      `process.exitCode` sets the code without stopping anything. `process.exit(code)` ends the
+      process immediately, and whatever was still pending is dropped:
+
+      ```js
+      setTimeout(() => console.log("saved"), 100);
+      process.exit(0); // "saved" never prints
+      ```
+
+      Node also reads settings from a file for you: `node --env-file=.env server.js` loads
+      `KEY=value` lines into `process.env` before your code runs, and stops with an error if
+      the file is missing. Values still arrive as strings.
+  - title: How Node decides between ES modules and CommonJS
+    body: |-
+      Node supports two module systems, covered in the modules lesson of the JavaScript
+      chapter: ES modules (`import` and `export`) and the older CommonJS (`require` and
+      `module.exports`). When you run a file, Node picks one:
+
+      - `.mjs` is always an ES module and `.cjs` is always CommonJS.
+      - A `.js` file follows the nearest `package.json`. `"type": "module"` means ES module,
+        and `"type": "commonjs"` means CommonJS.
+      - With no `type` at all, Node 24 tries CommonJS, and if the file contains `import` or
+        `export` it runs it as an ES module instead. When a `package.json` exists without a
+        `type`, it prints a `MODULE_TYPELESS_PACKAGE_JSON` warning, because it had to parse
+        the file twice.
+
+      The two systems can load each other, with limits. An ES module can import a CommonJS
+      file, and `module.exports` arrives as the default export. Named imports only work when
+      Node can spot the names by scanning the source, as with `exports.total = 3`. With
+      `module.exports = { total: 3 }` it can't, so `import { total } from "./cart.cjs"` fails
+      with `Named export 'total' not found`. Import the default and destructure it instead.
+
+      In the other direction, Node 24's `require()` can load an ES module synchronously,
+      unless that module or anything it imports uses top-level `await`. Then it throws
+      `ERR_REQUIRE_ASYNC_MODULE`, and you use `await import()` instead.
+
+      Two differences catch people when moving code across. `__dirname` and `__filename` only
+      exist in CommonJS: ES modules use `import.meta.dirname` and `import.meta.filename`. And
+      ES module imports of your own files need the extension, `./cart.js`, not `./cart`.
+pitfalls:
+  - '**Using `fs.readFileSync` inside a request handler.** Every request then waits for the disk in turn, and the server stops answering while it reads. Load files once at start-up, or use `fs.promises.readFile` in the handler.'
+  - '**Calling `process.exit()` to end a script.** It drops pending writes, timers and network requests. Set `process.exitCode` and let the event loop empty, or `await` the work before exiting.'
+  - '**Leaving a promise rejection unhandled.** Since Node 15 it crashes the process with exit code 1, often far from where the promise was created. `await` every promise or attach a `.catch`.'
+  - '**Assuming browser globals exist.** `window`, `document` and `localStorage` are undefined in Node, so shared code that touches them crashes at import. Check for them or keep browser-only code in browser-only files.'
+  - '**Printing errors with `console.log`.** They go to standard output, into files and pipes meant for data. Use `console.error` for diagnostics so `> out.txt` keeps results clean.'
+interview:
+  - question: Is Node single-threaded?
+    answer: >-
+      Your JavaScript runs on a single main thread, but the Node process is not
+      single-threaded. libuv runs a thread pool, four threads by default, for file access,
+      `dns.lookup`, and async crypto and compression, and V8 uses helper threads for garbage
+      collection. Network I/O doesn't need threads at all: libuv asks the operating system
+      to report ready sockets through epoll or kqueue. The single JavaScript thread is what
+      makes the model simple: no locks, and a callback never gets interrupted halfway. The
+      cost is that CPU-heavy work blocks everything. For that I'd use `worker_threads`, which
+      gives each worker its own V8 instance and event loop, or move the work to another
+      process or service.
+  - question: How can one Node process serve thousands of connections at the same time?
+    answer: >-
+      Because it never waits on a connection with a thread; it registers interest and gets
+      told when something happens. libuv hands open sockets to the operating system's
+      readiness mechanism, epoll on Linux or kqueue on macOS. While a request waits for a
+      database or a network reply, no thread is tied up, and the event loop runs other
+      callbacks. When data arrives, the callback for that socket is queued and runs on the
+      main thread. An idle connection therefore costs a little memory, not a thread. This
+      works as long as each callback is short. One handler that spends 200 ms on synchronous
+      work delays every other connection by 200 ms, so CPU-bound work has to move to worker
+      threads or another process.
+  - question: What happens when a Node process hits an uncaught exception or an unhandled rejection?
+    answer: >-
+      By default it prints the error with its stack trace to standard error and exits with
+      code 1. For rejections this has been the default since Node 15; before that it was only
+      a warning. The exit code matters because shells and CI read it: `node test.js && deploy`
+      won't deploy after a crash. You can listen for `process.on("uncaughtException")`, but
+      the documentation warns that the process is in an undefined state afterwards, so the
+      right use is to log and exit, not to carry on. In a server, the real fix is handling
+      errors where they happen: `try` around `await`, `.catch` on promises, and a process
+      manager or container that restarts the process when it does crash.
+  - question: What's the difference between `process.exit()` and setting `process.exitCode`?
+    answer: >-
+      `process.exit()` stops the process immediately, while `process.exitCode` only sets the
+      number reported when Node finishes on its own. With `exit()`, any timers, network
+      requests, and some pending writes to standard output are dropped, so a CLI can lose its
+      last lines of output when piped, or a log line never reaches the file. Setting
+      `exitCode = 1` and returning lets the event loop drain naturally, which is the safer
+      default for scripts and tests. `process.exit()` still has uses: after a fatal error in
+      an `uncaughtException` handler, or when a stray open handle, such as a forgotten
+      interval, would otherwise keep the process alive forever.

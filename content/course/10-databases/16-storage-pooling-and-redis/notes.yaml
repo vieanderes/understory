@@ -1,0 +1,305 @@
+summary: >-
+  Scaling a database means handling more traffic than one untuned setup can. The lesson gives
+  the order: fix slow queries and indexes, pool connections, cache hot reads in Redis, send
+  reads to replicas, and shard only when writes outgrow one machine. Each step solves a
+  different bottleneck and brings a different cost.
+
+
+  A connection pool fixes too many connections. A cache fixes the same expensive read
+  repeated thousands of times, at the cost of serving stale data. A replica adds read
+  capacity, at the cost of lag. Partitioning makes huge tables manageable on one server.
+  Sharding adds write capacity, at the cost of every query and feature having to respect the
+  shard key for ever.
+
+
+  These notes add what production needs: how to size pools and what a transaction-mode
+  pooler breaks, how to give users read-your-writes with replicas, a cache-aside that
+  survives a stampede, and how partitioning and shard keys behave. In interviews, the
+  strongest answers name the bottleneck first, measure it, and pick the cheapest step that
+  removes it.
+remember:
+  - Find the bottleneck before scaling; most slow databases need a missing index or a fixed query, not more machines.
+  - Create one connection pool per process at start-up and share it, keeping instances times pool size under the server's `max_connections`, which defaults to 100.
+  - A pooler in transaction mode lends a connection per transaction, so session state such as `SET`, session advisory locks and `LISTEN` doesn't survive between transactions.
+  - Replicas lag behind the primary, so read your own writes from the primary for a short window after a user writes.
+  - Cache-aside reads the cache first and fills it from the database on a miss with a TTL; on a write, update the database first and then delete the key.
+  - Protect a cache from stampedes with single-flight loading and jittered TTLs, and cache "not found" briefly too.
+  - A partitioned table's primary key must include the partition key, and queries that filter on that key read only the matching partitions.
+  - Choose a shard key that nearly every query includes and that spreads load evenly, such as a tenant or chat id; queries without it must ask every shard.
+sections:
+  - title: Sizing a pool, and what a pooler breaks
+    body: |-
+      Each Postgres connection is a separate server process with its own memory, and many
+      active connections compete for the same CPU cores and locks. Past a point, more
+      connections make every query slower. A small pool with a short queue in front usually
+      beats hundreds of connections.
+
+      In Node, `pg.Pool` defaults to `max: 10` connections, closes idle ones after 10
+      seconds, and by default waits for a free connection **for ever**. Set a timeout so an
+      exhausted pool fails fast instead of hanging requests:
+
+      ```ts
+      import pg from 'pg';
+
+      // One pool per process, created at start-up and shared by every request.
+      export const pool = new pg.Pool({
+        connectionString: process.env.DATABASE_URL,
+        max: 10, // the default; instances × max must stay under the server's max_connections
+        idleTimeoutMillis: 10_000,
+        connectionTimeoutMillis: 2_000, // the default, 0, waits for a free connection for ever
+      });
+
+      // A transaction needs one connection for all its statements, so borrow a client.
+      export async function transfer(fromId: number, toId: number, pence: number): Promise<void> {
+        const client = await pool.connect();
+        try {
+          await client.query('BEGIN');
+          await client.query('UPDATE accounts SET balance_pence = balance_pence - $1 WHERE id = $2', [pence, fromId]);
+          await client.query('UPDATE accounts SET balance_pence = balance_pence + $1 WHERE id = $2', [pence, toId]);
+          await client.query('COMMIT');
+        } catch (err) {
+          await client.query('ROLLBACK');
+          throw err;
+        } finally {
+          client.release(); // forgetting this leaks the connection until the pool runs dry
+        }
+      }
+      ```
+
+      Run through `pg`, a transfer that would take a balance below zero hit the `CHECK`,
+      rolled back, and left both balances as they were.
+
+      Do the arithmetic: 12 app instances with `max: 10` want 120 connections, more than the
+      default 100. With serverless functions, each running instance has its own pool, so a
+      busy minute can open hundreds. That's where an external pooler such as PgBouncer or
+      your host's pooler comes in, sharing a few real connections among all clients.
+
+      Poolers have modes. **Session mode** lends a connection for the whole client session
+      and saves little. **Transaction mode**, the usual choice, lends one per transaction and
+      takes it back at `COMMIT`. Anything tied to a session then breaks: a session-level
+      `SET`, session advisory locks, `LISTEN`, temporary tables kept across transactions,
+      and, on older PgBouncer versions, named prepared statements. Keep state inside a
+      transaction, as the RLS lesson's `set_config(..., true)` does, and run migrations and
+      `LISTEN` on a direct connection.
+  - title: Read replicas and reading your own writes
+    body: |-
+      A replica receives the primary's write-ahead log, the stream of every change, and
+      replays it. Replication is asynchronous by default, so a replica is usually a fraction
+      of a second behind, and much more under heavy writes or a long replay. Replicas refuse
+      writes with `cannot execute INSERT in a read-only transaction`.
+
+      The user-visible bug is a save followed by a page that shows the old value. Two common
+      fixes:
+
+      **Sticky reads after a write.** Send a user's reads to the primary for a few seconds
+      after they write.
+
+      ```ts
+      type Target = 'primary' | 'replica';
+
+      // Read-your-writes: after a user writes, send their reads to the primary for a short window.
+      export function createRouter(stickyMs = 5_000) {
+        const lastWriteAt = new Map<string, number>();
+        return {
+          wrote(userId: string, now: number): void {
+            lastWriteAt.set(userId, now);
+          },
+          readTarget(userId: string, now: number): Target {
+            const at = lastWriteAt.get(userId);
+            if (at !== undefined && now - at < stickyMs) return 'primary';
+            lastWriteAt.delete(userId);
+            return 'replica';
+          },
+        };
+      }
+      ```
+
+      After `wrote('ana', 1000)`, Ana reads from the primary at 2,000 ms and from a replica
+      at 6,000 ms; Ben always reads from a replica. With several app servers the map isn't
+      shared, so put the last-write time in the user's session or a cookie instead.
+
+      **Position checks.** After a write, the primary reports its log position with
+      `pg_current_wal_lsn()`. A replica reports how far it has replayed with
+      `pg_last_wal_replay_lsn()`. Read from the replica only once it has passed the position
+      of the user's write. It's exact, and more work to build.
+
+      Watch lag from the primary in `pg_stat_replication`, whose `replay_lag` column shows
+      how far each replica is behind. Long queries on a replica can also be cancelled with
+      `canceling statement due to conflict with recovery`, when replaying the primary's
+      cleanup would remove row versions the query still needs. Heavy analytics often get
+      their own replica with settings that tolerate this.
+  - title: Cache-aside that survives real traffic
+    body: |-
+      The cache-aside loop in the lesson has three production problems: a popular key that
+      expires sends every request to the database at once (a **stampede**), missing ids are
+      never cached so repeated lookups always hit the database, and keys set at the same
+      moment expire at the same moment. This version fixes all three:
+
+      ```ts
+      // The three Redis commands cache-aside needs: GET, SET key value EX seconds, DEL.
+      interface KeyValueStore {
+        get(key: string): Promise<string | null>;
+        set(key: string, value: string, ttlSeconds: number): Promise<void>;
+        del(key: string): Promise<void>;
+      }
+
+      interface Product {
+        id: number;
+        name: string;
+        pricePence: number;
+      }
+
+      const inFlight = new Map<string, Promise<Product | null>>();
+
+      export async function getProduct(
+        cache: KeyValueStore,
+        loadFromDb: (id: number) => Promise<Product | null>,
+        id: number,
+      ): Promise<Product | null> {
+        const key = `product:${id}:v1`;
+        const hit = await cache.get(key);
+        if (hit !== null) return JSON.parse(hit) as Product | null;
+
+        // Single flight: 500 requests missing at once share one database query.
+        const pending = inFlight.get(key);
+        if (pending) return pending;
+
+        const load = (async () => {
+          const product = await loadFromDb(id);
+          // Cache misses too, briefly, so a flood of requests for a missing id can't reach the database.
+          const ttl = product ? 300 + Math.floor(Math.random() * 60) : 30; // jitter spreads expiries
+          await cache.set(key, JSON.stringify(product), ttl);
+          return product;
+        })();
+        inFlight.set(key, load);
+        try {
+          return await load;
+        } finally {
+          inFlight.delete(key);
+        }
+      }
+
+      export async function renameProduct(
+        cache: KeyValueStore,
+        saveToDb: (id: number, name: string) => Promise<void>,
+        id: number,
+        name: string,
+      ): Promise<void> {
+        await saveToDb(id, name); // the database first, then drop the copy
+        await cache.del(`product:${id}:v1`);
+      }
+      ```
+
+      With an in-memory store in place of Redis, 500 concurrent requests for a cold product
+      caused one database query, a rename caused exactly one more, and two lookups of a
+      missing id caused one.
+
+      Single flight here works per process; ten servers still send ten queries, which is
+      usually fine. The `:v1` in the key lets you change the cached shape by bumping the
+      version instead of flushing Redis. Deleting after the write still leaves a small race,
+      where a slow reader writes an old value back just after the delete; the TTL bounds how
+      long that lasts. Never cache values where staleness is wrong: stock at checkout is
+      checked in the database.
+  - title: Partitioning on one server, sharding across many
+    body: |-
+      **Partitioning** splits one table into child tables on the same server, by range, list
+      or hash of a column. The planner skips partitions a query can't touch, and old data can
+      be removed by dropping a partition.
+
+      ```sql
+      CREATE TABLE events (
+        id bigint GENERATED ALWAYS AS IDENTITY,
+        happened_at timestamptz NOT NULL,
+        kind text NOT NULL,
+        PRIMARY KEY (id, happened_at)
+      ) PARTITION BY RANGE (happened_at);
+
+      CREATE TABLE events_2026_09 PARTITION OF events
+        FOR VALUES FROM ('2026-09-01 00:00+00') TO ('2026-10-01 00:00+00');
+      CREATE TABLE events_2026_10 PARTITION OF events
+        FOR VALUES FROM ('2026-10-01 00:00+00') TO ('2026-11-01 00:00+00');
+
+      EXPLAIN (COSTS OFF)
+      SELECT * FROM events
+      WHERE happened_at >= '2026-10-01 00:00+00' AND happened_at < '2026-10-08 00:00+00';
+      -- the plan touches events_2026_10 only
+
+      ALTER TABLE events DETACH PARTITION events_2026_09;
+      DROP TABLE events_2026_09;   -- a month gone, instantly
+      ```
+
+      Two rules surprise people. A primary key or unique constraint on a partitioned table
+      must include the partition key; `PRIMARY KEY (id)` alone fails with `unique constraint
+      on partitioned table must include all partitioning columns`. And a row with no
+      matching partition is refused with `no partition of relation "events" found for row`,
+      so create partitions ahead of time or add a `DEFAULT` partition.
+
+      **Sharding** puts the pieces on different servers, which partitioning doesn't. A good
+      shard key has three properties: almost every query includes it, it has many values,
+      and load spreads evenly across them. A tenant id in a business app or a chat id in a
+      messaging app often fits. A timestamp doesn't, because all new writes land on one
+      shard. Even a good key can have one huge tenant, a **hot shard**, which may need its
+      own server.
+
+      Sharding costs a lot: joins and transactions across shards, global unique constraints
+      and reports all get hard, and moving to more shards means moving data. Extensions such
+      as Citus make Postgres itself distribute tables. Reach for it only when the write load
+      of one well-tuned primary is truly the limit.
+pitfalls:
+  - '**A new pool per request.** Connections pile up until the server refuses more. Create one pool when the process starts and import it everywhere.'
+  - '**Forgetting `client.release()`.** Each leaked client is gone from the pool, and after `max` leaks every request waits. Release in `finally`.'
+  - '**Leaving `connectionTimeoutMillis` at 0.** An exhausted pool makes requests hang with no error. Set a timeout of a few seconds and alert on it.'
+  - '**Session state through a transaction-mode pooler.** A `SET` or advisory lock lands on a connection another client gets next. Keep state transaction-local, and use a direct connection for sessions.'
+  - '**Reading from a replica straight after a write.** The user sees their change undone. Route their reads to the primary briefly, or check the replica''s replay position.'
+  - '**Deleting the cache key before writing the database.** A reader can refill it with the old value before the write lands. Write first, then delete.'
+  - '**Identical TTLs on keys filled together.** They expire together and stampede the database. Add random jitter to each TTL.'
+  - '**Sharding by a key most queries don''t use.** Every such query fans out to all shards. Pick the key from the queries, not from the data.'
+interview:
+  - question: Your Postgres database is struggling under load. What do you do, in what order?
+    answer: >-
+      Measure first, then take the cheapest fix for the real bottleneck. I'd look at the
+      slowest and most frequent queries, with `pg_stat_statements` where available, and fix
+      them with indexes and rewrites, which is the usual cause. If connections are the
+      problem, I'd size pools properly and put a pooler in front. For hot repeated reads, a
+      Redis cache with TTLs. For read volume beyond that, read replicas, handling lag with
+      read-your-writes routing. Partitioning helps with huge tables and data retention.
+      Sharding comes last, only when writes exceed one well-tuned primary, because it makes
+      every future query and feature respect the shard key.
+  - question: What is connection pooling, and how do you size a pool?
+    answer: >-
+      A pool keeps a few database connections open and lends them to requests, because each
+      Postgres connection is a process with memory and setup cost, and the server has a hard
+      limit, 100 by default. I create one pool per process, and I size so that instances
+      times pool size stays under `max_connections` with headroom for migrations and admin
+      sessions. Bigger isn't faster: past roughly a few connections per CPU core, contention
+      slows everything, so a small pool with a queue usually wins. I set a connection
+      timeout so an exhausted pool fails fast. With serverless or many instances, I add
+      PgBouncer in transaction mode and avoid session state.
+  - question: How do you keep a cache consistent with the database?
+    answer: >-
+      Accept that it's eventually consistent and bound the staleness. With cache-aside, reads
+      fill the cache on a miss with a TTL, and writes update the database first and then
+      delete the key, so the next read reloads. Deleting beats updating the cache in place,
+      because two concurrent writers can leave the older value cached. A small race remains,
+      where a slow reader repopulates an old value just after the delete, and the TTL caps
+      it. For stampedes I use single-flight loading and jittered TTLs. I don't cache values
+      where staleness is wrong, such as stock at checkout or permissions just revoked,
+      unless invalidation is reliable.
+  - question: A user updates their profile and the next page shows the old data. What's happening and how do you fix it?
+    answer: >-
+      Almost certainly replica lag: the write went to the primary and the read went to a
+      replica that hadn't replayed it yet. It could also be a stale cache entry, so I'd check
+      both. For replicas, the fix is read-your-writes: route that user's reads to the primary
+      for a few seconds after a write, tracked in their session so it works across servers.
+      Where exactness matters, record `pg_current_wal_lsn()` after the write and read from a
+      replica only once `pg_last_wal_replay_lsn()` has passed it. For a cache, delete the
+      key after the write. The trade-off is more load on the primary right after writes.
+  - question: How would you choose a shard key for a multi-tenant SaaS product?
+    answer: >-
+      Tenant id, usually, because nearly every query is scoped to one tenant, so it goes to
+      a single shard, and a tenant's joins and transactions stay on one server. I'd check
+      three things: that queries really include it, that tenants spread load evenly, and
+      what happens with one very large tenant, which may need a dedicated shard. Keys like
+      timestamps are bad because new writes all land on one shard, and keys most queries
+      don't include force fan-out. Cross-tenant reports move to a separate analytics store.
+      And before any of this, I'd make sure one primary with replicas truly can't cope.

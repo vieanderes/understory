@@ -1,0 +1,255 @@
+id: perf.server-caching
+title: Caching on the server
+objective: Cache slow work and model calls under the right key, for the right time, and clear an entry the moment its data changes.
+level: essential
+minutes: 10
+concepts: [perf.application-caching, perf.cache-invalidation, perf.caching-model-calls]
+prerequisites: [perf.caching-layers, backend.calling-other-apis]
+opening:
+  text: >-
+    You'll make a slow query or a paid model call answer instantly the second time. And
+    you'll make sure the fast answer is still the true one.
+
+steps:
+  - type: prose
+    id: cache-in-code
+    body: |-
+      Your own slow work can be cached too: a query, a report, a model call. Keep each result in a `Map`, keyed by its inputs, with a **TTL** (time to live):
+
+      ```js
+      const cache = new Map();
+
+      async function getPrice(id) {
+        const hit = cache.get(id);
+        if (hit && hit.expires > Date.now()) return hit.value;
+        const value = await db.priceOf(id);
+        cache.set(id, { value, expires: Date.now() + 30000 });
+        return value;
+      }
+      ```
+
+  - type: multiple-choice
+    id: pick-the-key
+    concept: perf.application-caching
+    difficulty: 1
+    question: You cache `monthlyReport(userId, month)`. Which key is right?
+    choices:
+      - text: '`${userId}:${month}`'
+        correct: true
+        feedback: >-
+          Right. Every input that changes the result belongs in the key.
+      - text: '`month`'
+        feedback: >-
+          Then the first user's report is served to everyone for that month.
+      - text: '`userId`'
+        feedback: >-
+          Then March's report comes back when someone asks for April.
+
+  - type: prose
+    id: invalidation
+    body: >-
+      A cache can keep serving a value that's no longer true. Correcting it is **cache
+      invalidation**, and there are three ways.
+
+
+      Let it **expire**: a short TTL means short lies. **Delete** the entry the moment you
+      change the data. Or change the **key**, for example with a version number, so the old
+      entry is never asked for again.
+
+  - type: ai-review
+    id: review-price-never-cleared
+    concept: perf.cache-invalidation
+    difficulty: 2
+    language: js
+    request: Add an endpoint to change a price. Prices are cached for an hour.
+    flawClass: logic
+    code: |
+      async function setPrice(id, pence) {
+        await db.query("UPDATE products SET pence = $1 WHERE id = $2", [pence, id]);
+        return { ok: true };
+      }
+
+      async function getPrice(id) {
+        const hit = cache.get(id);
+        if (hit && hit.expires > Date.now()) return hit.value;
+        const value = await db.priceOf(id);
+        cache.set(id, { value, expires: Date.now() + 3600000 });
+        return value;
+      }
+    prompt: >-
+      An assistant wrote this. The test changes a price and checks the database, which
+      passes. Shoppers see the old price for up to an hour. Tap the line at fault.
+    lines: [2]
+    reasons:
+      - text: The write never deletes the cached price
+        correct: true
+        feedback: >-
+          Right. Add `cache.delete(id)` straight after the update.
+      - text: An hour is too long for any cache
+        feedback: >-
+          A shorter TTL only shortens the lie. Deleting on write ends it.
+      - text: '`getPrice` should skip the cache for admins'
+        feedback: >-
+          Shoppers are the ones seeing the old price. The write has to clear it for everyone.
+    fix: |
+      async function setPrice(id, pence) {
+        await db.query("UPDATE products SET pence = $1 WHERE id = $2", [pence, id]);
+        cache.delete(id);
+        return { ok: true };
+      }
+
+  - type: code-challenge
+    id: write-cache
+    concept: perf.cache-invalidation
+    difficulty: 3
+    language: ts
+    editable: '6-9'
+    prompt: >-
+      Finish `createCache(load, ttlMs, now)`. `get(id)` returns the cached value while it's
+      fresh, and otherwise awaits `load(id)` and stores it for `ttlMs` milliseconds.
+      `invalidate(id)` deletes that entry, so the next `get` loads again.
+
+
+      `now()` reads the clock. An entry is fresh while `expires > now()`.
+    hints:
+      - '`get` has two paths: a fresh hit returns `hit.value`, and anything else loads and stores.'
+      - 'Store `{ value, expires: now() + ttlMs }` under the id after loading.'
+      - '`invalidate` needs one line: `entries.delete(id)`.'
+
+  - type: prose
+    id: caching-model-calls
+    body: >-
+      Model calls are slow and billed per token, so caching them pays. The key holds all
+      that changes the answer: the model, the whole prompt and settings like temperature.
+
+
+      If the prompt includes one person's data, put their id in the key too. Model
+      providers also offer **prompt caching**: they reuse the work on a long, repeated start
+      of a prompt, so the call costs less and starts sooner.
+
+  - type: ai-review
+    id: review-model-cache-key
+    concept: perf.caching-model-calls
+    difficulty: 3
+    language: js
+    request: Cache the assistant's answers, so repeat questions are free.
+    flawClass: security
+    code: |
+      async function answer(user, question) {
+        const key = `answer:${question}`;
+        const hit = cache.get(key);
+        if (hit) return hit;
+        const text = await model.ask({
+          system: `Help this customer. Their orders: ${JSON.stringify(user.orders)}`,
+          question,
+        });
+        cache.set(key, text);
+        return text;
+      }
+    prompt: >-
+      An assistant wrote this. In testing, repeat questions came back instantly. In
+      production, one customer asked "Where's my order?" and saw a stranger's address.
+      Tap the line at fault.
+    lines: [2]
+    reasons:
+      - text: The key leaves out whose orders the prompt holds
+        correct: true
+        feedback: >-
+          Yes. Add `user.id` to the key, so answers never cross between customers.
+      - text: The cache has no expiry
+        feedback: >-
+          It should have one, but that's not the leak. Customers share entries.
+      - text: '`JSON.stringify` exposes the orders to the model'
+        feedback: >-
+          The model needs the orders to help. The trouble is who gets the answer back.
+    fix: |
+      const key = `answer:${user.id}:${question}`;
+
+  - type: explain-back
+    id: explain-cache-plan
+    concept: perf.application-caching
+    difficulty: 3
+    prompt: >-
+      A product page runs a 400 ms query on every visit. Explain how you'd cache it, and
+      how you'd stop it showing an old price.
+    rubric:
+      - Keep the result in a cache keyed by every input that changes it, such as the product id.
+      - Give entries a lifetime, so a mistake can't live for ever.
+      - Delete the entry whenever the product changes, so the next visit loads the new price.
+    modelAnswer: >-
+      I'd cache the query's result under the product id, with a TTL of a few minutes. Most
+      visits then skip the 400 ms, and the TTL limits any mistake. Wherever the product is
+      updated, I'd delete its entry straight after the write. The next visit loads the new
+      price at once.
+
+recap:
+  - Cache slow work under a key made of every input that changes the result.
+  - Give entries a lifetime, and delete an entry the moment its data changes.
+  - Cache model answers by model, prompt and settings, and never across users' private data.
+
+recall:
+  - id: card-ttl
+    concept: perf.application-caching
+    front: What is a TTL on a cache entry?
+    back: >-
+      Its time to live: how long it's served before being loaded again.
+  - id: card-cache-key
+    concept: perf.application-caching
+    front: What belongs in a cache key?
+    back: >-
+      Every input that changes the result, such as the user and the month for a report.
+  - id: card-delete-on-write
+    concept: perf.cache-invalidation
+    front: How do you stop a cache serving an old price after an update?
+    back: >-
+      Delete the price's entry right after the write, so the next read loads it fresh.
+  - id: card-model-cache
+    concept: perf.caching-model-calls
+    front: What must a cached model answer's key include?
+    back: >-
+      The model, the whole prompt and the settings, and the user when the prompt holds their
+      data.
+
+references:
+  - kind: docs
+    title: Map
+    authors: MDN contributors
+    venue: MDN Web Docs
+    url: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Map
+    note: The `get`, `set` and `delete` a simple cache is built on.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Prompt caching
+    authors: Anthropic
+    venue: Claude Docs
+    url: https://platform.claude.com/docs/en/build-with-claude/prompt-caching
+    note: How a provider reuses the work on a repeated prompt start, and what it saves.
+    verified: true
+  - kind: essay
+    title: Two Hard Things
+    authors: Martin Fowler
+    year: 2009
+    venue: martinfowler.com
+    url: https://martinfowler.com/bliki/TwoHardThings.html
+    note: '"Cache invalidation and naming things", and where the saying comes from.'
+    verified: true
+
+deepDive: >-
+  A `Map` lives inside one server process. Run three servers and each has its own copy, so a
+  delete on one leaves the others stale. A shared store such as Redis, covered in the
+  databases chapter, gives every server the same cache and the same delete.
+
+
+  A cache that only grows is a memory leak. Cap its size: a `Map` keeps insertion order,
+  so deleting its first key drops the oldest entry.
+
+
+  When a popular entry expires, many requests can miss at once and all run the slow work
+  together. That's a **cache stampede**. Storing the promise of the first load, and handing
+  it to everyone who asks meanwhile, runs the work once.
+
+
+  A cached model answer is only worth it when questions really repeat. Exact-match keys
+  miss "where is my order" against "where's my order". Some teams match on meaning with
+  embeddings, which the AI engineering chapter covers.

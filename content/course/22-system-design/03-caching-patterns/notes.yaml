@@ -1,0 +1,176 @@
+summary: >-
+  A cache is a second copy of data, kept somewhere faster. The moment you have two copies,
+  you have to decide who fills the fast one, who clears it, and what readers see while the
+  two disagree. The lesson names the four patterns and the two classic failures, the stale
+  refill and the stampede. These notes add the numbers that make caching worth it, the
+  techniques that close the remaining gaps, and how to pick a pattern in a design review.
+
+
+  Cache-aside with delete-on-write and a TTL is the default for read-heavy data that can be
+  a few seconds stale: product pages, profiles, menus, configuration. Write-through suits
+  data that must read fresh and is read far more than written. Write-behind suits data you
+  can afford to lose, such as view counters.
+
+
+  Don't cache when reads rarely repeat, when the data must never be stale (a balance at
+  the moment of payment), or when the database already answers fast enough. A cache you
+  don't need adds a failure mode and a consistency problem for nothing.
+remember:
+  - Database load equals read traffic times the miss rate, so a hit rate falling from 99% to 95% multiplies database reads by five.
+  - Cache-aside means the application reads the cache, loads from the database on a miss and fills the cache itself.
+  - On a write, update the database first and delete the cache key second; the reverse order lets a reader refill the old value.
+  - Every entry keeps a TTL, even with delete-on-write, because deletes get lost and slow readers refill stale values.
+  - Write-behind is fast and can lose confirmed writes, so it never holds money, orders or anything a user was told is saved.
+  - A stampede is many simultaneous misses on one hot key; request coalescing, early refresh and jittered TTLs prevent it.
+  - "A cache must be optional: an error or a timeout from it is treated as a miss, and the database is sized for the day it's empty."
+sections:
+  - title: The arithmetic of a hit rate
+    body: |-
+      The database sees only the misses:
+
+      ```text
+      database reads = total reads × (1 − hit rate)
+      ```
+
+      That makes hit rates less linear than they look. With 20,000 reads a second:
+
+      ```text
+      hit rate 99%   → 200 database reads a second
+      hit rate 95%   → 1,000
+      hit rate 90%   → 2,000
+      cache empty    → 20,000
+      ```
+
+      Dropping from 99% to 95% sounds small and quintuples database load. That's why a
+      deploy that changes key names, which empties the cache in effect, can take a database
+      down, and why cache restarts get planned like database maintenance.
+
+      What sets the hit rate? The share of reads that go to data already cached. It depends
+      on how skewed access is (a few hot items cache well), the TTL (longer means more hits
+      and more staleness), and the memory size (too small, and eviction throws out entries
+      before they're reused). Redis evicts by a policy you set, such as approximate
+      least-recently-used with `allkeys-lru`.
+
+      Watch two numbers in production: hit rate per key prefix, and the database read rate.
+      If the second jumps while traffic is flat, the cache is the first suspect.
+  - title: Closing the stale-refill race
+    body: |-
+      The lesson showed a slow reader putting an old price back after the writer's delete.
+      Update-then-delete narrows that window but can't close it. Three techniques go
+      further.
+
+      - **Versioned keys.** Store the current version with the row, and put it in the key:
+        `price:lamp:v8`. A writer bumps the version in the same transaction as the update.
+        A slow reader holding version 7 fills `price:lamp:v7`, which nobody reads any more.
+        The cost is an extra lookup for the version, often itself cached briefly.
+      - **Leases.** On a miss the cache hands out a token. A delete invalidates outstanding
+        tokens, and a fill with an invalid token is refused. This is how large look-aside
+        caches handle it, and the same lease rate-limits refills of a hot key.
+      - **Short TTLs as the backstop.** Whatever slips through expires in minutes.
+
+      Setting the new value into the cache on write, instead of deleting, looks fresher but
+      has its own race: two writers can update the database in one order and the cache in
+      the other, leaving the older value cached until the TTL. Deleting is safer because a
+      delete is the same whichever writer does it last.
+
+      For data where staleness is unacceptable, such as stock at checkout, read the source
+      of truth on that path and use the cache only for browsing.
+  - title: Stopping stampedes before they start
+    body: |-
+      Coalescing, from the lesson, stops one process sending duplicate loads. Two more
+      techniques stop the key from ever expiring under load, and a third spreads expiry.
+
+      **Probabilistic early refresh** lets a request refresh an entry before it expires,
+      with a probability that rises as expiry nears and as the load gets slower:
+
+      ```ts
+      // Math.log of a number in (0, 1) is negative, so this pulls "now" forward.
+      function shouldRefresh(now: number, expiresAt: number, loadMs: number, beta = 1) {
+        return now - loadMs * beta * Math.log(Math.random()) >= expiresAt;
+      }
+
+      // Spread expiries so keys written together don't expire together.
+      const jitteredTtl = (seconds: number) =>
+        seconds + Math.floor(Math.random() * seconds * 0.1);
+      ```
+
+      For a 200 ms load, a simulation of 100,000 requests refreshed 0% of the time with 60
+      seconds left, 0.7% with 1 second left, 37% with 200 ms left and 90% with 20 ms left.
+      A hot key gets refreshed shortly before it expires, and a cold key rarely early.
+
+      **Serve stale while refreshing.** Keep entries past their soft expiry, return the
+      stale value at once, and refresh in the background. Users see a slightly old value
+      rather than a slow page.
+
+      **Jittered TTLs** matter after bulk loads. Warm 100,000 keys with the same 300-second
+      TTL and they all expire in the same second. Adding up to 10% random jitter spreads
+      that over 30 seconds.
+  - title: Where caches live, and negative caching
+    body: |-
+      A request can meet several caches, each faster and less shared than the next.
+
+      ```text
+      browser cache     per user, controlled by Cache-Control headers
+      CDN               per region, for public responses and files
+      in-process memory per server, fastest, inconsistent across servers
+      Redis             shared by all servers, about half a millisecond away
+      database buffers  the database's own memory, automatic
+      ```
+
+      An in-process cache with a TTL of a few seconds in front of Redis is the standard
+      answer to a hot key: each server absorbs repeats locally, and Redis sees one read per
+      server per few seconds.
+
+      **Negative caching** stores "not found" too, briefly. Without it, requests for ids
+      that don't exist miss every time and go to the database. An attacker can use that on
+      purpose by requesting random ids. Cache the absence for 30 to 60 seconds, and
+      rate-limit clients that produce many misses.
+
+      Finally, cache what is expensive and shared. A rendered product page read by
+      thousands is worth caching. A per-user query run once a day isn't.
+pitfalls:
+  - "**Deleting the key before updating the database.** A reader in between refills the old value, which then lives for the full TTL. Update first, then delete."
+  - "**No TTL because writes delete keys.** Crashes between write and delete, and slow refills, leave stale entries for ever. Every key gets a TTL as a backstop."
+  - "**Write-behind for data users were told is saved.** A cache restart before the flush loses it. Use write-through or write to the database first for anything that matters."
+  - "**Letting a cache outage fail requests.** Treat cache errors and timeouts as misses, and size the database for a cold cache, or the cache becomes a hard dependency."
+  - "**Caching per-user data under a shared key.** A key such as `dashboard` without the user id serves one person's data to another. Put every dimension the response depends on into the key."
+  - "**Warming many keys with one TTL.** They all expire together and stampede. Add jitter."
+interview:
+  - question: When would you use cache-aside, write-through or write-behind?
+    answer: >-
+      Cache-aside is my default for read-heavy data that tolerates seconds of staleness,
+      write-through when reads must be fresh, and write-behind only for data I can afford
+      to lose. Cache-aside is simple and keeps the cache optional: a miss loads from the
+      database. Write-through updates both on every write, so reads are fresh, at the cost
+      of slower writes and caching things that may never be read. Write-behind acknowledges
+      after the cache write and flushes later, which is fast but loses anything unflushed
+      when the cache restarts, so it suits view counters, never balances or orders. Whatever
+      I choose, every key gets a TTL.
+  - question: You cache product prices. After a price change, some users see the old price for minutes. Why, and how do you fix it?
+    answer: >-
+      Most likely the invalidation order or a refill race, and the fix is update then
+      delete, plus a TTL, plus versioned keys if it must be tighter. If the code deletes the
+      key before updating the database, a reader in between reloads the old price and caches
+      it for the whole TTL. Swapping the order fixes the common case. A slow reader can still
+      put an old value back just after the delete, so I'd keep a short TTL as a cap and, if
+      minutes are unacceptable, put a version number in the key, bumped in the same
+      transaction as the price. At checkout I'd read the price from the database regardless,
+      because that's where being wrong costs money.
+  - question: A popular key expires and your database CPU spikes to 100%. What's happening and what do you do?
+    answer: >-
+      A cache stampede: every request misses at the same moment and each queries the
+      database. In the short term I'd coalesce misses so one load per key runs per process,
+      and let the others wait for it. Across a fleet I'd add early refresh, so a hot key is
+      reloaded shortly before it expires, or serve the stale value while one request
+      refreshes in the background. Jittered TTLs stop many keys expiring together after a
+      bulk load. The trade-off with serving stale is freshness: users may see a value a few
+      seconds old, which is fine for a product page and not for stock at checkout.
+  - question: How do you decide whether something is worth caching at all?
+    answer: >-
+      I cache when reads repeat, the data tolerates some staleness, and the source is
+      expensive or overloaded. The numbers decide it: read rate, expected hit rate, and what
+      a miss costs. A query that takes 2 ms and runs 50 times a second isn't worth a second
+      copy and its consistency problems. A rendered page that takes 80 ms and is read 5,000
+      times a second is. I also ask what staleness costs: a wrong price at checkout is a
+      real problem, a like count a few seconds behind isn't. Then I check the cache can fail
+      without taking the service with it.

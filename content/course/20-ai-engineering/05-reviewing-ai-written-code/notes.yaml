@@ -1,0 +1,279 @@
+summary: >-
+  Reviewing AI-written code means checking generated code with the same fixed questions
+  every time, instead of reading it and deciding it looks fine. It exists because
+  generated code is optimised to look fine. A model writes the likeliest next token, so it
+  produces code that reads fluently whether or not a method exists, an edge case is handled
+  or a query is safe. The usual signals a reviewer relies on, clear names, tidy structure, a
+  confident comment, say nothing about correctness here.
+
+
+  The lesson's six flaw classes (logic, race, security, hallucinated API, edge case,
+  performance) each come with a question that finds them. The checklist turns those
+  questions into a routine: does every name exist, what input breaks it, where does
+  untrusted data go, what happens on failure, what does the test assert, what does it cost
+  at scale. Tools answer some of them for you: a type checker, a linter, the test suite, a
+  dependency allow-list. The rest need a person who runs the code on the inputs that hurt.
+
+
+  Use the full checklist on anything that touches money, data, security or concurrency, and
+  on anything you'll maintain. You can go lighter on a throwaway script whose output you
+  check by eye. What you can't do anywhere is approve on plausibility, because the person
+  who approves owns the code, whoever typed it.
+remember:
+  - Generated code is built to look right, so reading for plausibility is not a review; a fixed checklist is.
+  - Ask first whether every name exists, because a hallucinated method, option or package reads perfectly and fails at run time or worse.
+  - Ask what input breaks it (empty, zero, negative, huge, duplicate, two at once) and run those inputs, don't imagine them.
+  - Follow untrusted data to where it lands, and any query, command, path or HTML built from it by string is a security flaw.
+  - A catch block that only logs turns a failure into a false success, so rethrow or return a result that says it failed.
+  - A test proves only what it asserts, so check it would fail if the code were wrong.
+  - A hallucinated package name is a supply-chain risk, because someone can register it, so install only packages you chose.
+  - "The approver owns the code: types, linters and tests catch some classes, and a person catches the rest."
+sections:
+  - title: Why fluent code hides flaws
+    body: |-
+      Human-written bugs often come with signals: messy code, odd names, a comment that says
+      "TODO: fix". A reviewer learns to slow down there. Generated code removes those signals.
+      Its names are good, its structure is conventional, and its comments explain it with
+      confidence, because all of that is what likely code looks like.
+
+      The flaws that remain are the ones likelihood can't see. A method name that fits the
+      pattern of the language but was never added (`list.sum()` in Python). An option that
+      would make sense but the library doesn't have. An API from an older major version, often
+      because the model saw more of it in training. A boundary like `slice(-0)` that only
+      breaks on the input the model's examples never tried. A test that exercises the code
+      without checking its result, because a test "looks like" a call wrapped in `test()`.
+
+      Two habits follow. First, verify existence against the source of truth, not memory:
+      the type checker, the library's docs for the installed version, the lockfile. Running
+      `tsc` or the test suite catches most invented methods in typed code in seconds.
+      Second, review behaviour by running it. Reading code tells you what it's meant to do;
+      running it on awkward inputs tells you what it does. A generated change you haven't
+      run is a change you haven't reviewed.
+
+      The model's explanation of its own code is not evidence either. It's more likely text,
+      written by the same process that wrote the bug. Ask it to explain if that helps you
+      read faster, and then check the claims yourself.
+  - title: Edge cases and performance, probed rather than imagined
+    body: |-
+      Edge-case review is a list of inputs, and the fastest way through it is a small probe
+      that runs them all. Decide first what each awkward input should do. Here the lesson's
+      `lastN` is fixed and probed:
+
+      ```ts
+      // The fixed lastN: state what each awkward input should do, then make it so.
+      function lastN<T>(items: T[], n: number): T[] {
+        if (!Number.isInteger(n) || n < 0) throw new RangeError(`n must be a whole number >= 0, got ${n}`);
+        if (n === 0) return [];
+        return items.slice(-n);
+      }
+
+      // Probe the inputs the checklist names: empty, zero, huge, odd.
+      const probes: [string[], number][] = [
+        [['a', 'b', 'c'], 2],
+        [['a', 'b', 'c'], 0],
+        [['a', 'b', 'c'], 10],
+        [[], 3],
+        [['a', 'b', 'c'], -1],
+        [['a', 'b', 'c'], 1.5],
+      ];
+      for (const [items, n] of probes) {
+        try {
+          console.log(JSON.stringify(items), n, '->', JSON.stringify(lastN(items, n)));
+        } catch (error) {
+          console.log(JSON.stringify(items), n, '->', (error as Error).message);
+        }
+      }
+      // ["a","b","c"] 0 -> []    and    ["a","b","c"] -1 -> n must be a whole number >= 0, got -1
+
+      // Performance: the same answer, two costs.
+      type Order = { id: string; customerId: string };
+      type Customer = { id: string; name: string };
+      const slowNames = (orders: Order[], customers: Customer[]) =>
+        orders.map((o) => customers.find((c) => c.id === o.customerId)?.name); // O(orders × customers)
+      const fastNames = (orders: Order[], customers: Customer[]) => {
+        const byId = new Map(customers.map((c) => [c.id, c.name])); // built once, O(customers)
+        return orders.map((o) => byId.get(o.customerId)); // O(1) per order
+      };
+      const customers = [{ id: 'c1', name: 'Ana' }, { id: 'c2', name: 'Ben' }];
+      const orders = [{ id: 'o1', customerId: 'c2' }, { id: 'o2', customerId: 'c1' }];
+      console.log(slowNames(orders, customers), fastNames(orders, customers)); // [ 'Ben', 'Ana' ] twice
+      ```
+
+      Both name functions pass any test with two customers. At 100,000 orders and 100,000
+      customers, the first does up to ten billion comparisons. The performance question is
+      always "what grows?": a lookup inside a loop, a database query inside a loop (the N+1
+      pattern), a whole table loaded to count it, a regular expression that backtracks on
+      long input. Look for loops inside loops, including hidden ones such as `find`,
+      `includes` and `indexOf` inside `map`.
+  - title: Races, the flaw a single test never shows
+    body: |-
+      A race needs two things at once, so a test that calls the code once will always pass.
+      The shape to look for is **check then act** with a wait in between: read a value, await
+      something, then write based on what was read.
+
+      ```ts
+      // A fake database whose calls take a moment, like a real one.
+      const seats = new Map<string, string>();
+      const pause = () => new Promise((resolve) => setTimeout(resolve, 10));
+
+      // Generated code: check, then write. Two requests can both pass the check.
+      async function bookSeat(seat: string, user: string): Promise<boolean> {
+        await pause();
+        if (seats.has(seat)) return false;
+        await pause();
+        seats.set(seat, user);
+        return true;
+      }
+
+      const results = await Promise.all([bookSeat('12A', 'ana'), bookSeat('12A', 'ben')]);
+      console.log(results, seats.get('12A')); // [ true, true ] ben
+      ```
+
+      Both customers were told they had seat 12A, and the second silently overwrote the
+      first. Run it as an ES module (a `.mts` file with `npx tsx`), since it uses top-level
+      `await`.
+
+      The fix is to make the check and the write one atomic step in the place that holds the
+      truth. Moving the check next to the write helps only inside one process; with two
+      servers, the database has to decide. A unique constraint on the seat with
+      `INSERT ... ON CONFLICT DO NOTHING`, a conditional `UPDATE ... WHERE seat_owner IS
+      NULL` that reports how many rows it changed, or a transaction with the right isolation
+      level. In review, the question is: what if this runs twice at the same moment? Ask it
+      of anything that reads a balance, a stock count, a "does it exist" check or a counter,
+      and then writes.
+  - title: Tests that pass and prove nothing
+    body: |-
+      Assistants write tests readily, and the same process that wrote the code writes tests
+      that agree with it. Watch for four patterns: no assertion at all; an assertion so weak
+      it can't fail (`typeof result === 'number'`); an expected value copied from running the
+      code, which freezes today's bug; and mocks so thorough the test checks the mock.
+
+      The check is a thought experiment you can also run: **break the code and see if the
+      test notices.** This is the idea behind mutation testing.
+
+      ```ts
+      type Cart = { pence: number; qty: number }[];
+
+      const total = (cart: Cart) => cart.reduce((sum, line) => sum + line.pence * line.qty, 0);
+      // A mutant: the kind of slip a review must catch. Quantity ignored.
+      const mutant = (cart: Cart) => cart.reduce((sum, line) => sum + line.pence, 0);
+
+      const cart: Cart = [{ pence: 250, qty: 2 }, { pence: 100, qty: 1 }];
+
+      // The generated test: it runs the code and checks the result is a number.
+      const weakTest = (fn: (c: Cart) => number) => typeof fn(cart) === 'number';
+      // A test that pins the behaviour: exact expected value from the spec.
+      const strongTest = (fn: (c: Cart) => number) => fn(cart) === 600 && fn([]) === 0;
+
+      console.log('weak', weakTest(total), weakTest(mutant)); // weak true true
+      console.log('strong', strongTest(total), strongTest(mutant)); // strong true false
+      ```
+
+      The weak test passes the broken version, so it proves nothing about totals. The strong
+      one takes its expected value from the requirement (two mugs at 250 and one at 100 is
+      600), not from the code's output, and it covers the empty cart. When you review a
+      generated test, delete or change the line it claims to cover. If it stays green, it's
+      decoration. A good working order is to write or approve the tests first, from the
+      requirement, and let the assistant write code until they pass.
+  - title: Hallucinated packages and the supply chain
+    body: |-
+      An invented method fails loudly the first time it runs. An invented package can be
+      worse. If the name doesn't exist, the install fails, which is the lucky case. If
+      someone has registered that name, perhaps because models tend to suggest it, the
+      install succeeds and runs their code, often at install time through lifecycle scripts,
+      on your laptop and in CI. This attack is sometimes called **slopsquatting**, a cousin of
+      typosquatting.
+
+      Defences, cheapest first:
+
+      - **An allow-list.** Only packages someone chose may appear in imports. The lesson's
+        `unknownImports` is that check, and it belongs in CI so no review depends on
+        noticing a new name.
+      - **A lockfile, committed, with frozen installs in CI.** The exact versions and
+        integrity hashes you reviewed are the ones that run.
+      - **A look before adding.** For any new dependency: does the registry page exist, who
+        publishes it, how old is it, does the repository match? A package created last week
+        with a plausible name deserves suspicion.
+      - **Fewer dependencies.** If the model suggests a package for ten lines of code, write
+        the ten lines.
+
+      The same logic covers hallucinated configuration: an environment variable, a CLI flag
+      or a config key that the tool ignores silently. Ignored configuration doesn't crash. It
+      does nothing, so check each unfamiliar option against the documentation for the
+      version you run.
+pitfalls:
+  - >-
+    **Approving because it looks right.** Looking right is what generated code is optimised
+    for. Run the checklist and run the code on awkward inputs.
+  - >-
+    **Trusting the model's own explanation.** Its account of why the code is correct is more
+    generated text. Check claims against docs, types and tests.
+  - >-
+    **Accepting a green test without reading its assertions.** A test with no `expect`, or a
+    weak one, passes against broken code. Break the code and see if the test notices.
+  - >-
+    **Copying expected values from the code's output.** That freezes today's bug into the
+    test. Take expected values from the requirement.
+  - >-
+    **Reviewing concurrency with single calls.** A race needs two requests at once, so a
+    one-call test always passes. Ask what happens if it runs twice at the same moment.
+  - >-
+    **Installing whatever the assistant imports.** An unfamiliar package may not exist, or may
+    belong to an attacker. Check it against an allow-list and the registry first.
+  - >-
+    **Keeping the swallowed error because the log line looks responsible.** Logging and
+    carrying on tells callers a failure succeeded. Rethrow, or return an explicit failure.
+  - >-
+    **Reviewing a large generated diff in one pass.** Attention runs out long before the diff
+    does. Ask for small changes, each with its tests, and review them one at a time.
+interview:
+  - question: How do you review code an AI assistant wrote?
+    answer: >-
+      With a fixed checklist and by running it, because generated code always reads well.
+      First, does every name exist: I let the type checker and tests confirm methods, and
+      check any new package against our allow-list. Then edge cases: empty, zero, huge,
+      duplicate, concurrent, and I run those inputs. Then where untrusted data goes, looking
+      for queries, commands or HTML built from strings. Then failure paths, especially catch
+      blocks that log and carry on. Then what the tests assert, checking they'd fail if I
+      broke the code. Last, cost at production size, looking for loops inside loops and
+      queries inside loops. For a throwaway script I'd go lighter, but anything touching
+      money, data or security gets all of it.
+  - question: What kinds of bugs do AI assistants tend to introduce?
+    answer: >-
+      Plausible ones: code that fits the pattern of correct code but is wrong in a detail
+      likelihood can't see. The typical classes are hallucinated APIs, such as a method or
+      option that doesn't exist, or one from an older version; unhandled edge cases like zero
+      or an empty list; security flaws such as SQL built by string interpolation; swallowed
+      errors; races in check-then-write code; and quadratic work hidden in `find` inside
+      `map`. Tests written alongside often assert too little. The difference from human bugs
+      is the lack of warning signs, so I rely on tools and a checklist rather than on the
+      code looking suspicious.
+  - question: An assistant's pull request has full test coverage and every test is green. Is it safe to merge?
+    answer: >-
+      Not on that evidence, because coverage measures which lines ran, not what was checked.
+      A test that calls a function and asserts nothing covers every line. So I read the
+      assertions and ask whether each would fail if the code were wrong, and for the
+      important paths I try it: change a line and see whether a test goes red. I check that
+      expected values come from the requirement, not from the code's own output, and that
+      edge cases and failure paths have tests. Mutation testing tools automate this at a
+      cost in CI time. Coverage is a useful signal of what is untested, and a poor signal of
+      what is tested.
+  - question: What is slopsquatting and how do you defend against it?
+    answer: >-
+      It's registering package names that models hallucinate, so generated code installs the
+      attacker's package. A model suggests a plausible name that doesn't exist, someone
+      publishes malware under it, and the next project that follows the suggestion runs it,
+      often at install time. My defences are an allow-list of dependencies checked in CI, a
+      committed lockfile with frozen installs, and a manual look at any new dependency: who
+      publishes it, how old it is, whether its repository matches. I also push back on
+      adding packages for small jobs. The cost is some friction for adding dependencies,
+      which I think is the right place for friction.
+  - question: Doesn't reviewing everything the assistant writes cancel out the speed gain?
+    answer: >-
+      No, if the review is structured and most of it is automated. Types, linters, tests and
+      a dependency allow-list catch hallucinated names and many edge cases in seconds. What's
+      left for a person is behaviour, security and design, which are what I'd review in any
+      colleague's code. The speed gain survives when changes are small and come with tests I
+      trust, ideally tests written from the requirement first. It disappears when someone
+      generates a large diff and reviews it by skimming, because then the time comes back
+      later as incidents. Unreviewed generated code is borrowed time, not saved time.

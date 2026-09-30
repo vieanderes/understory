@@ -1,0 +1,254 @@
+id: sysdesign.case-url-shortener
+title: "Case study: a URL shortener"
+objective: "Design a read-heavy service end to end: requirements, estimates, id generation, storage, caching, redirects and abuse."
+level: advanced
+minutes: 10
+concepts: [sysdesign.id-generation, sysdesign.read-heavy-design]
+prerequisites: [sysdesign.the-method, sysdesign.estimation, sysdesign.caching-patterns]
+opening:
+  text: >-
+    You'll design a link shortener the way an interview wants: requirements, numbers, a
+    sketch, one deep dive, and what breaks. It's small enough to finish, and full of trade-offs.
+
+steps:
+  - type: prose
+    id: requirements-and-numbers
+    body: |-
+      The brief: "Design a URL shortener." Requirements first. Shorten a URL, redirect fast,
+      never hand out one code twice. The interviewer gives the scale: 100 million new links a
+      month, each clicked about 100 times.
+
+      Your estimate function turns that into about 39 writes and 3,900 redirects a second,
+      and 6 TB over ten years. One Postgres holds that. The reads are the design problem.
+
+  - type: multiple-choice
+    id: pick-what-to-optimise
+    concept: sysdesign.read-heavy-design
+    difficulty: 1
+    question: Each link is clicked about 100 times. What should the design favour?
+    choices:
+      - text: Fast, cheap redirects
+        correct: true
+        feedback: >-
+          Yes. Clicks outnumber new links a hundred to one.
+      - text: Fast link creation
+        feedback: >-
+          Creation matters, but it's the rare path. A hundred clicks follow each new link.
+      - text: Both equally
+        feedback: >-
+          The traffic isn't equal, so the design shouldn't be either. Reads dominate.
+
+  - type: prose
+    id: name-id-strategies
+    body: |-
+      Codes use **base62**: the 62 characters 0-9, a-z and A-Z. Six give about 57 billion
+      codes, plenty. Three ways to pick them.
+
+      A **counter** in base62 never collides, but it's guessable. Servers share it by taking
+      ranges of a thousand ids.
+
+      A **random code** is unguessable, and a unique constraint catches the rare collision. A
+      **hash** of the URL gives the same code for the same URL.
+
+  - type: code-challenge
+    id: write-base62
+    concept: sysdesign.id-generation
+    difficulty: 3
+    language: ts
+    prompt: >-
+      Write `toBase62(n)`, which turns a counter value into a short code. Digits come from
+      `ALPHABET`: 0-9, then a-z, then A-Z. So 61 is `'Z'` and 62 is `'10'`.
+
+
+      0 returns `'0'`. Throw for a negative number or one that isn't whole.
+    hints:
+      - It's the same as writing a number in base 10, with 62 digits instead of 10.
+      - The last character is `n % 62`. Then divide by 62, rounding down, and repeat.
+      - 'Start with `let code = ""; while (n > 0) { ... }`'
+
+  - type: ai-review
+    id: review-guessable-shares
+    concept: sysdesign.id-generation
+    difficulty: 4
+    language: ts
+    request: Create short share links for users' private files.
+    flawClass: security
+    code: |
+      async function createShareLink(fileId: string, ownerId: string) {
+        const code = toBase62(await db.counter.next('share'));
+        await db.links.insert({ code, fileId, ownerId });
+        return `https://sho.rt/${code}`;
+      }
+    prompt: >-
+      An assistant wrote this. Tests checked that each code is unique and redirects to the
+      right file. A week later, someone downloads thousands of strangers' files. Tap the
+      line at fault.
+    lines: [2]
+    reasons:
+      - text: Sequential codes let anyone walk to the next file
+        correct: true
+        feedback: >-
+          Exactly. Unique isn't secret. Private links need random, unguessable codes.
+      - text: The owner id should be part of the code
+        feedback: >-
+          That leaks the owner instead. The code must be unguessable, not more informative.
+      - text: The insert should happen before the code is made
+        feedback: >-
+          Order doesn't matter here. The codes themselves are the leak.
+    fix: |
+      import { randomBytes } from 'node:crypto';
+
+      async function createShareLink(fileId: string, ownerId: string) {
+        const code = randomBytes(12).toString('base64url'); // 16 random characters
+        await db.links.insert({ code, fileId, ownerId }); // unique key on code
+        return `https://sho.rt/${code}`;
+      }
+
+  - type: prose
+    id: read-path-and-failures
+    body: |-
+      Now the deep dive: the read path. Cache hot codes in Redis, cache-aside, since a code
+      never changes. Add read replicas behind the cache.
+
+      Then name the failures unprompted. The cache dies, and every redirect hits the
+      database, so size it for that. Someone shortens phishing links, so scan new URLs and
+      rate-limit creation.
+
+  - type: multiple-choice
+    id: pick-redirect-status
+    concept: sysdesign.read-heavy-design
+    difficulty: 3
+    question: The product needs a count of every click. Which redirect status should you send?
+    choices:
+      - text: '302 Found'
+        correct: true
+        feedback: >-
+          Right. A 302 isn't cached by default, so every click reaches you.
+      - text: '301 Moved Permanently'
+        feedback: >-
+          Browsers may cache a 301, so repeat clicks never reach your servers to be counted.
+      - text: '200 with the long URL in the body'
+        feedback: >-
+          The browser wouldn't follow it. A redirect needs a 3xx status and a Location header.
+
+  - type: ai-review
+    id: review-design-summary
+    concept: sysdesign.read-heavy-design
+    difficulty: 3
+    language: yaml
+    request: Summarise my URL shortener design on one page for the interviewer.
+    flawClass: edge-case
+    code: |
+      requirements: shorten, redirect in under 50 ms, never reuse a code
+      numbers: 39 writes and 3,900 redirects a second, 6 TB over ten years
+      ids: random 7-character codes, unique constraint, retry on collision
+      read-path: Redis cache-aside in front of Postgres and two replicas
+      failure: if Redis is down, answer 503 until it's back
+      abuse: scan new URLs, rate-limit creation per account
+    prompt: >-
+      The interviewer asks, "What breaks first?" One line gives a weak answer. Tap it.
+    lines: [5]
+    reasons:
+      - text: A cache outage takes every redirect down
+        correct: true
+        feedback: >-
+          Yes. Fall back to the replicas, sized to take the full read load.
+      - text: Random codes need seven characters
+        feedback: >-
+          A seventh character buys room and makes guessing harder. It's a fair choice.
+      - text: Rate limits per account are too strict
+        feedback: >-
+          Limiting creation is the standard defence against spam links. Keep it.
+    fix: |
+      failure: if Redis is down, read from the replicas, sized for all redirects
+
+  - type: explain-back
+    id: explain-cache-failure
+    concept: sysdesign.read-heavy-design
+    difficulty: 4
+    prompt: >-
+      The cache serves 95% of redirects. Why is losing the cache a bigger risk here than a
+      slow write path?
+    rubric:
+      - Almost all traffic is reads, and the cache absorbs nearly all of them.
+      - Without it, the database suddenly gets about twenty times its usual read load.
+      - Writes are rare, so a slow write path hurts few users, while a flood of reads can take everything down.
+    modelAnswer: >-
+      Reads outnumber writes a hundred to one, and the cache answers 95% of them. If it dies,
+      the database goes from 5% of reads to all of them, twenty times the load at once. That
+      can take down redirects for everyone. A slow write path only affects the few people
+      creating links. So I size the database, or a second cache, for the day the cache fails.
+
+recap:
+  - Start from requirements and numbers, and let the read-to-write ratio shape the design.
+  - Choose counters, random codes or hashes for ids, knowing what each gives away.
+  - Put caches and replicas on the read path, and plan for the cache failing.
+
+recall:
+  - id: card-code-space
+    concept: sysdesign.id-generation
+    front: Why do private share links need random codes, not a counter?
+    back: >-
+      A counter is guessable: one code tells you the next. Random codes can't be walked.
+  - id: card-counter-ranges
+    concept: sysdesign.id-generation
+    front: How do many servers share one counter without asking a database for every link?
+    back: >-
+      Each server takes a range of ids, say a thousand at a time, and hands them out locally.
+  - id: card-301-302
+    concept: sysdesign.read-heavy-design
+    front: Why might a shortener send 302 instead of 301?
+    back: >-
+      Browsers may cache a 301 and skip your servers on repeat clicks. A 302 isn't cached by
+      default, so every click can be counted and the target can change.
+  - id: card-read-heavy
+    concept: sysdesign.read-heavy-design
+    front: In a read-heavy design, what carries the load, and what failure do you plan for?
+    back: >-
+      Caches, CDNs and replicas carry the reads. Plan for the cache failing, since the
+      database then takes all of them.
+
+references:
+  - kind: rfc
+    title: 'RFC 9110: HTTP Semantics'
+    authors: Roy Fielding, Mark Nottingham and Julian Reschke
+    year: 2022
+    venue: IETF
+    url: https://www.rfc-editor.org/rfc/rfc9110.html
+    note: Section 15.4 on redirects, including why a 301 is heuristically cacheable.
+    primary: true
+    verified: true
+  - kind: docs
+    title: 301 Moved Permanently
+    authors: MDN contributors
+    venue: MDN Web Docs
+    url: https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Status/301
+    note: How browsers treat a permanent redirect.
+    verified: true
+  - kind: book
+    title: Designing Data-Intensive Applications
+    authors: Martin Kleppmann
+    year: 2017
+    venue: O'Reilly Media
+    url: https://dataintensive.net/
+    note: Chapter 1 on describing load and performance, the habit this case study practises.
+    verified: true
+
+deepDive: >-
+  Every number here was computed in Node. 100 million links over a 30-day month is 38.6
+  writes a second; a hundred clicks each is 3,858 redirects a second on average. Peaks are
+  several times higher, so plan for them, not the mean. 500 bytes a link is 50 GB a month
+  and 6 TB over ten years. The base62 values in the challenge tests came from the reference
+  solution: a billion is `15FTGg`.
+
+
+  The fix in the review uses 12 random bytes, 96 bits, as 16 base64url characters. That's
+  far too many to guess, at the cost of longer links. Public links can stay short and
+  countable; private ones must not.
+
+
+  Deeper follow-ups an interviewer may ask. Custom aliases need a uniqueness check against
+  generated codes, so keep them in the same table. Expiry means a TTL column and a cleanup
+  job, and the cache entry must expire too. Analytics shouldn't slow the redirect: write each
+  click to a queue and count it later. Hot links, one code shared by millions, fit a CDN in
+  front of the redirect, if the product accepts less exact counts.

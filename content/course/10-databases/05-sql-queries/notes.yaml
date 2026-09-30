@@ -1,0 +1,194 @@
+summary: >-
+  A join puts normalised tables back together for reading. The schema stores each fact once,
+  customers in one table and orders in another, and a join pairs rows whose keys match so a
+  page can show an order with its customer's name. It's how you get the benefits of
+  normalisation without paying for them on every screen.
+
+
+  Joins are also where most wrong numbers come from. A join returns one row per matching
+  pair, so a parent with several children appears several times. That's right for a list
+  of children and wrong for a list of parents, or for any sum taken over the parent's
+  columns. Knowing how many rows a join produces before you run it is the core skill.
+
+
+  Use an inner join when both sides must exist, a left join when the left side must appear
+  whether or not it has matches, and `EXISTS` or `NOT EXISTS` when you only need to know
+  whether a match exists. Join in the database rather than in a loop in your code: one
+  query with a join beats one query per row.
+remember:
+  - A join returns one row for each pair of rows that satisfies the `ON` condition, so a parent with three children appears three times.
+  - An inner join drops rows without a match, and a left join keeps every left row and fills the right side with NULLs.
+  - For an outer join, a condition on the right table belongs in `ON`, because in `WHERE` it removes the NULL rows and turns the join back into an inner one.
+  - "`WHERE NOT EXISTS (...)` finds rows with no match, and is safer than `NOT IN` when the subquery can return NULL."
+  - Joining one parent to two child tables multiplies the children, so aggregate each child table before joining.
+  - An inner join after a left join, on the left join's right table, silently drops the unmatched rows again.
+  - Postgres runs a join as a nested loop, a hash join or a merge join, chosen by the planner from estimated row counts and available indexes.
+sections:
+  - title: What a join computes, and the three ways to ask about matches
+    body: |-
+      Logically, a join takes every pairing of left and right rows and keeps the pairs where
+      `ON` is true. Real joins never build all pairings, but that model predicts every
+      result correctly. With no condition at all you get every pairing, which SQL calls a
+      `CROSS JOIN`.
+
+      Three questions about matches come up constantly. Using a clinic's owners and pets:
+
+      ```sql
+      CREATE TABLE owners (id integer PRIMARY KEY, name text NOT NULL);
+      CREATE TABLE pets (id integer PRIMARY KEY, owner_id integer NOT NULL REFERENCES owners(id), name text NOT NULL, species text NOT NULL);
+      INSERT INTO owners VALUES (1, 'Ana'), (2, 'Ben'), (3, 'Dev');
+      INSERT INTO pets VALUES (1, 1, 'Miso', 'cat'), (2, 1, 'Pip', 'cat'), (3, 2, 'Rex', 'dog');
+      SELECT o.name FROM owners o
+      WHERE EXISTS (SELECT 1 FROM pets p WHERE p.owner_id = o.id AND p.species = 'cat');
+      SELECT o.name FROM owners o
+      WHERE NOT EXISTS (SELECT 1 FROM pets p WHERE p.owner_id = o.id);
+      SELECT o.name FROM owners o LEFT JOIN pets p ON p.owner_id = o.id
+      WHERE p.id IS NULL;
+      ```
+
+      The first is a **semi-join**: owners with at least one cat, each once, with no
+      `DISTINCT` needed. Ana appears once though she has two cats. The second and third are
+      **anti-joins**: owners with no pets, which is Dev. Both forms are correct and Postgres
+      usually plans them the same way. `NOT EXISTS` states the intent more plainly.
+
+      Test the left join form on a column that can't be NULL in a real match, such as the
+      primary key. Testing `p.name IS NULL` would also catch a real pet whose name happened
+      to be NULL, if the column allowed it.
+
+      A table can also join to itself. With `staff (id, name, manager_id)`,
+      `FROM staff s LEFT JOIN staff m ON m.id = s.manager_id` pairs each person with their
+      manager, and aliases keep the two copies apart.
+  - title: Chains of joins, and how a left join gets undone
+    body: |-
+      Logically, joins nest left to right: each one joins the result so far to the next table. That
+      makes one mistake common. Suppose you want every owner, with their pets' vaccinations
+      if any:
+
+      ```sql
+      CREATE TABLE owners (id integer PRIMARY KEY, name text NOT NULL);
+      CREATE TABLE pets (id integer PRIMARY KEY, owner_id integer NOT NULL, name text NOT NULL);
+      CREATE TABLE vaccinations (pet_id integer NOT NULL, vaccine text NOT NULL);
+      INSERT INTO owners VALUES (1, 'Ana'), (2, 'Dev');
+      INSERT INTO pets VALUES (1, 1, 'Miso');
+      INSERT INTO vaccinations VALUES (1, 'rabies');
+      SELECT o.name, p.name AS pet, v.vaccine
+      FROM owners o
+      LEFT JOIN pets p ON p.owner_id = o.id
+      JOIN vaccinations v ON v.pet_id = p.id;
+      SELECT o.name, p.name AS pet, v.vaccine
+      FROM owners o
+      LEFT JOIN pets p ON p.owner_id = o.id
+      LEFT JOIN vaccinations v ON v.pet_id = p.id;
+      ```
+
+      The first query loses Dev. His row survives the left join with `p.id` NULL, and the
+      inner join then needs `v.pet_id = NULL`, which is never true. Once a chain goes left,
+      every later join on those optional tables must be left too. The second query keeps
+      Dev, with NULL pet and vaccine.
+
+      Naming columns matters more as chains grow. Qualify every column with its table alias
+      and give output columns distinct names, or an app reading rows as objects will see
+      two `name` keys collide.
+  - title: Fan-out, and aggregating before you join
+    body: |-
+      Joining one parent to two independent child tables pairs every child of one kind with
+      every child of the other. An owner with two pets and three appointments produces six
+      rows, and every count or sum over them is wrong:
+
+      ```sql
+      CREATE TABLE owners (id integer PRIMARY KEY, name text NOT NULL);
+      CREATE TABLE pets (id integer PRIMARY KEY, owner_id integer NOT NULL);
+      CREATE TABLE appointments (id integer PRIMARY KEY, owner_id integer NOT NULL, fee_pence integer NOT NULL);
+      INSERT INTO owners VALUES (1, 'Ana');
+      INSERT INTO pets VALUES (1, 1), (2, 1);
+      INSERT INTO appointments VALUES (1, 1, 4000), (2, 1, 2500), (3, 1, 3000);
+      SELECT o.name, count(p.id) AS pets, sum(a.fee_pence) AS fees
+      FROM owners o
+      LEFT JOIN pets p ON p.owner_id = o.id
+      LEFT JOIN appointments a ON a.owner_id = o.id
+      GROUP BY o.id, o.name;
+      SELECT o.name, coalesce(p.pets, 0) AS pets, coalesce(a.fees, 0) AS fees
+      FROM owners o
+      LEFT JOIN (SELECT owner_id, count(*) AS pets FROM pets GROUP BY owner_id) p ON p.owner_id = o.id
+      LEFT JOIN (SELECT owner_id, sum(fee_pence) AS fees FROM appointments GROUP BY owner_id) a ON a.owner_id = o.id;
+      ```
+
+      The first query reports 6 pets and 19,000 pence in fees. The truth is 2 pets and
+      9,500 pence. The second aggregates each child table down to one row per owner first,
+      so the join is one-to-one and nothing multiplies.
+
+      `count(DISTINCT p.id)` would fix the pet count in the first query, but there's no
+      honest `DISTINCT` for a sum: two appointments can have the same fee. Aggregate first.
+
+      A quick check catches fan-out in review: for each join, ask whether the right side
+      can have more than one match per left row. If it can, every aggregate over left-side
+      columns is suspect.
+  - title: How Postgres executes a join
+    body: |-
+      The planner picks one of three algorithms for each join, from its estimates of how
+      many rows each side has and which indexes exist.
+
+      - **Nested loop.** For each row on the outer side, look up matches on the inner side.
+        Fast when the outer side is small and the inner side has an index on the join
+        column. Terrible when both sides are large and there's no index.
+      - **Hash join.** Build a hash table from the smaller input, then stream the other
+        through it. The usual choice for large equality joins with no useful order. Needs
+        memory, bounded by `work_mem`, and spills to disk beyond it.
+      - **Merge join.** Walk two inputs sorted on the join key side by side. Good when both
+        are already sorted, for example by an index, or when the result must be sorted
+        anyway.
+
+      Hash and merge joins need an equality condition. A join on a range, such as
+      `b.starts_at BETWEEN s.opens AND s.closes`, can only be a nested loop.
+
+      This is why indexes on foreign key columns matter so much. A page that joins one
+      order to its lines runs as a nested loop with an index lookup per order, which takes
+      microseconds. Without the index, the same query must scan or hash the whole
+      `order_lines` table. The `EXPLAIN` lesson shows how to read which algorithm was
+      chosen and whether its row estimates were right.
+pitfalls:
+  - '**Filtering the right table of a left join in `WHERE`.** Unmatched rows have NULLs there and get dropped. Move the condition into `ON`.'
+  - '**Summing across a one-to-many join.** Parent values repeat once per child. Aggregate the child table first, or don''t join it.'
+  - '**Joining two child tables to one parent.** Children multiply against each other. Aggregate each in a subquery, then join.'
+  - '**Reaching for `DISTINCT` to hide repeats.** It hides the symptom and costs a sort or hash. Use `EXISTS` when you only need to know that a match exists.'
+  - '**An inner join after a left join.** It drops the rows the left join kept. Keep every later join on optional tables as a left join.'
+  - '**`NOT IN (subquery)` for "has no match".** A NULL in the subquery empties the result. Use `NOT EXISTS`.'
+  - '**Joining in application code.** Fetching orders, then each order''s customer in a loop, is the N+1 pattern. Write one query with a join.'
+interview:
+  - question: What's the difference between an inner join and a left join, and when do you use each?
+    answer: >-
+      An inner join returns only pairs where both sides match; a left join returns every
+      left row, with NULLs for the right side where nothing matches. I use an inner join
+      when the relationship is required, such as order lines with their products, and a
+      left join when the question is "all of these, plus related data if any", such as all
+      customers with their latest order. The classic bug is putting a condition on the right
+      table in `WHERE` after a left join, which drops the NULL rows and silently makes it an
+      inner join. That condition belongs in `ON`.
+  - question: How would you find customers who have never placed an order?
+    answer: >-
+      `SELECT c.* FROM customers c WHERE NOT EXISTS (SELECT 1 FROM orders o WHERE
+      o.customer_id = c.id)`. It's an anti-join: Postgres stops at the first match per
+      customer and, with an index on `orders.customer_id`, each check is one index probe. A
+      left join with `WHERE o.id IS NULL` gives the same result and often the same plan.
+      I'd avoid `NOT IN (SELECT customer_id FROM orders)`, because if that column can ever
+      be NULL, the query returns no rows at all. On a huge table the planner may choose a
+      hash anti-join instead, which is also fine.
+  - question: A dashboard joins customers to orders and to support tickets, and the order totals are inflated. Why?
+    answer: >-
+      Fan-out: joining one customer to two independent child tables pairs every order with
+      every ticket. A customer with four orders and three tickets yields twelve rows, so
+      each order total is counted three times. The fix is to aggregate each child table to
+      one row per customer in a subquery or CTE, then join those results, which makes each
+      join one-to-one. `count(DISTINCT ...)` rescues counts but not sums, because distinct
+      orders can have equal totals. In review I ask of each join whether the right side can
+      match more than once, and if so, distrust every aggregate over the left side.
+  - question: What join algorithms does Postgres use, and how does it choose?
+    answer: >-
+      Nested loop, hash join and merge join, chosen by cost estimates from table
+      statistics. A nested loop wins when the outer side is small and the inner side has an
+      index on the join key. A hash join wins for large equality joins: it hashes the
+      smaller side and probes with the other, limited by `work_mem`. A merge join wins when
+      both inputs arrive sorted on the key. Only a nested loop can do non-equality joins.
+      When a join is slow, I look at `EXPLAIN ANALYZE` for row estimates far from actual
+      counts, because a bad estimate leads to the wrong algorithm, often a nested loop over
+      far more rows than expected.

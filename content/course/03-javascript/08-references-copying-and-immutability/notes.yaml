@@ -1,0 +1,317 @@
+summary: >-
+  JavaScript has two kinds of value. Primitives (numbers, strings, booleans, `null`,
+  `undefined`, symbols and bigints) can't be changed, so copying one is always safe. Objects,
+  which include arrays, functions, dates and maps, live somewhere in memory, and a variable
+  holds a reference to one. Assigning, passing and returning copy the reference, never the
+  object, so two names can quietly mean the same thing.
+
+
+  That's the source of a whole family of bugs: a draft that edits the saved data, a function
+  that changes its caller's array, a duplicate check with `includes` that never matches. It
+  also explains why `===` on objects asks "the same object?" and never "the same contents?".
+
+
+  Copies come in two depths. A **shallow copy** (spread, `Object.assign`, `slice`) makes a new
+  outer object that shares everything nested. A **deep copy** (`structuredClone`) copies
+  every level, with limits on what it can copy. Most production code avoids deep copies
+  altogether with **immutable updates**: copy only the objects on the path to a change and
+  reuse the rest. That makes change detection a single reference comparison, which is what
+  React, Redux and most UI libraries rely on.
+remember:
+  - A variable holds a reference to an object, and assignment, arguments and return values copy that reference, never the object.
+  - '`===` on objects compares identity, so two objects with the same contents are never equal; compare a key such as `id` instead.'
+  - JavaScript passes everything by value, and for objects that value is a reference, so a function can mutate the caller's object but can't rebind the caller's variable.
+  - Spread, `Object.assign`, `slice` and `Array.from` make shallow copies, which share every nested object with the original.
+  - '`structuredClone` deep-copies plain data, dates, maps, sets and cycles, but throws on functions and returns class instances as plain objects.'
+  - '`const` stops reassignment, not mutation, and `Object.freeze` is shallow, so nested objects stay editable.'
+  - An immutable update copies only the objects on the path to the change and reuses the rest, so an unchanged part keeps its identity.
+sections:
+  - title: Pass by sharing
+    body: |-
+      People argue about whether JavaScript is "pass by reference". It isn't. Every argument
+      is passed by value. When the value is an object, the value being copied is a
+      reference, a pointer to the object. The technical name is **pass by sharing**.
+
+      The difference shows when a function reassigns its parameter.
+
+      ```js
+      function rename(user) {
+        user.name = "Sam"; // changes the caller's object
+        user = { name: "Alex" }; // rebinds the local name only
+        user.name = "Kim";
+      }
+      const member = { name: "Jo" };
+      rename(member);
+      console.log(member.name); // Sam
+
+      function bump(n) {
+        n = n + 1;
+      }
+      let visits = 1;
+      bump(visits);
+      console.log(visits); // 1
+      ```
+
+      Mutating through the parameter reaches the caller's object. Reassigning the parameter
+      only moves the local name to a new object. In true pass by reference, as with C++ `&`
+      parameters, the reassignment would change `member` too.
+
+      Primitives are immutable, so sharing them is harmless. String methods such as
+      `toUpperCase` always return a new string.
+
+      Equality follows the same model. `===` on objects compares references. `Object.is` is
+      the same except for two numbers: it treats `NaN` as equal to itself and tells `0` from
+      `-0`.
+
+      ```js
+      console.log({ a: 1 } === { a: 1 }); // false
+      console.log(NaN === NaN, Object.is(NaN, NaN)); // false true
+      console.log(0 === -0, Object.is(0, -0)); // true false
+      console.log([NaN].includes(NaN), [NaN].indexOf(NaN)); // true -1
+      ```
+
+      `includes`, `Set` and `Map` use SameValueZero, which finds `NaN`; `indexOf` uses `===`,
+      which never does. None of them compare object contents, so to find an equal object you
+      compare what identifies it, usually an `id`.
+  - title: What structuredClone copies, and what it doesn't
+    body: |-
+      `structuredClone` uses the structured clone algorithm, the one browsers use to send
+      data to a worker or store it in IndexedDB. It's a global in Node 17 and later and in
+      every current browser.
+
+      ```js
+      class Booking {
+        constructor(date) {
+          this.date = date;
+        }
+        nights() {
+          return 2;
+        }
+      }
+      const original = {
+        when: new Date("2026-10-01T00:00:00Z"),
+        tags: new Set(["window"]),
+        seats: new Map([["A1", "Sam"]]),
+        missing: undefined,
+        score: NaN,
+        booking: new Booking("2026-10-01"),
+      };
+      original.self = original;
+
+      const deep = structuredClone(original);
+      console.log(deep.when instanceof Date, deep.tags.has("window"), deep.seats.get("A1")); // true true Sam
+      console.log(deep.self === deep, deep.self === original); // true false
+      console.log("missing" in deep, deep.score); // true NaN
+      console.log(deep.booking instanceof Booking, deep.booking); // false { date: '2026-10-01' }
+
+      try {
+        structuredClone({ onSave: () => {} });
+      } catch (e) {
+        console.log(e.name); // DataCloneError
+      }
+      ```
+
+      It keeps dates, maps, sets, regular expressions, typed arrays, errors, `undefined`, `NaN`
+      and cycles. It loses the prototype, so a class instance comes back as a plain object
+      without its methods. Getters are read once and stored as plain values, and
+      non-enumerable properties are dropped. Functions, symbols and DOM nodes throw a
+      `DataCloneError`.
+
+      The older `JSON.parse(JSON.stringify(value))` is worse on almost every count:
+
+      ```js
+      const viaJson = JSON.parse(
+        JSON.stringify({ when: new Date(0), tags: new Set([1]), missing: undefined, score: NaN }),
+      );
+      console.log(typeof viaJson.when, viaJson.tags); // string {}
+      console.log("missing" in viaJson, viaJson.score); // false null
+      ```
+
+      Dates become strings, maps and sets become `{}`, `undefined` properties vanish, `NaN`
+      and `Infinity` become `null`, and a cycle or a bigint throws a `TypeError`. It is still
+      the right tool when you want a JSON-safe copy, because that's exactly what it checks.
+
+      Deep copying is O(size of the whole structure). Use it at boundaries, such as a draft
+      of a form or data handed to code you don't trust. Inside your own state updates, copy
+      the path instead.
+  - title: const, Object.freeze and how deep they go
+    body: |-
+      Three tools sound alike and protect different things. `const` protects the variable:
+      you can't point the name at another value, but the object it points at is as mutable as
+      ever. `Object.freeze` protects one object's own properties. Immutable updates protect
+      nothing by force: they are a habit of never changing shared data.
+
+      ```js
+      "use strict";
+      const settings = Object.freeze({ theme: "dark", limits: { upload: 10 } });
+      try {
+        settings.theme = "light";
+      } catch (e) {
+        console.log(e.name); // TypeError
+      }
+      settings.limits.upload = 99; // the nested object isn't frozen
+      console.log(settings.limits.upload); // 99
+      console.log(Object.isFrozen(settings), Object.isFrozen(settings.limits)); // true false
+      ```
+
+      Writing to a frozen property throws in strict mode, which covers ES modules and class
+      bodies. In a sloppy script the write is ignored without an error, which is worse. A
+      deep freeze recurses:
+
+      ```js
+      function deepFreeze(value) {
+        if (value === null || typeof value !== "object" || Object.isFrozen(value)) return value;
+        Object.freeze(value);
+        for (const key of Reflect.ownKeys(value)) deepFreeze(value[key]);
+        return value;
+      }
+      const config = deepFreeze({ retry: { times: 3 }, hosts: ["a", "b"] });
+      try {
+        config.hosts.push("c");
+      } catch (e) {
+        console.log(e.name); // TypeError
+      }
+      console.log(config.hosts); // ['a', 'b']
+      ```
+
+      Freezing has a blind spot: it covers properties, not the internal data of built-ins.
+      A frozen `Map` still accepts `set`, and a frozen `Date` still accepts `setFullYear`.
+
+      ```js
+      const m = Object.freeze(new Map());
+      m.set("k", 1);
+      console.log(m.size); // 1
+      ```
+
+      In practice, freezing is most useful in tests and development builds, to make an
+      accidental mutation throw where it happens. Some libraries, such as Immer, freeze the
+      state they produce for that reason.
+  - title: Immutable updates on nested data
+    body: |-
+      An immutable update has one rule: copy every object on the path from the root to the
+      change, and reuse everything else. The reused parts keep their identity, which is
+      called **structural sharing**.
+
+      ```js
+      const state = {
+        user: { name: "Sam", address: { city: "Leeds", postcode: "LS1" } },
+        todos: [
+          { id: 1, text: "Buy milk", done: false },
+          { id: 2, text: "Post letter", done: false },
+        ],
+      };
+
+      const moved = {
+        ...state,
+        user: { ...state.user, address: { ...state.user.address, city: "York" } },
+      };
+      console.log(moved.user.address.city, state.user.address.city); // York Leeds
+      console.log(moved.todos === state.todos); // true
+
+      const toggled = {
+        ...state,
+        todos: state.todos.map((t) => (t.id === 2 ? { ...t, done: !t.done } : t)),
+      };
+      console.log(toggled.todos[1].done, toggled.todos[0] === state.todos[0]); // true true
+
+      console.log(["a", "b", "c"].with(1, "B")); // ['a', 'B', 'c']
+      ```
+
+      The pay-off is cheap change detection. React bails out of a render when
+      `Object.is(prev, next)` is true, and `memo` compares each prop the same way. After an
+      immutable update, "did the to-do list change?" is one comparison, not a walk through
+      every item. Undo, time-travel debugging and optimistic updates also get simpler, since
+      old versions stay intact.
+
+      The cost is allocation: each update creates a few new objects and, for arrays, an O(n)
+      copy of the array. Deep nesting also makes the spreads long and prone to mistakes.
+      Two remedies are common. Keep state flat, with items stored by id, so the path is
+      short. Or use a library such as Immer, which lets you write mutating code against a
+      draft and produces the immutable update for you.
+pitfalls:
+  - "**Assuming spread makes a deep copy.** `{ ...basket }` copies one level, so `draft.lines.push(...)` edits the original too. Copy each nested object you change, or use `structuredClone` for a full independent copy."
+  - "**Checking for an object with `includes` or `===`.** A fresh object from a form or an API is never the same object, so the check always fails. Compare a key: `items.some((item) => item.id === product.id)`."
+  - "**Mutating a parameter.** A helper that sorts or pushes into an array it was given changes the caller's data. Treat parameters as read-only and return new values."
+  - "**Expecting `const` to make an object immutable.** It only stops reassignment. Freeze the object if you need enforcement, and remember that freezing is shallow."
+  - "**Deep cloning class instances.** `structuredClone` returns a plain object without methods, and JSON turns dates into strings. Give the class its own copy method, or clone the data and rebuild the instance."
+  - "**Cloning everything on every update.** A deep copy of large state per keystroke costs time and breaks identity for parts that didn't change, so memoised components redraw. Copy the path only."
+interview:
+  - question: What's the difference between a shallow copy and a deep copy, and how do you make each?
+    answer: >-
+      A shallow copy creates a new outer object whose properties point at the same nested
+      objects; a deep copy duplicates every level. Spread, `Object.assign`, `slice`, `concat`
+      and `Array.from` are shallow, so after `const draft = { ...cart }`, changing
+      `draft.owner` is safe but `draft.lines.push()` also changes `cart.lines`. For a deep copy
+      I use `structuredClone`, which handles dates, maps, sets and cycles, but throws on
+      functions and drops prototypes, so class instances come back as plain objects. The JSON
+      round trip is a fallback with more losses: dates become strings and `undefined`
+      disappears. In application state I usually want neither, and do an immutable update
+      that copies only the path to the change.
+  - question: Is JavaScript pass by value or pass by reference?
+    answer: >-
+      It's pass by value, where the value of an object variable is a reference, often called
+      pass by sharing. So a function receives a copy of the pointer. If it mutates the
+      object, `user.name = "Sam"`, the caller sees it, because both pointers lead to the same
+      object. If it reassigns the parameter, `user = {}`, only the local copy moves, and the
+      caller's variable is untouched. In real pass by reference, as with a C++ reference
+      parameter, that reassignment would change the caller's variable too. The practical
+      takeaway is that functions can mutate their inputs, so I treat parameters as read-only
+      and return new values, which keeps data flow visible.
+  - question: What are the limits of `structuredClone`?
+    answer: >-
+      It copies structured data but not behaviour. It supports primitives, plain objects,
+      arrays, dates, regular expressions, maps, sets, array buffers, typed arrays and error
+      objects, and it preserves cycles and shared references. It throws a `DataCloneError` for
+      functions, symbols and DOM nodes, so one method anywhere in the object fails the whole
+      call. It loses prototypes, so a class instance comes back as a plain object without
+      methods, and it drops property descriptors: getters become plain values and
+      non-enumerable properties disappear. It also costs time proportional to the whole
+      structure. So I use it for data at boundaries, such as a form draft or a message
+      to a worker, and give domain classes their own copy methods.
+  - question: What's the difference between `const` and `Object.freeze`?
+    answer: >-
+      `const` makes the binding constant, while `Object.freeze` makes an object's own
+      properties read-only. With `const cart = { items: [] }` I can't reassign `cart`, but
+      `cart.items.push()` works. `Object.freeze(cart)` stops adding, removing or changing
+      `cart`'s own properties, and in strict mode a write throws a `TypeError`, though in
+      sloppy scripts it's silently ignored. Freeze is shallow: `cart.items` is still a mutable
+      array unless I freeze it too, which is why test helpers often have a recursive
+      `deepFreeze`. It also doesn't reach internal slots, so a frozen `Map` still accepts
+      `set`. I use freeze to catch accidental mutations in tests and constants, not as a
+      security boundary.
+  - question: Why do React and Redux insist on immutable updates?
+    answer: >-
+      Because they detect change by reference, which is only correct if nobody mutates
+      existing objects. React compares state with `Object.is` and skips the render when the
+      reference is unchanged; `memo`, `useMemo` and effect dependencies compare the same
+      way. If I push into the state array and set it again, it's the same array, so React
+      sees no change and the screen goes stale. With an immutable update, I copy only the
+      objects on the path to the change, so changed parts get new identities and unchanged
+      parts keep theirs. That makes change detection O(1) per reference and enables undo
+      and time travel. The costs are extra allocations and verbose nested spreads, which
+      flat state or Immer reduces.
+terms:
+  - term: Pass by reference
+    say: JavaScript passes objects by reference.
+    means: It passes everything by value, and for an object that value is a reference. A function can
+      mutate the caller's object but can't rebind the caller's variable.
+  - term: Shallow copy
+    say: A copy of the object.
+    means: A new outer object that shares every nested object with the original. Spread,
+      `Object.assign`, `slice` and `Array.from` all make one.
+  - term: Deep copy
+    say: "`JSON.parse(JSON.stringify(x))`."
+    means: A copy of every level. `structuredClone` keeps dates, maps, sets and cycles, while the JSON
+      round trip turns dates into strings and drops `undefined`.
+  - term: Object equality
+    say: Two objects with the same contents are equal.
+    means: "`===` on objects compares identity: whether both names point at the same object. Compare
+      contents through a key such as `id`."
+  - term: "`const`"
+    say: "`const` makes a value constant."
+    means: "`const` stops the name being reassigned, not the object being changed. `Object.freeze` stops
+      changes, but only one level deep."
+  - term: Immutable update
+    say: Deep-copy everything, then change it.
+    means: Copy only the objects on the path to the change and reuse the rest, so unchanged parts keep
+      their identity and cheap `===` checks still work.

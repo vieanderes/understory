@@ -1,0 +1,314 @@
+id: security.xss-and-csp
+title: Cross-site scripting and CSP
+objective: "Run an XSS attack against your own page, stop it with `textContent` and escaping, and add a Content Security Policy as a second wall."
+level: essential
+minutes: 10
+concepts: [security.xss, security.output-encoding, security.csp, security.security-headers]
+prerequisites: [security.threat-modelling, js.changing-the-page]
+opening:
+  text: >-
+    You'll watch one visitor's review take over the page for everyone else, then stop it
+    with a one-word fix. Then you'll add a second wall, so one slip isn't the whole defence.
+
+steps:
+  - type: prose
+    id: what-xss-is
+    body: >-
+      Your page's **origin** is its scheme, host and port, like `https://recipes.example`. A
+      signed-in visitor's **session** is the cookie that proves who they are there.
+
+
+      **Cross-site scripting**, XSS for short, is when an attacker's text reaches another
+      visitor's page and runs as script. It runs on your origin, as that visitor. It can read
+      their page, and act as them.
+
+  # Chromium, through buildPlaygroundDocument: with innerHTML the second review becomes an
+  # img whose onerror sets the h1 to "Hacked"; with textContent it shows as text and the h1
+  # stays "Reviews". jsdom loads no images, so the checks look at the elements, not the h1.
+  - type: playground
+    id: run-and-fix-xss
+    concept: security.xss
+    difficulty: 1
+    prompt: >-
+      The second review was written by an attacker. Look at the heading: their code ran.
+      Change one word so every review shows as plain text.
+    html: |
+      <h1>Reviews</h1>
+      <ul class="reviews"></ul>
+    js: |
+      // The reviews, as the server sent them.
+      const reviews = [
+        "Arrived fast. Works great.",
+        "Nice <img src=x onerror=\"document.querySelector('h1').textContent = 'Hacked'\">",
+      ];
+      const list = document.querySelector(".reviews");
+
+      for (const text of reviews) {
+        const item = document.createElement("li");
+        item.innerHTML = text;
+        list.append(item);
+      }
+    editable: [js]
+    showTree: true
+    checks:
+      - label: No review turns into an image
+        selector: .reviews img
+        count: 0
+      - label: The second review shows its tags as text
+        selector: 'li:nth-child(2)'
+        text: <img src=x
+      - label: The heading still says Reviews
+        selector: h1
+        text: Reviews
+    solution:
+      js: |
+        // The reviews, as the server sent them.
+        const reviews = [
+          "Arrived fast. Works great.",
+          "Nice <img src=x onerror=\"document.querySelector('h1').textContent = 'Hacked'\">",
+        ];
+        const list = document.querySelector(".reviews");
+
+        for (const text of reviews) {
+          const item = document.createElement("li");
+          item.textContent = text;
+          list.append(item);
+        }
+    hints:
+      - Look at the line that puts `text` into `item`.
+      - '`innerHTML` reads a string as HTML. Which property reads it as plain text?'
+      - Replace `innerHTML` with `textContent`.
+
+  - type: prose
+    id: escaping-contexts
+    body: >-
+      `textContent` works when you set one element. When you build HTML as a string, on the
+      server or in a template, you **escape** instead: turn `<` into `&lt;`, `&` into `&amp;`,
+      and so on. The browser shows the character and never reads a tag.
+
+
+      Where the value lands matters. Inside a link's `href`, escaping isn't enough, as you'll
+      see. React escapes for you, until you use `dangerouslySetInnerHTML`.
+
+  - type: code-challenge
+    id: write-escape-html
+    concept: security.output-encoding
+    difficulty: 3
+    language: ts
+    prompt: >-
+      Write `escapeHtml(text)`, the escaping that makes text safe to print in HTML. Replace
+      `&` with `&amp;`, `<` with `&lt;`, `>` with `&gt;`, `"` with `&quot;` and `'` with
+      `&#39;`. Leave every other character as it is. An input of `&lt;` must come out as
+      `&amp;lt;`.
+    hints:
+      - Walk the string one character at a time, building a new one.
+      - A lookup object maps the five characters to their entities.
+      - "Start with `let out = '';` and `for (const ch of text)`."
+
+  # Chromium: clicking the escaped link below runs the javascript: URL (an alert fired).
+  - type: ai-review
+    id: review-escaped-javascript-url
+    concept: security.output-encoding
+    difficulty: 3
+    language: js
+    request: Show a link to the website each user puts on their profile. Escape everything.
+    flawClass: security
+    code: |
+      function profileLink(user) {
+        const name = escapeHtml(user.name);
+        const site = escapeHtml(user.website);
+        return `<a href="${site}">${name}'s website</a>`;
+      }
+    prompt: >-
+      An assistant wrote this. A user sets their website to `javascript:alert(document.cookie)`.
+      Whoever clicks the link runs that script. Tap the line at fault.
+    lines: [3]
+    reasons:
+      - text: An escaped `javascript:` address still runs as a link
+        correct: true
+        feedback: >-
+          Yes. It has no `<` to escape. Allow only addresses starting with `https://`.
+      - text: '`name` needs escaping twice'
+        feedback: >-
+          Once is right for HTML text. The danger is the address, which escaping doesn't judge.
+      - text: The template literal runs the code
+        feedback: >-
+          It only builds a string. The script runs later, when a visitor clicks the link.
+    fix: |
+      function profileLink(user) {
+        const name = escapeHtml(user.name);
+        const safe = user.website.startsWith("https://") ? user.website : "#";
+        return `<a href="${escapeHtml(safe)}">${name}'s website</a>`;
+      }
+
+  - type: prose
+    id: csp-and-nonce
+    body: |-
+      Everyone misses one escape someday. So add a second wall: a **Content Security
+      Policy**, or CSP. It's a response header, a label the server sends with the page:
+
+      ```http
+      Content-Security-Policy: script-src 'self' 'nonce-r4nd0m'
+      ```
+
+      Now the browser runs only your own script files and inline scripts marked
+      `nonce="r4nd0m"`. A **nonce** is a random value, new for every response. Injected
+      script lacks it, and `onerror="..."` handlers are refused too.
+
+  # Chromium, served with the header above: the nonce script ran; the plain inline script and
+  # the onerror handler were refused with "Executing inline script violates ... directive".
+  # Adding 'unsafe-inline' beside the nonce changed nothing (it is ignored when a nonce is
+  # present); 'unsafe-inline' without the nonce let both run.
+  - type: ai-review
+    id: review-unsafe-inline
+    concept: security.csp
+    difficulty: 3
+    language: http
+    request: Our CSP blocks our own analytics snippet. Make the inline scripts work again.
+    flawClass: security
+    code: |
+      Content-Security-Policy: default-src 'self';
+        script-src 'self' 'unsafe-inline';
+    prompt: >-
+      An assistant changed the policy. The analytics snippet runs again. So does the attacker's
+      `onerror` from the review. Tap the line at fault.
+    lines: [2]
+    reasons:
+      - text: '`unsafe-inline` replaced the nonce, so every inline script runs'
+        correct: true
+        feedback: >-
+          Yes. Put the nonce back, and give the analytics snippet `nonce="..."`.
+      - text: '`default-src ''self''` is too strict'
+        feedback: >-
+          It only sets the fallback. Scripts follow `script-src`, which now allows everything inline.
+      - text: The header needs a semicolon at the end
+        feedback: >-
+          A trailing semicolon is optional. The problem is what `script-src` now allows.
+    fix: |
+      Content-Security-Policy: default-src 'self';
+        script-src 'self' 'nonce-r4nd0m';
+      <!-- and on the snippet: <script nonce="r4nd0m">...</script> -->
+
+  - type: prose
+    id: security-headers
+    body: >-
+      A few more **security headers** switch on defences the browser already has.
+      `Strict-Transport-Security` makes it use HTTPS on every later visit.
+      `X-Content-Type-Options: nosniff` stops it guessing a file's type.
+
+
+      An **iframe** shows one page inside another. In **clickjacking**, a site loads yours in
+      an invisible iframe and tricks visitors into clicking your buttons. The CSP rule
+      `frame-ancestors 'none'` forbids any site from framing yours.
+
+  - type: fill-blank
+    id: fill-security-headers
+    concept: security.security-headers
+    difficulty: 2
+    language: http
+    prompt: >-
+      Finish the headers: allow only nonce-marked inline scripts, forbid framing, and stop
+      type guessing.
+    template: |
+      Content-Security-Policy: script-src 'self' '{{1}}-k7Qx2'; frame-ancestors {{2}}
+      Strict-Transport-Security: max-age=31536000
+      X-Content-Type-Options: {{3}}
+    blanks:
+      - key: '1'
+        answer: nonce
+      - key: '2'
+        answer: "'none'"
+      - key: '3'
+        answer: nosniff
+    bank: [nonce, hash, "'none'", "'self'", nosniff, sniff]
+
+  - type: explain-back
+    id: explain-two-walls
+    concept: security.csp
+    difficulty: 3
+    prompt: >-
+      A teammate says a strict CSP means you can stop using `textContent` and escaping. Why
+      keep both?
+    rubric:
+      - Escaping and `textContent` stop hostile text becoming a tag in the first place.
+      - A CSP is a second wall that refuses script a missed escape let through.
+      - A CSP doesn't cover every hole, such as a `javascript:` link or a wrong policy, so the first wall still matters.
+    modelAnswer: >-
+      They do different jobs. `textContent` and escaping mean hostile text stays text, so
+      most XSS never forms. But someone will miss one someday, and the CSP catches that: an
+      inline script without the nonce is refused. And a CSP is only as good as its policy.
+      One `unsafe-inline` added in a hurry and it's gone. Two walls, so one gap isn't the end.
+
+recap:
+  - Put untrusted text in with `textContent`, or escape it for where it lands.
+  - Allow only `https://` addresses in links built from user input.
+  - Add a nonce CSP and the other security headers as a second wall.
+
+recall:
+  - id: card-what-xss-runs-with
+    concept: security.xss
+    front: When injected script runs through XSS, whose session and origin does it use?
+    back: >-
+      The visitor's. It runs on your origin with their cookies, so it can act as them.
+  - id: card-context-encoding
+    concept: security.output-encoding
+    front: Why doesn't HTML escaping make a user's link address safe?
+    back: >-
+      A `javascript:` address has nothing to escape and still runs on click. Check the address
+      starts with `https://`.
+  - id: card-nonce
+    concept: security.csp
+    front: What does a per-response nonce in a CSP let you do?
+    back: >-
+      Run the inline scripts marked with that nonce, and block any inline script or handler
+      without it, such as an injected one.
+  - id: card-frame-ancestors
+    concept: security.security-headers
+    front: Which CSP rule stops another site putting your page in an iframe?
+    back: >-
+      `frame-ancestors 'none'`. It's the defence against clickjacking.
+
+references:
+  - kind: docs
+    title: Cross Site Scripting Prevention
+    authors: OWASP
+    venue: OWASP Cheat Sheet Series
+    url: https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html
+    note: Output encoding per context, safe sinks such as `textContent`, and URL checks.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Content Security Policy
+    authors: OWASP
+    venue: OWASP Cheat Sheet Series
+    url: https://cheatsheetseries.owasp.org/cheatsheets/Content_Security_Policy_Cheat_Sheet.html
+    note: Nonce and hash strategies, and why `unsafe-inline` defeats them.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Content-Security-Policy (CSP) header
+    authors: MDN contributors
+    venue: MDN Web Docs
+    url: https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Content-Security-Policy
+    note: Every directive, including `script-src`, `frame-ancestors` and nonces.
+    verified: true
+
+deepDive: >-
+  A nonce must be fresh per response and unguessable, so an attacker can't copy it into
+  their injected script. Reuse one across responses and it protects nothing.
+
+
+  When a policy lists a nonce, browsers ignore `'unsafe-inline'` beside it. That lets a site
+  ship both for very old browsers. Remove the nonce, though, and `'unsafe-inline'` opens the
+  door wide.
+
+
+  Escaping is not sanitising. Escaping turns `<` into `&lt;` so it shows as a character.
+  Sanitising removes dangerous parts and keeps some HTML, which you need only when users
+  must submit formatted text. It's far harder to get right; use a tested library such as
+  DOMPurify, never a regular expression.
+
+
+  A CSP can report violations without enforcing them: `Content-Security-Policy-Report-Only`
+  sends a report to an address you name. Roll a policy out that way first, watch what it
+  would block, then enforce it.

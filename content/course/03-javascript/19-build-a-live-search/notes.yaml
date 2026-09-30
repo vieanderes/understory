@@ -1,0 +1,333 @@
+summary: >-
+  A live search looks like one feature and is really four problems stacked together. It must
+  turn keystrokes into requests without sending one per key, show the right answer when
+  answers arrive out of order, stay honest about empty results and failures, and avoid asking
+  the server the same question twice. The lesson built the core. These notes add the parts
+  that make it production grade, and the reasoning interviewers probe when they ask you to
+  "design a typeahead".
+
+
+  The tools are small. A **debounce** waits for a pause in typing before searching. Aborting
+  the previous request, or a sequence number, makes sure only the newest query can write to
+  the page. A small **cache** keyed by the normalised query makes going back instant. A status
+  line with a live region tells every user, including screen reader users, what's happening.
+
+
+  Each piece has a trade-off worth saying aloud. A longer debounce means fewer requests but a
+  laggier feel. A cache means speed but possibly stale data. Aborting saves bandwidth but
+  doesn't stop the server's work. Knowing which knob to turn, and why, is what separates a
+  demo from something people use all day.
+remember:
+  - Debounce runs a function once activity has stopped for a set time, while throttle runs it at most once per interval during the activity.
+  - Debounce search input (about 200 to 300 ms), and throttle continuous events such as scroll, resize or drag.
+  - A debounce is a timer you reset on every call, and it must forward the latest arguments and `this`.
+  - Debouncing reduces how many requests race, but only aborting or a sequence check stops a stale answer from overwriting a newer one.
+  - Abort the previous request before every new search, including when the answer comes from the cache or the box is cleared.
+  - Cache by the normalised query, store only successful answers, and bound the cache by size or age.
+  - Distinguish four states on screen, loading, results, no matches and error, and announce changes with a status region.
+sections:
+  - title: Debounce and throttle, built and compared
+    body: |-
+      Both limit how often a function runs when events fire in bursts. They differ in *when*
+      it runs.
+
+      A **debounce** waits for quiet. Each call resets a timer, and the function runs only
+      once calls have stopped for `waitMs`. It suits "act on the final value": a search box,
+      validating a field, saving window size after resizing ends.
+
+      A **throttle** keeps a steady rhythm. The function runs at most once per interval
+      while events keep coming. It suits "keep up during the activity": updating a position
+      while dragging, tracking scroll depth, an autosave that shouldn't wait for someone to
+      stop typing.
+
+      ```js
+      function debounce(fn, waitMs) {
+        let timer;
+        function debounced(...args) {
+          clearTimeout(timer);
+          timer = setTimeout(() => fn.apply(this, args), waitMs);
+        }
+        debounced.cancel = () => clearTimeout(timer);
+        return debounced;
+      }
+
+      function throttle(fn, intervalMs) {
+        let last = -Infinity;
+        let timer;
+        return function throttled(...args) {
+          const remaining = intervalMs - (Date.now() - last);
+          clearTimeout(timer);
+          if (remaining <= 0) {
+            last = Date.now();
+            fn.apply(this, args);
+          } else {
+            // A trailing call, so the final value is never lost.
+            timer = setTimeout(() => {
+              last = Date.now();
+              fn.apply(this, args);
+            }, remaining);
+          }
+        };
+      }
+
+      const search = debounce((query) => console.log("search:", query), 200);
+      const save = throttle((text) => console.log("autosave:", text), 200);
+
+      // Six key presses, 70 ms apart, then a pause.
+      const word = "coffee";
+      for (let i = 1; i <= word.length; i++) {
+        setTimeout(() => {
+          search(word.slice(0, i));
+          save(word.slice(0, i));
+        }, (i - 1) * 70);
+      }
+
+      // autosave: c        (at once: the leading call)
+      // autosave: cof      (at about 200 ms)
+      // autosave: coffee   (the trailing call, at about 400 ms)
+      // search: coffee     (200 ms after the last key, at about 550 ms)
+      ```
+
+      Details interviewers look for: the timer lives in the closure, so each debounced
+      function has its own; `...args` and `apply(this, ...)` forward the latest arguments and
+      the receiver, so it works as a method; and a `cancel` lets you drop a pending call when
+      a component goes away. Variants add a **leading** edge (run on the first call, then
+      ignore the burst, useful against double-clicked buttons) and a `maxWait` that forces a
+      run during very long bursts. Use `function`, not an arrow, for the returned wrapper
+      when you need `this`: an arrow would capture the `this` of `debounce` itself.
+  - title: Two ways to stop a stale answer
+    body: |-
+      Debouncing makes races rarer, not impossible. Someone pauses after "co", a slow request
+      goes out, they type "coco", and a second request goes out. Whichever lands last wins
+      unless you prevent it.
+
+      **Abort the previous request**, as the lesson did. The stale request stops, its promise
+      rejects with an `AbortError`, and you ignore that. It saves bandwidth and works with any
+      `fetch`.
+
+      **Or tag each request with a sequence number**, and only render if it's still the
+      newest. This works with APIs that can't be cancelled, and with results that come from
+      somewhere other than `fetch`:
+
+      ```js
+      const films = ["Alien", "Amélie", "Arrival", "Brazil", "Coco", "Up"];
+      // Shorter queries match more films and answer more slowly.
+      function searchFilms(query) {
+        return new Promise((resolve) => {
+          const found = films.filter((film) => film.toLowerCase().includes(query));
+          setTimeout(() => resolve(found), 120 - query.length * 20);
+        });
+      }
+
+      let latest = 0;
+      async function onInput(query) {
+        const id = ++latest;
+        const found = await searchFilms(query);
+        if (id !== latest) return console.log(`dropped stale "${query}"`);
+        console.log(`show "${query}":`, found.join(", ") || "No films match");
+      }
+
+      onInput("a");
+      onInput("ar");
+
+      // show "ar": Arrival
+      // dropped stale "a"
+      ```
+
+      The sequence check lets the stale request run to the end, so it wastes the
+      bandwidth, but it's simple and has no error path. In practice many teams use both:
+      abort to save work, and a check as a safety net when there are further `await`s
+      between the response and the render.
+
+      A common bug with either approach is forgetting the non-network paths. If the answer
+      comes from the cache, or the box is cleared, a request still in flight can land
+      afterwards and overwrite the right screen. Abort (or bump the counter) at the top of
+      every search, before any early return.
+  - title: Caching answers without caching mistakes
+    body: |-
+      People backspace and retype. Without a cache, "co" then "coc" then "co" asks the server
+      the same question twice. A `Map` keyed by the query fixes that. Four decisions make it
+      correct:
+
+      1. **Normalise the key**: trim and lower-case, so "Co " and "co" share an entry.
+      2. **Don't cache failures**: a 500 or a timeout must not stick for the next minute.
+      3. **Bound it**: by count, dropping the least recently used entry, and by age, so data
+         can't go stale forever.
+      4. **Decide what to store**: values, or promises. Storing the promise also deduplicates
+         requests already in flight, so three quick calls for the same query send one request.
+
+      ```js
+      function createSearchCache(search, { maxEntries = 50, maxAgeMs = 60_000 } = {}) {
+        const entries = new Map(); // key -> { promise, storedAt }
+        return function cachedSearch(raw) {
+          const key = raw.trim().toLowerCase();
+          const hit = entries.get(key);
+          if (hit && Date.now() - hit.storedAt < maxAgeMs) {
+            entries.delete(key); // re-insert, so Map order tracks recent use
+            entries.set(key, hit);
+            return hit.promise;
+          }
+          const promise = search(key).catch((error) => {
+            entries.delete(key); // a failure must not stick
+            throw error;
+          });
+          entries.set(key, { promise, storedAt: Date.now() });
+          if (entries.size > maxEntries) entries.delete(entries.keys().next().value);
+          return promise;
+        };
+      }
+
+      let requests = 0;
+      const films = ["Alien", "Amélie", "Arrival", "Brazil", "Coco", "Up"];
+      const search = async (query) => {
+        requests++;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        return films.filter((film) => film.toLowerCase().includes(query));
+      };
+      const cachedSearch = createSearchCache(search);
+
+      const results = await Promise.all([cachedSearch("co"), cachedSearch("Co "), cachedSearch("CO")]);
+      console.log(results[0], "requests:", requests); // [ 'Coco' ] requests: 1
+      await cachedSearch("co");
+      console.log("requests after a repeat:", requests); // requests after a repeat: 1
+      ```
+
+      A `Map` remembers insertion order, so deleting and re-inserting on a hit keeps the most
+      recently used entries at the end, and `keys().next()` gives the oldest. That's a
+      least-recently-used cache in a few lines.
+
+      Caching promises has one catch when you also abort. If a cached request is aborted
+      because one keystroke went stale, every caller sharing that promise gets the
+      `AbortError`. Either cache only successful values, as the full example below does, or
+      let the cached request finish and use a sequence check to ignore it.
+  - title: The whole search box, put together
+    body: |-
+      Here is the page with every piece in place: a label, a minimum query length, debounce,
+      abort, a deadline, a value cache, and a status line for each state.
+
+      ```html
+      <label for="search">Search films</label>
+      <input id="search" type="search" autocomplete="off">
+      <p id="status" role="status"></p>
+      <ul id="results"></ul>
+      ```
+
+      ```js
+      function debounce(fn, waitMs) {
+        let timer;
+        return (...args) => {
+          clearTimeout(timer);
+          timer = setTimeout(() => fn(...args), waitMs);
+        };
+      }
+
+      const box = document.querySelector("#search");
+      const status = document.querySelector("#status");
+      const list = document.querySelector("#results");
+      const cache = new Map(); // query -> films, successful answers only
+      let controller;
+
+      async function runSearch(raw) {
+        const query = raw.trim().toLowerCase();
+        controller?.abort(); // whatever was in flight is stale now
+        if (query.length < 2) {
+          list.replaceChildren();
+          status.textContent = "";
+          return;
+        }
+        if (cache.has(query)) return render(cache.get(query));
+
+        controller = new AbortController();
+        status.textContent = "Searching";
+        try {
+          const response = await fetch(`/films?${new URLSearchParams({ q: query })}`, {
+            signal: AbortSignal.any([controller.signal, AbortSignal.timeout(5000)]),
+          });
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          const films = await response.json();
+          cache.set(query, films);
+          render(films);
+        } catch (error) {
+          if (error.name === "AbortError") return; // a newer search replaced this one
+          list.replaceChildren();
+          status.textContent =
+            error.name === "TimeoutError" ? "Search timed out. Try again." : "Something went wrong. Try again.";
+        }
+      }
+
+      function render(films) {
+        list.replaceChildren(
+          ...films.map((film) => {
+            const item = document.createElement("li");
+            item.textContent = film;
+            return item;
+          }),
+        );
+        status.textContent = films.length === 1 ? "1 film" : films.length ? `${films.length} films` : "No films match";
+      }
+
+      box.addEventListener("input", debounce(() => runSearch(box.value), 250));
+      ```
+
+      We ran this against a stand-in server with a stubbed DOM: retyping a cached query sent
+      no request, a slow short query never overwrote a longer one, a 500 showed the error
+      message, and a request over five seconds showed the timeout message.
+
+      A few choices worth noticing. `textContent` rather than `innerHTML` keeps a film title
+      from ever running as markup. `role="status"` makes screen readers announce "3 films"
+      without moving focus. A timeout is reported differently from a server error, because
+      "try again" means something different for each. For a full combobox with arrow-key
+      navigation through suggestions, follow the ARIA Authoring Practices combobox pattern
+      rather than inventing one.
+pitfalls:
+  - "**Debouncing and calling it race-proof.** A pause after a short query still sends a slow request that can land after the next one. Keep the abort or the sequence check as well."
+  - "**Creating the debounced function inside the handler.** `input.addEventListener(\"input\", () => debounce(search, 300)())` makes a fresh timer on every key, so nothing is ever cancelled. Create it once, outside, and pass it as the listener."
+  - "**Losing arguments or `this` in a hand-written debounce.** Calling `fn()` inside the timer drops the latest query. Capture `...args` and use `fn.apply(this, args)`."
+  - "**Caching failed or aborted requests.** A cached rejection makes the query fail until the entry expires. Delete the entry when the promise rejects, or cache values only after success."
+  - "**Forgetting the early-return paths.** Returning a cached answer or clearing the box without aborting lets an in-flight response overwrite the screen a moment later. Abort first, before any `return`."
+  - "**Rendering results with `innerHTML`.** A title containing markup runs as HTML, which is an injection hole. Build elements and set `textContent`."
+interview:
+  - question: Implement a debounce function and explain how it works.
+    answer: >-
+      A debounce returns a wrapper that delays calling the original until calls stop for a
+      set time. Inside, a closure holds one timer. Each call clears the pending timer and
+      starts a new one, so only the call after the last pause survives. I write the wrapper
+      as a regular function taking `...args`, and call `fn.apply(this, args)` in the timer,
+      so the latest arguments and the receiver are preserved. I usually add a `cancel` method
+      for cleanup on unmount. Variants add a leading edge, which fires on the first call and
+      ignores the rest of the burst, and a `maxWait`, which guarantees a run during long
+      bursts. The trade-off is latency: the function always runs at least `waitMs` after the
+      last event.
+  - question: What's the difference between debouncing and throttling, and when do you use each?
+    answer: >-
+      Debounce waits for the activity to stop, then runs once; throttle runs at most once per
+      interval while the activity continues. Debounce fits cases where only the final value
+      matters: search as you type, validating a field, recalculating layout after a resize
+      ends. Throttle fits cases where you need regular updates during the activity: scroll
+      position, drag progress, an autosave, analytics on scroll depth. A throttle should
+      include a trailing call so the final state isn't dropped. For anything visual that
+      follows the pointer or scroll, `requestAnimationFrame` is often better than a fixed
+      throttle interval, because it matches the display's frames and pauses in background
+      tabs.
+  - question: Design the front end of a typeahead search.
+    answer: >-
+      I'd start with the request flow: debounce input around 250 ms, skip queries under two
+      characters, and encode the query with `URLSearchParams`. To keep results correct, I
+      abort the previous request on every new query, with a timeout signal combined via
+      `AbortSignal.any`, and ignore `AbortError`. A small LRU cache keyed by the normalised
+      query makes backspacing instant and doesn't store failures. The UI has distinct loading,
+      results, empty and error states, and uses the ARIA combobox pattern: a labelled input,
+      a listbox, arrow-key navigation and a live status. On the server side I'd want a
+      prefix index, a result limit, and rate limiting. The main trade-off is debounce length
+      versus perceived speed, which I'd tune by measuring.
+  - question: Why might you cache promises rather than values?
+    answer: >-
+      Caching the promise deduplicates requests that are still in flight, not only
+      finished ones. If three parts of the page ask for the same query within a few
+      milliseconds, a value cache misses three times and sends three requests; a promise
+      cache stores the first pending promise and hands it to all three callers, so one
+      request goes out. The costs are in failure handling. A rejected promise must be removed
+      from the cache, or every later caller gets the same failure. And if you cancel requests,
+      a shared promise means one caller's abort rejects everyone's result. So I cache promises
+      for shared, uncancelled data, and plain values when each caller manages its own
+      cancellation.

@@ -1,0 +1,202 @@
+summary: >-
+  HTTP methods and status codes are a shared vocabulary. The method tells every machine on the
+  path what kind of request this is: whether it may be cached, prefetched or retried. The
+  status tells the client what happened before it reads the body: done, done with nothing to
+  say, your mistake, or ours.
+
+
+  Getting them right is what makes an API work with software you didn't write. Browsers
+  prefetch `GET` links, caches store `GET` responses, proxies and client libraries retry
+  idempotent requests after a timeout, and monitoring counts `5xx` responses as outages. An API
+  that deletes on `GET` or reports errors with `200` confuses all of them.
+
+
+  The deepest idea here is idempotency. Networks fail in the middle: a client that times out
+  can't know whether the server acted. Idempotent methods can be retried safely. For the rest,
+  mainly `POST`, production APIs add an idempotency key so a retry is recognised and not
+  carried out twice. The same thinking gives you conditional requests, which stop two people
+  overwriting each other's changes.
+remember:
+  - Safe methods change nothing (`GET`, `HEAD`, `OPTIONS`), and idempotent methods leave the same state whether sent once or many times (the safe ones plus `PUT` and `DELETE`).
+  - '`POST` and `PATCH` aren''t idempotent, so a retry after a timeout can apply the change twice.'
+  - An `Idempotency-Key` header lets a server recognise a retried `POST` and replay the first response instead of acting again.
+  - '`2xx` means it worked, `3xx` look elsewhere, `4xx` the client must change the request, `5xx` the server failed and a retry may work.'
+  - '`401` means we don''t know who you are, `403` means we know and the answer is no.'
+  - '`201` comes with a `Location` header, `204` has no body, and `405` comes with an `Allow` header.'
+  - An `ETag` with `If-Match` turns a lost update into a `412`, and with `If-None-Match` turns an unchanged read into a `304`.
+sections:
+  - title: The status codes worth knowing
+    body: |-
+      Clients branch on the class first, then on specific codes. These are the ones you'll use
+      and meet most:
+
+      - **`200` OK**, **`201` Created** with `Location`, **`202` Accepted** when work happens
+        later, **`204` No Content** for a success with no body.
+      - **`301`** and **`308`** move permanently; **`302`** and **`307`** move temporarily.
+        `307` and `308` promise to keep the method and body, while clients may turn a `POST`
+        into a `GET` after `301` or `302`. **`303` See Other** sends the client to `GET` a
+        result page after a form `POST`. **`304` Not Modified** says the cached copy is
+        still good.
+      - **`400`** malformed request. **`401`** not authenticated, sent with a
+        `WWW-Authenticate` header. **`403`** authenticated but not allowed. **`404`** no such
+        resource, also used to hide that a resource exists. **`405`** wrong method, with
+        `Allow`. **`409` Conflict** with current state, such as a duplicate email.
+        **`410` Gone** for good. **`412`** a precondition failed. **`415`** a body type the
+        server can't read. **`422` Unprocessable Content** for well-formed input that breaks a
+        rule. **`429`** too many requests, with `Retry-After`.
+      - **`500`** an unexpected error. **`502` Bad Gateway** and **`504` Gateway Timeout**
+        come from a proxy whose upstream failed or was too slow. **`503` Service Unavailable**
+        for overload or maintenance, often with `Retry-After`.
+
+      When you're unsure, pick the most specific code a generic client can act on. A client
+      that knows only `4xx` from `5xx` still behaves sensibly.
+  - title: Making POST safe to retry with an idempotency key
+    body: |-
+      The client generates a unique key per logical operation, usually a UUID, and sends it
+      with the request and every retry of it. The server stores the key with the response it
+      gave. A repeat with the same key gets the stored response, not a second charge.
+
+      ```ts
+      type Saved = { status: number; body: string; fingerprint: string };
+      const seen = new Map<string, Saved>(); // a table with a unique key in production
+      let nextCharge = 1;
+
+      async function createCharge(request: Request): Promise<Response> {
+        const key = request.headers.get('Idempotency-Key');
+        if (!key) return Response.json({ error: 'Idempotency-Key header is required' }, { status: 400 });
+
+        const text = await request.text();
+        const earlier = seen.get(key);
+        if (earlier) {
+          if (earlier.fingerprint !== text) {
+            return Response.json({ error: 'Key reused with a different body' }, { status: 422 });
+          }
+          return new Response(earlier.body, {
+            status: earlier.status,
+            headers: { 'content-type': 'application/json', 'Idempotent-Replayed': 'true' },
+          });
+        }
+
+        const charge = { id: nextCharge++, ...JSON.parse(text) };
+        const saved = { status: 201, body: JSON.stringify(charge), fingerprint: text };
+        seen.set(key, saved);
+        return new Response(saved.body, { status: 201, headers: { 'content-type': 'application/json' } });
+      }
+      ```
+
+      Sending key `k-1` twice with `{"amount":500}` gives two `201` responses with the same
+      charge id 1, the second marked as replayed. The same key with `{"amount":900}` gets a
+      `422`, and a new key `k-2` creates charge 2.
+
+      In production the store is a database table with a unique constraint on the key, and
+      the row is inserted *before* the work starts, marked as in progress. A second request
+      arriving while the first is still running then fails the insert and can be told to
+      wait, often with a `409`. Keys expire after a day or so. Stripe's API works this way.
+  - title: Conditional requests and lost updates
+    body: |-
+      Two people open the same support ticket. Both edit it and save with `PUT`. The second
+      save silently wipes out the first. That's a **lost update**, and HTTP has a fix built in.
+
+      The server labels each version of a resource with an **ETag**. A client that wants to
+      change it sends `If-Match` with the tag it last saw. If the resource changed since, the
+      tag no longer matches and the server refuses with `412 Precondition Failed`. The same
+      tag in `If-None-Match` on a `GET` lets the server answer `304` with no body when nothing
+      changed, which saves bandwidth.
+
+      ```ts
+      import { createHash } from 'node:crypto';
+
+      let doc = { id: 7, title: 'Draft', body: 'Hello' };
+      const etagOf = (value: unknown) =>
+        `"${createHash('sha256').update(JSON.stringify(value)).digest('base64url').slice(0, 16)}"`;
+
+      async function handle(request: Request): Promise<Response> {
+        const current = etagOf(doc);
+        if (request.method === 'GET') {
+          if (request.headers.get('If-None-Match') === current) {
+            return new Response(null, { status: 304, headers: { ETag: current } });
+          }
+          return Response.json(doc, { headers: { ETag: current } });
+        }
+        if (request.method === 'PUT') {
+          const expected = request.headers.get('If-Match');
+          if (expected === null) return new Response(null, { status: 428 });
+          if (expected !== current) return new Response(null, { status: 412 });
+          doc = { ...(await request.json()), id: 7 };
+          return Response.json(doc, { headers: { ETag: etagOf(doc) } });
+        }
+        return new Response(null, { status: 405, headers: { Allow: 'GET, PUT' } });
+      }
+      ```
+
+      Run against this handler, a `GET` returns `200` and a tag, a second `GET` with that tag
+      returns `304`, the first `PUT` with the tag returns `200`, and a second `PUT` still
+      holding the old tag returns `412`. `428 Precondition Required` refuses writes that
+      don't say which version they expect. Many APIs use a version number column instead of a
+      hash, which is the same idea as optimistic locking in a database.
+  - title: HEAD, OPTIONS and the methods browsers send for you
+    body: |-
+      `HEAD` is a `GET` without the body: same status and headers. Clients use it to check
+      whether something exists or how large it is before downloading. Many frameworks answer
+      `HEAD` automatically from your `GET` route.
+
+      `OPTIONS` asks what a resource supports. Its most common sender is the browser itself:
+      before a cross-origin request that isn't "simple", such as a `PUT`, a `DELETE`, or a
+      `POST` with `Content-Type: application/json`, the browser sends a **CORS preflight**
+      `OPTIONS` request. Only if the server's answer allows the origin, method and headers does
+      the real request go out. That's why an API can work from `curl` and fail from a web
+      page: `curl` doesn't do CORS.
+
+      HTML forms can only send `GET` and `POST`. That's one reason older web apps used `POST`
+      for everything, and why some frameworks accept a hidden `_method` field. JSON APIs
+      called from JavaScript have no such limit.
+
+      Finally, methods are promises to *clients*, not locks. Nothing stops a handler from
+      deleting on `GET`. Link previews in chat apps, crawlers and browser prefetching will
+      follow such a link, which is why the lesson's `GET /books/clear` deletes books nobody
+      clicked.
+pitfalls:
+  - '**Changing data on `GET`.** Crawlers, prefetchers and link previews follow `GET` freely. Use `POST`, `PUT`, `PATCH` or `DELETE` for anything that changes state.'
+  - '**Retrying `POST` automatically.** A timeout doesn''t mean the request failed. Retry only idempotent methods, or send an idempotency key.'
+  - '**Answering errors with `200`.** Clients, caches and monitoring treat it as success. Use the true `4xx` or `5xx`.'
+  - '**Confusing `401` and `403`.** `401` asks the client to authenticate; `403` says authenticating again won''t help. Use `404` instead of `403` when even revealing existence is a leak.'
+  - '**Assuming `PATCH` is idempotent.** A patch such as "add 1 to quantity" doubles on retry. Send absolute values, or protect it with `If-Match`.'
+  - '**Last write wins on shared resources.** Without an `ETag` or version check, concurrent edits silently overwrite each other. Require `If-Match` on updates.'
+interview:
+  - question: What's the difference between safe and idempotent, and why does it matter?
+    answer: >-
+      Safe means the request doesn't change server state, like `GET` and `HEAD`. Idempotent
+      means repeating it leaves the same state as sending it once, which covers the safe
+      methods plus `PUT` and `DELETE`. It matters because infrastructure acts on it without
+      asking you: browsers prefetch safe requests, caches store them, and clients and proxies
+      retry idempotent requests after a timeout. `DELETE` twice gives `204` then `404`, but
+      the state is the same, so the difference is in the response, not the effect. `POST`
+      and `PATCH` are neither, so a blind retry can duplicate an order. That's why payments
+      APIs add idempotency keys.
+  - question: How would you make a payment endpoint safe for clients to retry?
+    answer: >-
+      With an idempotency key. The client generates a UUID per payment attempt and sends it
+      in an `Idempotency-Key` header on the first try and every retry. The server inserts the
+      key into a table with a unique constraint before doing any work, then stores the
+      response when done. A retry finds the key and gets the saved response. A concurrent
+      duplicate fails the insert and is told to retry later. A reused key with a different
+      body is a client bug and gets an error. Keys expire after a day or so. The cost is a
+      write per request and some storage, which is trivial next to a double charge.
+  - question: When would you return `401`, `403` and `404` for a resource the user can't see?
+    answer: >-
+      `401` when the request has no valid credentials at all: log in, then try again. `403`
+      when I know who they are and they aren't allowed, such as a member trying an admin
+      action they can see exists. `404` when revealing that the resource exists would itself
+      leak something, such as another customer's order id: to that user it effectively
+      doesn't exist. Returning `403` for other people's orders lets an attacker enumerate
+      which ids are valid. The trade-off is debuggability: a `404` is less helpful to a
+      legitimate user with a permissions problem, so logs should record the real reason.
+  - question: Two users edit the same record at the same time. How do you stop one overwriting the other?
+    answer: >-
+      Optimistic concurrency with conditional requests. Each read returns a version, as an
+      `ETag` header or a version field. Each update sends it back in `If-Match`. The server
+      applies the update only if the version still matches, ideally in one statement like
+      `UPDATE ... WHERE id = $1 AND version = $2`, and answers `412` otherwise, so the client
+      can reload, show the other change and let the user merge. It needs no locks held across
+      requests, which suits the web. When conflicts are frequent, such as a live shared
+      document, you need a different model, like operational transforms or CRDTs.

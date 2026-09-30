@@ -1,0 +1,254 @@
+summary: >-
+  A reverse proxy is the one front door of a web system. Browsers connect to it, it holds
+  the certificate, and it forwards each request over a private network to an app instance
+  behind it. With more than one instance, the same proxy chooses where each request goes,
+  which makes it a load balancer.
+
+
+  That position makes it the natural home for everything that shouldn't be written into
+  each app: TLS, compression, request size limits, timeouts, health checks and retries. It
+  also lets you add, remove and replace instances without the outside world noticing, which
+  the next lesson on releases depends on.
+
+
+  The proxy brings its own traps. The app now sees the proxy's address, not the client's,
+  and has to trust forwarded headers carefully. Long or streamed responses meet timeouts and
+  buffering. And sticky sessions can make state kept in memory look safe until an instance
+  goes away. These notes cover the mechanism behind each, with a production-shaped config.
+remember:
+  - A reverse proxy accepts the client's connection and opens its own connection to an upstream, so the app sees the proxy's address and must read the client's from headers.
+  - Trust `X-Forwarded-For` only as far as proxies you run, counting entries from the right, because the client controls everything to the left.
+  - TLS termination means the proxy decrypts and forwards plain HTTP on a private network, and the scheme the browser used travels in `X-Forwarded-Proto`.
+  - Active health checks probe each upstream on a timer; passive checks mark an upstream down after real requests to it fail; production setups use both.
+  - Round robin suits requests of similar cost, while least connections suits mixed durations such as model calls that take 50 ms or 20 seconds.
+  - A readiness check should say whether this instance can serve traffic, not whether every dependency is up, or one database blip takes every instance out at once.
+  - Retrying a request on another upstream is safe after a failed connection, and risky after the upstream received a non-idempotent request such as a booking.
+  - Sticky sessions hide state kept in one instance's memory; keep sessions in a shared store so any instance can serve any user.
+sections:
+  - title: A production-shaped Caddyfile, line by line
+    body: |-
+      The lesson's config had the minimum. This one is closer to what runs in front of a
+      real API. It passed `caddy validate` on Caddy 2.11.4.
+
+      ```text
+      {
+      	servers {
+      		trusted_proxies static 173.245.48.0/20
+      	}
+      }
+
+      booking.example.com {
+      	encode zstd gzip
+      	request_body {
+      		max_size 1MB
+      	}
+      	reverse_proxy app1:8080 app2:8080 app3:8080 {
+      		lb_policy least_conn
+      		lb_try_duration 5s
+
+      		health_uri /ready
+      		health_interval 5s
+      		health_timeout 2s
+
+      		fail_duration 30s
+      		max_fails 3
+      		unhealthy_status 5xx
+
+      		transport http {
+      			dial_timeout 2s
+      			response_header_timeout 60s
+      		}
+      	}
+      }
+      ```
+
+      The global `trusted_proxies` block names the addresses allowed to set forwarded
+      headers, here one range of a CDN in front of Caddy. Without it, Caddy ignores what
+      clients send and writes its own. A public domain name gets a certificate by ACME with
+      no further config.
+
+      `encode` compresses responses, and `max_size` refuses bodies over 1 MB before they
+      reach the app. `least_conn` sends each request to the instance with the fewest in
+      flight. `lb_try_duration` lets Caddy keep trying other upstreams for up to five
+      seconds when one can't be reached, which covers the gap before a health check notices.
+
+      The `health_*` lines are the **active** check: every five seconds, a request to
+      `/ready` with two seconds to answer. `fail_duration`, `max_fails` and
+      `unhealthy_status` turn on the **passive** check: three failures, or three 5xx
+      answers, within 30 seconds mark an upstream down for that long. Active checks catch an
+      instance that is down before users hit it. Passive checks catch one that answers
+      `/ready` happily and fails real requests.
+
+      `dial_timeout` bounds how long Caddy waits to connect, and `response_header_timeout`
+      how long for the first byte of the answer.
+  - title: The same front door in nginx
+    body: |-
+      nginx is the other proxy you'll meet most. This config passed `nginx -t` in the
+      official `nginx:alpine` image. TLS lines are left out to keep it short.
+
+      ```text
+      upstream booking_app {
+        least_conn;
+        server app1:8080 max_fails=3 fail_timeout=30s;
+        server app2:8080 max_fails=3 fail_timeout=30s;
+        keepalive 32;
+      }
+
+      server {
+        listen 80;
+        server_name booking.example.com;
+        client_max_body_size 1m;
+
+        location / {
+          proxy_pass http://booking_app;
+          proxy_http_version 1.1;
+          proxy_set_header Connection "";
+          proxy_set_header Host $host;
+          proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+          proxy_set_header X-Forwarded-Proto $scheme;
+          proxy_connect_timeout 2s;
+          proxy_read_timeout 60s;
+          proxy_next_upstream error timeout;
+        }
+      }
+      ```
+
+      Three things differ from Caddy. First, nginx forwards nothing by default: without the
+      `proxy_set_header` lines, the app gets no client address, no scheme and the upstream
+      name as its `Host`. Second, `$proxy_add_x_forwarded_for` *appends* to whatever the
+      client sent, which is why the app must count from the right. Third, open-source nginx
+      only has passive health checks, through `max_fails` and `fail_timeout`. Active
+      checks are part of the commercial version.
+
+      `keepalive 32` with `proxy_http_version 1.1` and an empty `Connection` header keeps
+      connections to the apps open between requests. Without it, nginx opens a new TCP
+      connection per request, which costs time and can exhaust ports under load.
+
+      `proxy_next_upstream error timeout` retries on another server when one fails. Since
+      nginx 1.9.13, a `POST` or `PATCH` that already reached an upstream isn't passed on
+      unless you add `non_idempotent`. That default protects you from a double booking.
+  - title: Streaming and slow responses through a proxy
+    body: |-
+      A proxy is built for requests that finish in milliseconds. Two of its defaults hurt
+      when a response is long or streamed, as a chat reply from a language model is.
+
+      **Timeouts.** nginx's `proxy_read_timeout` defaults to 60 seconds. It's the longest
+      gap allowed between two reads from the upstream, not the whole response. A model call
+      that thinks for 70 seconds before its first byte gets `504 Gateway Timeout` from the
+      proxy, while the app carries on working for nobody. A stream that sends a token every
+      second never trips it. Raise the timeout only on the routes that need it, so a hung
+      upstream elsewhere still fails fast.
+
+      **Buffering.** nginx buffers upstream responses by default. It reads as much as it can
+      from the app, then sends it on. For a stream of server-sent events, that means the
+      user sees nothing, then a whole paragraph at once.
+
+      ```text
+      location /api/chat/stream {
+        proxy_pass http://booking_app;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_buffering off;
+        proxy_read_timeout 300s;
+      }
+      ```
+
+      An app can also switch buffering off for one response by sending the header
+      `X-Accel-Buffering: no`, which nginx reads and strips. Caddy flushes immediately for
+      responses with `Content-Type: text/event-stream`, and its `flush_interval -1` forces
+      it for other types.
+
+      Two more checks when streams misbehave. A CDN in front may buffer too, with its own
+      settings. And compression can hold back small chunks, so exclude the stream's content
+      type from compression if tokens arrive in bursts.
+  - title: Health checks that don't take everything down
+    body: |-
+      A health check answers one question for the balancer: should this instance get
+      traffic now? What the endpoint checks decides how failures spread.
+
+      Suppose `/ready` runs `SELECT 1` against the database and fails if it can't. The
+      database has a two-second hiccup. Every instance fails its check at the same moment,
+      the balancer removes them all, and a brief slowdown becomes a full outage with `503`
+      for everyone. The same happens with a check that calls a model provider.
+
+      So split the questions. **Liveness** asks "is this process stuck?" and is answered by
+      the process alone. **Readiness** asks "can this instance take requests?" and covers
+      things local to it: it has finished starting, loaded its config, opened its pool, and
+      isn't shutting down.
+
+      ```js
+      import http from 'node:http';
+
+      let ready = false;
+      let draining = false;
+
+      const server = http.createServer((req, res) => {
+        if (req.url === '/live') return res.end('ok');
+        if (req.url === '/ready') {
+          res.statusCode = ready && !draining ? 200 : 503;
+          return res.end(res.statusCode === 200 ? 'ready' : 'not ready');
+        }
+        res.end('booking api');
+      });
+
+      server.listen(8080, () => {
+        ready = true; // warm-up work finished
+      });
+      process.on('SIGTERM', () => {
+        draining = true; // the balancer stops sending new requests
+      });
+      ```
+
+      A dependency that is down shows up in the requests that need it, as errors your
+      metrics and passive checks see. That keeps the instance serving everything that
+      doesn't need the broken part. The `draining` flag is the start of a graceful
+      shutdown, which the releases lesson finishes.
+pitfalls:
+  - "**Reading the first `X-Forwarded-For` entry as the client.** The client wrote it, so a blocked visitor or a rate-limited script picks its own address. Count proxies you run from the right, or configure your framework's trusted-proxy setting."
+  - "**Letting the app listen on a public port as well.** Anyone can then skip the proxy, its limits and its TLS, and set forwarded headers freely. Bind the app to a private network, or firewall the port."
+  - "**A readiness check that tests every dependency.** One slow database makes every instance fail at once, and the balancer serves `503` to all. Check what's local to the instance, and let dependency failures show as request errors."
+  - "**Default timeouts on long model calls.** nginx cuts the upstream off after 60 seconds without a byte, and the user sees `504` while the app keeps paying for the call. Raise timeouts per route, or stream so bytes keep flowing."
+  - "**Streaming through a buffering proxy.** The reply arrives all at once, and the stream looks broken. Turn buffering off for that route, or send `X-Accel-Buffering: no` from the app."
+  - "**Sticky sessions to fix lost logins.** They move the failure to deploys and crashes. Keep session data in a shared store and remove the need for stickiness."
+  - "**Retrying every failed request.** A booking the upstream received but didn't finish answering can be made twice. Retry freely only when the connection failed, and give writes an idempotency key."
+interview:
+  - question: What's the difference between a layer 4 and a layer 7 load balancer, and when would you pick each?
+    answer: >-
+      A layer 4 balancer forwards TCP connections without reading them; a layer 7 balancer
+      understands HTTP and routes each request. Layer 4 is cheaper and protocol-agnostic,
+      so it suits databases, raw TCP services, or passing TLS through untouched. But it
+      balances connections, not requests, so one busy HTTP/2 or keep-alive connection can
+      pin lots of work on one instance. Layer 7 terminates TLS, sees paths and headers, and
+      can route `/api` and `/static` differently, retry, compress and add forwarded headers.
+      For a web API I'd use layer 7. The trade-off is that it decrypts traffic, so it holds
+      certificates and costs more CPU per request.
+  - question: How does your app find out the real client IP address behind a proxy, and what can go wrong?
+    answer: >-
+      From `X-Forwarded-For`, reading the entry added by the outermost proxy I run, counted
+      from the right. Each proxy appends the address it saw, but anything the client sent
+      sits to the left and is fake-able. With a CDN and Caddy in front, the client is the
+      second entry from the end. Frameworks have a setting for this, such as Express's
+      `trust proxy` with a hop count, and I'd configure that rather than parse by hand. Two
+      things break it: the app being reachable without the proxy, so anyone can set the
+      header, and a proxy added later without updating the count. Then rate limits and
+      audit logs record the wrong address.
+  - question: Walk me through what happens when one of three app instances crashes behind your load balancer.
+    answer: >-
+      For a few seconds some requests fail, then the balancer routes around it. Until the
+      next active check or enough passive failures, the balancer still sends that instance
+      its share, and those requests get connection errors. A retry setting such as Caddy's
+      `lb_try_duration` or nginx's `proxy_next_upstream` sends them to a healthy instance,
+      which is safe because the dead one never received them. Once the check fails, the
+      instance is skipped, and the other two take the load, so they need headroom of about
+      50%. When the container restarts and passes readiness, it rejoins. Anything stored in
+      its memory, such as sessions, is lost, which is why state lives in a shared store.
+  - question: Why might a team avoid sticky sessions, and when are they acceptable?
+    answer: >-
+      Because they hide state that lives in one instance, and that state disappears on every
+      deploy, crash or scale-down. They also balance badly: a few heavy users stuck to one
+      instance can overload it while the others idle, and new instances only get new
+      visitors. I'd move sessions to the database or Redis so any instance can serve anyone.
+      Stickiness is acceptable as an optimisation where losing the state is harmless, such
+      as a warm local cache, or for protocols that are stateful by nature, like a WebSocket
+      connection, which stays on one instance for its lifetime anyway. Then the client must
+      be able to reconnect and resume.

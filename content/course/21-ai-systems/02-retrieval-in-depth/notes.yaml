@@ -1,0 +1,238 @@
+summary: >-
+  Retrieval decides what the model is allowed to know. If the right passage isn't among the
+  few chunks placed in the prompt, the model either says it doesn't know or, worse, answers
+  confidently from what it did get. Most bad RAG answers are retrieval failures, and they
+  happen before generation starts.
+
+
+  The passage gets lost in four places. The split cut it off from its topic, the search ran
+  on the wrong words, it searched rows that could never qualify, or the ranking pushed it
+  below the cut. The fixes are structure-aware chunks with their context added back, query
+  rewriting, metadata filters inside the query, and a two-stage search: a cheap, wide first
+  pass and an accurate reranker over its candidates.
+
+
+  Reach for these once you can measure retrieval on its own: a set of real questions, each
+  labelled with the passage that answers it. Without that you can't tell whether a change
+  helped. For a small corpus that fits comfortably in the context window, or a handful of
+  pages, skip retrieval and put the documents in the prompt.
+remember:
+  - The model can only use what retrieval returns, so measure retrieval separately, as recall at k on labelled questions.
+  - Chunk along the document's structure and prepend the title and heading, so every chunk states its own topic.
+  - A reranker only reorders its candidates, so fetch 50 to 100 cheaply and rerank those down to a few.
+  - Filter by tenant, permission and date inside the search query, before the limit, never on the results afterwards.
+  - Rewrite conversational follow-ups into a standalone query before searching, with a small, fast model.
+  - Keyword and vector search fail on different queries, so hybrid search merges both, often with reciprocal rank fusion.
+  - Queries and documents must be embedded by the same model, and changing that model means re-embedding the whole corpus.
+sections:
+  - title: Chunk size and overlap, the trade-off underneath
+    body: |-
+      A chunk is the unit you embed, rank and paste into the prompt, so its size pulls in two
+      directions. Small chunks match a precise question well, because the vector is about one
+      thing, but each carries little context. Large chunks carry context but blur several
+      topics into one vector, and each costs more prompt tokens.
+
+      Fixed-size chunking with **overlap** is the baseline to beat. Each window repeats the
+      last few words of the previous one, so a sentence cut at a boundary appears whole in at
+      least one chunk.
+
+      ```python
+      def fixed_chunks(text: str, size: int, overlap: int) -> list[str]:
+          if not 0 <= overlap < size:
+              raise ValueError("overlap must be at least 0 and smaller than size")
+          words = text.split()
+          step = size - overlap
+          chunks = []
+          for start in range(0, len(words), step):
+              chunks.append(" ".join(words[start:start + size]))
+              if start + size >= len(words):
+                  break
+          return chunks
+
+
+      text = "Refunds reach your account within five working days of our receiving the item"
+      for chunk in fixed_chunks(text, size=6, overlap=2):
+          print(chunk)
+      # Refunds reach your account within five
+      # within five working days of our
+      # of our receiving the item
+      print(fixed_chunks("", 6, 2))  # []
+      ```
+
+      Real systems count tokens rather than words and use windows of a few hundred tokens,
+      but the logic is the same. Overlap duplicates text in the index, so it costs storage
+      and can return near-identical chunks side by side; dedupe before building the prompt.
+
+      A common refinement is **small to big**: embed small chunks for precise matching, but
+      store the id of the section each came from, and paste the whole section into the
+      prompt. You get the matching precision of small chunks and the context of large ones.
+  - title: Hybrid search and reciprocal rank fusion
+    body: |-
+      Vector search matches meaning: "money back" finds "refund". It is weak on exact tokens
+      such as order numbers, product codes, error messages and rare names, where keyword
+      search is strong. **Hybrid search** runs both and merges the lists.
+
+      The scores aren't comparable, one being a cosine distance and the other a text-match
+      score, so merge by rank instead. **Reciprocal rank fusion** gives each document the sum
+      of `1 / (k + rank)` over the lists it appears in. The constant `k`, often 60, stops the
+      very top ranks from dominating.
+
+      ```python
+      def rrf(rankings: list[list[str]], k: int = 60) -> list[tuple[str, float]]:
+          scores: dict[str, float] = {}
+          for ranking in rankings:
+              for rank, doc_id in enumerate(ranking, start=1):
+                  scores[doc_id] = scores.get(doc_id, 0.0) + 1 / (k + rank)
+          return sorted(scores.items(), key=lambda item: item[1], reverse=True)
+
+
+      keyword = ["faq-7", "policy-2", "blog-9"]   # full-text search, best first
+      vector = ["policy-2", "faq-3", "faq-7"]     # nearest embeddings, best first
+      for doc_id, score in rrf([keyword, vector]):
+          print(doc_id, round(score, 4))
+      # policy-2 0.0325
+      # faq-7 0.0323
+      # faq-3 0.0161
+      # blog-9 0.0159
+      ```
+
+      Documents found by both searches rise to the top. In PostgreSQL both halves can live in
+      one database: full-text search with a `tsvector` column and a GIN index for keywords,
+      pgvector for embeddings, merged in application code or a SQL query. The fused list then
+      goes to the reranker as its candidate pool.
+  - title: Measuring retrieval on its own
+    body: |-
+      Evaluate retrieval before generation. Build a set of real questions, each labelled with
+      the chunk or document that answers it, and score the search results directly. Two
+      numbers cover most needs. **Recall at k** is the share of questions whose answer
+      appears in the top k. **Mean reciprocal rank** rewards putting it near the top: 1 for
+      first place, 1/2 for second, 0 if missing.
+
+      ```python
+      def recall_at_k(results: dict[str, list[str]], relevant: dict[str, str], k: int) -> float:
+          hits = sum(1 for q, ids in results.items() if relevant[q] in ids[:k])
+          return hits / len(results)
+
+
+      def mrr(results: dict[str, list[str]], relevant: dict[str, str]) -> float:
+          total = 0.0
+          for q, ids in results.items():
+              if relevant[q] in ids:
+                  total += 1 / (ids.index(relevant[q]) + 1)
+          return total / len(results)
+
+
+      results = {
+          "how long do refunds take": ["faq-7", "policy-2", "faq-3"],
+          "swap a size in store": ["faq-3", "faq-9", "faq-1"],
+          "delivery to islands": ["faq-1", "faq-4", "faq-8"],
+      }
+      relevant = {
+          "how long do refunds take": "policy-2",
+          "swap a size in store": "faq-3",
+          "delivery to islands": "faq-12",
+      }
+      print(round(recall_at_k(results, relevant, k=3), 3))  # 0.667
+      print(round(recall_at_k(results, relevant, k=1), 3))  # 0.333
+      print(round(mrr(results, relevant), 3))               # 0.5
+      ```
+
+      Read the numbers per stage. Measure recall at 50 on the first stage: if the answer
+      isn't in the pool, no reranker helps, so fix chunking, rewriting or hybrid search.
+      Then measure recall at 5 after reranking: that is what the model sees. A question like
+      "delivery to islands" that is never found is worth reading by hand. Often the corpus
+      has no answer, and the right behaviour is to say so.
+  - title: Cost and latency of each fix
+    body: |-
+      Each fix adds a box to the request path, so choose them by measured gain. Rough orders
+      of magnitude, to be checked on your own stack: an indexed vector search over a large
+      corpus takes milliseconds to tens of milliseconds; a reranker over 50 candidates adds
+      tens to a few hundred milliseconds; a query rewrite with a small model adds a few
+      hundred milliseconds and a small token cost per request.
+
+      Contextual chunks cost at ingestion time, not at query time. Generating a short context
+      line per chunk with a model is a one-off cost per document, paid again only when the
+      document changes. That makes it one of the cheapest gains for a read-heavy system.
+
+      Rewriting is worth skipping when it isn't needed. The first message of a conversation
+      usually stands alone, and a rule such as "rewrite only when there is history" saves the
+      call on most traffic. Multi-query rewriting, which generates several phrasings and
+      merges their results with fusion, raises recall further at the price of several
+      searches per question.
+
+      Metadata filters are the exception: they make the search cheaper and are also an access
+      control. A tenant filter is not a tuning knob. It is the rule that one customer never
+      sees another's documents, so it belongs in the query and in a test.
+pitfalls:
+  - '**Filtering after the top k.** `results = search(q, limit=5)` followed by a tenant filter can leave nothing, and a missing filter leaks data. Put the filter in the `WHERE` clause, and check the approximate index returns enough rows under a selective filter.'
+  - '**Chunks that lost their topic.** A paragraph that starts "It takes 5 working days" matches nothing about refunds. Prepend the title and heading, or a generated context line, before embedding.'
+  - '**Reranking too few candidates.** Reranking the top five only shuffles them. Widen the first stage to 50 to 100, then rerank.'
+  - '**Reranking the whole corpus.** A cross-encoder scores one pair at a time, so running it over every passage is far too slow. It only ever sees the first stage''s candidates.'
+  - '**Mixing embedding models.** Vectors from different models, or different versions of one, live in different spaces. After an embedding model change, re-embed every document, ideally into a new column or index, and switch over when it is complete.'
+  - '**Tuning by eye.** Trying a few questions after each change feels like progress and hides regressions. Keep a labelled question set and compare recall at k before and after.'
+interview:
+  - question: Our RAG system gives wrong answers. How do you work out whether it's retrieval or generation?
+    answer: >-
+      I'd score retrieval on its own first, because the model can only use what it's given.
+      I'd take a sample of failing questions, label the passage that answers each, and check
+      recall at k: is the answer in the chunks we sent? If it isn't, the fix is in retrieval,
+      so I'd look at chunking, query rewriting, hybrid search and the first-stage pool size.
+      If it is there and the answer is still wrong, it's generation: the prompt, the order of
+      the context, or the model ignoring sources, which a grounding check can catch. The
+      trade-off is labelling effort, but even fifty labelled questions separate the two
+      causes quickly.
+  - question: Why use a reranker if you already have vector search?
+    answer: >-
+      Because a reranker reads the query and passage together, it judges relevance far more
+      accurately than comparing two separately made embeddings. Vector search is a bi-encoder:
+      documents are embedded once, ahead of time, so search is fast over millions of rows,
+      but the vectors can't capture how a specific question relates to a specific passage. A
+      cross-encoder does, at the cost of one model pass per pair. So I run two stages: a
+      cheap search fetches 50 to 100 candidates, the reranker scores them, and I keep the top
+      five. When not to: on a tiny corpus or a tight latency budget, where recall at five is
+      already high, the extra hop may not pay.
+  - question: How do you keep one customer's documents out of another's answers in a multi-tenant RAG system?
+    answer: >-
+      Filter by tenant inside the search query, so ranking only ever sees that tenant's rows.
+      Filtering the top k afterwards is both a correctness bug, since it can leave nothing,
+      and a leak risk, since one missed filter exposes data. I'd enforce it in one place, such
+      as a repository function that requires the tenant id, and add a test that a query from
+      tenant A never returns tenant B's passage. With an approximate index, a selective filter
+      can return too few rows, so I'd use iterative index scans, a partial index, or a
+      partition per tenant for large tenants. Row-level security in PostgreSQL adds a second
+      layer if the application layer slips.
+  - question: When would you add keyword search to a vector search system?
+    answer: >-
+      When queries contain exact tokens that embeddings handle badly: order numbers, product
+      codes, error strings, rare names. Embeddings capture meaning, so "money back" finds
+      "refund", but they blur "ERR-4012" into "some error code". Keyword search nails those
+      and misses paraphrases. Hybrid search runs both and merges them by rank with reciprocal
+      rank fusion, because their scores aren't on the same scale. I'd confirm it on the
+      labelled set: if recall at k rises on the exact-token questions without dropping
+      elsewhere, keep it. The cost is a second index to maintain and a little latency.
+terms:
+  - term: Reranker
+    say: Better embeddings.
+    means: A cross-encoder that reads the query and each candidate together and scores the pair.
+      It is accurate but slow, so it only reorders the 50 to 100 candidates a cheap first
+      pass fetched.
+  - term: Query rewriting
+    say: Fixing the user's typos.
+    means: Turning a conversational follow-up such as "and the cheaper one?" into a standalone
+      query before searching, usually with a small, fast model.
+  - term: Metadata filtering
+    say: Filtering the results afterwards.
+    means: Restricting by tenant, permission or date inside the search query, before the limit.
+      Filtering afterwards can leave too few results or leak another tenant's rows.
+  - term: Hybrid search
+    say: Vector search is enough on its own.
+    means: Keyword and vector search run side by side and merged, often with reciprocal rank
+      fusion, because each fails on queries the other handles.
+  - term: Embedding model
+    say: Any model can embed at any time.
+    means: The model that turns text into vectors. Queries and documents must use the same one,
+      and changing it means re-embedding the whole corpus.
+  - term: Recall at k
+    say: How good the answers are.
+    means: The share of relevant chunks for a labelled question that appear in the top k
+      results. It measures retrieval apart from generation.

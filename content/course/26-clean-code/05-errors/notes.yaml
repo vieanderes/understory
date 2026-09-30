@@ -1,0 +1,294 @@
+summary: >-
+  Error handling decides where a failure becomes visible. Done badly, a bad input turns
+  into a `NaN` three calls later, a network outage shows up as "Profile not found", and an
+  empty `catch` hides a bug for months. Done well, a failure stops next to its cause, says
+  what went wrong, and reaches code that can do something sensible about it.
+
+
+  The rules fit in a few lines. **Fail fast**: check input at the edge of your code and
+  stop with a clear error. **Never swallow**: a `catch` handles the error for real,
+  rethrows it with context using `cause`, or isn't there. **Be specific**: named error
+  classes, or result values for expected failures, let callers handle the cases they
+  expect and let the rest rise. And **decide where errors are handled**: usually in a few
+  places near the top, such as a request handler or a UI error boundary, that log the
+  detail and show people a safe message.
+
+
+  The senior skill is choosing between the tools. Expected, recoverable outcomes like "card
+  declined" fit a returned result the compiler forces callers to check. Bugs and outages
+  fit exceptions that travel up to a boundary. Mixing the two, or catching everything
+  everywhere, is where error handling goes wrong.
+remember:
+  - Fail fast by validating input at the boundary and throwing a clear error, so the failure appears next to its cause.
+  - A `catch` must handle the error, rethrow it with context, or not exist, and an empty `catch` is a hidden bug.
+  - 'Rethrow with `new Error("what failed", { cause: error })` so logs keep the original error and its stack.'
+  - Named error classes let a `catch` handle the failures it expects with `instanceof` and rethrow everything else.
+  - Return a result for expected outcomes the caller must handle, and throw for bugs and outages.
+  - Inside `try`, write `return await promise`, or a rejection escapes the `catch`.
+  - Error messages are for developers, so log them in full and show users a short, safe sentence.
+  - Handle errors in a few boundaries near the top, such as a request handler or a React error boundary, not in every function.
+sections:
+  - title: Error classes that carry context
+    body: |-
+      A good error answers three questions for whoever reads the log: what failed, with
+      which input, and what caused it. A small hierarchy of classes carries all three, and
+      `cause`, part of JavaScript since ES2022, chains the original error underneath.
+
+      ```ts
+      class AppError extends Error {
+        constructor(message: string, options?: { cause?: unknown }) {
+          super(message, options);
+          this.name = new.target.name;
+        }
+      }
+
+      class NotFoundError extends AppError {
+        readonly resource: string;
+        readonly id: string;
+        constructor(resource: string, id: string) {
+          super(`${resource} ${id} not found`);
+          this.resource = resource;
+          this.id = id;
+        }
+      }
+
+      class UpstreamError extends AppError {
+        readonly service: string;
+        constructor(service: string, cause: unknown) {
+          super(`${service} request failed`, { cause });
+          this.service = service;
+        }
+      }
+
+      function parseReply(text: string): unknown {
+        try {
+          return JSON.parse(text);
+        } catch (error) {
+          throw new UpstreamError('catalogue', error);
+        }
+      }
+
+      try {
+        parseReply('<html>Bad gateway</html>');
+      } catch (error) {
+        if (error instanceof UpstreamError) {
+          console.log(error.name, '|', error.message, '|', error.cause instanceof SyntaxError);
+          // UpstreamError | catalogue request failed | true
+        }
+      }
+
+      const missing = new NotFoundError('Book', 'b42');
+      console.log(missing.name, missing.message, missing instanceof AppError);
+      // NotFoundError Book b42 not found true
+      ```
+
+      A few details make this work. `new.target.name` sets `name` to the subclass's name, so
+      logs say `NotFoundError`, not `Error`. Extra fields such as `resource` and `id` give
+      handlers structured data instead of parsing the message. A base `AppError` lets a
+      top-level handler tell your known errors from truly unexpected ones.
+
+      When Node prints an error with a cause, as `console.error` does, it shows the cause
+      and its stack underneath, marked `[cause]`. That chain is what turns "catalogue request
+      failed" into a fixable bug report. Throw `Error` objects, never strings: a thrown
+      string has no stack and no `cause`, and `instanceof Error` checks miss it.
+  - title: Throw or return a result?
+    body: |-
+      Exceptions and return values suit different failures. An **exception** unwinds the
+      stack until something catches it, which is right for bugs and outages that no nearby
+      code can fix. A **result** is an ordinary return value that says "it worked, here is
+      the value" or "it didn't, here is why". TypeScript can model it as a discriminated
+      union, and the compiler then refuses to let callers use the value without checking.
+
+      ```ts
+      type Result<T, E> = { ok: true; value: T } | { ok: false; error: E };
+
+      type CouponError = 'unknown-code' | 'expired' | 'below-minimum';
+
+      const COUPONS = new Map([
+        ['SPRING10', { percentOff: 10, expiresDay: 200, minimumPence: 2000 }],
+      ]);
+
+      function applyCoupon(code: string, basketPence: number, today: number): Result<number, CouponError> {
+        const coupon = COUPONS.get(code);
+        if (!coupon) return { ok: false, error: 'unknown-code' };
+        if (today > coupon.expiresDay) return { ok: false, error: 'expired' };
+        if (basketPence < coupon.minimumPence) return { ok: false, error: 'below-minimum' };
+        return { ok: true, value: Math.round(basketPence * (1 - coupon.percentOff / 100)) };
+      }
+
+      const result = applyCoupon('SPRING10', 1500, 100);
+      if (result.ok) {
+        console.log(`New total: ${result.value}`);
+      } else {
+        console.log(`Coupon refused: ${result.error}`); // Coupon refused: below-minimum
+      }
+      ```
+
+      Reading `result.value` before checking `result.ok` is a compile error, because
+      `value` doesn't exist on the failure shape. And the error cases are a union of
+      literals, so a `switch` over them can be made exhaustive.
+
+      The rule of thumb: if the caller is expected to handle the failure as part of normal
+      flow, such as a declined card, an invalid form or a sold-out room, return a result.
+      If the failure means something is broken, such as a network outage, a bug or
+      corrupted data, throw, and let it rise to a boundary. Results everywhere make every
+      call site verbose; exceptions everywhere hide the expected cases from the type system.
+  - title: Async errors that escape the try
+    body: |-
+      A `try` block only catches what fails while it is running. With promises, that has a
+      sharp edge: returning a promise without `await` hands it back to the caller before it
+      settles, so a later rejection skips your `catch` entirely.
+
+      ```js
+      async function fetchProfile() {
+        throw new Error('offline');
+      }
+
+      async function withoutAwait() {
+        try {
+          return fetchProfile(); // the promise leaves the try before it rejects
+        } catch {
+          return 'handled';
+        }
+      }
+
+      async function withAwait() {
+        try {
+          return await fetchProfile(); // the rejection is thrown here, inside the try
+        } catch {
+          return 'handled';
+        }
+      }
+
+      console.log(await withAwait()); // handled
+      await withoutAwait().catch((error) => console.log('escaped:', error.message)); // escaped: offline
+      ```
+
+      That is why the lesson's `loadProfile` writes `return await fetchProfile(id)`. Outside
+      a `try`, `return await` and `return` behave the same, so the rule is only about code
+      inside `try`.
+
+      A promise that rejects with nobody listening is an **unhandled rejection**. Since
+      Node 15, the default is to treat it like an uncaught exception, so the process prints
+      the error and exits with code 1. Fire-and-forget calls such as `sendAnalytics()`
+      without `await` or `.catch` are the usual source. Either await them or attach a
+      `.catch` that logs.
+
+      When running several operations at once, `Promise.all` rejects as soon as one fails
+      and you lose the other results. `Promise.allSettled` waits for all of them and
+      returns `{ status: 'fulfilled', value }` or `{ status: 'rejected', reason }` for each,
+      which suits "send these ten emails and report which failed".
+  - title: Validate at the edge, handle at the boundary
+    body: |-
+      Two places do most of the error work in a well-built system.
+
+      **The edge** is where outside data enters: a request body, a form, a file, a reply
+      from another service, an environment variable. Its type there is honestly `unknown`.
+      Parse it once into a typed value, and fail fast with a clear error if it doesn't fit.
+      Code inside can then trust its types and skip defensive checks. This is often
+      summarised as "parse, don't validate": the check produces a typed value rather than a
+      yes or no. Schema libraries such as Zod do this, where `schema.safeParse(input)`
+      returns either `{ success: true, data }` or `{ success: false, error }`.
+
+      ```ts
+      type NewBooking = { roomId: string; nights: number };
+
+      class ValidationError extends Error {
+        name = 'ValidationError';
+      }
+
+      function parseNewBooking(input: unknown): NewBooking {
+        if (typeof input !== 'object' || input === null) throw new ValidationError('Body must be an object');
+        const { roomId, nights } = input as Record<string, unknown>;
+        if (typeof roomId !== 'string' || roomId === '') throw new ValidationError('roomId is required');
+        if (!Number.isInteger(nights) || (nights as number) < 1) {
+          throw new ValidationError('nights must be a whole number of at least 1');
+        }
+        return { roomId, nights: nights as number };
+      }
+
+      console.log(parseNewBooking({ roomId: 'r7', nights: 2 })); // { roomId: 'r7', nights: 2 }
+      try {
+        parseNewBooking({ roomId: 'r7', nights: 0 });
+      } catch (error) {
+        if (error instanceof ValidationError) console.log(error.message);
+        // nights must be a whole number of at least 1
+      }
+      ```
+
+      **The boundary** is where errors are finally handled: the top of a request handler,
+      a job runner or a UI screen. It logs the full error with its `cause`, maps known
+      classes to a response, such as `ValidationError` to 400 and `NotFoundError` to 404,
+      and turns everything else into a generic 500 with no internal detail.
+
+      In React, an **error boundary** does this for rendering: a component that catches
+      errors thrown while rendering its children and shows a fallback instead of a blank
+      page. It doesn't catch errors in event handlers or asynchronous code, so those need
+      their own handling. In the Next.js App Router, an `error.tsx` file sets up an error
+      boundary for a route segment.
+
+      Between the edge and the boundary, most functions don't catch at all. They let errors
+      rise, and only catch the specific ones they can act on.
+pitfalls:
+  - "**Catching everything and returning a default.** `catch { return null; }` turns an outage into \"not found\" and a bug into an empty screen. Catch the specific error you expect with `instanceof` and rethrow the rest."
+  - "**Logging and carrying on.** `console.error(error)` followed by normal flow still swallows the failure: the caller acts on a value that isn't real. After logging, rethrow or return an explicit failure."
+  - "**Rethrowing without `cause`.** `throw new Error('Save failed')` inside a `catch` throws away the original stack and message. Pass `{ cause: error }` so the chain survives into the logs."
+  - "**Returning a promise from inside `try` without `await`.** The rejection happens after the `try` has finished, so the `catch` never runs. Write `return await` inside `try` blocks."
+  - "**Throwing strings.** `throw 'Not allowed'` has no stack, no `name` and fails `instanceof Error`. Always throw an `Error` or a subclass."
+  - "**Showing `error.message` to users.** Messages are written for developers and can leak internals such as SQL or file paths. Log the full error and show a short, safe sentence, with a stable code if clients need one."
+  - "**Sentinel values like `-1` or `0` for failure.** They look like real answers, so callers forget to check and the bad value travels on. Throw, or return a result type the compiler makes callers inspect."
+  - "**Checking everything everywhere.** Defensive checks in every function bloat the code and still miss the real entry points. Validate once at the edge into a typed value, then trust it inside."
+interview:
+  - question: When do you throw an exception, and when do you return an error value?
+    answer: >-
+      I return a result for failures the caller is expected to handle as normal flow, and
+      throw for failures that mean something is broken. A declined card, an invalid coupon
+      or a sold-out room are business outcomes: a `Result` type in TypeScript, a
+      discriminated union of `ok: true` with a value or `ok: false` with an error, makes the
+      compiler force callers to handle them. A network outage, a bug or corrupted data can't
+      be fixed by the immediate caller, so I throw and let it rise to a boundary that logs
+      it and returns a generic error. The trade-off: results everywhere make every call
+      site verbose, and exceptions everywhere hide expected cases from the type system.
+  - question: What's wrong with an empty catch block, and what should a catch do instead?
+    answer: >-
+      An empty `catch` swallows the failure: the program carries on with a value that looks
+      real, and the bug surfaces later, far from its cause, with no log to trace. A `catch`
+      should do one of three things. Handle the error for real, such as retrying or showing
+      "Try again". Rethrow it with context, `new Error("Basket b1 not loaded", { cause:
+      error })`, so the log has both the high-level story and the original stack. Or not
+      exist, letting the error rise to code that can decide. When I do catch, I narrow with
+      `instanceof` and rethrow anything I didn't expect, because catching broadly turns
+      outages into misleading answers like "not found".
+  - question: How do you design custom error types in JavaScript or TypeScript?
+    answer: >-
+      I create a small hierarchy that extends `Error`, with a base class for the
+      application's known errors and a few specific subclasses such as `NotFoundError`,
+      `ValidationError` and `UpstreamError`. Each sets `name`, often via `new.target.name`,
+      so logs show the real type, and carries structured fields, such as the resource and
+      id, so handlers don't parse messages. Constructors accept a `cause` to chain the
+      original error. At the boundary, `instanceof` maps each class to a response, like 404
+      or 400, and anything not derived from the base class is treated as a bug and becomes
+      a 500. I keep the hierarchy shallow: a type exists only if some code handles it
+      differently.
+  - question: What does "fail fast" mean, and where do you validate input?
+    answer: >-
+      Fail fast means detecting bad state as early as possible and stopping with a clear,
+      specific error, instead of carrying on with a default or a `NaN` that breaks
+      something far away. In practice I validate at the edges, where untrusted data enters:
+      request bodies, forms, files, other services' replies and environment variables at
+      start-up. There I parse the `unknown` input into a typed value, with a schema library
+      such as Zod or a hand-written parser, and throw a `ValidationError` naming the field.
+      Inside the system, functions trust their types, so I don't repeat checks everywhere.
+      The trade-off is that internal invariants still deserve an assertion where a bug
+      would otherwise corrupt data silently.
+  - question: Where should errors be handled in a web application?
+    answer: >-
+      In a few boundaries near the top, not in every function. On the server, one handler
+      around each request or job logs the full error with its cause chain, maps known error
+      classes to status codes, such as validation to 400 and not found to 404, and returns
+      a generic 500 for anything else, with no stack or SQL in the body. In the UI, React
+      error boundaries catch rendering errors and show a fallback for that part of the
+      page, and in Next.js an `error.tsx` file does that per route segment. Event handlers
+      and async code aren't covered by error boundaries, so they catch and report errors
+      themselves. Everywhere in between, code lets errors rise and only catches what it can
+      act on.

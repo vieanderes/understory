@@ -1,0 +1,285 @@
+summary: >-
+  The fastest JavaScript is the code a page never loads. Since every byte is downloaded,
+  parsed, compiled and run, shrinking the bundle improves load time, INP and hydration at
+  once. The work has three parts: find what's big with a bundle report, move what the first
+  screen doesn't need behind `import()`, and guard the result with a budget in CI.
+
+
+  The lesson teaches those three moves. These notes explain what the bundler does with a
+  dynamic import, how tree shaking removes unused exports and why it often fails, how to
+  split a React and Next.js app without creating loading waterfalls, and how to write a
+  budget check against compressed sizes.
+
+
+  Splitting isn't free. Each split adds a request and a wait at the moment the code is
+  needed, so the best candidates are large, rarely used features: an editor, a chart, a
+  map, an admin panel. The biggest wins often come from not shipping code at all: running
+  it on the server, using the platform instead of a library, or deleting a dependency.
+remember:
+  - Measure the production build, and read a bundle report before cutting anything, because the biggest part is rarely the one you'd guess.
+  - "A dynamic `import()` is a split point: the bundler puts that module and its private dependencies in a separate chunk loaded when the call runs."
+  - A static `import` at the top of a file loads the module with the page, however late you use it.
+  - Tree shaking drops unused exports only from ES modules with no side effects, so CommonJS packages and side-effectful files stay whole.
+  - Split by route first, then by rarely used feature, and start loading a chunk on intent, such as hover, to hide the wait.
+  - In Next.js, Server Components send no JavaScript for their own code, so move work that needs no interactivity to the server.
+  - A performance budget fails CI when a size or metric crosses its limit, and size budgets usually count compressed bytes.
+  - Content-hashed file names let unchanged chunks stay cached across deploys, so a stable vendor chunk costs returning visitors nothing.
+sections:
+  - title: What the bundler does with `import()`
+    body: |-
+      A bundler starts at your entry file and follows every static `import` to build a
+      module graph. Everything reachable that way goes into the entry chunk. A dynamic
+      `import("./chart.js")` is different: it marks a **split point**. The bundler puts
+      `chart.js`, and anything only it imports, into a separate chunk, and replaces the call
+      with code that fetches that chunk.
+
+      If two lazy chunks share a dependency, most bundlers move it into a shared chunk so it
+      downloads once. If the entry also imports it statically, it stays in the entry and
+      the lazy chunk reuses it.
+
+      At run time, `import()` is cached per module: the second call returns the same module
+      without downloading or evaluating it again. That makes loading on intent safe, because
+      calling it early and again later costs nothing extra.
+
+      ```js
+      // chart.js
+      console.log("chart.js evaluated");
+      export function drawChart(points) {
+        return points.length;
+      }
+      ```
+
+      ```js
+      // main.mjs: start the download on intent, use it on click.
+      let chartModule;
+      const loadChart = () => (chartModule ??= import("./chart.js"));
+
+      loadChart(); // for example on pointerenter over the Stats tab
+
+      const a = await loadChart();
+      const b = await import("./chart.js");
+      console.log(a === b); // true
+      console.log(a.drawChart([1, 2, 3])); // 3
+      // "chart.js evaluated" is printed once
+      ```
+
+      Run both files with `node main.mjs` to see it. The pattern matters in the browser:
+      start the import on `pointerenter` or `focus`, and by the time the click lands the
+      chunk is often already there. For whole routes, frameworks prefetch linked pages when
+      the link is visible, which hides the split from the user.
+
+      Chunk file names carry a hash of their contents, such as `chart-3f9a1c.js`. A deploy
+      that doesn't change the chart leaves its name, and its browser cache, intact. That's a
+      second benefit of splitting: a small change to your app code no longer throws away
+      the cached copy of a large, stable library.
+  - title: Tree shaking, and why it fails
+    body: |-
+      **Tree shaking** removes exports nobody imports. It works because ES module imports
+      are static: the bundler can see which names each file uses without running anything.
+
+      ```js
+      // format.js
+      export function formatPrice(pence) {
+        return `£${(pence / 100).toFixed(2)}`;
+      }
+
+      export function formatReceipt(lines) {
+        return lines.map((line) => `${line.name}  ${formatPrice(line.pence)}`).join("\n");
+      }
+      ```
+
+      ```js
+      // cart.js
+      import { formatPrice } from "./format.js";
+
+      console.log(formatPrice(1299));
+      ```
+
+      ```bash
+      npx esbuild cart.js --bundle --format=esm
+      ```
+
+      The output contains `formatPrice` and not `formatReceipt`. Three things commonly
+      defeat it:
+
+      - **CommonJS.** `require` and `module.exports` can be computed at run time, so the
+        bundler keeps the whole module. Rewrite `format.js` with `exports.formatPrice = ...`
+        and the same build keeps `formatReceipt` too. Prefer packages that ship ES modules.
+      - **Side effects.** A module that does something when loaded, such as setting a
+        global, must be kept even if none of its exports are used. Package authors declare
+        `"sideEffects": false` in `package.json` to promise there are none, which lets the
+        bundler drop unused files whole. A wrong promise silently deletes needed code, such
+        as an imported stylesheet.
+      - **Code the bundler can't prove is unused.** A top-level call such as
+        `const theme = createTheme()` might have side effects, so it stays. Libraries mark
+        such calls with a `/* @__PURE__ */` comment to say they're safe to drop.
+
+      Barrel files, an `index.js` that re-exports everything, make this worse in practice:
+      one import pulls the bundler through hundreds of modules, and any one with side
+      effects is kept. Next.js has an `optimizePackageImports` setting for libraries built
+      like this.
+  - title: Splitting React and Next.js apps
+    body: |-
+      In React, `lazy` wraps a dynamic import as a component, and `Suspense` shows a
+      fallback while it loads.
+
+      ```tsx
+      import { lazy, Suspense, useState } from 'react';
+
+      const RichEditor = lazy(() => import('./RichEditor'));
+
+      export function NoteForm() {
+        const [editing, setEditing] = useState(false);
+        return editing ? (
+          <Suspense fallback={<p>Loading editor</p>}>
+            <RichEditor />
+          </Suspense>
+        ) : (
+          <button onClick={() => setEditing(true)}>Edit note</button>
+        );
+      }
+      ```
+
+      Next.js splits by route automatically, so each page loads its own code. Inside a page,
+      `next/dynamic` combines `lazy` and `Suspense`, and `ssr: false` skips server rendering
+      for a component that needs browser APIs. That option only works in Client Components.
+
+      The larger lever in the App Router is the `'use client'` boundary. Server Components
+      run only on the server, and their code never reaches the browser. Everything a Client
+      Component imports does. So a syntax highlighter or a Markdown parser used to render
+      static output belongs in a Server Component, where it costs the browser nothing. Push
+      `'use client'` down to the small interactive leaves, such as a like button, instead of
+      marking a whole page.
+
+      Watch for **waterfalls**. If a lazy component, once loaded, lazily loads another, each
+      step waits for the previous one. The same happens when a lazy chunk fetches its data
+      only after it arrives. Start the data request and the chunk download together, and
+      don't split code the first screen needs: a lazy header adds a request to every page
+      load and saves nothing.
+
+      To see what's in each route's bundle, Next.js 16.1 and later ships
+      `next experimental-analyze` for Turbopack builds, and `@next/bundle-analyzer` covers
+      webpack builds.
+  - title: A budget check against compressed size
+    body: |-
+      The lesson's budget reads raw sizes. Most teams budget the compressed size, since
+      that's what travels, and keep an eye on raw size, since that's what the phone parses.
+      Node's `zlib` can compute both.
+
+      ```js
+      // check-budgets.mjs: run after the production build.
+      import { readFileSync } from "node:fs";
+      import { brotliCompressSync, gzipSync } from "node:zlib";
+
+      // Compressed-size budgets in kB, keyed by entry file.
+      const budgets = { "dist/app.js": 90, "dist/preview.js": 20 };
+
+      let failed = false;
+      for (const [file, limitKb] of Object.entries(budgets)) {
+        const raw = readFileSync(file);
+        const gzipKb = gzipSync(raw, { level: 9 }).length / 1000;
+        const brotliKb = brotliCompressSync(raw).length / 1000;
+        const verdict = gzipKb > limitKb ? "OVER" : "ok";
+        if (gzipKb > limitKb) failed = true;
+        console.log(
+          `${verdict} ${file}: ${(raw.length / 1000).toFixed(1)} kB raw, ` +
+            `${gzipKb.toFixed(1)} kB gzip, ${brotliKb.toFixed(1)} kB brotli, budget ${limitKb} kB`,
+        );
+      }
+      process.exit(failed ? 1 : 0);
+      ```
+
+      A non-zero exit code fails the CI step. Tools such as `size-limit` do the same with
+      more features, and Lighthouse CI can budget metrics like Total Blocking Time as well as
+      sizes.
+
+      Set budgets a little above today's size, not at an ideal you can't reach, or the
+      check fails on day one and gets switched off. When a pull request crosses a budget,
+      the useful response is a conversation: is this package worth its weight, can it load
+      later, is there a smaller one? Raising the budget is allowed, but it should be a
+      decision someone makes on purpose.
+  - title: Shipping less without splitting
+    body: |-
+      Splitting moves code later. Often you can remove it instead.
+
+      - **Use the platform.** `Intl.DateTimeFormat`, `Intl.NumberFormat` and
+        `Intl.RelativeTimeFormat` format dates, currencies and "3 days ago" in every modern
+        browser, with no library. `structuredClone` deep-copies objects. The `dialog` element
+        and CSS cover much of what modal and animation libraries once did.
+      - **Import narrowly.** A whole utility library for one function is common. Import the
+        single function from a package that ships ES modules, or write the ten lines.
+      - **Check before you install.** Sites such as bundlephobia show a package's size, and
+        your bundle report shows what an upgrade added.
+      - **Audit third-party scripts.** Tag managers, chat widgets and analytics can outweigh
+        your app, and you don't control their long tasks. Load them with `async` or after
+        the page is interactive, and remove the ones nobody reads.
+      - **Target modern browsers.** Compiling down to old JavaScript versions adds helpers
+        and polyfills. If your supported browsers all run modern syntax, set the build
+        target to match.
+
+      ```js
+      const price = new Intl.NumberFormat('en-GB', { style: 'currency', currency: 'GBP' });
+      console.log(price.format(1299 / 100)); // £12.99
+
+      const ago = new Intl.RelativeTimeFormat('en-GB', { numeric: 'auto' });
+      console.log(ago.format(-3, 'day')); // 3 days ago
+      console.log(ago.format(-1, 'day')); // yesterday
+      ```
+
+      Each of these is a deletion, which is the best kind of performance change: less to
+      download, parse, run and maintain.
+pitfalls:
+  - "**Measuring a development build.** Dev builds skip minifying and keep extra checks, so sizes can be several times larger. Always report on the production build."
+  - "**Waiting before using a static import.** A timer or an `await` before `marked.parse` doesn't change when `marked` loads. Only `await import()` creates a split point."
+  - "**Splitting what the first screen needs.** A lazy header or hero adds a request and a wait to every page load. Split large, rarely used features and keep the first view in the main chunk."
+  - "**Creating loading waterfalls.** A lazy chunk that lazily loads another, or fetches its data only once it arrives, stacks waits in series. Start chunk and data downloads together, or prefetch on intent."
+  - "**Importing a whole library through a barrel file.** One named import can drag in hundreds of modules if any has side effects. Import from the specific module path, or use `optimizePackageImports` in Next.js."
+  - "**Marking a whole page with `'use client'`.** Every import below it ships to the browser. Keep pages as Server Components and mark only the interactive leaves."
+  - "**Budgets nobody can meet.** A limit below today's size fails every build until someone disables it. Start slightly above the current size and tighten as you cut."
+interview:
+  - question: A React app's initial bundle is 1 MB. How would you reduce it?
+    answer: >-
+      Measure first, then remove, split and guard. I'd build for production and open a
+      bundle report per route to see which packages dominate. Then I'd remove before I
+      split: replace a date library with `Intl`, import single functions instead of whole
+      libraries, drop unused dependencies and move rendering-only work, like Markdown or
+      syntax highlighting, to Server Components where the framework supports them. Next I'd
+      split: routes first, then large features behind `import()` or `React.lazy`, such as an
+      editor or charts, prefetched on hover so the wait is hidden. Finally, a size budget in
+      CI on compressed bytes, so the next big package fails review. The trade-off with
+      splitting is latency when the feature is first used, so I wouldn't split anything the
+      first screen needs.
+  - question: What is tree shaking, and why might it not remove code you don't use?
+    answer: >-
+      It's the bundler removing exports that nothing imports, which works because ES module
+      imports are static and can be analysed without running code. It fails in three common
+      cases. CommonJS modules can compute their exports at run time, so bundlers keep them
+      whole. Modules with side effects must be kept even if their exports are unused, unless
+      the package declares `"sideEffects": false`. And top-level calls the bundler can't prove
+      pure stay unless annotated with `/* @__PURE__ */`. Barrel files make it worse, since one
+      import walks through every re-exported module. So I'd prefer packages that ship ES
+      modules, import from specific paths, and check the bundle report rather than assume.
+      The risk runs the other way too: a wrong `sideEffects: false` can drop a needed
+      stylesheet import.
+  - question: What are the trade-offs of code splitting?
+    answer: >-
+      Splitting makes the first load smaller but adds a request and a wait when the split
+      code is first needed. It pays off for large, rarely used features, like an admin panel
+      or a map, and for routes, since most visits see few pages. It hurts when you split
+      something the first screen needs, or when chunks load in series, a waterfall where a
+      lazy component lazily loads another or fetches data only after it arrives. I'd
+      mitigate by prefetching on intent, such as hover or a visible link, and by starting
+      data and code downloads together. There's also a caching upside: with content-hashed
+      names, a change to app code doesn't invalidate a stable vendor chunk. Too many tiny
+      chunks cost overhead per request, so bundlers merge small shared modules for you.
+  - question: How do you stop a bundle from growing back after you've optimised it?
+    answer: >-
+      With a performance budget enforced in CI, so growth fails a check like a failing test.
+      I'd set size budgets per entry or route on compressed bytes, a little above the current
+      size, using a script or a tool such as `size-limit`, and metric budgets such as Total
+      Blocking Time or LCP through Lighthouse CI against the production build. The check
+      should print which file grew and by how much, so the author can decide whether the
+      package is worth it, load it later or pick a smaller one. Raising a budget is allowed,
+      but it has to be deliberate and reviewed. The trade-off is noise: lab metrics vary run
+      to run, so I'd run Lighthouse several times and assert on the median, while size
+      budgets are deterministic and can be strict.

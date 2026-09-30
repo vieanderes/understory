@@ -1,0 +1,286 @@
+id: sysdesign.message-brokers
+title: Message brokers
+objective: Tell a queue from a log, key events so order holds, give each reader its own consumer group, and make consumers idempotent.
+level: advanced
+minutes: 10
+concepts: [sysdesign.queue-vs-log, sysdesign.partitions-and-ordering, sysdesign.consumer-groups, sysdesign.idempotent-consumers]
+prerequisites: [scale.queues-and-workers, scale.idempotency]
+opening:
+  text: >-
+    You'll pick the right broker for a design and explain what it guarantees. "Put a queue
+    in front of it" is only half an answer until you can say which kind, and why.
+
+steps:
+  - type: prose
+    id: name-queue-and-log
+    body: |-
+      A **message broker** is a server that holds messages between the services that send
+      them and those that process them. It comes in two kinds.
+
+      A **queue** gives each message to one consumer and deletes it once handled. RabbitMQ
+      and SQS work this way. A **log**, like Kafka, keeps messages in order for days. Each
+      reader tracks its own position, so many readers see everything and can replay it.
+
+  - type: multiple-choice
+    id: pick-one-queue-two-readers
+    concept: sysdesign.queue-vs-log
+    difficulty: 1
+    question: >-
+      Billing and analytics both need every order event. They share one work queue. What
+      happens?
+    choices:
+      - text: Each event reaches only one of them
+        correct: true
+        feedback: >-
+          Right. A work queue hands each message to one consumer, then deletes it.
+      - text: Both get every event
+        feedback: >-
+          That's what people expect. A queue splits the work between consumers instead.
+      - text: The second reader waits for the first
+        feedback: >-
+          They read side by side. Each one takes different messages.
+
+  - type: prose
+    id: name-partitions
+    body: |-
+      In Kafka a named log is a **topic**. A topic is split into **partitions**: several
+      ordered logs side by side, so many machines can share the work.
+
+      Each message carries a **key**, and one key always lands on the same partition. Its
+      place in that partition is its **offset**, 0, 1, 2 and on. Order holds inside a
+      partition, not across them.
+
+  - type: predict-output
+    id: predict-partition-order
+    concept: sysdesign.partitions-and-ordering
+    difficulty: 2
+    language: text
+    code: |
+      # 6 events keyed by cart, into a topic with 3 partitions
+      Partition:0  Offset:0  cart-7  created
+      Partition:0  Offset:1  cart-7  paid
+      Partition:0  Offset:2  cart-7  shipped
+      Partition:2  Offset:0  cart-3  created
+      Partition:2  Offset:1  cart-9  created
+      Partition:2  Offset:2  cart-3  paid
+    question: Why do cart-7's events come out as created, paid, shipped?
+    choices:
+      - text: One key always lands on one partition
+        correct: true
+        feedback: >-
+          Right. Order holds inside a partition, and the key picks the partition.
+      - text: Kafka orders the whole topic
+        feedback: >-
+          It doesn't. Partition 0 and partition 2 are read independently, in any interleaving.
+      - text: The consumer sorts them by time
+        feedback: >-
+          The consumer only reads offsets in order. The ordering came from the partition.
+
+  - type: prose
+    id: name-groups-and-offsets
+    body: |-
+      Readers join a **consumer group**. The group shares out the partitions, one consumer
+      per partition, and commits an **offset** for each: how far it has read.
+
+      So the partition count caps parallel work. Three partitions and five consumers leaves
+      two idle. A different group keeps its own offsets, so a new group can read everything
+      from the start. When consumers join or leave, the group reshuffles partitions: a
+      **rebalance**.
+
+  - type: ai-review
+    id: review-shared-group
+    concept: sysdesign.consumer-groups
+    difficulty: 3
+    language: ts
+    request: Build the new search index from every order event in the topic.
+    flawClass: logic
+    code: |
+      const consumer = kafka.consumer({ groupId: 'billing' });
+      await consumer.connect();
+      await consumer.subscribe({ topic: 'orders', fromBeginning: true });
+      await consumer.run({ eachMessage: async ({ message }) => indexOrder(message) });
+    prompt: >-
+      An assistant wrote this. The index came out nearly empty, and billing slowed down the
+      same hour. Tap the line at fault.
+    lines: [1]
+    reasons:
+      - text: It joins billing's group instead of its own
+        correct: true
+        feedback: >-
+          Yes. It resumes from billing's offsets and takes some of billing's partitions.
+      - text: '`fromBeginning` replays too much'
+        feedback: >-
+          Reading from the start is what a new index needs. It only applies to a new group.
+      - text: Indexing should happen after `run` returns
+        feedback: >-
+          `run` keeps consuming. Each message is handled as it arrives, as intended.
+    fix: |
+      const consumer = kafka.consumer({ groupId: 'search-indexer' });
+
+  - type: prose
+    id: name-idempotent-consumer
+    body: |-
+      A consumer processes a message, then commits. If it crashes in between, the message
+      comes again. SQS standard queues can also hand out the same message twice. That's
+      **at-least-once** delivery.
+
+      You made handlers **idempotent** in the Concurrency chapter: safe to run twice. Here
+      that means recording each message id with its effect, in one transaction, and
+      skipping ids you've already seen.
+
+  - type: ai-review
+    id: review-check-then-credit
+    concept: sysdesign.idempotent-consumers
+    difficulty: 4
+    language: ts
+    request: Make the payment consumer safe against duplicate deliveries.
+    flawClass: race
+    code: |
+      async function handle(msg: PaymentMessage) {
+        if (await db.processed.exists(msg.id)) return;
+        await db.accounts.credit(msg.account, msg.amount);
+        await db.processed.insert(msg.id);
+      }
+    prompt: >-
+      An assistant wrote this. Replaying one message twice in a test worked fine. Then a slow
+      consumer lost its partition mid-batch and a second consumer took over. One payment was
+      credited twice. Tap the line at fault.
+    lines: [2]
+    reasons:
+      - text: Two consumers can both pass the check first
+        correct: true
+        feedback: >-
+          Exactly. Check, then act, with a gap between. Both saw "not processed yet".
+      - text: '`credit` should run after `insert`'
+        feedback: >-
+          Swapping the order still leaves a gap. Both steps must be one atomic unit.
+      - text: The id should be the account, not the message
+        feedback: >-
+          An account gets many payments. Only the message id marks one delivery.
+    fix: |
+      async function handle(msg: PaymentMessage) {
+        await db.transaction(async (tx) => {
+          const fresh = await tx.processed.insertIfAbsent(msg.id); // unique key on id
+          if (!fresh) return;
+          await tx.accounts.credit(msg.account, msg.amount);
+        });
+      }
+
+  - type: code-challenge
+    id: write-apply-once
+    concept: sysdesign.idempotent-consumers
+    difficulty: 3
+    language: ts
+    prompt: >-
+      Write `applyOnce(messages, processed)`. Each message has an `id`, an `account` and an
+      `amount`. Return the total amount per account, counting each id once.
+
+
+      Skip ids already in the `processed` set, and add every id you apply to it. A duplicate
+      inside one batch also counts once. An empty batch returns `{}`.
+    hints:
+      - The set is your memory across batches. Check it before you add anything.
+      - A duplicate inside the same batch is caught the same way, if you add each id as you go.
+      - 'Start with `if (processed.has(m.id)) continue;` inside the loop.'
+
+  - type: explain-back
+    id: explain-at-least-once
+    concept: sysdesign.idempotent-consumers
+    difficulty: 4
+    prompt: >-
+      The producer sends each payment event exactly once. Why must the consumer still expect
+      duplicates?
+    rubric:
+      - A consumer commits its offset or acknowledges only after processing.
+      - A crash, timeout or rebalance between processing and committing redelivers the message.
+      - So delivery is at least once, and only an idempotent consumer makes the effect happen once.
+    modelAnswer: >-
+      Sending once isn't the same as processing once. The consumer handles the message, then
+      commits. If it crashes, times out or loses its partition before committing, the broker
+      hands the message out again. Some queues also duplicate on their own. So I record each
+      message id with its effect in one transaction and skip ids I've seen.
+
+recap:
+  - Choose a queue for jobs and a log for events many readers replay.
+  - Key events so the ones that must stay in order share a partition.
+  - Make every consumer idempotent, because delivery is at least once.
+
+recall:
+  - id: card-queue-vs-log
+    concept: sysdesign.queue-vs-log
+    front: What's the difference between a queue and a log?
+    back: >-
+      A queue gives each message to one consumer and deletes it on acknowledgement. A log
+      keeps messages in order, so many readers can read and replay them.
+  - id: card-ordering
+    concept: sysdesign.partitions-and-ordering
+    front: Where does Kafka guarantee order, and how do you use that?
+    back: >-
+      Only within a partition. Give events that must stay in order the same key, such as the
+      cart id.
+  - id: card-partition-cap
+    concept: sysdesign.consumer-groups
+    front: A topic has 4 partitions. How many consumers in one group can do work at once?
+    back: >-
+      Four. Each partition goes to one consumer in the group, so extra consumers sit idle.
+  - id: card-idempotent-consumer
+    concept: sysdesign.idempotent-consumers
+    front: How do you stop a redelivered payment message being applied twice?
+    back: >-
+      Record the message id with a unique key in the same transaction as the effect, and skip
+      it when the insert finds it already there.
+
+references:
+  - kind: docs
+    title: Introduction
+    authors: The Apache Software Foundation
+    venue: Apache Kafka documentation
+    url: https://kafka.apache.org/intro/
+    note: Topics, partitions, keys, and the ordering guarantee within a partition.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Amazon SQS standard queues
+    authors: Amazon Web Services
+    venue: Amazon SQS Developer Guide
+    url: https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/standard-queues.html
+    note: At-least-once delivery, and why a message can arrive twice or out of order.
+    verified: true
+  - kind: docs
+    title: Exactly-once processing in Amazon SQS
+    authors: Amazon Web Services
+    venue: Amazon SQS Developer Guide
+    url: https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/FIFO-queues-exactly-once-processing.html
+    note: FIFO queues and the five-minute deduplication interval on sends.
+    verified: true
+  - kind: book
+    title: Designing Data-Intensive Applications
+    authors: Martin Kleppmann
+    year: 2017
+    venue: O'Reilly Media
+    note: Chapter 11 compares message brokers with log-based brokers in depth.
+    primary: true
+    verified: true
+
+deepDive: >-
+  The Kafka output in this lesson is real: Kafka 4.3.1 in Docker, a topic with three
+  partitions, and six keyed events from the console producer. The partition comes from a hash of
+  the key modulo the partition count. So cart-7 went to 0, cart-3 and cart-9 shared 2, and
+  partition 1 got nothing. Adding partitions later changes that
+  mapping, so per-key order can break across the change. Pick a partition count with room to
+  grow.
+
+
+  Choosing a broker, roughly. SQS is a managed queue with almost nothing to run. Standard
+  queues are at least once with best-effort order. FIFO queues keep order per message group
+  and drop duplicate sends within five minutes. RabbitMQ is a flexible queue with
+  routing between exchanges and queues, and it also offers streams, a log-like queue type.
+  Kafka is a replicated log for high-volume events that several systems read and replay.
+  Many teams run a queue for jobs and a log for events side by side.
+
+
+  Exactly-once in Kafka exists, as idempotent producers plus transactions, but it covers
+  reading from and writing to Kafka itself. The moment your consumer writes to a database or
+  calls an API, you're back to at-least-once, and the idempotent consumer is what makes the
+  effect happen once. The outbox pattern from the architecture module solves the mirror
+  problem on the producer side.

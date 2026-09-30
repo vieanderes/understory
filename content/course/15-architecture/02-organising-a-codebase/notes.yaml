@@ -1,0 +1,206 @@
+summary: >-
+  How you arrange folders decides how far a change travels. Grouping by technical kind,
+  `controllers/`, `models/`, `validators/`, spreads every feature across every folder.
+  Grouping by feature, `bookings/`, `invoices/`, puts the code that changes together in one
+  place. A folder alone hides nothing, though, so each feature gets one entry file, and a
+  lint rule turns the convention of importing from `index.js` into a failing build.
+
+
+  The lesson also covers import cycles: two modules that import each other, which crash
+  when one reads a value the other hasn't set yet. These notes explain exactly why some
+  cycles crash and others run, how CommonJS differs, how a tool finds cycles, and how to
+  lay out a feature folder and its shared code so the boundaries stay honest as the code
+  grows.
+
+
+  You apply this on day one of a project and again whenever a feature's change keeps
+  touching five folders. Small scripts don't need it: a single folder of ten files is
+  already organised.
+remember:
+  - Group code by feature, because a feature's files change together and one change should touch one folder.
+  - A folder hides nothing by itself; one entry file per module plus a lint rule such as `no-restricted-imports` makes the boundary real.
+  - An import cycle runs or crashes depending on load order, so "it works today" proves nothing.
+  - In an ES module cycle, reading a `const` or `let` before its module has run throws a `ReferenceError`, while a function declaration is already usable.
+  - Break a cycle by moving what both sides need into a module that imports neither, or by removing one direction.
+  - 'Keep entry files short: re-export what outsiders need, because a barrel of everything invites cycles and slows tools.'
+  - Shared code should stay small and generic; a business rule in `shared/` is a feature without a folder.
+sections:
+  - title: Why some cycles crash and others run
+    body: |-
+      An ES module loads in phases. First Node reads every file in the graph and links the
+      imports to the exports, creating a binding for each exported name. Then it runs the
+      files, dependencies first. In a cycle, one file has to run before the other has
+      finished, and what that file can read depends on what kind of binding it touches.
+
+      A `const`, `let` or `class` binding exists from linking but has no value until its
+      line runs. Reading it earlier is the "temporal dead zone", and it throws the
+      `ReferenceError` from the lesson. A **function declaration** is different: it's
+      created and initialised during linking, so it's callable before its module has run.
+
+      ```js
+      // users.js
+      import { ordersFor } from './orders.js';
+      export function defaultRole() {
+        return 'customer';
+      }
+      export function badgeFor(userId) {
+        return ordersFor(userId).length > 10 ? 'regular' : 'new';
+      }
+
+      // orders.js
+      import { defaultRole } from './users.js';
+      console.log('orders sees', defaultRole()); // works: "orders sees customer"
+      export function ordersFor(userId) {
+        return [];
+      }
+      ```
+
+      Swap `defaultRole` for `const defaultRole = () => 'customer'` and the same cycle
+      crashes. That fragility is the problem: whether the code runs depends on a detail
+      nobody reviewing the change will look at.
+
+      CommonJS behaves differently again. `require` returns the other module's `exports`
+      object as it is at that moment, half filled. Reading a name that hasn't been assigned
+      yet gives `undefined`, not an error. Node 24 prints a warning, "Accessing
+      non-existent property 'DEFAULT_ROLE' of module exports inside circular dependency",
+      but the program carries on with the wrong value. That's worse than a crash, because
+      nothing stops.
+  - title: Finding cycles with a graph search
+    body: |-
+      Tools such as `import/no-cycle` and `madge --circular` build the import graph and
+      search it. The algorithm is a depth-first search that remembers which modules are on
+      the current path. Reaching a module that's already on the path means you've come
+      round in a loop.
+
+      ```js
+      function findCycle(graph) {
+        const state = new Map(); // 1: on the current path, 2: finished
+        const path = [];
+        function visit(node) {
+          if (state.get(node) === 2) return null;
+          if (state.get(node) === 1) return [...path.slice(path.indexOf(node)), node];
+          state.set(node, 1);
+          path.push(node);
+          for (const next of graph[node] ?? []) {
+            const cycle = visit(next);
+            if (cycle) return cycle;
+          }
+          path.pop();
+          state.set(node, 2);
+          return null;
+        }
+        for (const node of Object.keys(graph)) {
+          const cycle = visit(node);
+          if (cycle) return cycle;
+        }
+        return null;
+      }
+
+      console.log(findCycle({ app: ['users'], users: ['orders'], orders: ['users'] }));
+      // [ 'users', 'orders', 'users' ]
+      console.log(findCycle({ app: ['users'], users: ['orders', 'roles'], orders: ['roles'], roles: [] }));
+      // null
+      ```
+
+      The search visits each module and each import once, so it's linear in the size of
+      the graph and cheap enough to run on every commit. Two practical notes. Cycles
+      through type-only imports (`import type`) disappear when TypeScript compiles, so they
+      can't crash at runtime, though they still signal tangled design. And a cycle that
+      runs through an entry file is common: `a.js` imports `bookings/index.js`, which
+      re-exports `b.js`, which imports `a.js`. Inside a module, import siblings directly
+      rather than through your own `index.js`.
+  - title: A feature folder that scales
+    body: |-
+      A feature folder needs an inside as well as an outside. A layout that holds up for a
+      mid-sized web app:
+
+      ```text
+      src/
+        bookings/
+          index.ts            the public API: what other features may import
+          book-room.ts        a use case: one exported function
+          cancel-booking.ts
+          rules.ts            pure business rules, no I/O
+          store.ts            database queries for bookings only
+          http.ts             route handlers, thin
+          book-room.test.ts   tests sit next to the code they test
+        invoices/
+          index.ts
+          ...
+        shared/
+          money.ts            a Money type and formatting
+          dates.ts
+      ```
+
+      A few rules keep it honest. Dependencies between features go through `index.ts`
+      only, and ideally in one direction: invoices may depend on bookings, but then
+      bookings doesn't depend on invoices. If both need each other, either the boundary is
+      wrong or the dependency should become an event, which the events lesson later in
+      this chapter covers. `shared/` imports no feature at all, and a lint rule can
+      enforce that with the same `no-restricted-imports` patterns.
+
+      Colocating tests means a feature can be deleted or moved as one folder. It also makes
+      a missing test visible: a use-case file without a test beside it stands out.
+
+      When a feature grows large, it can get sub-features with their own entry files. The
+      rule stays the same at every level: a folder's outsiders see its entry file and
+      nothing else.
+  - title: The cost of barrels
+    body: |-
+      An entry file that re-exports a whole folder is often called a **barrel**. Barrels
+      make imports tidy, and they have three costs worth knowing.
+
+      First, loading. `import { formatPrice } from './shared/index.js'` makes the runtime
+      load every module the barrel re-exports, and everything those import. In a test
+      runner, that can turn one small test file into thousands of loaded modules. Bundlers
+      can drop unused exports through tree shaking, but only when the re-exported modules
+      have no side effects the bundler must keep.
+
+      Second, cycles. Once everything imports the barrel, it takes one careless line for a file inside the
+      folder to import the barrel too, closing a loop through it.
+
+      Third, a large barrel is a large public API. Every name in it is a promise to other
+      teams. The point of an entry file is to make that promise small.
+
+      So write the entry file by hand, list what outsiders need, and don't use
+      `export * from` across a whole folder. A short list also doubles as documentation:
+      reading `bookings/index.ts` tells a newcomer what the feature offers.
+pitfalls:
+  - '**Fixing a cycle by reordering imports.** It runs again, and the next unrelated import flips the order back. Move the shared value to a third module instead.'
+  - '**Assuming a cycle is safe because it only involves functions.** Function declarations survive a cycle, but a later refactor to an arrow function in a `const` crashes it. Remove the cycle rather than rely on the kind of binding.'
+  - '**Importing your own feature through its `index.ts`.** Files inside `bookings/` that import `bookings/index.ts` create cycles through the barrel. Import siblings by their own path inside a module.'
+  - '**Folders by feature with no entry file and no lint rule.** Any file can still import any other, so the layout only looks organised. Add `index.ts` and a rule that fails deeper imports.'
+  - '**`export *` in every entry file.** It turns every internal name into public API and pulls whole folders into tests and bundles. List exports by name.'
+  - '**A `shared/` folder that grows business rules.** It becomes the most-imported, least-owned code in the app. When a rule appears there, give it a feature folder.'
+interview:
+  - question: How would you structure the folders of a new backend service, and why?
+    answer: >-
+      By feature, with one entry file per feature and a lint rule that forbids deeper
+      imports. A feature such as bookings holds its handlers, rules, queries and tests, so
+      a change to cancelling lands in one folder and one reviewer's area. Inside each
+      feature I keep layers as files: thin HTTP handlers, pure rules, a store for queries.
+      Shared code is limited to generic things like money and dates and imports no feature.
+      Grouping by kind, `controllers/` and `models/`, looks tidy at first but spreads every
+      change across the tree. The trade-off is some duplication between features and a
+      judgement call about where a feature ends, which I'd revisit once real changes show
+      the seams.
+  - question: What is a circular dependency, and why does it matter if the code runs?
+    answer: >-
+      Two or more modules that import each other, directly or through a chain. It matters
+      because whether it runs depends on load order. In ES modules, the first module pauses
+      at its import while the other runs, and reading a `const` from the paused one throws
+      a `ReferenceError`; in CommonJS it quietly gives `undefined`. Add an import anywhere
+      that changes which file loads first and working code crashes. Even when it never
+      crashes, the modules can't be loaded, tested or reasoned about apart, so they're one
+      module split across files. I'd find what they share and move it into a module that
+      imports neither, and add `import/no-cycle` so it can't come back.
+  - question: How do you enforce module boundaries so they don't erode over time?
+    answer: >-
+      With tooling in CI, because conventions alone erode under deadline pressure. Each
+      module gets an entry file, and ESLint's `no-restricted-imports` fails the build on
+      any import past it; a cycle rule such as `import/no-cycle` catches loops. In a
+      monorepo, a package's `exports` field makes Node itself refuse internal paths. I also
+      keep entry files short and hand-written, so the public API is a deliberate list. The
+      trade-off is some friction: sometimes a developer needs an internal function and has
+      to export it properly, and that small cost is the point, because it makes each new
+      dependency a visible decision in review.

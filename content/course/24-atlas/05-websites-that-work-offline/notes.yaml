@@ -1,0 +1,138 @@
+summary: |-
+  A progressive web app is a website that keeps working without a network and can be installed like an app. Two pieces make one. A service worker is a script with no page of its own that sits between the site and the network, sees every request in its scope, and can answer from a cache. A web app manifest names the app, its icons and how it opens, so the browser can install it.
+
+  The heart of offline design is choosing a strategy per kind of request. Cache-first for files that never change under the same name, network-first for data that must be fresh when possible, stale-while-revalidate where speed matters more than the newest copy. Writes need their own plan, because a POST can't be answered from a cache.
+
+  PWAs meet their limits on iPhones. Install is a manual Add to Home Screen step, push reaches only web apps installed that way, and Safari can delete a site's data after seven days of use without a visit. These notes add the service worker lifecycle and why updates get stuck, a tested stale-while-revalidate handler, a strategy for each type of request, storage limits, and how to answer the interview questions on offline web apps.
+remember:
+  - A service worker controls requests only within its scope, the folder its script is served from and below, which is why `sw.js` usually sits at the site root.
+  - Service workers need HTTPS, except on localhost, because a script that intercepts every request must not be injectable by a network attacker.
+  - A new service worker waits until no tab uses the old one, unless it calls `skipWaiting()`, which is why regulars can see an old version after a deploy.
+  - Choose a strategy per request type, cache-first for hashed static files, network-first for fresh data, stale-while-revalidate where an old copy is acceptable.
+  - Never answer writes from a cache, and store failed writes locally to retry, since background sync is not available in every browser.
+  - On iPhones install is manual, push works only for Home Screen web apps from iOS 16.4, and Safari can clear site data after seven days of use without a visit.
+  - Personalised responses must not outlive the session, so clear user caches on sign-out.
+sections:
+  - title: The lifecycle, and why updates get stuck
+    body: |-
+      A service worker moves through fixed states, and most PWA bugs come from misunderstanding them.
+
+      - **Register.** The page calls `navigator.serviceWorker.register('/sw.js')`. The browser downloads and parses the script.
+      - **Install.** The `install` event fires once per version. This is where you precache the app shell with `cache.addAll`. If any file fails to download, installation fails and the old worker stays.
+      - **Waiting.** If an older worker controls open tabs, the new one waits. Two versions never control pages at the same time by default, which protects a page running old code from a worker expecting new files.
+      - **Activate.** When the last tab using the old worker closes, the new one activates. This is where you delete caches from old versions.
+      - **Fetch.** The active worker now receives `fetch` events for pages in its scope.
+
+      The browser checks for a new version when the user navigates to a page in scope, and on events such as push if it hasn't checked in the last 24 hours. If the script's bytes differ, even by one character, it installs the new version. Changing only a precached file without changing `sw.js` doesn't update anything, which is why build tools write a hash or version into the worker.
+
+      "Refreshing doesn't help" follows from this: a reload keeps the same tab open, so the old worker still controls it. `self.skipWaiting()` in install and `clients.claim()` in activate make the new worker take over at once. The trade-off: an open page may be running old JavaScript while the new worker serves new files. Many apps instead show "A new version is available" and reload when the user agrees, which avoids that mismatch.
+  - title: A tested stale-while-revalidate handler
+    body: |-
+      Stale-while-revalidate answers from the cache immediately and refreshes the copy in the background, so the next visit gets newer data.
+
+      ```js
+      // sw.js: answer from the cache at once, refresh the copy in the background.
+      self.addEventListener('fetch', (event) => {
+        if (event.request.method !== 'GET') return; // let the browser handle writes
+        event.respondWith(
+          caches.open('runtime-v1').then(async (cache) => {
+            const cached = await cache.match(event.request);
+            const refresh = fetch(event.request).then((response) => {
+              if (response.ok) cache.put(event.request, response.clone());
+              return response;
+            });
+            event.waitUntil(refresh.catch(() => {})); // keep the worker alive until it lands
+            return cached ?? refresh;
+          }),
+        );
+      });
+      ```
+
+      Run against a fake network and cache in Node, three visits gave `times v1` (nothing cached, so the network answered), `times v1` again (served from the cache while v2 was fetched), then, offline, `times v2` (the refreshed copy).
+
+      Four details carry the weight. Returning early for non-GET requests leaves writes to the network. `response.clone()` is needed because a response body can be read only once, and both the cache and the page want it. `event.waitUntil` keeps the worker alive until the background refresh finishes; without it the browser may stop the worker once the page has its answer. And `cached ?? refresh` falls back to the network on a first visit. If that network request fails too, the promise rejects and the page sees a network error, so pair this handler with an offline page for navigations.
+  - title: A strategy for each kind of request
+    body: |-
+      A real app mixes strategies, chosen by URL or request type in the `fetch` handler.
+
+      - **The app shell** (HTML entry, scripts, styles, fonts). Precache on install. Build tools give scripts and styles hashed names, such as `app.3f9a.js`, so the content at a name never changes and cache-first is safe for them. The HTML entry isn't hashed, so serve it network-first or stale-while-revalidate, or users never get the new build.
+      - **API data that should be fresh** (bus times, a basket, account balance). Network-first, falling back to the cache. Add a short timeout, a few seconds, so a weak signal doesn't leave users staring at a spinner before the fallback.
+      - **Content where a slightly old copy is fine** (avatars, article lists, product images). Stale-while-revalidate.
+      - **Writes** (POST, PUT, DELETE). Never cached. Offline, save the pending action to IndexedDB, show it as pending in the UI, and send it when the connection returns. The Background Sync API can wake the worker to retry, but it isn't in every browser, so also retry when the page next opens. Give each write an idempotency key, so a retry after a lost response doesn't create a duplicate.
+      - **Personalised responses.** Cache them per user if at all, and delete them on sign-out. A shared device must never show the previous user's data.
+      - **Navigations to pages never visited.** Serve a saved offline page rather than the browser's error.
+
+      Name caches with a version, such as `shell-v7`, and delete old versions in `activate`. Libraries such as Workbox package these strategies, and knowing the underlying choices lets you configure them sensibly.
+  - title: Storage limits and installability
+    body: |-
+      Offline data lives in the Cache API and IndexedDB, and browsers can evict it.
+
+      Browsers grant each site a quota, which varies by browser and by the device's free space. `navigator.storage.estimate()` reports usage and quota. Under storage pressure, browsers evict data from sites marked "best effort", usually least recently used first. `navigator.storage.persist()` asks the browser to exempt the site, and the browser may grant or refuse it. Safari adds its own rule: script-writable storage, including caches and IndexedDB, can be deleted after seven days of Safari use without the user interacting with the site. A web app on the Home Screen keeps its own counter, which resets whenever it's opened.
+
+      The design consequence: the server is the source of truth. Treat on-device data as a cache that may disappear, and never hold the only copy of something the user created for long. Sync pending writes as soon as a connection allows.
+
+      For installability, the manifest needs at least a `name` or `short_name`, icons (192 and 512 pixels are the common pair), a `start_url` and a `display` mode such as `standalone`, and the site must be served over HTTPS. Chromium browsers fire a `beforeinstallprompt` event that lets you offer install from your own button at a sensible moment; other browsers don't, so the prompt can't be your only path. On iPhones, show a short instruction for Share, then Add to Home Screen, to users who'd benefit, such as those who've enabled notifications on Android or visited several times.
+pitfalls:
+  - >-
+    **Cache-first on unhashed files.** `index.html` or `app.js` served cache-first means
+    users never see a new release. Use hashed file names, and serve the HTML entry
+    network-first or stale-while-revalidate.
+  - >-
+    **Expecting a reload to apply an update.** The old worker keeps control while its tabs
+    stay open. Use `skipWaiting` with `clients.claim`, or prompt the user to reload.
+  - >-
+    **Placing `sw.js` in a subfolder.** Its scope then covers only that folder. Serve it from
+    the root to control the whole site.
+  - >-
+    **Caching personalised data without clearing it.** The next person on a shared device
+    sees it. Key caches by user and delete them on sign-out.
+  - >-
+    **Treating the device as the source of truth.** Browsers evict storage, and Safari can
+    clear it after seven days without a visit. Sync to the server as soon as possible.
+  - >-
+    **Relying on the install prompt.** Only Chromium browsers fire `beforeinstallprompt`.
+    Offer instructions for iPhones and other browsers.
+  - >-
+    **Retrying writes without idempotency.** A retried POST after a lost response can
+    create a duplicate order. Send an idempotency key with each write.
+interview:
+  - question: What is a service worker, and how is it different from a web worker?
+    answer: >-
+      Both are scripts that run off the main thread with no DOM, but they do different jobs.
+      A web worker belongs to one page and exists to run CPU-heavy work without freezing the
+      UI; it lives and dies with that page. A service worker belongs to an origin and scope,
+      not a page. It sits between the site and the network, receives `fetch` events for every
+      request its pages make, and can answer from a cache, which is what makes offline
+      possible. It also receives push messages and can run briefly with no page open. The
+      browser starts and stops it as needed, so it can't keep state in memory between events;
+      anything lasting goes in the Cache API or IndexedDB.
+  - question: How would you make a booking app usable offline?
+    answer: >-
+      Split reads, writes and the app shell. The shell, meaning hashed scripts, styles and
+      icons, is precached, so the app opens without a network. Reads such as upcoming bookings
+      use network-first with a short timeout, falling back to the last cached copy with a
+      visible "last updated" time. Writes such as a new booking can't be answered from a
+      cache: offline, I'd save the pending booking in IndexedDB, show it as pending, and send
+      it when the connection returns, with an idempotency key so a retry never books twice.
+      The server remains the source of truth and may reject a pending booking if the slot was
+      taken, so the UI needs a clear conflict state. Personal caches are cleared on sign-out.
+  - question: After a deploy, some users still see the old version for days. Why, and how do you fix it?
+    answer: >-
+      Almost certainly the service worker lifecycle. A new worker installs but waits until
+      every tab controlled by the old one is closed, and regular users often keep a tab open
+      for days, so a reload doesn't help. A second cause is cache-first on unhashed files like
+      `index.html`, which serves the old entry point for ever. The fixes: give scripts and
+      styles hashed names and serve the HTML network-first or stale-while-revalidate; call
+      `skipWaiting()` in install and `clients.claim()` in activate, or show a "new version
+      available" prompt that reloads on consent; and delete old versioned caches in
+      activate. The prompt is safer when old page code and new files might not match.
+  - question: What are the limits of PWAs on iPhones?
+    answer: >-
+      Three matter most. Install is manual: Safari never prompts, so users must tap Share,
+      then Add to Home Screen, and most never do. Push notifications work only for web apps
+      added to the Home Screen, from iOS 16.4, never for a Safari tab. And Safari can delete a
+      site's script-writable storage, including service worker caches and IndexedDB, after
+      seven days of Safari use without a visit, so offline data can vanish. Device APIs such
+      as Web Bluetooth and Web NFC aren't available either, and outside the EU every iPhone
+      browser uses Safari's engine. So I'd design the server as the source of truth and guide
+      iPhone users to install when push matters.

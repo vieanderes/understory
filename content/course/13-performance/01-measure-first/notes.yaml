@@ -1,0 +1,247 @@
+summary: >-
+  Performance work starts with a number you trust. Without one, you can't tell whether a
+  change helped, and you'll spend days speeding up code nobody waits for. The lesson gives
+  you the vocabulary (latency, throughput, percentiles) and the habit of timing many warm
+  runs and reading the median.
+
+
+  These notes go further. A percentile is only as good as how you compute and combine it,
+  and averaging percentiles is one of the most common mistakes in dashboards. The tail
+  matters more than it looks, because one page often waits on many calls at once. And a
+  micro benchmark answers a narrow question: for "why is this page slow for real people",
+  you need field data and a profiler, not a stopwatch around one function.
+
+
+  Reach for a stopwatch to compare two ways of writing one piece of code. Reach for real
+  user monitoring to learn what people feel, and for a profiler to learn where the time
+  goes. Set a latency budget before you build, so every step has a number to stay under.
+remember:
+  - Describe latency with percentiles such as p50, p95 and p99, never an average, because an average hides the slow tail people complain about.
+  - p95 is the time that 95 in 100 requests beat, so 1 in 20 users waits longer than it.
+  - Percentiles can't be averaged or added, so keep raw timings or a histogram and compute the percentile over the whole set.
+  - When one page waits on many parallel calls, the slowest call sets the pace, so a rare backend tail becomes a common page tail.
+  - Time code with `performance.now()`, warm it up first, repeat many runs and report the median, plus a high percentile if the tail matters.
+  - Lab measurements find causes and check fixes, while real user monitoring (field data) tells you what people feel.
+  - A profiler shows where time goes, so profile before you optimise instead of guessing.
+  - A latency budget splits the wait people will accept across the steps, so each team has a number to defend.
+sections:
+  - title: Computing a percentile, and why an average lies
+    body: |-
+      The simplest correct definition is the **nearest rank**: sort the samples, and the
+      p-th percentile is the value at position `ceil(p / 100 × n)`, counting from 1. Other
+      methods interpolate between neighbours, and tools differ, so two dashboards can
+      disagree slightly on the same data. What matters is that you pick one and stay with
+      it.
+
+      ```js
+      // Nearest-rank percentile: the smallest value that p% of samples are at or below.
+      function percentile(samples, p) {
+        const sorted = [...samples].sort((a, b) => a - b);
+        const rank = Math.ceil((p / 100) * sorted.length);
+        return sorted[Math.max(0, rank - 1)];
+      }
+
+      const mean = (xs) => xs.reduce((sum, x) => sum + x, 0) / xs.length;
+
+      // 97 fast requests and 3 that hit a cold cache.
+      const timings = [...Array(97).fill(100), 2000, 2500, 3000];
+
+      console.log(mean(timings)); // 172
+      console.log(percentile(timings, 50)); // 100
+      console.log(percentile(timings, 95)); // 100
+      console.log(percentile(timings, 99)); // 2500
+      ```
+
+      The mean says 172 ms, a time **no request actually took**. It's too high to describe
+      the typical request and far too low to describe the slow ones. The percentiles tell
+      the real story: almost everyone gets 100 ms, and about 1 in 100 waits two and a half
+      seconds.
+
+      Latency data is skewed: it can't go below zero, but it can go very high. That's why
+      the mean drifts towards the tail without describing it. Two more habits help. Look at
+      the maximum as well, because it's where timeouts and retries live. And say how many
+      samples a percentile rests on: a p99 over 50 requests is one request, which is an
+      anecdote, not a trend.
+  - title: Percentiles don't average
+    body: |-
+      Dashboards often store one p95 per minute or per server, then average them for the
+      hour. The result isn't a p95 of anything. Each stored p95 describes its own group, and
+      the groups have different sizes and shapes.
+
+      ```js
+      function percentile(samples, p) {
+        const sorted = [...samples].sort((a, b) => a - b);
+        const rank = Math.ceil((p / 100) * sorted.length);
+        return sorted[Math.max(0, rank - 1)];
+      }
+
+      // A quiet hour and a busy hour.
+      const quiet = Array.from({ length: 20 }, (_, i) => 100 + i); // 100..119 ms
+      const busy = Array.from({ length: 980 }, (_, i) => 200 + (i % 100) * 10); // 200..1190 ms
+
+      const averageOfP95s = (percentile(quiet, 95) + percentile(busy, 95)) / 2;
+      const trueP95 = percentile([...quiet, ...busy], 95);
+
+      console.log(percentile(quiet, 95), percentile(busy, 95)); // 118 1140
+      console.log(averageOfP95s); // 629
+      console.log(trueP95); // 1140
+      ```
+
+      The quiet hour had 20 requests and the busy hour 980, yet the average weighs them
+      equally. It reports 629 ms when 1 in 20 requests really took 1,140 ms or more.
+
+      The fix is to keep data you can merge. Raw samples work at small scale. At large
+      scale, monitoring systems store **histograms**: counts of requests per latency bucket.
+      Bucket counts add up across servers and minutes, and you read a percentile from the
+      merged counts. The price is precision: the answer is only as fine as the buckets. The
+      same trap applies to adding percentiles: the p95 of a page isn't the p95 of its API
+      call plus the p95 of its render.
+  - title: The tail at scale
+    body: |-
+      A p99 sounds rare. It stops being rare when one screen depends on many calls. If a
+      page fans out to n backend calls in parallel and waits for all of them, it is as slow
+      as its slowest call.
+
+      ```js
+      // Chance that at least one of n parallel calls is slower than its own p99.
+      const atLeastOneSlow = (n, p = 0.99) => 1 - p ** n;
+
+      for (const n of [1, 10, 100]) {
+        console.log(n, `${(atLeastOneSlow(n) * 100).toFixed(1)}%`);
+      }
+      // 1 1.0%
+      // 10 9.6%
+      // 100 63.4%
+      ```
+
+      With 100 calls, most page loads include at least one p99 response. So the backend's
+      tail becomes the page's typical case. The same effect hits a user who visits many
+      pages in a session: the more requests they make, the more likely they meet the tail.
+
+      That's why teams set targets on p95 or p99, not the median, and why tail fixes pay off.
+      Common ones are removing the fan-out, putting a cache in front of a slow dependency,
+      setting timeouts so one slow call can't hold the page, and sending a second copy of a
+      request that hasn't answered by the p95 (a **hedged request**), accepting some extra
+      load in return.
+
+      One trap when load testing: a tool that waits for each response before sending the next
+      stops sending while the server stalls. The stall hides the requests that would have
+      queued behind it, so the reported tail looks better than users would see. This is
+      called **coordinated omission**. Tools that send at a fixed rate, whatever the server
+      does, avoid it.
+  - title: 'Lab, field and profiler: three different questions'
+    body: |-
+      A stopwatch around a function is a **lab measurement**: one machine, one input, under
+      your control. It's repeatable, so it's the right tool to compare two versions. It can't
+      tell you what people feel, because their devices, networks and data differ from yours.
+
+      **Real user monitoring** (RUM) records timings from real visits and sends them to your
+      servers. That's field data, and it's the number to report and to set targets on. The
+      next lesson covers the browser's version, the Core Web Vitals.
+
+      Between the two sits the **User Timing API**, which labels spans in your own code so
+      they appear in the browser's Performance panel and can be sent to your RUM. It works in
+      Node too:
+
+      ```js
+      performance.mark('cart:start');
+      const items = Array.from({ length: 200_000 }, (_, i) => ({ price: i % 50, qty: 1 + (i % 3) }));
+      const total = items.reduce((sum, item) => sum + item.price * item.qty, 0);
+      performance.mark('cart:end');
+
+      const entry = performance.measure('cart:total', 'cart:start', 'cart:end');
+      console.log(entry.name, entry.duration.toFixed(2), 'ms', total);
+      console.log(performance.getEntriesByType('measure').length); // 1
+      ```
+
+      When you know something is slow but not why, use a **profiler**. A sampling profiler
+      records which function is running many times a second and draws a flame chart: wide
+      bars are where the time goes. In the browser, record in the Performance panel. In
+      Node, run `node --cpu-prof app.js`, which writes a `.cpuprofile` file you can open in
+      Chrome DevTools. Profile first, then optimise the widest bar. Guessing usually picks
+      the code you wrote most recently, not the code that's slow.
+  - title: Benchmarks that lie, and budgets that hold
+    body: |-
+      Warm-up and repetition fix the two biggest benchmark errors. A few more catch people
+      out:
+
+      - **Dead code.** If a result is never used, an optimising compiler may skip part of
+        the work. Keep the result, for example by adding it to a total you print.
+      - **Unrealistic input.** Sorting 10 items says little about sorting 10,000. Benchmark
+        the sizes and shapes you have in production.
+      - **The wrong clock.** `Date.now()` is wall-clock time with millisecond steps, and it
+        can jump when the system clock is corrected. `performance.now()` is monotonic and
+        finer. Browsers deliberately coarsen it to blunt timing attacks, so time a batch of
+        calls when one call is too quick to measure.
+      - **A noisy machine.** Other processes steal CPU. Close them, repeat, and distrust
+        differences smaller than the spread between runs.
+
+      A **latency budget** turns "fast" into numbers before you build. Start from what people
+      will accept, then split it across the steps.
+
+      ```text
+      Search results within 1,000 ms at p95
+        network, both ways       150 ms
+        API and auth              50 ms
+        search query             300 ms
+        ranking model            300 ms
+        render in the browser    150 ms
+        spare                     50 ms
+      ```
+
+      Each step now has an owner and a number, and a regression shows up as a step over
+      its line. Keep some spare: budgets that add up to exactly the target break the day
+      one step has a bad week.
+pitfalls:
+  - "**Reporting the average latency.** It's the default in many tools, and it looks tidy. It hides the tail and describes no real request. Report p50 with p95 or p99, and say how many samples they rest on."
+  - "**Averaging percentiles across servers or hours.** Stored p95s look like numbers you can combine, but each describes a different group. Keep raw samples or histograms and compute the percentile over the merged data."
+  - "**Timing one cold run.** The first run pays for compiling and warming caches, and any single run can be hit by noise. Warm up, repeat twenty or more times, and compare medians."
+  - "**Benchmarking a toy input.** Code that wins on 10 items can lose on 10,000, where caches and memory behave differently. Use production-sized, production-shaped data."
+  - "**Optimising before profiling.** It feels productive to rewrite the loop you suspect. Record a profile first and fix the widest bar in the flame chart, then measure again."
+  - "**Treating a green lab number as the verdict.** Your laptop on office wifi is not a mid-range phone on a train. Use lab runs to find and check fixes, and field data to decide whether users feel them."
+interview:
+  - question: Why do teams track p95 or p99 latency instead of the average?
+    answer: >-
+      Because latency is skewed, and the average hides the slow requests that people
+      actually complain about. A few very slow requests pull the mean up, so it's too high
+      for the typical case and far too low for the slow ones, and it describes no real
+      request. Percentiles say something concrete: p95 of 480 ms means 1 in 20 requests is
+      slower. The tail also matters more than it looks. A page that fans out to 100 backend
+      calls hits at least one p99 response on about 63% of loads, so the backend's tail is
+      the page's normal case. The trade-off is data: a high percentile needs many samples to
+      be stable, and percentiles can't be averaged, so you keep histograms rather than one
+      number per minute.
+  - question: How would you benchmark two implementations of a function?
+    answer: >-
+      Warm both up, time many runs of each on realistic input, and compare medians and
+      spread rather than one run each. The first runs are slow because the engine
+      interprets before it compiles hot code, and caches are cold. I'd use
+      `performance.now()`, or a tool such as Vitest's `bench` or `tinybench`, which repeat
+      and report statistics. I'd use production-sized data, keep each result so the
+      compiler can't skip the work, and alternate the two versions so background noise hits
+      both. If the difference is smaller than the run-to-run spread, I'd call it a tie. The
+      caveat is that a micro benchmark answers a narrow question. Before optimising I'd
+      check with a profiler that this function matters at all.
+  - question: Your p99 API latency doubled after a release but the median didn't move. How do you investigate?
+    answer: >-
+      A stable median with a worse tail points at something that hits a minority of
+      requests, so I'd find what those requests have in common. First I'd slice the slow
+      requests by endpoint, customer, payload size and server, because a p99 change is often
+      one route or one tenant. Then I'd look at traces for a handful of slow requests to see
+      which span grew: a database query, a downstream call, lock contention or garbage
+      collection pauses. I'd diff the release for new fan-out, a missing index, a cache key
+      change or a lowered timeout. Once I had a suspect, I'd reproduce it with a load test
+      that sends at a fixed rate, so coordinated omission doesn't hide the tail. The
+      trade-off is time: slicing needs good labels on your metrics, which is why you add
+      them before the incident.
+  - question: What is a latency budget and how do you use one?
+    answer: >-
+      It's the total wait users will accept for an action, split across the steps that make
+      it up, so each step has a number to stay under. For a search that must answer within
+      one second at p95, I might give 150 ms to the network, 300 ms to the query, 300 ms to
+      ranking, 150 ms to rendering and keep some spare. Then a regression shows up as one
+      step over its line, and the owner of that step knows. For AI features I'd name two
+      numbers: time to first token, which streaming fixes, and total time, which only a
+      faster model or a shorter answer fixes. The catch is that percentiles don't add, so
+      step budgets at p95 don't guarantee the total at p95. I'd keep spare and measure the
+      end-to-end number too.

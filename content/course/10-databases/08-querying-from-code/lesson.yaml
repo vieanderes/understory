@@ -1,0 +1,304 @@
+id: db.from-code
+title: Querying from code
+objective: "Query Postgres from a server with `$1` parameters, see why gluing input into SQL is an injection, and replace N+1 queries with one."
+level: essential
+minutes: 10
+concepts: [db.drivers-and-parameters, db.sql-injection, db.n-plus-one]
+prerequisites: [db.schema-design, js.promises, tooling.configuration-and-environment]
+opening:
+  text: >-
+    You'll send SQL from your own server code the way real apps do, safely. You'll also break
+    into a login with one line of text, then close the hole for good.
+
+steps:
+  - type: prose
+    id: what-a-driver-is
+    body: >-
+      Your server talks to Postgres through a **driver**, a package that sends SQL and brings
+      rows back. For Node, it's `pg`:
+
+
+      ```js
+
+      import pg from "pg";
+
+      const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
+
+
+      const { rows } = await pool.query("SELECT id, name FROM users");
+
+      ```
+
+
+      `rows` is an array of plain objects, one per row: `[{ id: 1, name: "Ana" }, ...]`. The
+      address and password live in an environment variable, never in the code.
+
+  - type: prose
+    id: glued-sql
+    body: >-
+      A login looks up a user by email. The tempting way glues the input into the SQL text:
+
+
+      ```js
+
+      pool.query(`SELECT id, name FROM users WHERE email = '${email}'`);
+
+      ```
+
+
+      Now someone types this into the email box: `' OR '1'='1`. The SQL that reaches Postgres
+      is `WHERE email = '' OR '1'='1'`. That's true for every row. The input rewrote your
+      query, and that's **SQL injection**.
+
+  - type: prose
+    id: parameters
+    body: >-
+      The fix is a **parameter**. Put `$1` where the value goes, and pass the value separately:
+
+
+      ```js
+
+      pool.query("SELECT id, name FROM users WHERE email = $1", [email]);
+
+      ```
+
+
+      Postgres receives the SQL and the value apart. The value is only ever data, never SQL, so
+      no text can change the query. Plain SQL has the same thing: `PREPARE` a statement with
+      `$1`, then `EXECUTE` it with a value.
+
+  - type: sql
+    id: run-the-injection
+    prompt: >-
+      Run both. The first is what the glued query became: every user comes back. The second
+      sends the same attacker text as a parameter, and finds nobody. (`''` inside quotes is one
+      quote.)
+    setup: |
+      CREATE TABLE users (id integer PRIMARY KEY, email text NOT NULL UNIQUE, name text NOT NULL);
+      INSERT INTO users VALUES
+        (1, 'ana@example.com', 'Ana'),
+        (2, 'ben@example.com', 'Ben'),
+        (3, 'cleo@example.com', 'Cleo');
+    starter: |
+      -- What the glued query became:
+      SELECT id, name FROM users WHERE email = '' OR '1'='1';
+
+      -- The same lookup with a parameter:
+      PREPARE find_user(text) AS SELECT id, name FROM users WHERE email = $1;
+      EXECUTE find_user(''' OR ''1''=''1');
+    showSchema: true
+
+  - type: fill-blank
+    id: fill-parameters
+    concept: db.drivers-and-parameters
+    difficulty: 2
+    language: js
+    prompt: >-
+      Find a room's bookings for one day, with both values sent as parameters. Fill the gaps.
+    template: |
+      const { rows } = await pool.query(
+        "SELECT * FROM bookings WHERE room_id = {{1}} AND day = {{2}}",
+        [{{3}}, day],
+      );
+    blanks:
+      - key: '1'
+        answer: $1
+      - key: '2'
+        answer: $2
+      - key: '3'
+        answer: roomId
+    bank: [$1, $2, roomId, '${roomId}', '?', "'day'"]
+
+  - type: ai-review
+    id: review-half-parameterised
+    concept: db.sql-injection
+    difficulty: 3
+    language: js
+    request: Return a customer's orders, filtered by the status in the URL.
+    flawClass: security
+    code: |
+      async function ordersByStatus(customerId, status) {
+        const { rows } = await pool.query(
+          `SELECT * FROM orders WHERE customer_id = $1 AND status = '${status}'`,
+          [customerId],
+        );
+        return rows;
+      }
+    prompt: >-
+      An assistant wrote this, and the review nearly passed it. It uses `$1`, after all. Tap
+      the line at fault.
+    lines: [3]
+    reasons:
+      - text: '`status` from the URL is glued into the SQL'
+        correct: true
+        feedback: >-
+          Right. One parameter doesn't protect the other. `status` needs `$2`.
+      - text: '`$1` should be `${customerId}`'
+        feedback: >-
+          That would make both values injectable. `$1` is the safe half of this line.
+      - text: '`SELECT *` lets an attacker read every column'
+        feedback: >-
+          It returns more than needed, but the attacker gets in through `status`.
+    fix: |
+      async function ordersByStatus(customerId, status) {
+        const { rows } = await pool.query(
+          "SELECT * FROM orders WHERE customer_id = $1 AND status = $2",
+          [customerId, status],
+        );
+        return rows;
+      }
+
+  - type: prose
+    id: orms-and-query-builders
+    body: >-
+      Many projects don't write SQL strings at all. A **query builder** such as Drizzle, or an
+      **ORM** such as Prisma, lets you write JavaScript that becomes SQL:
+
+
+      ```js
+
+      await db.select().from(orders).where(eq(orders.customerId, id)); // Drizzle
+
+      await prisma.order.findMany({ where: { customerId: id } }); // Prisma
+
+      ```
+
+
+      Both send values as parameters for you. Their escape hatches for raw SQL, such as
+      `sql.raw`, bring the injection risk straight back.
+
+  - type: prose
+    id: n-plus-one
+    body: >-
+      A blog lists 50 posts with their authors. This looks innocent:
+
+
+      ```js
+
+      const { rows: posts } = await pool.query("SELECT id, title, author_id FROM posts");
+
+      for (const post of posts) {
+
+        const { rows } = await pool.query("SELECT name FROM authors WHERE id = $1", [post.author_id]);
+
+        post.author = rows[0].name;
+
+      }
+
+      ```
+
+
+      One query for the list, then one per post: 51 trips to the database, each waiting on the
+      network. That's the **N+1** pattern. One query with a join does it in one trip.
+
+  - type: sql
+    id: replace-n-plus-one
+    concept: db.n-plus-one
+    difficulty: 2
+    prompt: >-
+      Replace the loop with one query: each post's `title` with its author's name as `author`.
+    setup: |
+      CREATE TABLE authors (id integer PRIMARY KEY, name text NOT NULL);
+      CREATE TABLE posts (
+        id integer PRIMARY KEY,
+        title text NOT NULL,
+        author_id integer NOT NULL REFERENCES authors(id)
+      );
+      INSERT INTO authors VALUES (1, 'Ines'), (2, 'Kwame'), (3, 'Lotte');
+      INSERT INTO posts VALUES
+        (1, 'Sourdough for beginners', 1), (2, 'Fixing a slow bike chain', 2),
+        (3, 'Ten-minute lunches', 1), (4, 'Night photography', 3),
+        (5, 'Growing chillies indoors', 2);
+    starter: |
+      SELECT id, title, author_id FROM posts;
+    solution: |
+      SELECT posts.title, authors.name AS author
+      FROM posts JOIN authors ON authors.id = posts.author_id;
+    checks:
+      ordered: false
+    showSchema: true
+    hints:
+      - The loop looked up each author by `author_id`. A join does that for every post at once.
+      - '`JOIN authors ON authors.id = posts.author_id`, then pick `posts.title` and `authors.name AS author`.'
+
+  - type: explain-back
+    id: explain-parameters
+    concept: db.sql-injection
+    difficulty: 3
+    prompt: >-
+      A teammate says they escape quotes in user input, so gluing it into SQL is fine. Why are
+      parameters still the right fix?
+    rubric:
+      - Glued input becomes part of the SQL text, so crafted input can change the query.
+      - Escaping by hand goes wrong, or is forgotten in one place.
+      - With parameters the value is sent separately and is only ever data, never SQL.
+    modelAnswer: >-
+      When input is glued in, it becomes part of the SQL, so the right characters turn data into
+      code. Escaping tries to spot those characters, and one missed case or one forgotten call
+      reopens the hole. With `$1`, Postgres gets the SQL and the value separately. The value can
+      never become SQL, whatever it contains, so there's nothing to escape.
+
+recap:
+  - Query Postgres from Node with a driver such as `pg`, and read `rows`.
+  - Send every value as a `$1` parameter, never glued into the SQL text.
+  - Spot the query inside a loop, and fetch the whole list in one query instead.
+
+recall:
+  - id: card-parameter
+    concept: db.drivers-and-parameters
+    front: Rewrite ``pool.query(`... WHERE id = ${id}`)`` safely.
+    back: "`pool.query(\"... WHERE id = $1\", [id])`"
+  - id: card-injection
+    concept: db.sql-injection
+    front: What does the input `' OR '1'='1` do to a query that glues it after `email = '`?
+    back: >-
+      It closes the quote and adds a condition that's always true, so every row matches.
+  - id: card-n-plus-one
+    concept: db.n-plus-one
+    front: What is an N+1 query pattern?
+    back: >-
+      One query for a list, then one more per item, usually inside a loop. A join or
+      `WHERE id = ANY($1)` fetches everything in one query.
+
+references:
+  - kind: docs
+    title: Queries
+    authors: node-postgres
+    venue: node-postgres documentation
+    url: https://node-postgres.com/features/queries
+    note: Parameterised queries with `$1`, and why the values travel separately.
+    primary: true
+    verified: true
+  - kind: docs
+    title: PREPARE
+    authors: The PostgreSQL Global Development Group
+    venue: PostgreSQL 18 documentation
+    url: https://www.postgresql.org/docs/18/sql-prepare.html
+    note: A statement with `$1` parameters, run later with `EXECUTE`.
+    verified: true
+  - kind: docs
+    title: SQL Injection Prevention Cheat Sheet
+    authors: OWASP
+    venue: OWASP Cheat Sheet Series
+    url: https://cheatsheetseries.owasp.org/cheatsheets/SQL_Injection_Prevention_Cheat_Sheet.html
+    note: Parameterised queries as the primary defence, and why escaping is not enough.
+    primary: true
+    verified: true
+
+deepDive: >-
+  `pg.Pool` keeps a few open connections and lends one to each query, because opening a
+  connection is slow. The scaling lesson returns to pools.
+
+
+  When the ids come from somewhere else, you can still avoid N+1 without a join:
+  `SELECT id, name FROM authors WHERE id = ANY($1)` with one array of ids. GraphQL servers
+  batch lookups this way, with a helper called a data loader.
+
+
+  Parameters cover values, not names. A column or table name chosen by the user can't be a
+  `$1`. Pick it from a fixed list in code: `const column = allowed.includes(sort) ? sort :
+  "created_at"`.
+
+
+  An AI assistant writing SQL for you is a great time to check this. Models often reach for a
+  template string because it's shorter, and a test with normal input will pass.

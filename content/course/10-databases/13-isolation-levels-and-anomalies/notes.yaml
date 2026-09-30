@@ -1,0 +1,278 @@
+summary: >-
+  Isolation decides what one transaction can see of others running at the same time. Full
+  isolation would make every transaction behave as if it ran alone, one after another. That
+  costs throughput, so databases offer levels that allow some **anomalies**: odd results
+  that only appear under concurrency, such as a lost update or write skew.
+
+
+  Postgres defaults to read committed, where each statement sees data committed before it
+  began. That never shows half-finished work, but it doesn't stop two requests reading the
+  same value and each writing back its own result. The lesson fixes that three ways: an
+  atomic `UPDATE`, a row lock with `FOR UPDATE`, and serializable isolation with retries.
+
+
+  These notes add the map of anomalies to levels as Postgres implements them, the mechanism
+  that makes `stock = stock - 1` safe, the full family of row locks, optimistic concurrency
+  with a version column, and a retry loop you can drop into production code. In an
+  interview, this topic separates people who have run a busy system from people who have
+  read about one.
+remember:
+  - Read committed, the Postgres default, gives each statement a fresh snapshot of committed data, so a read-then-write in app code can lose an update.
+  - An `UPDATE` that computes from the row itself (`SET stock = stock - 1`) is safe at read committed, because a second updater waits for the row lock and then re-evaluates against the new version.
+  - '`SELECT ... FOR UPDATE` locks the rows it returns until the transaction ends; use it when the app must read, decide and then write.'
+  - Repeatable read gives the whole transaction one snapshot and fails with SQLSTATE `40001` if it tries to update a row someone else changed since.
+  - Write skew, two transactions each changing a different row after reading the same ones, is prevented only by serializable, or by locking what you read.
+  - Serializable can cancel any transaction with `40001`, even at `COMMIT`, so the whole transaction runs in a retry loop and must be safe to repeat.
+  - Lock rows in a consistent order, such as by id, to avoid deadlocks; Postgres breaks one by cancelling a transaction with `40P01`.
+  - A version column checked in the `WHERE` gives optimistic concurrency without holding locks, which suits edits that span user think time.
+sections:
+  - title: Anomalies and the levels that stop them in Postgres
+    body: |-
+      The SQL standard defines four levels by the anomalies they forbid. Postgres implements
+      them with snapshots (MVCC), which makes its levels stronger than the minimum.
+
+      - **Dirty read**: seeing another transaction's uncommitted change. Never happens in
+        Postgres. `READ UNCOMMITTED` is accepted and behaves as read committed.
+      - **Non-repeatable read**: the same row read twice in one transaction gives different
+        values. Possible at read committed, because each statement takes a new snapshot.
+      - **Phantom read**: the same `WHERE` returns new rows the second time. Possible at read
+        committed. Postgres's repeatable read prevents it too, which the standard doesn't
+        require.
+      - **Lost update**: two read-modify-write cycles, one overwriting the other. Possible at
+        read committed when the read happens in app code. At repeatable read, the second
+        writer fails with `could not serialize access due to concurrent update`.
+      - **Write skew**: two transactions read overlapping data, then each writes a different
+        row, and together they break a rule. Possible at repeatable read. Only serializable
+        stops it.
+
+      You can check and set the level per transaction:
+
+      ```sql
+      BEGIN ISOLATION LEVEL REPEATABLE READ;
+      SELECT current_setting('transaction_isolation');  -- repeatable read
+      COMMIT;
+
+      SHOW default_transaction_isolation;               -- read committed
+      ```
+
+      The level must be set before the transaction's first query. `SET TRANSACTION
+      ISOLATION LEVEL` after a `SELECT` fails with `must be called before any query`.
+
+      Repeatable read suits long reports that must be consistent across many queries, such
+      as totals that must add up. It needs the same retry handling as serializable when it
+      writes.
+  - title: Why stock = stock - 1 doesn't lose updates
+    body: |-
+      At read committed, an `UPDATE` finds its rows using the statement's snapshot. If a
+      target row has been changed by a transaction still in progress, the update **waits** for
+      that transaction. When it commits, Postgres doesn't give up or overwrite blindly: it
+      fetches the newest version of that row, re-checks the `WHERE` against it, and computes
+      the `SET` from it.
+
+      So with stock at 5, two concurrent `SET stock = stock - 1` statements give 3. And
+      `WHERE id = 1 AND stock > 0` is re-checked after the wait, which is why the last item
+      can't be sold twice: the second update finds `stock = 0` and changes no rows.
+
+      There's a limit. Only the target row is re-read. Subqueries and joins to other tables
+      in the same statement still use the old snapshot, so a clever single statement that
+      reads another table can still decide on stale data. Keep the rule on the row being
+      updated where you can.
+
+      At repeatable read, the same situation ends differently: the second update fails with
+      `40001` instead of re-reading, because re-reading would break the promise of one
+      snapshot. The application retries the whole transaction.
+  - title: The family of row locks
+    body: |-
+      `FOR UPDATE` is the strongest of four row-level lock modes a `SELECT` can take:
+
+      - **`FOR UPDATE`**: you'll change or delete the row. Blocks all other row locks.
+      - **`FOR NO KEY UPDATE`**: you'll change it but not its key. A plain `UPDATE` that
+        leaves key columns alone takes this, so foreign key checks elsewhere aren't blocked.
+      - **`FOR SHARE`**: the row must not change while you work, but others may read-lock it
+        too.
+      - **`FOR KEY SHARE`**: the key must not change. Foreign key checks take this.
+
+      Two modifiers change what happens on a conflict. `NOWAIT` fails at once with SQLSTATE
+      `55P03` instead of waiting. `SKIP LOCKED` leaves locked rows out of the result, which
+      turns a table into a job queue that many workers share:
+
+      ```sql
+      CREATE TABLE jobs (
+        id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        payload jsonb NOT NULL,
+        status text NOT NULL DEFAULT 'queued'
+      );
+      INSERT INTO jobs (payload) VALUES ('{"email": 1}'), ('{"email": 2}');
+
+      BEGIN;
+      UPDATE jobs SET status = 'running'
+      WHERE id = (
+        SELECT id FROM jobs
+        WHERE status = 'queued'
+        ORDER BY id
+        FOR UPDATE SKIP LOCKED
+        LIMIT 1
+      )
+      RETURNING id, payload;
+      COMMIT;
+      ```
+
+      A deadlock needs two transactions each holding a lock the other wants. Postgres checks
+      for one after `deadlock_timeout` (1 second by default) and cancels one side with
+      `40P01`. The prevention is a fixed order. A transfer locks both accounts in id order,
+      whichever direction the money moves:
+
+      ```sql
+      CREATE TABLE accounts (id integer PRIMARY KEY, balance_pence integer NOT NULL CHECK (balance_pence >= 0));
+      INSERT INTO accounts VALUES (1, 5000), (2, 1000);
+
+      BEGIN;
+      SELECT id, balance_pence FROM accounts WHERE id IN (2, 1) ORDER BY id FOR UPDATE;
+      UPDATE accounts SET balance_pence = balance_pence - 1500 WHERE id = 1;
+      UPDATE accounts SET balance_pence = balance_pence + 1500 WHERE id = 2;
+      COMMIT;
+      ```
+
+      `FOR UPDATE` can't be combined with an aggregate: `SELECT count(*) ... FOR UPDATE`
+      fails. Select the rows themselves and count them in code.
+  - title: Optimistic concurrency with a version column
+    body: |-
+      Locks work within one transaction. They are wrong for an edit that spans a person
+      reading a form for two minutes: you can't hold a transaction open while someone
+      thinks. **Optimistic concurrency** checks at write time that nobody changed the row
+      since you read it.
+
+      ```sql
+      CREATE TABLE documents (
+        id integer PRIMARY KEY,
+        body text NOT NULL,
+        version integer NOT NULL DEFAULT 1
+      );
+      INSERT INTO documents VALUES (1, 'First draft', 1);
+
+      -- Both editors loaded version 1. The first save wins:
+      UPDATE documents SET body = 'Second draft', version = version + 1
+      WHERE id = 1 AND version = 1
+      RETURNING version;   -- one row: version 2
+
+      -- The second save still says version 1:
+      UPDATE documents SET body = 'Stale edit', version = version + 1
+      WHERE id = 1 AND version = 1
+      RETURNING version;   -- no row: someone saved first
+      ```
+
+      No row back means a conflict. The app shows "this document changed, reload" or merges.
+      Over HTTP the same idea is an `ETag` sent back in `If-Match`, answered with `412
+      Precondition Failed` on a mismatch.
+
+      Choose by contention. Optimistic concurrency costs nothing when conflicts are rare and
+      wastes work when they're common. Pessimistic locking with `FOR UPDATE` makes others
+      wait but never throws their work away.
+  - title: Serializable with a retry loop
+    body: |-
+      Serializable in Postgres uses **serializable snapshot isolation**: transactions run on
+      snapshots, as at repeatable read, and Postgres also tracks what each one read. If the
+      reads and writes form a pattern that no serial order could produce, it cancels one
+      transaction with `40001`. It may cancel some that were in fact harmless; that's the
+      price of not blocking.
+
+      So every serializable transaction needs a loop. Retry the whole thing from `BEGIN`,
+      with a small random wait, a few times at most:
+
+      ```ts
+      interface Client {
+        query(sql: string, params?: unknown[]): Promise<unknown>;
+      }
+
+      const RETRYABLE = new Set(['40001', '40P01']); // serialization failure, deadlock
+
+      async function inSerializable<T>(
+        client: Client,
+        work: (tx: Client) => Promise<T>,
+        maxAttempts = 5,
+      ): Promise<T> {
+        for (let attempt = 1; ; attempt++) {
+          await client.query('BEGIN ISOLATION LEVEL SERIALIZABLE');
+          try {
+            const result = await work(client);
+            await client.query('COMMIT'); // a serializable COMMIT can fail with 40001 too
+            return result;
+          } catch (err) {
+            await client.query('ROLLBACK');
+            const code = (err as { code?: unknown }).code;
+            if (typeof code !== 'string' || !RETRYABLE.has(code) || attempt >= maxAttempts) throw err;
+            const waitMs = Math.random() * 10 * 2 ** attempt; // jitter, so retries don't collide again
+            await new Promise((resolve) => setTimeout(resolve, waitMs));
+          }
+        }
+      }
+      ```
+
+      With `pg`, pass a client from `pool.connect()`, never the pool, since every statement
+      of a transaction must use one connection. Tested with a first attempt that throws
+      `40001`, the work ran twice and committed once; a `23505` was rethrown immediately.
+
+      Everything inside `work` must be safe to run twice. Send emails, charge cards and call
+      other services after the commit, not inside. Keep serializable transactions short and
+      mark pure readers `READ ONLY`, which lowers the chance of cancellation.
+pitfalls:
+  - '**Reading a value into the app and writing back a number.** Every read-modify-write in code is a lost update waiting for traffic. Send the change as an expression, or lock the row first.'
+  - '**Retrying only the failed statement.** After `40001` the transaction is aborted and every further statement fails. Roll back and rerun the whole transaction.'
+  - '**Side effects inside a retried transaction.** An email sent on the first attempt goes out again on the second. Do side effects after `COMMIT`, or record them in an outbox table.'
+  - '**Locking rows in different orders.** One path locks order then payment, another payment then order, and they deadlock under load. Pick one order, such as ascending id, everywhere.'
+  - '**Holding a transaction open across a network call.** Locks stay held while you wait for a payment provider, and everyone queues. Do the slow call outside, then a short transaction.'
+  - '**Running `BEGIN` and `COMMIT` through a pool.** Each `pool.query` may use a different connection, so the statements are not one transaction. Check out one client with `pool.connect()`.'
+  - '**Believing repeatable read stops write skew.** It stops lost updates on the same row, not rules across rows. Use serializable, or lock the rows the rule reads.'
+interview:
+  - question: Explain the isolation levels in Postgres. Which do you use, and when?
+    answer: >-
+      Postgres has three distinct levels: read committed, repeatable read and serializable;
+      read uncommitted behaves as read committed, so dirty reads never happen. Read
+      committed, the default, gives each statement a fresh snapshot, so data can change
+      between statements. Repeatable read gives the transaction one snapshot, prevents
+      phantoms in Postgres, and aborts with `40001` on a concurrent update of the same row.
+      Serializable adds tracking of reads and cancels any transaction that couldn't be
+      ordered serially, which also stops write skew. I use read committed with atomic
+      updates and `FOR UPDATE` for most work, repeatable read for consistent reports, and
+      serializable for rules across many rows, always with a retry loop. The cost of
+      stronger levels is retries, not locks.
+  - question: What's a lost update, and how do you prevent one?
+    answer: >-
+      Two transactions read the same value, each computes a new one in the app and writes it
+      back, so one change silently disappears: two sales, one decrement. Read committed
+      doesn't stop it. The best fix is not to read at all: `UPDATE ... SET stock = stock -
+      1`, which waits for the row lock and recomputes from the latest version. If the app
+      must decide in between, I lock with `SELECT ... FOR UPDATE` in a transaction. For
+      edits that span user think time, I use a version column checked in the `WHERE`, which
+      is optimistic and holds no lock. Repeatable read also catches it by raising `40001`,
+      but then I need retries.
+  - question: What is write skew? Give an example and a fix.
+    answer: >-
+      Two transactions read the same set of rows, each decides it's safe to change a
+      different row, and together they break an invariant. The classic case: two doctors on
+      call, each checks that someone else is on call, and both go off call. No row was
+      written twice, so row locks from the updates never collide, and repeatable read allows
+      it. Serializable detects the read-write dependency and cancels one with `40001`, and
+      the retry sees one doctor left and refuses. Without serializable, I'd lock the rows the
+      rule reads, `SELECT ... WHERE shift_id = $1 AND on_call FOR UPDATE`, or lock a shared
+      parent row such as the shift. Locking only works for rows that already exist; rules
+      about rows that might be inserted need serializable or a constraint.
+  - question: How do you build a job queue on Postgres without workers taking the same job?
+    answer: >-
+      `SELECT ... FOR UPDATE SKIP LOCKED LIMIT 1` inside the claim. Each worker locks one
+      queued row and skips rows other workers have locked, so they never wait on each other
+      or double-claim. I'd wrap it in an `UPDATE ... SET status = 'running' WHERE id = (that
+      select) RETURNING *`, with an index on status and order. For crash safety I'd store a
+      `locked_until` or heartbeat so a job whose worker died becomes claimable again, and
+      make jobs idempotent since one may run twice. It avoids a separate broker for moderate
+      volume; at high throughput or with fan-out needs, a real queue fits better.
+  - question: What causes deadlocks in a database, and how do you avoid them?
+    answer: >-
+      Two transactions each hold a lock the other needs, so neither can proceed. Postgres
+      detects this after `deadlock_timeout`, one second by default, and cancels one with
+      `40P01`. The usual cause is different code paths locking the same rows in different
+      orders, such as a transfer from A to B running alongside one from B to A. I avoid it
+      by locking in a consistent order, for example `ORDER BY id FOR UPDATE` before the
+      updates, keeping transactions short, and never waiting on network calls while holding
+      locks. I still treat `40P01` as retryable, because it can happen through foreign keys
+      and indexes in ways the code doesn't show.

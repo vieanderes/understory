@@ -1,0 +1,326 @@
+summary: >-
+  A slow request is a sum of parts: waiting for a database connection, queries, calls to
+  other services, your own code. Finding the slow part is a measuring job, not a guessing
+  one. Time each part, look at the biggest number, fix that, and measure again. Most of the
+  time the answer is in the database: too many queries, or one query without the index it
+  needs.
+
+
+  The lesson covers `Server-Timing`, counting queries to spot an N+1, reading a plan with
+  `EXPLAIN ANALYZE`, and why pages that fan out to many calls meet the slow tail. These
+  notes add how to describe latency properly with percentiles, a complete `Server-Timing`
+  implementation, distributed tracing for requests that cross services, a closer reading of
+  query plans, and a batching loader for data that no join can reach.
+
+
+  In an interview, the method matters as much as the fix. Say how you'd measure, what
+  you'd expect to see, which number would change your mind, and how you'd prove the fix
+  worked.
+remember:
+  - Measure before changing anything, fix the biggest part first, and measure again afterwards.
+  - Describe latency with percentiles such as p50, p95 and p99, because an average hides the slow requests users complain about.
+  - Percentiles can't be averaged across servers, so compute them from the combined samples or histograms.
+  - A page that waits on N calls is as slow as its slowest one, so the chance of meeting a rare slow call grows quickly with N.
+  - An N+1 is one query for a list and one per item, and one join or one batched `WHERE id = ANY(...)` query replaces it.
+  - '`EXPLAIN ANALYZE` runs the query and shows estimated against actual rows, and a large gap between them is often the real problem.'
+  - A function or a leading wildcard on an indexed column, such as `lower(genre)` or `LIKE '%train%'`, usually stops a plain index being used.
+  - Distributed tracing links the spans of one request across services with a shared trace id, passed in the `traceparent` header.
+sections:
+  - title: Percentiles, and why the average lies
+    body: |-
+      Latency is never one number. Most requests are fast and a few are very slow, and the
+      average blends them into a figure that matches nobody's experience. Percentiles
+      describe the shape instead: the **p50** (median) is what a typical request gets, the
+      **p95** and **p99** what the slowest 5% and 1% get.
+
+      ```js
+      // Nearest-rank percentile: sort, then take the value at rank ceil(p/100 * n).
+      function percentile(samples, p) {
+        const sorted = [...samples].sort((a, b) => a - b);
+        const rank = Math.ceil((p / 100) * sorted.length);
+        return sorted[Math.max(0, rank - 1)];
+      }
+
+      // 1,000 checkout requests: most take 80 ms, 2% hit a lock and take 2,000 ms.
+      const latencies = Array.from({ length: 1000 }, (_, i) => (i % 50 === 0 ? 2000 : 80));
+      const mean = latencies.reduce((sum, ms) => sum + ms, 0) / latencies.length;
+
+      console.log("mean", mean); // 118.4
+      console.log("p50", percentile(latencies, 50)); // 80
+      console.log("p95", percentile(latencies, 95)); // 80
+      console.log("p99", percentile(latencies, 99)); // 2000
+
+      // Chance that a page waiting on n calls meets at least one slower than the p99.
+      for (const n of [1, 10, 100]) console.log(n, (1 - 0.99 ** n).toFixed(3));
+      // 1 0.010, 10 0.096, 100 0.634
+      ```
+
+      The mean of 118 ms describes no real request, and nothing in it warns you that one
+      checkout in fifty takes two seconds. The p99 does.
+
+      Three habits follow. Track p50 and p99 together: the first tells you about the
+      typical path, the second about locks, garbage collection pauses, cold caches and
+      retries. Never average percentiles from several servers, because the average of two
+      p99s isn't the p99 of the combined traffic; monitoring tools store histograms so they
+      can merge them correctly. And remember that the busiest users make the most requests,
+      so a p99 request is something most active users meet every session.
+
+      The last loop is the fan-out effect from the lesson in numbers. One call slower than
+      its p99 is a 1% event. Across 100 calls it's a 63% event. The Tail at Scale paper
+      describes defences beyond "call fewer things": set timeouts, and send a **hedged
+      request**, a second copy of a slow call to another replica after a short delay, then
+      use whichever answer arrives first. Hedging only suits calls that are safe to repeat.
+  - title: Server-Timing, end to end
+    body: |-
+      A small helper times each part of a request and builds the header. Wrapping every
+      part in the same function keeps the names consistent and makes it hard to forget one.
+
+      ```js
+      import { createServer } from "node:http";
+
+      const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+      // Records how long each named part of one request takes.
+      function timings() {
+        const parts = [];
+        return {
+          async time(name, work) {
+            const start = performance.now();
+            try {
+              return await work();
+            } finally {
+              parts.push(`${name};dur=${(performance.now() - start).toFixed(1)}`);
+            }
+          },
+          header: () => parts.join(", "),
+        };
+      }
+
+      const server = createServer(async (req, res) => {
+        const t = timings();
+        await t.time("auth", () => sleep(3));
+        const bookings = await t.time("db", () => sleep(120).then(() => [{ room: 4 }]));
+        const html = await t.time("render", async () => `<ul><li>Room ${bookings[0].room}</li></ul>`);
+        res.setHeader("Server-Timing", t.header());
+        res.setHeader("Content-Type", "text/html");
+        res.end(html);
+      });
+
+      server.listen(0, async () => {
+        const response = await fetch(`http://localhost:${server.address().port}/bookings`);
+        console.log(response.headers.get("server-timing"));
+        // auth;dur=3.0, db;dur=121.2, render;dur=0.0
+        server.close();
+      });
+      ```
+
+      Each metric is a name with optional `dur` in milliseconds and an optional `desc`, for
+      example `db;dur=121.2;desc="bookings query"`. In the browser, the values appear in
+      DevTools under the request's Timing tab, and page code can read them from
+      `performance.getEntriesByType("navigation")[0].serverTiming` for the page itself. For
+      responses from another origin, that origin must also send `Timing-Allow-Origin` before
+      scripts can read them.
+
+      The header is visible to anyone who opens DevTools, so it can reveal how your system
+      is built. Many teams send it only to staff or in non-production environments, and send
+      the same timings to their monitoring in all environments.
+
+      The parts should add up to roughly the total. If they don't, the missing time is
+      somewhere you haven't timed: waiting for a free database connection from the pool,
+      middleware, serialising a large JSON body, or a blocked event loop that delays every
+      request on that process.
+  - title: Tracing a request across services
+    body: |-
+      `Server-Timing` covers one server. When a request passes through a gateway, three
+      services and a queue, you need **distributed tracing**. A **trace** is one request's
+      whole journey. It's made of **spans**, each a timed operation with a name, a start, a
+      duration, attributes such as the SQL statement, and a parent span. Drawn as a waterfall,
+      the spans show where time went and what waited on what.
+
+      The services stay linked because each outgoing call carries the trace context. The
+      W3C Trace Context standard puts it in a `traceparent` header:
+
+      ```http
+      traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+      ```
+
+      That's a version, a 32-hex-digit trace id shared by every span in the trace, the
+      16-hex-digit id of the calling span, and flags such as whether this trace is sampled.
+      **OpenTelemetry** is the common open standard for producing traces. Its automatic
+      instrumentation for Node wraps HTTP, popular database drivers and frameworks, so you
+      get most spans without touching your code, and you add your own spans around business
+      logic.
+
+      Reading a waterfall, look for three shapes:
+
+      - **A staircase**: spans that run one after another although none needs the other's
+        result. Awaiting three independent calls in sequence costs their sum; `Promise.all`
+        costs the slowest.
+      - **A comb**: dozens of short identical spans, such as `SELECT ... FROM authors`
+        repeated 200 times. That's an N+1, visible without reading any code.
+      - **A gap**: time inside a parent span not covered by any child. That's your own CPU
+        work, a blocked event loop, or waiting for a pooled connection.
+
+      Tracing every request costs storage, so production systems **sample**, keeping for
+      example 1% of traces. Head sampling decides at the start of a request. Tail sampling
+      decides once the trace is complete, so it can keep every slow or failed trace, which
+      are the ones you want when debugging a p99.
+  - title: Reading a plan more closely
+    body: |-
+      `EXPLAIN` shows the plan Postgres chose. `EXPLAIN ANALYZE` also runs the query and
+      adds what really happened. Add `BUFFERS` to see how many 8 kB pages it touched. Here's
+      the lesson's join after adding the index on `(genre, published)`, trimmed, from
+      Postgres 18 running in PGlite:
+
+      ```text
+      Limit  (actual time=0.421..0.585 rows=20.00 loops=1)
+        ->  Nested Loop  (actual time=0.416..0.559 rows=20.00 loops=1)
+              ->  Index Scan Backward using books_genre_published_idx on books
+                    (cost=0.29..788.08 rows=4000 width=22) (actual rows=20.00 loops=1)
+                    Index Cond: (genre = 'poetry'::text)
+              ->  Memoize  (actual rows=1.00 loops=20)
+                    ->  Index Scan using authors_pkey on authors  (actual rows=1.00 loops=20)
+      Execution Time: 0.848 ms
+      ```
+
+      Read it from the innermost lines outwards. The index hands books over newest first,
+      so `LIMIT 20` stops after 20 rows, although the plan estimated 4,000 poetry books in
+      total. The authors lookup ran 20 times (`loops=20`), once per book, and every time
+      figure on a looped node is per loop, so multiply by `loops` for its real cost.
+
+      Now the same query with the genre wrapped in a function:
+
+      ```text
+      Limit  (actual time=20.471..20.489 rows=20.00 loops=1)
+        ->  Sort  (actual time=20.468..20.475 rows=20.00 loops=1)
+              Sort Key: published DESC
+              ->  Seq Scan on books  (cost=0.00..467.00 rows=100 width=33)
+                    (actual time=0.302..17.210 rows=4000.00 loops=1)
+                    Filter: (lower(genre) = 'poetry'::text)
+                    Rows Removed by Filter: 16000
+      Execution Time: 20.522 ms
+      ```
+
+      `lower(genre)` doesn't match the index on `genre`, so Postgres reads all 20,000 rows
+      and sorts. The estimate is also wrong: 100 rows expected, 4,000 found. Bad estimates
+      lead to bad join choices in bigger queries. Fix the query to compare `genre` directly,
+      or create an expression index on `lower(genre)`. A leading wildcard such as
+      `title LIKE '%train%'` has the same problem for a plain B-tree index.
+
+      `EXPLAIN ANALYZE` really executes the statement, so wrap an `UPDATE` or `DELETE` in
+      `BEGIN` and `ROLLBACK`. To find which queries to look at in the first place, the
+      `pg_stat_statements` extension totals time per query shape across all calls. A 3 ms
+      query run a million times a day often matters more than one slow report.
+  - title: Batching when a join isn't possible
+    body: |-
+      When the data lives behind another service, or resolvers load their own data as in
+      GraphQL, you can't write one join. A **batching loader** gets the same effect: it
+      collects every id requested during the same tick of the event loop and sends one
+      request for all of them. This is the idea behind the DataLoader library.
+
+      ```ts
+      function batcher<K, V>(loadMany: (keys: K[]) => Promise<Map<K, V>>) {
+        let queue: { key: K; resolve: (v: V | undefined) => void; reject: (e: unknown) => void }[] = [];
+
+        function flush() {
+          const batch = queue;
+          queue = [];
+          const keys = [...new Set(batch.map((item) => item.key))];
+          loadMany(keys).then(
+            (found) => batch.forEach((item) => item.resolve(found.get(item.key))),
+            (error) => batch.forEach((item) => item.reject(error)),
+          );
+        }
+
+        return function load(key: K): Promise<V | undefined> {
+          return new Promise((resolve, reject) => {
+            if (queue.length === 0) queueMicrotask(flush); // first request this tick schedules the flush
+            queue.push({ key, resolve, reject });
+          });
+        };
+      }
+
+      const calls: number[][] = [];
+      const authorById = batcher(async (ids: number[]) => {
+        calls.push(ids); // stands in for: SELECT id, name FROM authors WHERE id = ANY($1)
+        return new Map(ids.map((id) => [id, `Author ${id}`]));
+      });
+
+      const books = [{ authorId: 7 }, { authorId: 8 }, { authorId: 7 }];
+      const names = await Promise.all(books.map((book) => authorById(book.authorId)));
+      console.log(names); // [ 'Author 7', 'Author 8', 'Author 7' ]
+      console.log(calls); // [ [ 7, 8 ] ]
+      ```
+
+      Each caller still writes `authorById(id)` as if it loaded one author, which keeps the
+      code readable, yet three calls became one request for two ids. Run it as an ES module,
+      for example `npx tsx authors.mts`.
+
+      Create a loader per request, not per process. A shared one would mix users' data and
+      keep a cache that nobody invalidates. And cap the batch size: a list of 50,000 ids in
+      one `ANY($1)` query or one URL can be slow or rejected, so split large batches into
+      chunks of a few hundred.
+pitfalls:
+  - '**Optimising before measuring.** Rewriting the part you suspect often saves 18 ms of a 433 ms request. Time every part first and start with the biggest.'
+  - '**Reporting average latency.** A mean hides the slow tail and matches no real request. Report p50 alongside p95 or p99.'
+  - '**Testing performance on a tiny database.** Three rows make an N+1 or a missing index invisible. Test with production-sized data, or at least count queries per request in tests.'
+  - '**Treating `Promise.all` as a fix for N+1.** It overlaps the queries but still sends all of them, and can exhaust the connection pool. Send one join or one batched query.'
+  - '**Reading `EXPLAIN` without `ANALYZE`.** The plan alone shows estimates, which can be far off. Compare estimated and actual rows, and remember times on looped nodes are per loop.'
+  - '**Running `EXPLAIN ANALYZE` on a write.** It executes the statement. Wrap it in `BEGIN` and `ROLLBACK`.'
+  - '**Sharing one batching loader across requests.** It mixes users'' data and caches values for ever. Create a loader per request.'
+interview:
+  - question: The p99 latency of an endpoint doubled after a release. How do you investigate?
+    answer: >-
+      I'd start by narrowing where the time went, using traces rather than guesses. First
+      I'd check whether p50 moved too: if only the tail moved, suspects are locks,
+      connection pool waits, garbage collection pauses, retries or one slow dependency,
+      rather than a generally slower code path. Then I'd pull traces of slow requests from
+      after the release, ideally tail-sampled ones, and compare their waterfalls with
+      traces from before. A new staircase of sequential calls, a comb of repeated queries,
+      or an unexplained gap each points somewhere specific. If it's a query, I'd run
+      `EXPLAIN (ANALYZE, BUFFERS)` on production-like data. I'd also diff the release for
+      new queries and dependencies. After the fix, I'd confirm the p99 recovered on the
+      dashboard, not only in a local test.
+  - question: What's an N+1 query problem, and how do you detect and fix it?
+    answer: >-
+      It's one query to load a list and then one more query per item, usually hidden in an
+      ORM's lazy loading or a loop that calls a helper. Two hundred books with their authors
+      becomes 201 queries, each paying a round trip. It hides in development because test
+      data is small. I detect it by counting queries per request, in logs, in a trace where
+      it shows as a comb of identical spans, or with a test that asserts a query budget.
+      The fix is one query: a join, the ORM's eager loading, or a second query with
+      `WHERE id = ANY($1)` for all ids at once. When the data lives in another service, a
+      batching loader collects the ids from one tick into a single call. `Promise.all` isn't
+      a fix, because it still sends every query.
+  - question: Why do averages mislead for latency, and what do you use instead?
+    answer: >-
+      Because latency is skewed: most requests are fast and a few are very slow, and the
+      mean blends them into a number no user experiences. With 98% of requests at 80 ms and
+      2% at two seconds, the mean is about 118 ms, which suggests everything's fine, while
+      the p99 is two seconds. I use percentiles: p50 for the typical experience, p95 and
+      p99 for the tail, which is where locks, pauses and slow dependencies show up. The
+      tail matters more than it looks, because active users make many requests and pages
+      fan out to many calls. One caveat: percentiles can't be averaged across servers, so
+      they must be computed from merged histograms.
+  - question: A page calls 30 microservices in parallel and is often slow, though each service's median is fast. What would you do?
+    answer: >-
+      The page is waiting on the slowest of 30 calls, so each service's tail, not its
+      median, sets the page's speed. With 30 calls, a 1-in-100 slow response shows up on
+      about a quarter of page loads. First I'd cut the fan-out: combine calls into batched
+      endpoints, cache data that rarely changes, and drop calls the page doesn't need
+      straight away, loading them later or in the background. Then I'd reduce each tail:
+      timeouts so one slow service can't hold the page, with a fallback or a partial render,
+      and hedged requests for safe, idempotent reads, sending a second copy to another
+      replica after roughly the p95 delay. The trade-off is extra load, since hedging and
+      retries add traffic, so they need limits.
+  - question: How do you read an `EXPLAIN ANALYZE` plan to find the problem?
+    answer: >-
+      I read from the innermost nodes out and look for where the actual time and rows pile
+      up. A `Seq Scan` with a large `Rows Removed by Filter` means the query reads far more
+      than it returns, so an index on the filtered columns, in the right order for any
+      `ORDER BY`, may help. I compare estimated rows with actual rows, because a large gap
+      means the planner is working from wrong statistics or can't use a condition, such as
+      a function wrapped around an indexed column, and bad estimates cause bad join
+      choices. For nodes inside loops, I multiply the time by `loops`. I add `BUFFERS` to see
+      whether pages came from memory or disk. And I always test on realistic data volumes,
+      since the planner chooses differently on tiny tables.

@@ -1,0 +1,274 @@
+summary: >-
+  The Core Web Vitals turn "does this page feel fast" into three numbers. **LCP** (Largest
+  Contentful Paint) measures loading: when the main content appears. **INP** (Interaction to
+  Next Paint) measures responsiveness: how long a tap or key press waits for the screen to
+  answer. **CLS** (Cumulative Layout Shift) measures visual stability: how much content jumps.
+  Good is LCP up to 2.5 s, INP up to 200 ms and CLS up to 0.1, judged at the 75th percentile
+  of real visits.
+
+
+  The lesson covers what each number means, where Lighthouse fits, and how to stop layout
+  shift. These notes explain how each metric is actually computed, because that decides
+  how you fix it: LCP splits into four phases, INP into three, and CLS is a score per burst
+  of shifts, not a sum over the visit.
+
+
+  Use the vitals to decide where to spend effort and to prove a fix worked. Use lab tools to
+  find causes. And remember they're a proxy: a page can pass all three and still feel slow
+  if its key action, such as adding to the cart, waits on a slow API. Measure that with your
+  own timings too.
+remember:
+  - LCP is good at 2.5 s or less, INP at 200 ms or less and CLS at 0.1 or less, and poor starts above 4 s, 500 ms and 0.25.
+  - Each vital is judged at the 75th percentile of real page loads, separately for phones and desktops, so a quarter of visits can be slower and still pass.
+  - LCP splits into time to first byte, resource load delay, resource load duration and element render delay, and you fix whichever phase is biggest.
+  - INP is roughly the slowest interaction of a visit, from input to the next frame painted, and it counts clicks, taps and key presses but not scrolling or hover.
+  - INP replaced First Input Delay as a Core Web Vital in March 2024, because FID only measured the wait before the first interaction's handler.
+  - CLS is the largest burst of layout shifts, where a burst groups shifts less than 1 s apart for at most 5 s, and shifts within 500 ms of input don't count.
+  - Lab tools such as Lighthouse can't measure INP, so they report Total Blocking Time as a stand-in, and field data remains the verdict.
+  - Reserve space for anything that arrives late, and animate with `transform`, which never counts as a layout shift.
+sections:
+  - title: How LCP is measured, and its four phases
+    body: |-
+      The browser reports a new LCP candidate each time a larger element paints. Candidates
+      are images (including an image inside an SVG and a video's poster or first frame),
+      elements with a CSS `background-image` loaded through `url()`, and block-level
+      elements containing text. The last candidate before the user first taps, scrolls or
+      presses a key is the page's LCP. Reporting stops at that first input, because what
+      appears after it is the user's doing.
+
+      That means the LCP element differs by device. On a phone the headline may be larger
+      on screen than the hero image, so a fix for desktop can miss phones. The
+      `web-vitals` attribution build reports which element it was, per visit.
+
+      For an image, LCP breaks into four phases that add up to the total:
+
+      ```text
+      time to first byte        the HTML starts arriving
+      resource load delay       from first byte until the image request starts
+      resource load duration    downloading the image
+      element render delay      from image loaded until it paints
+      ```
+
+      Each phase has its own fix. A slow first byte is a server or CDN problem: caching,
+      closer edges, less work before responding. A long load delay means the browser found
+      the image late: it was lazy, set from JavaScript, or a CSS background. Make it
+      discoverable in the HTML, eager, with `fetchpriority="high"`. A long load duration
+      means too many bytes: serve AVIF or WebP at the right size through `srcset`. A long
+      render delay means something blocked painting after the image arrived, such as
+      render-blocking CSS or a long JavaScript task.
+
+      A common finding is that the download itself is a small share. The time goes on the
+      delay before it starts, which costs nothing to fix once you see it.
+  - title: How INP and CLS are computed
+    body: |-
+      **INP** watches every click, tap and key press during the visit. For each one it
+      takes the time from the input to the next frame painted, which is input delay plus
+      processing plus presentation delay. The visit's INP is the slowest of those, with one
+      adjustment: on pages with many interactions, one of the slowest is ignored for every
+      50, so a single freak in a long session doesn't set the score. Scrolling and hovering
+      aren't interactions for INP. A page with no interactions has no INP at all.
+
+      **CLS** starts with a score per shift: the share of the viewport the moving elements
+      affect, times the distance they moved as a share of the viewport. Shifts are then
+      grouped into **session windows**: a window continues while shifts come less than 1 s
+      apart, up to 5 s long. The page's CLS is the worst window, not the sum of all shifts,
+      so a long-lived page isn't punished for being open for hours.
+
+      ```js
+      // CLS: the largest session window of layout shifts.
+      function cumulativeLayoutShift(shifts) {
+        let worst = 0;
+        let current = 0;
+        let windowStart = 0;
+        let last = -Infinity;
+        for (const shift of shifts) {
+          if (shift.hadRecentInput) continue; // expected after a tap or key press
+          const gapTooLong = shift.time - last >= 1000;
+          const windowTooLong = shift.time - windowStart >= 5000;
+          if (gapTooLong || windowTooLong) {
+            current = 0;
+            windowStart = shift.time;
+          }
+          current += shift.value;
+          last = shift.time;
+          worst = Math.max(worst, current);
+        }
+        return worst;
+      }
+
+      const shifts = [
+        { time: 400, value: 0.05, hadRecentInput: false }, // web font swaps in
+        { time: 900, value: 0.04, hadRecentInput: false }, // advert slot fills
+        { time: 3000, value: 0.2, hadRecentInput: true }, // accordion opened by a tap
+        { time: 7000, value: 0.03, hadRecentInput: false }, // late banner
+      ];
+
+      console.log(cumulativeLayoutShift(shifts).toFixed(2)); // 0.09
+      ```
+
+      The first two shifts form one window worth 0.09, which passes. The accordion's big
+      shift doesn't count because it followed a tap within 500 ms, which the browser marks
+      as `hadRecentInput`. The late banner starts a window of its own.
+  - title: The 75th percentile and what "passing" means
+    body: |-
+      Field data arrives as one value per page load. To rate a page, you take the 75th
+      percentile of each metric and compare it with the thresholds. The 75th is a
+      compromise: high enough that most visits are covered, low enough that a few extreme
+      devices or networks don't dominate.
+
+      ```js
+      const THRESHOLDS = {
+        LCP: [2500, 4000], // ms
+        INP: [200, 500], // ms
+        CLS: [0.1, 0.25], // unitless
+      };
+
+      function percentile(samples, p) {
+        const sorted = [...samples].sort((a, b) => a - b);
+        return sorted[Math.max(0, Math.ceil((p / 100) * sorted.length) - 1)];
+      }
+
+      function rate(name, samples) {
+        const p75 = percentile(samples, 75);
+        const [good, poor] = THRESHOLDS[name];
+        const rating = p75 <= good ? 'good' : p75 <= poor ? 'needs improvement' : 'poor';
+        return { name, p75, rating };
+      }
+
+      // Eight visits to a product page, LCP in ms.
+      const lcp = [1200, 1400, 1500, 2100, 2400, 2700, 3900, 5200];
+      console.log(rate('LCP', lcp)); // { name: 'LCP', p75: 2700, rating: 'needs improvement' }
+      console.log(percentile(lcp, 50)); // 2100
+      ```
+
+      The median visit is fine at 2.1 s, yet the page needs improvement. That's the point
+      of the 75th percentile: the slow quarter, usually older phones on mobile networks,
+      decides the rating.
+
+      A page passes the Core Web Vitals assessment when all three metrics are good at the
+      75th percentile. Google's public field data, the Chrome User Experience Report, splits
+      phones from desktops and covers a rolling 28 days, so a fix takes weeks to show there.
+      Your own reporting shows it the next day, and lets you slice by route, device and
+      country, which is where causes hide.
+  - title: Collecting field data yourself
+    body: |-
+      The `web-vitals` library wraps the browser's performance observers and handles the
+      awkward cases, such as pages restored from the back-forward cache and tabs opened in
+      the background. The part you write is getting the numbers home reliably.
+
+      ```js
+      import { onCLS, onINP, onLCP } from 'web-vitals';
+
+      function sendToAnalytics(metric) {
+        const body = JSON.stringify({
+          name: metric.name, // 'LCP', 'INP' or 'CLS'
+          value: metric.value,
+          rating: metric.rating, // 'good', 'needs-improvement' or 'poor'
+          id: metric.id, // unique per page load, to deduplicate
+          page: location.pathname,
+        });
+        // sendBeacon survives the page being closed; fall back to a keepalive fetch.
+        if (!navigator.sendBeacon('/vitals', body)) {
+          fetch('/vitals', { method: 'POST', body, keepalive: true });
+        }
+      }
+
+      onCLS(sendToAnalytics);
+      onINP(sendToAnalytics);
+      onLCP(sendToAnalytics);
+      ```
+
+      CLS and INP can change until the visit ends, so the library reports them when the page
+      is hidden, for example when the user switches tab or closes it. An ordinary `fetch`
+      started then is often cancelled, which is why `navigator.sendBeacon` or
+      `keepalive: true` matters. Expect to lose some reports from crashes and killed apps.
+
+      Store the raw values with their labels, not one average per day, so you can compute
+      the 75th percentile per route and device later. When a number is poor, import from
+      `web-vitals/attribution` instead: each metric then carries details such as which
+      element was the LCP and which phase of an interaction was slow.
+  - title: Layout shift beyond images
+    body: |-
+      Images without dimensions are the classic cause. A few more are common in production:
+
+      - **Web fonts.** When the real font replaces the fallback, text reflows if the two have
+        different widths and line heights. Preload the font, and match the fallback's size
+        with `size-adjust` and the related `@font-face` descriptors. `font-display: optional`
+        avoids the swap entirely by keeping the fallback when the font is late.
+      - **Adverts, embeds and banners.** Reserve the slot with `min-height`, or
+        `aspect-ratio` for embeds whose width varies.
+      - **Content inserted above what the user is reading.** A cookie notice or "new items"
+        bar should overlay the page or take space reserved from the start.
+      - **Animating layout properties.** Animating `top`, `left`, `width` or `height` moves
+        other boxes and each frame can count as a shift. Animate `transform` instead, which
+        is drawn on top without moving anything else.
+
+      ```css
+      .embed {
+        aspect-ratio: 16 / 9;
+        width: 100%;
+      }
+
+      .toast {
+        position: fixed;
+        inset: auto 16px 16px auto;
+        transform: translateY(0);
+        transition: transform 200ms ease-out;
+      }
+      ```
+
+      A fixed-position toast sits outside the flow, so it can't push anything. Lighthouse and
+      the Performance panel list each shift with the element that moved, which is the
+      quickest way to find the culprit.
+pitfalls:
+  - "**Running Lighthouse on the dev server.** Unminified bundles and development checks make every number worse, so you chase problems users never have. Build for production and serve that."
+  - "**Trusting a green lab score over amber field data.** One simulated load on your machine can't see older phones and slow networks. Use the lab to find and check fixes, and let the field 75th percentile decide."
+  - "**Lazy-loading the LCP image.** A lazy image waits for layout before its request starts, which lands on the resource load delay. Keep the hero eager with `fetchpriority=high` in the HTML."
+  - "**Adding up all layout shifts.** CLS is the worst session window, not the visit total, so a long page isn't doomed by being open for hours. Find the burst that scores highest and fix those shifts."
+  - "**Sending vitals with a plain fetch on unload.** The browser often cancels requests started while the page is being hidden, so the slowest visits go missing. Use `navigator.sendBeacon` or `fetch` with `keepalive: true`."
+  - "**Fixing desktop and assuming phones follow.** The LCP element and the slow phase often differ by device. Split field data by device type and check each one."
+interview:
+  - question: Explain the Core Web Vitals and their thresholds.
+    answer: >-
+      They're three field metrics for how a page feels: LCP for loading, INP for
+      responsiveness and CLS for visual stability. LCP is when the largest image or text
+      block in the viewport paints, good at 2.5 s or less. INP is roughly the slowest
+      interaction of the visit, measured from the input to the next painted frame, good at
+      200 ms or less. CLS scores unexpected layout movement as the worst burst of shifts,
+      good at 0.1 or less. Poor starts above 4 s, 500 ms and 0.25. Each is judged at the
+      75th percentile of real page loads, per device type, and a page passes when all three
+      are good. The caveat I'd add is that they're generic. For a checkout I'd also time the
+      business actions directly, such as how long "place order" takes to confirm.
+  - question: Lighthouse says the page is fast, but real users report it's slow. Why might that be, and what do you do?
+    answer: >-
+      Lighthouse is one simulated load, so it misses what varies in the field: devices,
+      networks, logged-in state and interactions. It also can't measure INP, because nobody
+      taps during the test. First I'd look at field data at the 75th percentile, split by
+      device and route, to find which metric fails and where. Real users often have
+      personalised pages, bigger carts, third-party scripts that only load after consent, or
+      slow phones where JavaScript runs several times slower. With the failing metric and
+      segment known, I'd reproduce it in the lab with CPU throttling and the same route and
+      state, fix it, and confirm in the field. The trade-off is lag: public field data covers
+      28 days, so I'd rely on my own `web-vitals` reporting to see the change quickly.
+  - question: How would you debug a poor LCP?
+    answer: >-
+      Find the LCP element per device, then split its time into the four phases and fix the
+      biggest. The `web-vitals` attribution build or the Performance panel gives the element
+      and the phases: time to first byte, resource load delay, load duration and render
+      delay. A slow first byte points at the server or missing CDN caching. A long load delay
+      means the image was found late, for example lazy-loaded, injected by JavaScript or a
+      CSS background, so I'd put it in the HTML, eager, with `fetchpriority="high"`. A long
+      download means too many bytes, so modern formats and `srcset`. A long render delay
+      means render-blocking CSS or a long task. What I wouldn't do is start by compressing
+      images, because the delay before the download often dominates.
+  - question: Why did INP replace First Input Delay?
+    answer: >-
+      Because FID measured too little. It only covered the first interaction, and only the
+      input delay: the wait before the handler started. It ignored the handler's own time and
+      the time to paint the result, and every later interaction. Most sites passed FID while
+      users still met sluggish menus and filters. INP, a Core Web Vital since March 2024,
+      measures every click, tap and key press from input to the next painted frame, and
+      reports roughly the worst one. That catches slow handlers, heavy rendering after state
+      changes, and long tasks at any point in the visit. The cost is that INP is harder to
+      pass and harder to debug, because the slow interaction might happen minutes into a
+      session, so you need attribution data from the field to know which one it was.

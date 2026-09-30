@@ -1,0 +1,214 @@
+summary: >-
+  Anyone can write a Dockerfile that works. A good one rebuilds in seconds, carries nothing
+  it doesn't run, holds no secrets, and has a name that points at exactly one build. Those
+  four properties come from four ideas: the layer cache, the build context, multi-stage
+  builds and immutable tags.
+
+
+  They matter because an image is copied everywhere: to CI caches, registries, laptops and
+  every server. Whatever is in a layer is in every copy, for as long as the copy exists.
+  And a deploy is only as exact as the tag it names; "roll back to the last good one" needs
+  a name for the last good one.
+
+
+  These notes add the rest of what a production image needs: exactly how the cache decides
+  to reuse a step, cache mounts that keep npm fast even when the cache misses, a complete
+  tested Dockerfile with production dependencies only, a non-root user and a health check,
+  building for the server's CPU from an ARM laptop, secrets the build itself needs, and
+  pinning and scanning the base image.
+remember:
+  - Order a Dockerfile from what changes least to what changes most, because a changed step rebuilds every step after it.
+  - '`COPY` is cached by the content of the files it copies, but `RUN` is cached by its command text, so `RUN apt-get update` alone goes stale.'
+  - Anything written to a layer stays in the image even if a later step deletes it, so secrets must never enter a layer.
+  - A `.dockerignore` keeps `node_modules`, `.env`, `.git` and build output out of the build context.
+  - A multi-stage build installs and builds in one stage and copies only the output and production dependencies into a clean final stage.
+  - Tag every image with its commit and deploy that tag or its digest, never `latest`.
+  - Build for the server's CPU; an arm64 image from an Apple laptop fails with "exec format error" on an x86 server.
+  - A secret the build needs goes through `RUN --mount=type=secret`, which is never written to a layer.
+sections:
+  - title: How the cache decides
+    body: |-
+      For each instruction, BuildKit, Docker's builder, works out a cache key from the
+      previous layer and the instruction itself. If a layer with that key exists, it's
+      reused. The inputs differ by instruction.
+
+      **`COPY` and `ADD`** hash the contents of the files they copy. Touching a file without
+      changing it doesn't miss the cache; changing one byte does. That's why copying only
+      `package.json` and the lockfile before `npm ci` works: most commits don't change them.
+
+      **`RUN`** keys on the command text. Docker doesn't know what the command reads from
+      the network. `RUN apt-get update` stays cached for months, and a later
+      `RUN apt-get install curl` installs from a stale list, or fails. Put them in one step,
+      so a change to the package list reruns the update too:
+
+      ```text
+      RUN apt-get update \
+        && apt-get install -y --no-install-recommends curl \
+        && rm -rf /var/lib/apt/lists/*
+      ```
+
+      The last part matters for size only because it's in the **same** layer. Deleting files
+      in a later step hides them from the final file tree, but the earlier layer still ships,
+      full size and readable. The same rule is why a secret copied in and then deleted is
+      still in the image.
+
+      When the cache does miss, a **cache mount** keeps a folder between builds without
+      putting it in the image. npm's download cache is the useful one:
+
+      ```text
+      RUN --mount=type=cache,target=/root/.npm npm ci
+      ```
+
+      A lockfile change still reruns `npm ci`, but packages already downloaded come from the
+      mount instead of the network.
+  - title: A production Dockerfile, complete
+    body: |-
+      This one builds a TypeScript API bundled with esbuild. It uses three stages: production
+      dependencies only, a full build, and a clean runtime. We built and ran it with Docker
+      28.3; `docker build --check` reported no warnings, the health check turned `healthy`,
+      `whoami` printed `node`, and `docker stop` exited 0 in about a second.
+
+      ```text
+      # syntax=docker/dockerfile:1
+      FROM node:24-slim AS deps
+      WORKDIR /app
+      COPY package.json package-lock.json ./
+      RUN --mount=type=cache,target=/root/.npm npm ci --omit=dev
+
+      FROM node:24-slim AS build
+      WORKDIR /app
+      COPY package.json package-lock.json ./
+      RUN --mount=type=cache,target=/root/.npm npm ci
+      COPY . .
+      RUN npm run build
+
+      FROM node:24-slim
+      ENV NODE_ENV=production
+      WORKDIR /app
+      COPY --from=deps /app/node_modules ./node_modules
+      COPY --from=build /app/dist ./dist
+      USER node
+      EXPOSE 3000
+      HEALTHCHECK --interval=10s --timeout=3s --retries=3 \
+        CMD ["node", "-e", "fetch('http://127.0.0.1:3000/health').then(r => process.exit(r.ok ? 0 : 1), () => process.exit(1))"]
+      CMD ["node", "dist/server.js"]
+      ```
+
+      The `deps` stage gives the runtime `node_modules` without esbuild, TypeScript or test
+      tools. The files it copies are owned by `root` and readable by all, which is what you
+      want: the `node` user can run the code but can't change it. `EXPOSE` only documents the
+      port; it publishes nothing. The health check uses Node's built-in `fetch`, because the
+      slim image has no `curl`. Orchestrators such as Kubernetes ignore `HEALTHCHECK` and use
+      their own probes, while Docker and Compose use it.
+
+      Label the image with its source, so anyone holding it can find the commit:
+      `docker build --label org.opencontainers.image.revision=$(git rev-parse HEAD)`.
+  - title: Tags, digests and the server's CPU
+    body: |-
+      A tag is a movable pointer. Even `todo-api:3f2a91c` can be pushed again with different
+      contents, unless your registry marks tags immutable, which most can. A **digest**,
+      `todo-api@sha256:...`, is the hash of the image's manifest, so it can only ever mean
+      those bytes. Tag by commit for humans, and let the deploy record the digest it
+      actually ran.
+
+      ```bash
+      sha=$(git rev-parse --short HEAD)
+      docker buildx build --platform linux/amd64 -t registry.example.com/todo-api:$sha --push .
+      docker buildx imagetools inspect registry.example.com/todo-api:$sha
+      ```
+
+      The `--platform` flag is the one that saves an afternoon. An Apple silicon laptop
+      builds `linux/arm64` images by default. Push one to an x86 server and the container
+      dies at once with "exec format error", the same message as the lesson's copied
+      `node_modules`, for the same reason: a program built for another CPU. Build for the
+      server's platform, or build both with `--platform linux/amd64,linux/arm64`, and the
+      registry serves each machine its own. Building for a foreign CPU runs under emulation
+      and is slower, which is one reason teams build in CI on the target architecture.
+
+      Base images need the same care. `node:24-slim` follows Node 24's patch releases, which
+      brings security fixes and, rarely, a surprise. Pinning a digest makes builds exactly
+      repeatable, and a bot that opens a pull request for each new digest keeps the fixes
+      coming through review.
+  - title: Smaller and safer images
+    body: |-
+      Every package in an image is something that can have a vulnerability, and scanners
+      will report it whether your app uses it or not. Smaller images mean fewer reports to
+      triage and faster pulls.
+
+      The choice of base is the biggest lever. **`node:24`** is a full Debian with compilers,
+      handy for building native modules and large. **`node:24-slim`** is Debian with the
+      minimum, a sensible default. **`node:24-alpine`** is smaller still, and uses the musl C
+      library instead of glibc, so native modules may need a different build and some behave
+      differently. **Distroless** images carry the runtime and no shell at all, which is
+      safer and makes `docker exec ... sh` impossible, so debugging needs other tools.
+
+      A multi-stage build lets you mix them: build on the full image, where compilers exist,
+      and run on slim or distroless.
+
+      Scan in CI. `docker scout cves image` and Trivy's `trivy image image` both list known
+      vulnerabilities by package and severity. Fail the build on critical ones that have a
+      fix available, and rebuild images regularly even without code changes, because a new
+      base image patch only reaches you when you rebuild.
+
+      For secrets the build itself needs, such as a token for a private npm registry, a
+      secret mount keeps them out of every layer:
+
+      ```bash
+      docker build --secret id=npmrc,src=$HOME/.npmrc -t todo-api .
+      ```
+
+      ```text
+      RUN --mount=type=secret,id=npmrc,target=/root/.npmrc npm ci
+      ```
+
+      The file exists only while that one `RUN` runs. `ARG` is not a substitute: build
+      arguments used in a step show up in `docker history`.
+pitfalls:
+  - '**`COPY . .` before `npm ci`.** Every code change reinstalls every package. Copy the manifests, install, then copy the source.'
+  - '**Deleting a secret in a later step.** The earlier layer still holds it, readable by anyone with the image. Use a secret mount, or never copy it in.'
+  - '**No `.dockerignore`.** The laptop''s `node_modules`, `.env` and `.git` end up in the image. List them.'
+  - '**A lone `RUN apt-get update`.** It stays cached with a stale package list. Update and install in one `RUN`.'
+  - '**Shipping dev dependencies.** TypeScript and test tools add size and vulnerabilities. Install with `npm ci --omit=dev` in the runtime''s dependencies.'
+  - '**Building on an ARM laptop for an x86 server.** The container fails with "exec format error". Pass `--platform linux/amd64` or build in CI.'
+  - '**Deploying `latest`.** Nobody knows which code runs or what to roll back to. Deploy a commit tag, and record the digest.'
+interview:
+  - question: How would you make a Docker image build fast in CI?
+    answer: >-
+      Order the Dockerfile for the layer cache, then make sure CI can actually use a cache.
+      Manifests and `npm ci` come before the source, so most commits reuse the install layer.
+      A cache mount for npm's download folder keeps even a lockfile change quick. CI runners
+      often start empty, so I'd export and import the build cache, for example to the
+      registry or the CI system's cache, otherwise the careful ordering buys nothing. A tight
+      `.dockerignore` keeps the context small and stops irrelevant files busting `COPY`
+      caches. The trade-off is correctness against speed: a cached `RUN` that fetches from
+      the network can go stale, so I'd rebuild without cache on a schedule to pick up base
+      image fixes.
+  - question: What goes into a production-ready Dockerfile for a Node service?
+    answer: >-
+      A multi-stage build ending in a small runtime stage that holds only what runs. A build
+      stage installs everything and compiles; a deps stage runs `npm ci --omit=dev`; the final
+      stage on `node:24-slim` copies in the built output and production `node_modules`. It
+      sets `NODE_ENV=production`, runs as `USER node`, and starts with exec-form
+      `CMD ["node", "dist/server.js"]` so signals reach the app. A `.dockerignore` keeps
+      secrets and local modules out, secrets arrive at run time, and the image is tagged with
+      its commit. I'd add a `HEALTHCHECK` for Docker and Compose, and scan it in CI. Distroless
+      would be smaller and safer at the cost of losing a shell for debugging.
+  - question: A teammate committed an API key into a Docker image and pushed it. They've removed it in a new commit. Is that enough?
+    answer: >-
+      No: the key is compromised and must be rotated first. The old image still exists in the
+      registry, in CI caches and on every machine that pulled it, and anyone can read its
+      layers with `docker history` or by extracting them. Even inside the new image, if the
+      fix was a later `RUN rm`, the earlier layer still carries the file. So I'd revoke and
+      reissue the key at the provider, then delete the affected tags, check the provider's
+      logs for use of the old key, and add the file to `.dockerignore`. For secrets the build
+      needs, a `--mount=type=secret` step. Removal from history is cleanup; rotation is the
+      fix.
+  - question: Why is deploying the `latest` tag a problem?
+    answer: >-
+      Because `latest` is a pointer that moves with every push, so it doesn't say what's
+      running. Two servers that pulled at different times can run different code under the
+      same name. A rollback to `latest` gets the broken build that took over the tag. And
+      nobody can answer "which commit is in production?" I'd tag each image with its commit
+      hash, make tags immutable in the registry, and have the deploy record the image digest,
+      which can only ever mean those exact bytes. The small cost is that deploys must pass a
+      tag explicitly, which is the point.

@@ -1,0 +1,325 @@
+summary: >-
+  Your program never touches the hardware directly. The **operating system** stands in the
+  middle. It gives each program the illusion of its own CPU, memory and files, and it shares
+  the real ones out fairly and safely. It does that with processes and
+  threads, a scheduler, virtual memory, and a narrow door called the system call. File
+  descriptors are the small numbers you get back when you walk through that door.
+
+
+  The network is the same idea stretched between machines. Each layer turns something
+  unreliable into something more useful. IP moves packets between addresses with no
+  promises. TCP turns them into a reliable, ordered byte stream. UDP hands over separate
+  datagrams with no promises at all, which is what QUIC builds on. TLS adds privacy and
+  proof of identity. DNS turns names into addresses, and HTTP gives requests and responses
+  a shape.
+
+
+  You need this when things fail in production: a process killed for memory, a server that
+  stops accepting connections, a page slow only on mobile networks, a message cut in half.
+  Each of those is an operating system or network layer showing through, and knowing the
+  layers tells you where to look.
+remember:
+  - A process has its own virtual address space and descriptors, and its threads share that memory while each has its own stack.
+  - The scheduler preempts running threads on a timer and switches between them, so threads waiting on I/O cost no CPU time.
+  - Virtual memory maps each process's addresses to physical pages through page tables, which isolates processes and lets memory be loaded lazily.
+  - A system call is how a program asks the kernel to do privileged work, such as opening a file or sending bytes, and each one crosses from user mode into kernel mode.
+  - A file descriptor is a per-process integer for an open file, socket or pipe, and 0, 1 and 2 are standard input, output and error.
+  - TCP gives a reliable ordered byte stream after a handshake, while UDP sends independent datagrams that may be lost, duplicated or reordered.
+  - HTTP/1.1 handles one request at a time per connection, HTTP/2 multiplexes streams over one TCP connection, and HTTP/3 runs over QUIC on UDP so one lost packet stalls only its own stream.
+  - Loading a URL means DNS lookup, a transport and TLS handshake, the HTTP request and response, then parsing and rendering, and each step can be the slow one.
+sections:
+  - title: Processes, threads and the scheduler
+    body: |-
+      A CPU core runs one thread at a time, yet a laptop runs thousands of threads. The
+      **scheduler** in the kernel makes that work. It gives a runnable thread a short time
+      slice, then a timer interrupt hands control back to the kernel, which may **preempt**
+      the thread and switch to another. A **context switch** saves one thread's registers and
+      restores another's. Switching between threads of different processes also switches
+      address spaces, which costs more.
+
+      Most threads spend most of their time **blocked**: waiting on a disk read, a network
+      packet or a lock. A blocked thread isn't runnable, so it uses no CPU. That's why a
+      server handling ten thousand idle connections can be nearly idle, and why the useful
+      split is between **CPU-bound** work (limited by computation) and **I/O-bound** work
+      (limited by waiting).
+
+      Node maps onto this directly. Your JavaScript runs on one thread, and waiting on I/O
+      costs nothing because the event loop is blocked in the kernel, not spinning. For CPU
+      work you add threads with `worker_threads` or processes with `child_process` or
+      `cluster`. Workers share a process, but by default messages between them are copied,
+      not shared.
+
+      ```js
+      import { Worker } from 'node:worker_threads';
+
+      const code = `
+        const { parentPort } = require('node:worker_threads');
+        parentPort.on('message', ({ order, counter }) => {
+          order.status = 'changed in worker';
+          Atomics.add(counter, 0, 1);
+          parentPort.postMessage('done');
+        });
+      `;
+      const worker = new Worker(code, { eval: true });
+      const order = { status: 'new' };
+      const counter = new Int32Array(new SharedArrayBuffer(4));
+      worker.postMessage({ order, counter });
+      worker.once('message', async () => {
+        console.log(order.status); // new, the worker changed a copy
+        console.log(counter[0]); // 1, shared memory really is shared
+        await worker.terminate();
+      });
+      ```
+
+      Processes give isolation: a crash or a memory leak stays in one. Threads give cheap
+      sharing, and with it data races, which is why Node makes sharing opt-in. A good
+      default for a CPU-heavy pool is one worker per core, from
+      `os.availableParallelism()`.
+  - title: Virtual memory
+    body: |-
+      Every process sees its own **virtual address space**, as if it had the machine's memory
+      to itself. The hardware's memory management unit translates each virtual address to a
+      physical one, using **page tables** the kernel keeps per process. Memory is managed in
+      fixed-size **pages**: 4 KB on most x86 Linux machines, and 16 KB on Apple silicon Macs.
+      A small cache in the CPU, the TLB, keeps recent translations so most lookups are free.
+
+      This one mechanism gives several things at once.
+
+      - **Isolation.** A process can only name addresses in its own tables, so it can't read
+        another's memory. Touching an unmapped address is a segmentation fault.
+      - **Lazy loading.** Pages are mapped on first touch. A **page fault** traps into the
+        kernel, which finds a physical page, fills it from a file or with zeros, and resumes
+        the program. That's why a process's virtual size is much larger than its resident
+        size, `rss` in `process.memoryUsage()`.
+      - **Sharing.** Two processes running the same binary can map the same physical pages
+        for its code. After `fork`, parent and child share pages **copy-on-write** until one
+        of them writes.
+      - **Swapping.** When physical memory runs short, the kernel can write idle pages to
+        disk and fault them back in later. Heavy swapping makes everything crawl.
+
+      In containers, the memory limit is enforced by the kernel, and on Linux a process that
+      exceeds it is killed by the out-of-memory killer with `SIGKILL`. It gets no chance to
+      log, and the exit code shows as 137, which is 128 plus signal 9. When a Node container
+      dies that way, compare `--max-old-space-size` with the container limit: the heap limit
+      should sit well below it, leaving room for buffers and native memory.
+  - title: System calls and file descriptors in practice
+    body: |-
+      User programs run in **user mode**, where the CPU refuses privileged instructions. To
+      open a file, send a packet or start a process, a program makes a **system call**. That's
+      a special instruction that switches to kernel mode. The kernel runs its own code with
+      checked arguments, then returns. Node's `fs.readFileSync` is a handful of them, roughly `open`,
+      `fstat`, `read` and `close`. `strace` on Linux lists them as they happen.
+
+      Each call crosses the user-kernel boundary, so code that does many tiny reads or
+      writes is slow. That's why streams and buffered writers batch bytes into larger calls.
+
+      The kernel keeps a table of open files per process, and a **file descriptor** is an
+      index into it. Files, pipes, sockets and terminals all look alike through it: you
+      `read` and `write` a descriptor without caring what's behind it. Descriptor 1 is
+      standard output, and you can write to it directly.
+
+      ```js
+      import { writeSync } from 'node:fs';
+      writeSync(1, 'written straight to descriptor 1\n'); // written straight to descriptor 1
+      ```
+
+      Descriptors are limited per process (`ulimit -n` shows the soft limit in a shell), and
+      each open socket takes one. The lesson closed descriptors with `try` and `finally`.
+      Node 24 also supports `await using` with `fs/promises` file handles, which closes the
+      handle when the block ends, even if it throws.
+
+      ```js
+      import { open } from 'node:fs/promises';
+
+      let handle;
+      {
+        await using file = await open(new URL(import.meta.url), 'r');
+        handle = file;
+        console.log(typeof file.fd); // number
+      }
+      try {
+        await handle.stat();
+      } catch (error) {
+        console.log(error.code); // EBADF, the descriptor was closed
+      }
+      ```
+
+      Descriptors are also inherited: a child process starts with copies of its parent's
+      descriptors. That's how a shell pipes one program's output into another's input.
+  - title: The network stack, layer by layer
+    body: |-
+      Each layer adds one promise on top of the one below.
+
+      - **IP** delivers packets from one address to another, router by router. It promises
+        nothing: packets can be lost, duplicated or reordered. IPv4 addresses are 32 bits and
+        IPv6 addresses 128 bits.
+      - **TCP** adds a connection between two ports, set up by a handshake. Sequence numbers
+        and acknowledgements give reliable, ordered delivery, with retransmission of lost
+        segments. **Flow control** stops a sender overrunning a slow receiver, and
+        **congestion control** backs off when the network is overloaded. The price is
+        head-of-line blocking: one lost segment holds back every byte behind it.
+      - **UDP** adds only ports and a checksum. Each `send` is one datagram, and message
+        boundaries survive, unlike TCP. DNS, voice, games and QUIC use it.
+      - **TLS** encrypts a TCP stream and proves the server's identity with a certificate
+        chain up to an authority the client trusts. TLS 1.3 takes one round trip. Its
+        handshake also carries ALPN, which picks HTTP/2 or HTTP/1.1.
+      - **DNS** maps names to addresses. A resolver asks the root servers, then the
+        top-level domain's servers, then the domain's authoritative servers, and caches each
+        answer for its TTL.
+
+      UDP's boundaries show clearly on loopback: two sends arrive as two messages.
+
+      ```js
+      import dgram from 'node:dgram';
+
+      const server = dgram.createSocket('udp4');
+      const client = dgram.createSocket('udp4');
+      const got = [];
+      server.on('message', (msg) => {
+        got.push(msg.toString());
+        if (got.length === 2) {
+          console.log(got); // [ 'e4', 'e5' ]
+          server.close();
+          client.close();
+        }
+      });
+      server.bind(0, '127.0.0.1', () => {
+        const { port } = server.address();
+        client.send('e4', port, '127.0.0.1');
+        client.send('e5', port, '127.0.0.1');
+      });
+      ```
+
+  - title: Framing TCP messages with a length prefix
+    body: |-
+      On TCP you frame messages yourself. The lesson used a newline. Binary protocols
+      usually send a **length prefix**, which also allows newlines inside messages. Note the
+      big-endian length, network byte order from the data representation lesson.
+
+      ```ts
+      function encode(text: string): Buffer {
+        const body = Buffer.from(text, 'utf8');
+        const header = Buffer.alloc(4);
+        header.writeUInt32BE(body.length);
+        return Buffer.concat([header, body]);
+      }
+
+      function createDecoder(onMessage: (text: string) => void) {
+        let pending = Buffer.alloc(0);
+        return (chunk: Buffer) => {
+          pending = Buffer.concat([pending, chunk]);
+          while (pending.length >= 4) {
+            const size = pending.readUInt32BE(0);
+            if (pending.length < 4 + size) break; // wait for the rest of the body
+            onMessage(pending.subarray(4, 4 + size).toString('utf8'));
+            pending = pending.subarray(4 + size);
+          }
+        };
+      }
+
+      const wire = Buffer.concat([encode('hello'), encode('naïve café 😀')]);
+      const received: string[] = [];
+      const feed = createDecoder((text) => received.push(text));
+      for (let i = 0; i < wire.length; i += 5) feed(wire.subarray(i, i + 5));
+      console.log(received); // [ 'hello', 'naïve café 😀' ]
+      ```
+
+      The length counts bytes, not characters, which is why the decoder slices the buffer
+      before turning it into text. Decoding each chunk separately could split the emoji's
+      four bytes.
+  - title: HTTP versions, and what happens when you type a URL
+    body: |-
+      **HTTP/1.1** is text over TCP. Connections stay open between requests, but each one
+      carries one request at a time, so browsers open several connections per host, usually
+      up to six. **HTTP/2** keeps the same methods, headers and status codes but sends them
+      as binary frames, compresses headers, and **multiplexes** many streams over one TCP
+      connection. TCP still delivers bytes in order, so one lost packet stalls every stream.
+      **HTTP/3** runs over **QUIC**, a transport on UDP with TLS 1.3 built in. QUIC orders
+      each stream separately, sets up transport and encryption in one round trip, and can
+      keep a connection alive when a phone changes network. A browser usually learns a
+      server speaks HTTP/3 from an `Alt-Svc` response header or a DNS record, so the first
+      visit often starts on HTTP/2.
+
+      Now the classic question, as a sequence.
+
+      1. The browser parses the URL. If the site is on its HSTS list, it upgrades `http` to
+         `https` before sending anything.
+      2. It resolves the host name: the browser's cache, then the operating system's, then a
+         recursive resolver, which may walk from the root servers down.
+      3. It connects: a TCP handshake then a TLS handshake, or one QUIC handshake. TLS
+         checks the certificate matches the host name and chains to a trusted authority.
+      4. It sends the HTTP request, with method, path, headers and cookies. A CDN or load
+         balancer often answers or forwards it before any application code runs.
+      5. The server responds with a status, headers and a body, often compressed.
+      6. The browser parses the HTML into the DOM, finds CSS, scripts and images, and fetches
+         them, reusing the connection. It builds the CSSOM, lays out the page and paints it.
+
+      Each step has its own cost: a DNS miss, a round trip per handshake on a slow mobile
+      link, a slow server, or render-blocking CSS and scripts. Browser devtools show them as
+      separate bars in the network timing view, which is where you'd start.
+pitfalls:
+  - '**Treating one TCP read as one message.** TCP keeps no message edges, so a read can hold two messages or half of one. Frame each message with a delimiter or a length prefix, and keep the unfinished tail between reads.'
+  - '**Assuming UDP is TCP without the handshake.** UDP datagrams can be lost, duplicated or arrive out of order, and nothing retries. Use it only when the application handles that, or use a protocol such as QUIC built on top.'
+  - '**Giving a Node heap limit equal to the container limit.** The process also needs memory for buffers, native code and the stack. So it exceeds the limit, and the kernel kills it with no log. Set `--max-old-space-size` well below the container''s memory.'
+  - '**Using threads when you need isolation.** A thread that crashes or leaks takes its whole process down, along with every other thread in it. Use separate processes when failures must stay contained.'
+  - '**Making many tiny writes.** Each `write` on a file or socket is a system call, and thousands of small ones cost far more than one batched write. Use streams or build a buffer, then write once.'
+  - '**Blaming the server for every slow page.** DNS lookups, TCP and TLS round trips on a mobile link, and render-blocking assets often dominate. Read the network timing breakdown before optimising the backend.'
+interview:
+  - question: What's the difference between a process and a thread?
+    answer: >-
+      A process is an isolated running program, and a thread is a path of execution inside
+      one. Each process has its own virtual address space, file descriptors and security
+      identity, so one process can't read another's memory and a crash stays contained.
+      Threads in a process share its memory and descriptors, and each has only its own
+      stack and registers. That makes threads cheaper to create and switch, and sharing data
+      is a memory access rather than inter-process communication. The cost is safety:
+      shared mutable state brings data races, so you need locks or atomics. In Node I'd use `worker_threads` for CPU-heavy work
+      that needs shared buffers. I'd use separate processes, such as `cluster` or containers,
+      when a crash in one must leave the others serving.
+  - question: What happens when you type a URL into the browser and press Enter?
+    answer: >-
+      The browser resolves the name, connects securely, sends a request and renders the
+      response. First it parses the URL and applies HSTS, upgrading to HTTPS if the site
+      requires it. It resolves the host name through its own cache, the operating system's
+      cache and a recursive DNS resolver. It opens a TCP connection and runs a TLS 1.3
+      handshake, verifying the certificate against the host name, or does a single QUIC
+      handshake for HTTP/3. It sends an HTTP request with headers and cookies, which a CDN
+      or load balancer may answer or forward to the application. The response's HTML is
+      parsed into the DOM, subresources are fetched over the same connection, and the page
+      is laid out and painted. When it's slow, the network timing view shows which of these
+      steps is to blame.
+  - question: Compare TCP and UDP. When would you choose UDP?
+    answer: >-
+      TCP is a reliable, ordered byte stream with a connection, and UDP sends independent
+      datagrams with no guarantees. TCP's handshake, acknowledgements and retransmissions
+      mean every byte arrives once and in order, and congestion control keeps it fair on a
+      busy network. The price is setup latency and head-of-line blocking: a lost segment
+      stalls everything behind it. UDP has no handshake and keeps message boundaries, but
+      datagrams can be lost, duplicated or reordered. I'd choose UDP when fresh data beats
+      complete data, as in voice, video calls or game state, or for small request and
+      response exchanges like DNS. It's also the base for QUIC, which rebuilds reliability
+      per stream on top. For ordinary application traffic I'd stay on TCP or HTTP, because
+      rebuilding reliability correctly is hard.
+  - question: What changed between HTTP/1.1, HTTP/2 and HTTP/3?
+    answer: >-
+      The semantics stayed the same, and the transport underneath changed to cut latency.
+      HTTP/1.1 is text, and a connection carries one request at a time, so browsers open
+      several connections per host. HTTP/2 uses binary frames and header compression, and
+      multiplexes many streams over one TCP connection, which removes the need for many
+      connections. But TCP delivers bytes strictly in order, so one lost packet blocks every
+      stream. HTTP/3 moves to QUIC over UDP. QUIC orders each stream independently, builds
+      TLS 1.3 into its handshake so setup takes one round trip, and survives network
+      changes through connection IDs. One trade-off is that
+      UDP is sometimes blocked or throttled by middleboxes, so clients fall back to HTTP/2.
+      Another is that QUIC usually runs in user space, which tends to cost more CPU than the kernel's TCP.
+  - question: What is a file descriptor, and what does `EMFILE` mean?
+    answer: >-
+      A file descriptor is a small integer a process uses to refer to an open file, socket,
+      pipe or terminal, an index into the kernel's per-process table of open files.
+      Descriptors 0, 1 and 2 are standard input, output and error. Every `open`, accepted
+      connection or outgoing socket takes a new one, and the kernel caps how many a process
+      may hold. `EMFILE` means the process hit that cap, which almost always means a leak:
+      something is opened and never closed on some path, often an error path. For a server
+      it shows up as failing to accept new connections. The fix is to close in `finally`, or
+      with `await using`, and to limit concurrency when processing many files. Raising the
+      limit with `ulimit -n` only helps when the load is legitimate.

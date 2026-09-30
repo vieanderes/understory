@@ -1,0 +1,319 @@
+summary: >-
+  A large language model is a next-token predictor wrapped in a loop. Given the text so far,
+  it scores every token in its vocabulary, one token is chosen, it's appended, and the model
+  runs again on the longer text. It stops at an end token or when it reaches `max_tokens`.
+  Everything you build on top, from a chat to an agent, is this loop with different text fed
+  in.
+
+
+  Knowing the loop explains most of the surprises you'll meet in production. Bills, limits
+  and latency are counted in tokens, not words or requests. The same prompt gives different
+  answers because a token is drawn from a distribution, and one different early token sends
+  the rest of the reply somewhere else. A model answers questions instead of continuing them
+  because post-training taught it that an answer is the likely next text.
+
+
+  You reach for this mental model whenever an AI feature behaves oddly: a flaky test, a
+  truncated reply, a cost spike on JSON input, a confident answer about something the model
+  never saw. It doesn't tell you how the network computes its scores, and you rarely need
+  that to build well. What you need is to treat model output as sampled, token-counted and
+  plausible rather than checked.
+remember:
+  - A language model writes by repeating one step, predict the next token, append it, and predict again, until an end token or `max_tokens`.
+  - Prices, context limits and `max_tokens` are all counted in tokens from the model's own tokeniser, so count with the provider's counter, never with words.
+  - The model outputs a probability for every token and one is sampled, so identical prompts can give different replies.
+  - Temperature reshapes the distribution before sampling, low sharpens it towards the top token and high flattens it.
+  - One different early token changes everything written after it, which is why answers drift apart rather than differ by a word.
+  - Pre-training makes a base model that continues text, and post-training on conversations and preference rankings makes it answer.
+  - Output tokens are generated one at a time, so a long reply costs more latency than a long prompt of the same size.
+  - A reply that stopped at `max_tokens` is incomplete, so check the stop reason before you use it.
+sections:
+  - title: How a tokeniser builds its vocabulary
+    body: |-
+      Most current tokenisers are built with a method in the family of **byte pair
+      encoding**. Start with single characters (or bytes). Count which adjacent pair
+      appears most often in a large training corpus, merge it into one new token, and
+      repeat until the vocabulary reaches its target size. Frequent words end up as one
+      token, rare ones stay split into pieces.
+
+      ```python
+      from collections import Counter
+
+      def most_common_pair(words):
+          pairs = Counter()
+          for word, count in words.items():
+              for a, b in zip(word, word[1:]):
+                  pairs[(a, b)] += count
+          return pairs.most_common(1)[0][0]
+
+      def merge(words, pair):
+          merged = {}
+          for word, count in words.items():
+              out, i = [], 0
+              while i < len(word):
+                  if i + 1 < len(word) and (word[i], word[i + 1]) == pair:
+                      out.append(word[i] + word[i + 1])
+                      i += 2
+                  else:
+                      out.append(word[i])
+                      i += 1
+              merged[tuple(out)] = count
+          return merged
+
+      # Word counts from a tiny corpus, each word split into characters.
+      words = {tuple("lower"): 5, tuple("lowest"): 3, tuple("newer"): 6, tuple("wider"): 2}
+      for _ in range(4):
+          pair = most_common_pair(words)
+          words = merge(words, pair)
+          print(pair, list(words))
+      # Last line: ('n', 'e') [('lo', 'wer'), ('lo', 'we', 's', 't'), ('ne', 'wer'), ('w', 'i', 'd', 'e', 'r')]
+      ```
+
+      This explains the lesson's JSON surprise. The corpus is mostly prose, so English
+      words earn whole tokens. Braces, quotes, ids, hashes, base64 and uncommon languages
+      earned fewer merges and split into many small tokens. Each provider trains its own
+      tokeniser, so the same text has a different count on different models. A rough rule
+      for English prose is a few characters per token, but treat it as a sanity check, not
+      a budget. Tokens are also why models are unreliable at counting letters in a word: the
+      model sees `wer`, not `w`, `e`, `r`.
+  - title: From scores to a token, temperature and top p
+    body: |-
+      The network outputs a raw score, a **logit**, for every token in the vocabulary. A
+      function called softmax turns the scores into probabilities that add up to 1.
+      Temperature divides every logit before softmax. Dividing by less than 1 widens the
+      gaps, so the top token dominates. Dividing by more than 1 shrinks them, so unlikely
+      tokens get a real chance. **Top p** (nucleus sampling) then keeps only the smallest
+      set of top tokens whose probabilities reach p, and samples among those, which cuts
+      off the long tail of nonsense.
+
+      ```python
+      import math
+
+      def softmax(logits, temperature=1.0):
+          scaled = {t: s / temperature for t, s in logits.items()}
+          top = max(scaled.values())
+          exps = {t: math.exp(s - top) for t, s in scaled.items()}  # subtract max to avoid overflow
+          total = sum(exps.values())
+          return {t: e / total for t, e in exps.items()}
+
+      def top_p(probs, p):
+          kept, running = {}, 0.0
+          for token, prob in sorted(probs.items(), key=lambda kv: kv[1], reverse=True):
+              kept[token] = prob
+              running += prob
+              if running >= p:
+                  break
+          total = sum(kept.values())
+          return {t: q / total for t, q in kept.items()}
+
+      logits = {" mat": 4.0, " sofa": 3.0, " roof": 2.2, " moon": -0.5}
+      for t in (0.5, 1.0, 1.5):
+          print(t, {k: round(v, 2) for k, v in softmax(logits, t).items()})
+      # 0.5 {' mat': 0.86, ' sofa': 0.12, ' roof': 0.02, ' moon': 0.0}
+      # 1.0 {' mat': 0.65, ' sofa': 0.24, ' roof': 0.11, ' moon': 0.01}
+      # 1.5 {' mat': 0.54, ' sofa': 0.28, ' roof': 0.16, ' moon': 0.03}
+      print({k: round(v, 2) for k, v in top_p(softmax(logits), 0.9).items()})
+      # {' mat': 0.65, ' sofa': 0.24, ' roof': 0.11}
+      ```
+
+      Temperature near 0 approaches greedy decoding: always the top token. That isn't
+      always best. Greedy text can loop or turn bland, which is one reason providers pick
+      a default for you. Which knobs a provider exposes varies by model, and some newer
+      models accept only the default, so read the model's documentation before setting
+      them.
+  - title: Why tokens drive latency and cost
+    body: |-
+      A call has two phases. In the first, often called **prefill**, the model reads the
+      whole prompt. It can process those tokens in parallel, so a long prompt adds time,
+      but not in proportion to its length the way output does. In the second, **decoding**,
+      it writes the reply one token at a time, and each token needs a full pass through the
+      network. So latency is roughly the time to the first token plus the number of output
+      tokens times the time per token.
+
+      ```text
+      illustrative figures, not any real model's
+      time to first token        0.8 s
+      output speed               50 tokens a second
+      200-token answer           0.8 + 200 / 50  = 4.8 s
+      1,000-token answer         0.8 + 1000 / 50 = 20.8 s
+      ```
+
+      That's why streaming matters for chat: the user starts reading after the first token,
+      not after the last. It's also why asking for a shorter answer is the most direct
+      speed lever, and why hidden reasoning tokens, which you pay for as output, make a
+      reply slower as well as dearer.
+
+      Providers usually price output tokens several times higher than input tokens, and
+      bill both. In a chat the whole history is resent as input each turn, so input often
+      dominates the bill even though each output token costs more. The next lesson works
+      through that growth.
+  - title: What training explains about model behaviour
+    body: |-
+      Pre-training rewards one thing: predicting the next token of real text well. The
+      model gets good at producing text that is **plausible**, which is often but not
+      always text that is true. When it lacks a fact, the most plausible continuation is
+      still a fluent, confident sentence. That's the root of hallucination. The model has
+      no separate store of facts it can check, and no built-in signal for "I don't know"
+      unless post-training taught it to say so.
+
+      Post-training shapes the style: answer the question, follow instructions, refuse some
+      requests, use a chat format with roles. It does not add live knowledge. What the model
+      knows comes from data up to its **training cutoff**. Anything newer, and anything
+      private to your company, has to arrive in the prompt. Retrieval, tools and the
+      context engineering in the next lessons all exist for that reason.
+
+      Three practical consequences follow. Ask for facts the model can ground in text you
+      provide, and ask it to say when the text doesn't answer the question. Check anything
+      with consequences, such as a price, a date or a legal claim, in code or against a
+      source. And don't read the model's confidence as evidence: a hallucinated citation is
+      written with the same fluency as a real one.
+  - title: Testing code that calls a sampled model
+    body: |-
+      Exact-match tests on model text fail at random, as the lesson showed. Even with
+      temperature at 0, providers don't promise identical output, because batching and
+      floating point arithmetic on the servers can shift a close call between two tokens.
+      So test in two layers.
+
+      Unit tests replace the model with a stub that returns recorded replies, and check
+      your code: parsing, error paths, the stop reason, retries. They're fast, free and
+      deterministic. Behaviour tests run the real model several times and check
+      **properties** of the reply, not its wording, then assert a pass rate.
+
+      ```python
+      import random
+
+      def fake_summarise(text, rng):
+          # Stands in for a model call: same facts, varying wording.
+          opener = rng.choice(["Order 1042", "The order 1042", "Your order, 1042,"])
+          verb = rng.choice(["ships", "will ship", "is due to ship"])
+          return f"{opener} {verb} on 3 October."
+
+      def check(summary):
+          problems = []
+          if "1042" not in summary:
+              problems.append("missing order number")
+          if "3 October" not in summary:
+              problems.append("missing date")
+          if len(summary) > 120:
+              problems.append("too long")
+          return problems
+
+      rng = random.Random(7)
+      runs = [fake_summarise("...", rng) for _ in range(20)]
+      passed = sum(not check(s) for s in runs)
+      print(f"{passed}/{len(runs)} passed")  # 20/20 passed
+      print(len(set(runs)), "different wordings")  # 9 different wordings
+      assert passed / len(runs) >= 0.95
+      ```
+
+      Behaviour tests cost money and time, so run them on a schedule or before a release
+      rather than on every commit. They grow into the evaluation sets of lesson 10.
+pitfalls:
+  - "**Counting words instead of tokens.** Words feel like the natural unit, and English prose roughly agrees. JSON, code, logs and other languages don't. Use the provider's token counter before the call and read the usage figures it returns after."
+  - "**Using a reply that stopped at `max_tokens`.** The text looks like an answer until you notice it ends mid-sentence, or the JSON has no closing brace. Check the stop reason on every response and treat a cut-off as a failure to handle."
+  - "**Asserting exact model text in tests.** It passes on your machine and fails one run in five in CI. Stub the model in unit tests and assert properties, such as fields, facts and length, in behaviour tests."
+  - "**Setting temperature to 0 and expecting determinism.** It reduces variation but doesn't remove it, and some models reject non-default values. Design for variation instead of trying to switch it off."
+  - "**Trusting what the model says it knows.** Fluency comes from training on plausible text, not from checking. Put the facts in the prompt and verify anything with consequences."
+  - "**Asking for long answers when speed matters.** Each output token is a sequential step. Ask for the length you need, and stream the reply so the first words arrive early."
+interview:
+  - question: Explain how an LLM generates a response, as you would to a backend engineer.
+    answer: >-
+      It's a loop around a function that predicts the next token. The prompt is split into
+      tokens by the model's tokeniser. The model scores every token in its vocabulary, those
+      scores become probabilities, one token is sampled, it's appended, and the model runs
+      again on the longer sequence. It stops at an end token or at `max_tokens`, and the
+      response says which. Two consequences matter for engineering: cost and latency scale
+      with tokens, and output is sampled, so it varies and has to be validated like any
+      untrusted input. What the loop doesn't give you is truth: the model produces plausible
+      text, so facts need grounding in context you supply.
+  - question: Why does the same prompt give different answers, and how do you handle that in tests?
+    answer: >-
+      Because each token is sampled from a probability distribution, and one different early
+      token changes all the text that follows. Temperature controls how spread out that
+      distribution is, but even at 0 providers don't guarantee identical output, since
+      server-side batching and floating point can flip a close choice. So I test in layers.
+      Unit tests stub the model with recorded replies and check my parsing, retries and
+      error handling deterministically. Behaviour tests call the real model several times
+      and assert properties, like the right order number and a length limit, with a pass
+      rate threshold. The trade-off is cost: behaviour tests aren't free, so I run them
+      before releases rather than on every commit.
+  - question: A feature's model bill tripled after launch, though the request count matched the forecast. What would you look at?
+    answer: >-
+      Tokens, not requests, because that's what's billed. First I'd compare input and
+      output token counts per request against the forecast, from the usage figures the API
+      returns. Common causes: users pasting JSON or logs, which tokenise into far more
+      tokens than prose; chat history resent in full on every turn, so input grows each
+      turn; a longer system prompt or more retrieved documents; or replies running to
+      `max_tokens`. Then I'd fix the biggest line: cap history, trim retrieved context,
+      count tokens before sending and reject or truncate oversized input, and ask for
+      shorter answers. Prompt caching helps if a long prefix repeats, where the provider
+      supports it.
+  - question: What's the difference between a base model and a chat model, and why does it matter to you?
+    answer: >-
+      A base model continues text; a chat model has been post-trained to answer. Pre-training
+      on huge amounts of text teaches next-token prediction, so a base model given a question
+      may write more questions, because that's what often follows on the web. Post-training
+      on example conversations and on people's rankings of better and worse answers makes an
+      answer the likely continuation, and teaches the role format and refusals. For me it
+      matters in two ways. It explains why the chat format and system prompt carry so much
+      weight. And it reminds me that post-training changes behaviour, not knowledge, so
+      anything after the training cutoff or private to us must come in through the prompt.
+  - question: What is attention, and why is the context window limited?
+    answer: >-
+      Attention is how each token gathers information from the others. For every token,
+      the model scores how relevant each earlier token is, then blends in their information
+      by those weights. That's how "it" in a sentence links to the right noun many words
+      back. The context window is the maximum number of tokens the model handles at once,
+      prompt and reply together. It's limited for two reasons. Plain attention compares
+      every token with every other, so compute grows with the square of the length, and the
+      KV cache grows with it in memory. And models use information less reliably when it's
+      buried in the middle of a very long input. So I put the important material early or
+      late, and retrieve what's relevant instead of sending everything.
+  - question: What do temperature, top-k and top-p do, and how do you choose them?
+    answer: >-
+      All three shape how the next token is drawn from the model's probabilities.
+      Temperature divides the scores before they become probabilities: low sharpens them
+      towards the top token, high flattens them. Top-k keeps only the k likeliest tokens
+      and samples among those. Top-p keeps the smallest set of top tokens whose
+      probabilities add up to p, so the cut adapts: few candidates when the model is sure,
+      more when it isn't. I use low temperature for extraction, classification and code,
+      where I want the likeliest answer, and higher for brainstorming. I change one knob at
+      a time, check the model's documentation first, since some newer models accept only
+      the defaults, and judge the result on an eval rather than by eye.
+
+  - question: Why do LLMs hallucinate, and how do you reduce it?
+    answer: >-
+      Because a model writes the most plausible next token, not a checked fact. Nothing in
+      generation looks anything up, so when the training data is thin, out of date or
+      silent, it still produces fluent, confident text. You reduce it at several layers.
+      Retrieval puts the real source in the prompt. The prompt asks for citations and
+      allows "I don't know". Code checks the citations and refuses when nothing relevant
+      was found. Lower temperature and structured output narrow what it can say. And an
+      eval set measures the rate, so you know whether a change helped. None of these
+      removes it entirely, so high-stakes answers keep a person in the loop.
+
+terms:
+  - term: Large language model
+    say: It predicts the next word.
+    means: It gives a probability to every *token* in its vocabulary, one is sampled and appended, and
+      it runs again on the longer text, until an end token or `max_tokens`.
+  - term: Token
+    say: A word.
+    means: "A piece of text from the model's own tokeniser: a word, part of a word or a punctuation
+      mark. Prices, context limits and `max_tokens` are counted in these."
+  - term: Temperature
+    say: How creative the model is.
+    means: "A number that reshapes the probabilities before sampling: low sharpens them towards the top
+      token, high flattens them. Even at 0, identical replies are not guaranteed."
+  - term: Context window
+    say: The model's memory.
+    means: The most tokens one call can hold, prompt and output together. Nothing carries over between
+      calls unless you send it again.
+  - term: Base model
+    say: A weaker version of the chat model.
+    means: The pre-trained model, which continues text instead of answering it. Post-training on
+      conversations and preference rankings turns it into a chat model.
+  - term: "`max_tokens`"
+    say: How long the answer will be.
+    means: A cap on output tokens, not a target. A reply that hits it stops mid-thought, so check the
+      stop reason before using it.

@@ -1,0 +1,314 @@
+summary: >-
+  A single call to a model API works in a demo and breaks in production. The call hangs for
+  a minute, the provider answers `429` during a busy hour, a burst of users asks the same
+  question at once, and the JSON you asked for arrives inside a code fence with a friendly
+  sentence in front. A production client is the thin layer that absorbs all of that, so the
+  features above it can treat a model call like any other function.
+
+
+  It has five parts, and interviewers ask about each one. A timeout per attempt. Retries
+  only on errors that can pass on a second try, with backoff and jitter. A cap on how many
+  calls are in flight. A cache that stores the promise, so identical calls share one
+  request. And output that is stripped, parsed, checked against a type guard and re-asked
+  once with the problem named.
+
+
+  The design choice that makes it testable is passing the model call in. The client never
+  imports `fetch`; a small transport function does, and tests replace it with a fake that
+  fails, hangs or answers on cue. Reach for this layer in any service that calls a model.
+  Don't stack it on top of an SDK that already retries, or the retries multiply.
+remember:
+  - Retry timeouts, `408`, `429` and `5xx` only; a `400`, `401` or `403` fails the same way every time, so throw it at once.
+  - Wait `random() * base * 2 ** attempt` before each retry, capped, so clients that failed together don't return together; honour `Retry-After` when the server sends it.
+  - Give every attempt its own deadline, and cancel the request itself with an abort signal, not only the wait for it.
+  - Cache the promise the moment the call starts, so identical calls made meanwhile share one request, and delete it when it rejects.
+  - Cap calls in flight with a pool or a semaphore; `Promise.all` over a thousand prompts sends a thousand requests at once.
+  - Strip code fences, parse, check the shape with a type guard, and re-ask once with the problem named, then fail loudly.
+  - Pass the model call in as a function, so tests fake failures, hangs and bad JSON without a network or a clock.
+  - Retry in one layer only; an SDK that retries three times inside a client that retries three times makes sixteen attempts.
+sections:
+  - title: The same client, outside the sandbox
+    body: |-
+      The lesson's sandbox has no `fetch` and no `AbortController`, so the challenge builds
+      its own signal. In Node or a browser you'd write the retry loop like this, with a real
+      transport and `AbortSignal.timeout`.
+
+      ```ts
+      export class HttpError extends Error {
+        constructor(public status: number, message: string) {
+          super(message);
+        }
+      }
+
+      type Transport = (prompt: string, signal: AbortSignal) => Promise<string>;
+
+      // The only part that knows about HTTP. The URL and fields are placeholders.
+      export const transport: Transport = async (prompt, signal) => {
+        const response = await fetch('https://api.example.com/v1/chat', {
+          method: 'POST',
+          signal,
+          headers: { 'content-type': 'application/json', authorization: `Bearer ${process.env.API_KEY}` },
+          body: JSON.stringify({ messages: [{ role: 'user', content: prompt }] }),
+        });
+        if (!response.ok) throw new HttpError(response.status, await response.text());
+        return (await response.json()).text;
+      };
+
+      const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+      function retryable(error: unknown): boolean {
+        if (error instanceof HttpError) return error.status === 408 || error.status === 429 || error.status >= 500;
+        return error instanceof Error && error.name === 'TimeoutError';
+      }
+
+      export async function withRetry(send: Transport, prompt: string, { timeoutMs = 30_000, retries = 3, baseMs = 500 } = {}) {
+        for (let attempt = 0; ; attempt++) {
+          try {
+            // A fresh signal per attempt: one that already fired would abort the retry at once.
+            return await send(prompt, AbortSignal.timeout(timeoutMs));
+          } catch (error) {
+            if (attempt >= retries || !retryable(error)) throw error;
+            await sleep(Math.random() * baseMs * 2 ** attempt);
+          }
+        }
+      }
+      ```
+
+      When the timeout fires, `fetch` rejects with a `DOMException` named `TimeoutError`,
+      which is why `retryable` checks the name rather than a class. The abort closes the
+      connection, and a well-behaved provider stops generating, so you stop paying too. We
+      ran it in Node 24 against a fake transport that failed with `503`, then hung until its
+      signal fired, then answered: three calls, one answer. A `400` threw after one call.
+
+      Two limits are worth saying out loud. A per-attempt timeout of 30 seconds with three
+      retries can keep a user waiting two minutes, so a request often also carries an
+      overall deadline and stops retrying when it has passed. And a streamed response needs
+      a different timeout: time to the first byte, then a gap allowed between chunks.
+  - title: The cache, the pool and the JSON check together
+    body: |-
+      The three challenges compose. `callWithRetry` wraps the transport, `createClient`
+      wraps that, and `completeJson` takes the client's `complete`. Each layer knows one
+      thing.
+
+      ```ts
+      const client = createClient((prompt) => callWithRetry(transport, prompt, retryOptions));
+
+      type Label = { label: 'bug' | 'feature' | 'question' };
+      const isLabel = (value: unknown): value is Label =>
+        typeof value === 'object' && value !== null &&
+        ['bug', 'feature', 'question'].includes((value as { label?: unknown }).label as string);
+
+      const labels = await Promise.all(
+        tickets.map((ticket) => completeJson(client.complete, `Label this ticket as JSON: ${ticket}`, isLabel)),
+      );
+      ```
+
+      Two details matter here. First, the cache key. The challenge keys by prompt alone,
+      which is right while the client talks to one model with fixed settings. In a real
+      service the key is everything that changes the answer: model, system prompt,
+      temperature, tools and the prompt. Hash them together.
+
+      Second, the cache holds raw replies, including the invalid one, for good. We ran it:
+      a later `completeJson` for the same ticket still recovered, because its re-ask prompt
+      was cached too, and made no new call. But any plain `complete` caller gets the broken
+      text back every time. The fix is to cache after validation: put the cache around
+      `completeJson`, or evict an entry when its reply fails the check. Interviewers like
+      this one because it only shows up when two layers meet.
+
+      In-flight de-duplication also needs a bound. An unbounded `Map` of every prompt ever
+      asked is a memory leak with a slow fuse. Keep finished answers with a time to live
+      and a size cap, for example the LRU cache from the utilities lesson, and keep in-flight
+      promises only until they settle if answers go stale quickly.
+  - title: Testing without a network or a clock
+    body: |-
+      Every test in the lesson is a fake passed in, and each fake plays one role.
+
+      A scripted transport returns or throws from a list: `[503, 429, 'answer']` proves
+      retries and waits. A recording `sleep` resolves at once and pushes the milliseconds
+      into an array, so the backoff sequence is an `expect(...).toEqual([50, 100])`, and the
+      suite runs in milliseconds. A fixed `random` of `0.5` makes jitter predictable. A
+      counting transport that increments an in-flight counter, awaits a few microtasks, and
+      decrements, records the highest count seen, which proves the concurrency cap without
+      timers.
+
+      The hang is the subtle one. A fake that never settles makes a broken implementation
+      hang the whole run instead of failing one test. The lesson's fake answers "too late"
+      after fifty turns of the event loop instead: code with a working timeout has already
+      moved on, and code without one fails with a clear wrong answer.
+
+      In a real codebase, a fake clock does this more generally. Vitest and Jest both offer
+      fake timers, which fire `setTimeout` callbacks when the test advances time. Check
+      that they cover every timer your code uses before relying on them. Keep one integration test against the real provider in a separate,
+      rarely run suite, to catch the day its error format changes.
+  - title: The same client in Python
+    body: |-
+      Python's standard library has the pieces ready-made. `asyncio.timeout` raises
+      `TimeoutError`, an `asyncio.Semaphore` caps calls in flight, and an `asyncio.Task` is
+      the promise you cache.
+
+      ```python
+      import asyncio
+      import random
+
+
+      class HttpError(Exception):
+          def __init__(self, status: int) -> None:
+              super().__init__(f"HTTP {status}")
+              self.status = status
+
+
+      def retryable(error: Exception) -> bool:
+          if isinstance(error, HttpError):
+              return error.status in (408, 429) or error.status >= 500
+          return isinstance(error, TimeoutError)
+
+
+      class Client:
+          def __init__(self, send, limit: int = 4, timeout: float = 30, retries: int = 3) -> None:
+              self.send, self.timeout, self.retries = send, timeout, retries
+              self.gate = asyncio.Semaphore(limit)  # at most `limit` calls in flight
+              self.cache: dict[str, asyncio.Task[str]] = {}
+
+          async def _call(self, prompt: str) -> str:
+              for attempt in range(self.retries + 1):
+                  try:
+                      async with self.gate, asyncio.timeout(self.timeout):
+                          return await self.send(prompt)
+                  except Exception as error:
+                      if attempt == self.retries or not retryable(error):
+                          raise
+                      await asyncio.sleep(random.random() * 0.5 * 2**attempt)
+              raise AssertionError("unreachable")
+
+          async def complete(self, prompt: str) -> str:
+              task = self.cache.get(prompt)
+              if task is None:
+                  task = self.cache[prompt] = asyncio.ensure_future(self._call(prompt))
+              try:
+                  return await task
+              except Exception:
+                  self.cache.pop(prompt, None)
+                  raise
+      ```
+
+      Run with four prompts, one repeated, and a limit of two, it returned four answers
+      from three calls. The semaphore is released before the backoff sleep, so a waiting
+      retry doesn't hold a slot. For JSON, Pydantic's `model_validate_json` plays the part
+      of the type guard.
+pitfalls:
+  - >-
+    **Retrying every error.** A `400` or `401` fails the same way on every try, so a blanket
+    retry turns a bug into four slow failures and hides it. Check the status and throw at
+    once on anything that can't pass later.
+  - >-
+    **Retrying in two layers.** The official SDKs already retry `429` and `5xx`. Wrapping
+    them in your own retries multiplies attempts during an outage, exactly when the
+    provider needs fewer. Turn one layer off.
+  - >-
+    **Caching the answer instead of the promise.** Nothing is stored until the first call
+    finishes, so a burst of identical requests all miss. Store the promise before anyone
+    awaits it.
+  - >-
+    **Keeping a rejected promise in the cache.** One failure is then served to every later
+    caller without a new try. Delete the entry when the promise rejects.
+  - >-
+    **Timing out the wait but not the request.** A `Promise.race` alone stops you waiting,
+    while the request keeps running and billing. Pass an abort signal so the request
+    itself is cancelled.
+  - >-
+    **Re-asking for JSON without limit.** A model that can't produce the shape will fail
+    the same way many times, at full price each time. Re-ask once with the problem named,
+    then fail loudly or fall back.
+  - >-
+    **`Promise.all` over the whole batch.** A thousand prompts become a thousand requests
+    in flight, and the rate limiter answers with `429`s. Run them through a pool with a
+    cap.
+interview:
+  - question: Which errors from a model API would you retry, and how long would you wait?
+    answer: >-
+      Recommend retrying only what can pass on a second try: timeouts, `408`, `429` and
+      `5xx`. Say why the rest fail fast: a `400` is a bad request and a `401` a bad key, so
+      another attempt only delays the error someone needs to see. For the wait, describe
+      exponential backoff with full jitter, a random wait between zero and `base * 2 **
+      attempt`, capped at a few seconds, with three or four attempts. Mention that jitter
+      stops clients that failed together from retrying together. Add that a `Retry-After`
+      header overrides your own backoff. Close with the trade-off: retries raise the
+      success rate but add latency and load, so also set an overall deadline, and retry in
+      one layer only when an SDK already retries.
+  - question: How do you stop a slow model call from hanging your service?
+    answer: >-
+      Lead with a deadline on every attempt that cancels the request, not only the wait.
+      In TypeScript that's `AbortSignal.timeout(ms)` passed to `fetch`, and in Python
+      `asyncio.timeout`. Explain why cancelling matters: the connection closes, the
+      provider can stop generating, and you stop paying for an answer nobody will read. A
+      timed-out attempt then counts as retryable. Then name the second layer: an overall
+      deadline for the request, so three thirty-second attempts can't keep a user waiting
+      two minutes. For streamed answers, suggest two timeouts instead, one for the first
+      token and one for the gap between chunks, because a long answer that keeps arriving
+      isn't hung.
+  - question: Two identical requests arrive at the same moment. How does your client avoid paying twice?
+    answer: >-
+      Explain request de-duplication: store the promise in a map the moment the call
+      starts, keyed by everything that changes the answer, and hand the same promise to
+      every identical caller. Contrast it with caching answers, which misses for the whole
+      burst because no answer exists yet. Then cover the lifecycle: delete the entry when
+      the promise rejects, so one failure isn't served to everyone, and bound the cache
+      with a time to live and a size limit. Mention that this only works inside one
+      process. Across several servers you'd need a shared cache, and de-duplicating
+      in-flight calls there needs a lock or a "pending" marker, which usually isn't worth
+      it for model calls.
+  - question: The model sometimes returns invalid JSON. What does your client do?
+    answer: >-
+      Describe a short pipeline: strip code fences, parse, then validate the shape with a
+      type guard or a schema library such as Zod, so the rest of the code gets a typed
+      value. On failure, re-ask once and include what was wrong, because models usually
+      fix output when told the problem. After a second failure, throw or fall back, and
+      log the raw reply. Then recommend the stronger fix where the provider offers it:
+      structured outputs or a tool definition with a JSON schema, which constrain the
+      reply so parsing rarely fails. Note the trap between layers: if replies are cached
+      before validation, a bad reply stays in the cache, so cache after the check.
+  - question: How do you process ten thousand prompts against an API with a rate limit?
+    answer: >-
+      Recommend a pool: a fixed number of workers, each taking the next prompt until none
+      are left, with results written back by index so order is kept. Say why not
+      `Promise.all` over the lot: it opens ten thousand requests and meets a wall of
+      `429`s. Size the pool from the provider's limits on requests and tokens per minute,
+      and let the retry layer absorb the occasional `429`. For large offline jobs, suggest
+      the provider's batch API, which is cheaper and has no rate-limit dance. Mention
+      failure handling too: with `Promise.all` one failure rejects everything, so collect
+      per-item results with `Promise.allSettled` or record failures and retry them later.
+  - question: What would you log for each model call?
+    answer: >-
+      Suggest one structured log line or trace span per call with enough to answer "why is
+      it slow, why is it expensive, why did it fail". That means the model, input and
+      output tokens, cached tokens, latency and time to first token, the number of
+      retries, the final status, a request id from the provider, and a hash of the prompt
+      template version. Leave out raw prompts and replies by default, because they can
+      hold personal data, or sample and redact them. Add that these fields feed cost per
+      feature, alerting on error rate, and debugging with the provider using the request
+      id.
+terms:
+  - term: Exponential backoff
+    say: Wait a bit, then retry.
+    means: Waiting longer before each retry, typically doubling, up to a cap, so a struggling
+      server gets room to recover.
+  - term: Jitter
+    say: A random delay for no reason.
+    means: Randomness added to each backoff wait, so clients that failed at the same moment
+      don't all retry at the same moment.
+  - term: "429"
+    say: The server is down.
+    means: "Too Many Requests: you went over a rate limit. It is worth retrying after a wait,
+      and the `Retry-After` header, when sent, says how long."
+  - term: Request de-duplication
+    say: Caching the response.
+    means: Storing the in-flight promise the moment a call starts, so identical calls made
+      meanwhile share one request. The entry is deleted if the promise rejects.
+  - term: Concurrency limit
+    say: The same as a rate limit.
+    means: A cap on how many calls are in flight at once, set with a pool or a semaphore. A rate
+      limit caps calls per unit of time, which is a different thing.
+  - term: Timeout
+    say: Giving up on waiting.
+    means: A deadline per attempt that cancels the request itself through an abort signal, so
+      the connection is freed instead of left running in the background.

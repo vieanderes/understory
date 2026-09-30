@@ -1,0 +1,281 @@
+summary: >-
+  A hash turns any input into a fixed-size fingerprint that can't be turned back. It's how
+  you check data without keeping it: a login compares fingerprints, a download compares a
+  checksum, a lookup table indexes a token without storing it. Encryption is the other tool,
+  for data you need to read again, and it's the next lesson.
+
+
+  Passwords need a special kind of hash. People choose guessable passwords, so after a leak
+  the attacker's job is guessing, and a general-purpose hash like SHA-256 lets them guess
+  billions of times a second on graphics cards. A password hash (Argon2id, scrypt, bcrypt,
+  or PBKDF2 where rules demand it) is slow and, in the first two cases, memory-hungry on
+  purpose, and takes a per-user salt so every account is attacked on its own.
+
+
+  Around that sit three everyday tools from `node:crypto`: `randomBytes` and `randomUUID`
+  for values nobody can predict, HMAC for fingerprints only a key holder can make, and
+  `timingSafeEqual` for comparing secrets without leaking how much matched. Reach for a
+  password hash only for secrets a human chose. For machine-made tokens with 256 random
+  bits, a fast hash is right, because there's nothing to guess.
+remember:
+  - Store passwords with Argon2id, or scrypt or bcrypt if it isn't available, never with SHA-256, MD5 or encryption.
+  - 'OWASP''s minimum for Argon2id is 19 MiB of memory, 2 passes and 1 lane; for scrypt it''s N = 2^17, r = 8, p = 1.'
+  - A salt is random, per password, not secret, and stored with the hash, so equal passwords get different hashes.
+  - Store the algorithm and cost with each hash, and rehash with the current cost when a user logs in.
+  - Secrets such as session ids, tokens and keys come from `randomBytes` or `randomUUID`, never `Math.random`.
+  - HMAC is a hash with a secret key, so only key holders can make or check the tag, and it resists the length extension that breaks `sha256(secret + message)`.
+  - Compare secrets with `timingSafeEqual` on equal-length Buffers, because `===` stops at the first difference.
+  - bcrypt reads only the first 72 bytes of a password, so cap input length or use Argon2id.
+sections:
+  - title: A password hasher you could ship
+    body: |-
+      The lesson stores `salt:hash` with scrypt's default cost. Production code adds two
+      things: the algorithm and cost stored with each hash, so you can raise the cost later,
+      and the async API, so hashing doesn't freeze your server. Node 24.7 added Argon2 to
+      `node:crypto`, so no native package is needed.
+
+      ```js
+      import { argon2, randomBytes, timingSafeEqual } from 'node:crypto';
+      import { promisify } from 'node:util';
+
+      const argon2Async = promisify(argon2);
+
+      // OWASP's minimum for Argon2id: 19 MiB of memory, 2 passes, 1 lane.
+      const CURRENT = { memory: 19456, passes: 2, parallelism: 1 };
+
+      const derive = (password, nonce, cost) =>
+        argon2Async('argon2id', { message: password, nonce, tagLength: 32, ...cost });
+
+      export async function hashPassword(password) {
+        const nonce = randomBytes(16); // the salt
+        const tag = await derive(password, nonce, CURRENT);
+        const { memory: m, passes: t, parallelism: p } = CURRENT;
+        return `argon2id$m=${m},t=${t},p=${p}$${nonce.toString('base64url')}$${tag.toString('base64url')}`;
+      }
+
+      function parse(stored) {
+        const [alg, params, nonce, tag] = stored.split('$');
+        if (alg !== 'argon2id' || !params || !nonce || !tag) return null;
+        const n = Object.fromEntries(params.split(',').map((kv) => kv.split('=')));
+        return {
+          cost: { memory: Number(n.m), passes: Number(n.t), parallelism: Number(n.p) },
+          nonce: Buffer.from(nonce, 'base64url'),
+          tag: Buffer.from(tag, 'base64url'),
+        };
+      }
+
+      export async function verifyPassword(stored, attempt) {
+        const parsed = parse(stored);
+        if (!parsed) return false;
+        const candidate = await derive(attempt, parsed.nonce, parsed.cost);
+        return candidate.length === parsed.tag.length && timingSafeEqual(candidate, parsed.tag);
+      }
+
+      export function needsRehash(stored) {
+        const parsed = parse(stored);
+        return !parsed || parsed.cost.memory < CURRENT.memory || parsed.cost.passes < CURRENT.passes;
+      }
+
+      const stored = await hashPassword('correct horse battery staple');
+      console.log(stored); // argon2id$m=19456,t=2,p=1$<salt>$<hash>
+      console.log(await verifyPassword(stored, 'correct horse battery staple')); // true
+      console.log(await verifyPassword(stored, 'correct horse battery stapler')); // false
+      console.log(needsRehash(stored)); // false
+      ```
+
+      Verification reads the cost from the stored string, not from `CURRENT`, so old hashes
+      keep working after you raise it. On a laptop this took about 30 ms per hash. Argon2
+      libraries write a similar self-describing format, the PHC string, which starts
+      `$argon2id$v=19$m=19456,t=2,p=1$`. If you use one, you get the same property for free.
+
+      Argon2 also accepts a `secret`, a **pepper**: a key kept in a secret store rather than the
+      database. A leaked table without the pepper can't be attacked at all. OWASP treats it as
+      optional defence in depth, and it adds a key you must manage and rotate.
+  - title: Choosing and tuning the slow hash
+    body: |-
+      The four acceptable choices differ in what they make expensive. **Argon2id** costs both
+      time and memory, and memory is what graphics cards and custom chips lack per core, so it's
+      OWASP's first choice. **scrypt** is also memory-hard. **bcrypt** costs time only, has
+      been in use since 1999, and reads only the first 72 bytes of input. **PBKDF2** is the
+      weakest, kept for FIPS-140 compliance, and needs 600,000 iterations with HMAC-SHA256
+      to meet OWASP's current guidance.
+
+      OWASP gives equivalent settings, so you can trade memory for time:
+
+      ```text
+      Argon2id  m=19 MiB t=2 p=1   |  m=46 MiB t=1 p=1   |  m=12 MiB t=3 p=1
+      scrypt    N=2^17 r=8 p=1     |  N=2^16 r=8 p=2     |  N=2^15 r=8 p=3
+      bcrypt    cost 10 or more
+      PBKDF2    HMAC-SHA256 600,000 iterations
+      ```
+
+      scrypt uses about `128 × N × r` bytes. At OWASP's first setting that's 128 MiB, and
+      Node's `maxmem` default is 32 MiB, so you must raise it or the call throws:
+
+      ```js
+      import { scrypt, randomBytes } from 'node:crypto';
+      import { promisify } from 'node:util';
+
+      const scryptAsync = promisify(scrypt);
+      const COST = { N: 2 ** 17, r: 8, p: 1, maxmem: 256 * 1024 * 1024 };
+
+      const key = await scryptAsync('correct horse battery staple', randomBytes(16), 64, COST);
+      console.log(key.length); // 64
+
+      await scryptAsync('x', randomBytes(16), 64, { N: 2 ** 17, r: 8, p: 1 }).catch((err) =>
+        console.log(err.code), // ERR_CRYPTO_INVALID_SCRYPT_PARAMS
+      );
+      ```
+
+      Tune on your production hardware: pick the highest cost that keeps a login fast enough
+      under peak load, and revisit it every year or two. Remember the server pays too. The
+      async functions run on libuv's thread pool, four threads by default
+      (`UV_THREADPOOL_SIZE`), so a burst of logins queues behind each other and behind file
+      and DNS work. The `Sync` versions block the whole event loop and belong only in scripts.
+      Rate-limit the login endpoint, because each attempt costs you real CPU and memory.
+  - title: Upgrading hashes you already have
+    body: |-
+      Nobody starts with perfect settings, and you can't recompute a hash without the
+      password. There are two ways forward.
+
+      **Rehash on login.** When `verifyPassword` succeeds and `needsRehash` says the stored
+      cost is old, hash the password you now hold with the current settings and save it. Active
+      users move over within weeks. Dormant accounts keep the old hash, so after a deadline you
+      can clear those and send them through a password reset.
+
+      **Wrap the old hash.** For a legacy table of fast hashes, you can't wait for logins,
+      because those hashes are the risk today. Compute `argon2id(oldHash)` for every row now,
+      and mark each row as wrapped. At login, compute the old hash of the attempt first, then
+      verify that against the Argon2id layer. Once a user logs in, replace the wrapped value
+      with a plain Argon2id of the password. The whole table is protected on the day you run
+      the migration, and nobody has to reset.
+
+      Two edge cases. If the legacy hashes were unsalted, the wrap must include a new salt,
+      which the outer Argon2id does. And never go the other way: a downgrade path, such as
+      accepting a legacy format for new sign-ups "temporarily", tends to become permanent.
+
+      The same self-describing format makes algorithm changes routine: the prefix says which
+      verifier to use, and anything that isn't the current algorithm and cost is flagged for a
+      rehash at the next login.
+  - title: Randomness you can bet on
+    body: |-
+      Every secret in a web app, session ids, reset tokens, API keys, salts, CSRF tokens,
+      starts as random bytes. They must come from a **cryptographically secure** generator,
+      which Node exposes as `randomBytes`, `randomInt`, `randomUUID` and `getRandomValues`.
+      `Math.random` is built for speed and games. Its output isn't designed to be
+      unpredictable, and it has been predicted from a few outputs.
+
+      ```js
+      import { randomBytes, randomInt, randomUUID } from 'node:crypto';
+
+      const sessionId = randomBytes(32).toString('base64url'); // 256 bits, 43 characters
+      const orderRef = randomUUID();                           // version 4: 122 random bits
+      const code = String(randomInt(0, 1_000_000)).padStart(6, '0'); // uniform over 000000..999999
+
+      console.log(sessionId.length, orderRef, code);
+      ```
+
+      How many bits? OWASP asks at least 64 bits of entropy for a session id; 128 to 256 is
+      the common choice for any bearer token, and it costs nothing. `base64url` keeps the
+      token safe in URLs and cookies without escaping.
+
+      `randomInt` matters for short codes. The tempting `randomBytes(1)[0] % 6` is biased,
+      because 256 doesn't divide evenly by 6, so some values come up more often. `randomInt`
+      handles that for you. A six-digit code has only a million values, so it's safe only with
+      a short expiry and a small number of attempts.
+
+      A version 4 UUID is fine as an unguessable identifier. A version 7 UUID, which Node 24
+      can also make with `randomUUIDv7`, starts with a timestamp so it sorts well as a
+      database key, but that also makes part of it predictable. Use it as an id, never as a
+      secret.
+  - title: HMAC, and comparing secrets safely
+    body: |-
+      An **HMAC** mixes a secret key into a hash in two nested passes. Only someone with the
+      key can make the tag or check it. The obvious shortcut, `sha256(secret + message)`, is
+      broken: SHA-256 is built so that from a hash of some input you can compute the hash of
+      that input plus more data, without knowing the input. That's a **length extension**, and
+      it lets an attacker extend a signed message and produce a valid tag. HMAC's construction
+      prevents it.
+
+      Beyond webhooks, HMAC solves a common storage problem: an API key must be findable by
+      its value, but storing it plainly means a leak hands out working keys.
+
+      ```js
+      import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
+
+      const pepper = randomBytes(32); // in real code, loaded from a secret store
+      const apiKey = `sk_${randomBytes(24).toString('base64url')}`; // shown to the customer once
+      const digestOf = (key) => createHmac('sha256', pepper).update(key).digest('hex');
+      const stored = digestOf(apiKey); // indexed column: a plain equality lookup works
+
+      function safeEqualHex(a, b) {
+        const x = Buffer.from(a, 'hex');
+        const y = Buffer.from(b, 'hex');
+        return x.length === y.length && timingSafeEqual(x, y);
+      }
+
+      console.log(safeEqualHex(stored, digestOf(apiKey))); // true
+      console.log(safeEqualHex(stored, 'ab')); // false, without throwing
+      try {
+        timingSafeEqual(Buffer.from('ab'), Buffer.from('abc'));
+      } catch (err) {
+        console.log(err.code); // ERR_CRYPTO_TIMING_SAFE_EQUAL_LENGTH
+      }
+      ```
+
+      The digest is deterministic, which is what makes the lookup work, and keyed, so a
+      leaked table can't be checked against guesses without the pepper.
+
+      `timingSafeEqual` throws on different lengths, so check lengths first. That reveals the
+      length, which is fine when every valid value has a fixed length, such as a hex SHA-256.
+      When comparing a secret the attacker supplies in full, HMAC both sides first and compare
+      the digests, which always have equal length.
+pitfalls:
+  - '**Encrypting passwords "so support can read them".** Whoever gets the key reads every password, and keys leak with the data. Hash them and send reset links.'
+  - '**Using a fast hash with a salt and calling it done.** A salt stops shared guesses, not fast ones. Use Argon2id, scrypt or bcrypt at OWASP''s cost settings.'
+  - '**Calling `scryptSync` or `pbkdf2Sync` in a request handler.** Each call blocks the event loop for every user. Use the async versions, and rate-limit logins.'
+  - '**Pre-hashing for bcrypt with raw digest bytes.** A raw digest can contain a zero byte, and some bcrypt libraries stop there. Use Argon2id, or follow OWASP''s base64 HMAC recipe exactly.'
+  - '**Making tokens with `Math.random` or a timestamp.** Both can be predicted. Use `randomBytes(32)` or `randomUUID()`.'
+  - '**Comparing tags with `===`.** It returns faster the more leading characters match. Use `timingSafeEqual` on equal-length Buffers.'
+interview:
+  - question: How would you store user passwords?
+    answer: >-
+      With Argon2id and a per-user random salt, stored with its parameters, at least OWASP's
+      minimum of 19 MiB, two passes and one lane, tuned upwards on our hardware. Argon2id is
+      slow and memory-hard, so each guess after a leak costs real time and memory, which is
+      what graphics cards lack. The salt means identical passwords produce different hashes,
+      so each account is attacked separately. Storing the parameters lets me raise the cost
+      and rehash at the next successful login. Verification uses `timingSafeEqual`. I'd use
+      the async API so logins don't block the event loop, and rate-limit the endpoint because
+      each attempt is expensive for us too. A pepper in a secret store is optional defence in
+      depth; the trade-off is another key to manage.
+  - question: What's the difference between hashing, encryption and encoding?
+    answer: >-
+      Encoding changes representation with no secret, hashing is one-way, and encryption is
+      reversible with a key. Base64 or hex is encoding: anyone can decode it, so it hides
+      nothing. A hash maps input to a fixed-size digest that can't be reversed, used to check
+      data without keeping it, such as passwords or file integrity. Encryption scrambles data
+      so only key holders can recover it, used when you'll need the data back, such as a
+      stored card number. The classic mistake is using the wrong one: encrypting passwords
+      when you never need them back, or base64-encoding a secret and calling it protected. An
+      HMAC sits between, a hash keyed with a secret, used to prove who made a message.
+  - question: What is a salt, what is a pepper, and does either need to be secret?
+    answer: >-
+      A salt is random data unique to each password, stored openly with the hash. A pepper is
+      a secret key shared by all hashes and kept outside the database. The salt's job is to
+      make every hash unique, so identical passwords don't match and precomputed tables are
+      useless. It doesn't need to be secret, because its job isn't to be unknown. The pepper's
+      job is that a leaked database alone is useless: without the key, the attacker can't even
+      test guesses. OWASP treats peppering as optional defence in depth. The cost is key
+      management: rotating a pepper means rehashing or keeping old peppers around, since you
+      can't recompute hashes without the passwords.
+  - question: Why use HMAC instead of hashing a secret concatenated with the message?
+    answer: >-
+      Because `sha256(secret + message)` is vulnerable to length extension, and HMAC isn't.
+      SHA-256 processes input in blocks and its output is its internal state, so from the tag
+      of one message an attacker can compute a valid tag for that message plus extra data,
+      without knowing the secret. For a signed query string, that means appending parameters
+      and still passing the check. HMAC hashes twice with the key mixed in differently each
+      time, which closes that. In practice I'd use `createHmac` for webhook signatures, signed
+      cookies and keyed lookups, and compare tags with `timingSafeEqual`. If the checker must
+      not be able to forge tags, HMAC is wrong, and you need a signature instead.

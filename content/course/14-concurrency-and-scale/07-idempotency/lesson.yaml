@@ -1,0 +1,282 @@
+id: scale.idempotency
+title: Idempotency
+objective: Make a retried request safe with an idempotency key, so a lost reply never charges anyone twice.
+level: advanced
+minutes: 10
+concepts: [scale.idempotency-keys, scale.deduplication-window]
+prerequisites: [scale.race-conditions, backend.webhooks, backend.payments]
+opening:
+  text: >-
+    You'll make a payment request safe to send twice, so a retry never charges a customer
+    twice. Every network drops a reply sooner or later, and this is how real payment APIs cope.
+
+steps:
+  - type: prose
+    id: the-lost-reply
+    body: |-
+      A shop's server sends `POST /charges` to take £12.50. The charge goes through. Then the
+      reply is lost on the way back, and the call times out:
+
+      ```bash
+      $ curl -X POST --max-time 5 localhost:8080/charges -d '{"pence":1250}'
+      curl: (28) Operation timed out after 5001 milliseconds
+      ```
+
+      A timeout only means the client stopped waiting. It says nothing about what the server did.
+
+  - type: predict-output
+    id: predict-blind-retry
+    concept: scale.idempotency-keys
+    difficulty: 1
+    language: bash
+    code: |
+      # The first call timed out, so the app tries again:
+      $ curl -X POST --max-time 5 localhost:8080/charges -d '{"pence":1250}'
+      {"id":"ch_2","pence":1250}
+    question: The customer pressed Pay once. How many times were they charged?
+    choices:
+      - text: Once, the retry replaced the first
+        feedback: >-
+          The server can't tell a retry from a second purchase. Both looked like fresh requests.
+      - text: Twice
+        correct: true
+        feedback: >-
+          Right. The first charge went through. Only its reply was lost.
+      - text: Once, the first call timed out
+        feedback: >-
+          Most people think so. But the timeout was on the client's side. The server finished its work.
+
+  - type: prose
+    id: name-idempotency-key
+    body: >-
+      An operation is **idempotent** when doing it twice has the same effect as once. HTTP in
+      depth showed `PUT` is and `POST` isn't. So make the `POST` idempotent.
+
+
+      The client makes one random id per payment with `crypto.randomUUID()`, and sends it on
+      every attempt in an `Idempotency-Key` header. That's an **idempotency key**. The server
+      stores it with its reply, and answers a repeat with that reply. Stripe works this way.
+
+  - type: ai-review
+    id: review-new-key-per-attempt
+    concept: scale.idempotency-keys
+    difficulty: 3
+    language: js
+    request: Retry the donation request up to three times, with an idempotency key.
+    flawClass: logic
+    code: |
+      async function donate(pence) {
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          const key = crypto.randomUUID();
+          try {
+            return await fetch("/donations", {
+              method: "POST",
+              headers: { "Idempotency-Key": key },
+              body: JSON.stringify({ pence }),
+              signal: AbortSignal.timeout(5000),
+            });
+          } catch (error) {
+            if (attempt === 3) throw error;
+          }
+        }
+      }
+    prompt: >-
+      A pull request for a charity site. Its test checks that the header is sent, and the
+      first attempt always works. On slow networks, donors are charged twice. Tap the line
+      at fault.
+    lines: [3]
+    reasons:
+      - text: Each attempt gets a new key, so nothing matches
+        correct: true
+        feedback: >-
+          Yes. One operation, one key. Make it before the loop.
+      - text: Three attempts is too many for a payment
+        feedback: >-
+          With one key, thirty attempts would still make one donation. The count isn't the flaw.
+      - text: '`AbortSignal.timeout` cancels the donation on the server'
+        feedback: >-
+          It only stops the client waiting. The server may well have finished, which is why
+          the key matters.
+    fix: |
+      async function donate(pence) {
+        const key = crypto.randomUUID();
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          // ...the same request, with the same key on every attempt
+        }
+      }
+
+  - type: prose
+    id: replay-and-claim
+    body: >-
+      On the server, look the key up first. Found with a reply? Send that reply back, and
+      skip the work.
+
+
+      But a retry can arrive while the first attempt is still running. That's the gap from
+      Race conditions. So **claim** the key before any `await`, as you did for webhook event
+      ids. A repeat meanwhile gets `409 Conflict`. If the work throws, release the claim, so
+      a later retry can run.
+
+  - type: code-challenge
+    id: write-with-idempotency
+    concept: scale.idempotency-keys
+    difficulty: 4
+    language: ts
+    editable: '13-14'
+    prompt: >-
+      Write the body of the handler that `withIdempotency(store, handler)` returns. For a
+      key stored as done, return its reply without calling `handler`. For a key that's
+      running, return `{ status: 409, body: 'Still in progress' }`.
+
+
+      Otherwise mark the key running, call `handler(body)`, store the reply as done and
+      return it. If `handler` throws, delete the key and throw again.
+    hints:
+      - Start with `store.get(key)`. Its `state` tells you which of the three cases you're in.
+      - The claim must happen before `await handler(body)`, or two attempts both see an empty store.
+      - "Wrap the call: `try { const reply = await handler(body); ... } catch (error) { store.delete(key); throw error; }`"
+
+  - type: prose
+    id: keys-expire
+    body: >-
+      Keys can't be kept for ever. Stripe may delete one once it's 24 hours old, and then a
+      repeat counts as new. That span is the **deduplication window**.
+
+
+      AI agents need keys too. When a model asks your code to run a tool, such as
+      `issue_refund`, the request carries a **tool call id**. If your loop retries that
+      call, send its id as the key.
+
+  - type: multiple-choice
+    id: pick-window-too-short
+    concept: scale.deduplication-window
+    difficulty: 3
+    question: Your app retries a failed charge for up to an hour. Keys last ten minutes. What goes wrong?
+    choices:
+      - text: A late retry can charge the customer again
+        correct: true
+        feedback: >-
+          Right. Once the key is gone, the retry looks new. Outlast every retry.
+      - text: Late retries are refused with an error
+        feedback: >-
+          The server has forgotten the key, so it has nothing to refuse with. It sees a new charge.
+      - text: Nothing, the key still matches
+        feedback: >-
+          A key only matches while it's stored. After ten minutes there's nothing to match.
+
+  - type: fill-blank
+    id: fill-tool-call-key
+    concept: scale.idempotency-keys
+    difficulty: 3
+    language: js
+    prompt: >-
+      Your agent's `issue_refund` tool retries on a timeout. Pick the key, so a retry of this
+      tool call refunds once. Fill the gap.
+    template: |
+      async function issueRefund(toolCall) {
+        return stripe.refunds.create(
+          { payment_intent: toolCall.input.paymentId },
+          { idempotencyKey: {{1}} },
+        );
+      }
+    blanks:
+      - key: '1'
+        answer: toolCall.id
+    bank: [toolCall.id, crypto.randomUUID(), toolCall.input.paymentId, Date.now()]
+
+  - type: explain-back
+    id: explain-timeout-retry
+    concept: scale.idempotency-keys
+    difficulty: 4
+    prompt: >-
+      A charge request timed out. A teammate says retrying is unsafe, so the app should
+      show "Payment failed". Explain what's wrong with that, and what you'd do.
+    rubric:
+      - A timeout doesn't say whether the charge happened, so "failed" may be false.
+      - Retrying blindly can charge twice, and not retrying can lose a sale or confuse the customer.
+      - One idempotency key per payment, sent on every retry, lets the server replay the first result.
+    modelAnswer: >-
+      The timeout only tells us we stopped waiting. The charge may have gone through, so
+      "Payment failed" could be a lie. The customer might then pay again by hand. Retrying
+      without protection could charge twice. So I'd make one idempotency key when the
+      customer presses Pay and send it on every attempt. If the first charge happened, the
+      server replays its reply. If not, the retry does the work.
+
+recap:
+  - Treat a timeout as "unknown", not "failed", and retry with the same idempotency key.
+  - Replay stored replies, claim a key before the work, and release it if the work throws.
+  - Keep keys longer than your longest retry, and key a retried tool call by its id.
+
+recall:
+  - id: card-idempotency-key
+    concept: scale.idempotency-keys
+    front: Who creates an idempotency key, and when?
+    back: >-
+      The client, once per operation, before the first attempt. Every retry of that operation
+      carries the same key.
+  - id: card-claim-first
+    concept: scale.idempotency-keys
+    front: Why does the server claim a key before doing the work?
+    back: >-
+      A retry can arrive while the first attempt still runs. Without the claim, both see no
+      key and both do the work.
+  - id: card-dedup-window
+    concept: scale.deduplication-window
+    front: How long should a deduplication window be?
+    back: >-
+      Longer than the client's longest retry schedule. A repeat after the window is treated
+      as new.
+  - id: card-timeout-unknown
+    concept: scale.idempotency-keys
+    front: What does a timeout on a `POST` tell you about the server's work?
+    back: >-
+      Nothing. The work may have finished and only the reply was lost.
+
+references:
+  - kind: paper
+    title: Idempotence Is Not a Medical Condition
+    authors: Pat Helland
+    year: 2012
+    venue: ACM Queue, 10(4)
+    url: https://doi.org/10.1145/2181796.2187821
+    note: Why messages get retried, and why every handler in a large system must tolerate repeats.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Idempotent requests
+    authors: Stripe
+    venue: Stripe API reference
+    url: https://docs.stripe.com/api/idempotent_requests
+    note: The `Idempotency-Key` header, replayed results including errors, and keys pruned after 24 hours.
+    primary: true
+    verified: true
+  - kind: spec
+    title: The Idempotency-Key HTTP Header Field
+    authors: IETF HTTPAPI Working Group
+    venue: IETF Internet-Draft, revision 07
+    url: https://datatracker.ietf.org/doc/draft-ietf-httpapi-idempotency-key-header/
+    note: The header's draft definition. An Internet-Draft that expired in April 2026, not a standard.
+    verified: true
+
+deepDive: >-
+  Stripe saves the status and body of the first request for a key, even a `500`, and returns
+  them for every repeat. It compares the parameters too: the same key with a different body
+  is refused as a client bug. A request that clashes with one still running isn't saved, so
+  you can retry it. The IETF draft suggests `409` for that case and `422` for a reused key
+  with a different body.
+
+
+  In a database, the claim is a row in an `idempotency_keys` table whose key column is
+  `UNIQUE`. Insert the key and do the work in one transaction. Two attempts at once then
+  race for the insert, and the loser fails with `duplicate key value violates unique
+  constraint` and rolls back. A crash between work and key can't happen, because they
+  commit together.
+
+
+  Not every call needs a key. `GET`, `PUT` and `DELETE` are idempotent by definition. Keys
+  are for `POST`, and for jobs on a queue, which the next lesson meets.
+
+
+  A tool call id only covers retries of that call. If the model itself asks for a second
+  refund, that's a new call with a new id. Guard money-moving tools with a check of their
+  own, such as refusing a refund on a payment that's already refunded.

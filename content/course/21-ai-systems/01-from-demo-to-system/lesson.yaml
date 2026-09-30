@@ -1,0 +1,283 @@
+id: aisys.demo-to-system
+title: From demo to system
+objective: "Read a production AI pipeline as code, say what each part guards against, and spot where a one-call demo breaks first."
+level: advanced
+minutes: 7
+concepts: [aisys.production-pipeline, aisys.demo-failure-modes]
+prerequisites: [ai.agents, ai.evals]
+opening:
+  text: >-
+    You'll see the whole production pipeline this chapter builds, as one short function.
+    It's the map for every lesson after it, and the first drawing an interviewer asks for.
+
+steps:
+  - type: prose
+    id: the-demo
+    body: |-
+      Here's a support bot demo. One call does everything:
+
+      ```python
+      reply = client.messages.create(model="claude-opus-5", max_tokens=1024,
+          system=SUPPORT_PROMPT, messages=[{"role": "user", "content": ticket.text}])
+      send_email(ticket.customer, reply.content[0].text)
+      ```
+
+      On twenty test tickets it's charming. Then the team asks it to issue refunds too.
+
+  - type: ai-review
+    id: review-demo-refund
+    concept: aisys.demo-failure-modes
+    difficulty: 1
+    language: python
+    request: Let the support bot issue refunds when its reply agrees to one.
+    flawClass: logic
+    code: |
+      def handle(ticket):
+          reply = client.messages.create(model="claude-opus-5", max_tokens=1024,
+              system=SUPPORT_PROMPT, messages=[{"role": "user", "content": ticket.text}])
+          text = reply.content[0].text
+          if "refund" in text.lower():
+              payments.refund(ticket.order_id)
+          send_email(ticket.customer, text)
+    prompt: >-
+      An assistant wrote this, and the demo went well. On day one the bot replied "Sorry, a
+      refund isn't possible here", and the refund went through. Tap the line at fault.
+    lines: [5]
+    reasons:
+      - text: A word in free text triggers an irreversible action
+        correct: true
+        feedback: >-
+          Yes. "Refund" appears in yes and in no. Money needs a clear decision in code.
+      - text: '`max_tokens` is too low for a reply'
+        feedback: >-
+          1,024 tokens is plenty for a support reply. The refund check is the problem.
+      - text: The email should be sent before the refund
+        feedback: >-
+          Order isn't the issue. The refund should never have run on this reply.
+    fix: |
+      decision = triage(ticket.text)          # a label and a probability, lesson 3
+      if decision.label == "refund" and decision.p >= 0.9:
+          payments.refund(ticket.order_id)    # code decides, not a word in the reply
+
+  - type: prose
+    id: what-breaks
+    body: >-
+      That's one failure. Real traffic brings more in its first week. Spam and legal threats
+      need different paths. A customer pastes their bank details, which land in your logs.
+      An agent loops all night. A Friday prompt tweak quietly breaks refund answers. The
+      bill arrives at three times the forecast.
+
+
+      A one-call demo has no place to catch any of them.
+
+  - type: prose
+    id: the-pipeline
+    body: |-
+      A production pipeline gives each risk a box, and **code owns the flow**. Here it is,
+      with the lesson that builds each part:
+
+      ```python
+      def handle(ticket):
+          text = redact_pii(ticket.text)                    # 7
+          route = triage(text)                              # 3, 4
+          if route.p < 0.6:
+              return human_queue(ticket)
+          context = retrieve(text, tenant=ticket.tenant)    # 2
+          result = run_agent(text, context, max_steps=8)    # 5
+          if guard(result.action) == "approve":             # 6
+              return await_approval(ticket, result.action)
+          trace(ticket, result, prompt="support-answer@v7") # 9
+          return send_reply(ticket, result.reply)
+      ```
+
+      Evals gate every change to it (8, 9), and budgets cap each call (10).
+
+  - type: parsons
+    id: arrange-pipeline
+    concept: aisys.production-pipeline
+    difficulty: 2
+    language: python
+    prompt: >-
+      Rebuild the body of `handle(ticket)` without looking back. Personal data goes first,
+      the reply goes last. One block doesn't belong.
+    checkIndent: true
+    blocks:
+      - id: redact
+        code: text = redact_pii(ticket.text)
+        subgoal: Strip personal data
+      - id: triage
+        code: route = triage(text)
+        subgoal: Classify and route
+      - id: unsure
+        code: 'if route.p < 0.6:'
+      - id: queue
+        code: return human_queue(ticket)
+        indent: 1
+      - id: agent
+        code: result = run_agent(text, retrieve(text), max_steps=8)
+        subgoal: Let a capped agent act
+      - id: guard
+        code: 'if guard(result.action) == "approve":'
+        subgoal: Guard the action
+      - id: approval
+        code: return await_approval(ticket, result.action)
+        indent: 1
+      - id: reply
+        code: return send_reply(ticket, result.reply)
+        subgoal: Answer
+    distractors:
+      - id: redact-late
+        code: 'log.info("ticket: %s", ticket.text)   # redact later, in the exporter'
+        feedback: >-
+          The raw text would reach your logs first. Redaction comes before anything leaves.
+
+  - type: prose
+    id: model-proposes
+    body: >-
+      Notice who decides. The model answers narrow questions: which label, which action,
+      what reply. Code takes every branch, and every branch has a fallback, such as a
+      person, a refusal or a shorter answer.
+
+
+      So a wrong answer costs one branch, not the whole request. Each branch is also
+      something you can test, measure and trace.
+
+  - type: multiple-choice
+    id: pick-box
+    concept: aisys.demo-failure-modes
+    difficulty: 2
+    question: A Friday prompt edit breaks refund answers. Which part should have stopped it?
+    choices:
+      - text: An eval gate in CI
+        correct: true
+        feedback: >-
+          Right. It runs the eval set on the pull request and blocks the drop.
+      - text: The guardrail on actions
+        feedback: >-
+          Guards check each live action. They never compare the new prompt with the old one.
+      - text: The PII redactor
+        feedback: >-
+          Redaction protects personal data. It can't tell a good answer from a bad one.
+      - text: A lower step cap
+        feedback: >-
+          A cap stops runaway loops. A wrong answer takes one step, like a right one.
+
+  - type: bug-hunt
+    id: hunt-trace-before-redact
+    concept: aisys.demo-failure-modes
+    difficulty: 2
+    language: python
+    code: |
+      def handle(ticket):
+          trace_start(ticket.id, prompt="support-answer@v7", text=ticket.text)
+          text = redact_pii(ticket.text)
+          route = triage(text)
+          if route.p < 0.6:
+              return human_queue(ticket)
+          result = run_agent(text, retrieve(text, tenant=ticket.tenant), max_steps=8)
+          return send_reply(ticket, result.reply)
+    prompt: >-
+      A privacy review finds 3,000 IBANs in the trace store, though every prompt was
+      redacted. Tap the line at fault.
+    lines: [2]
+    reasons:
+      - text: The trace records the text before redaction
+        correct: true
+        feedback: >-
+          Right. Redact first, then trace only the redacted text.
+      - text: The triage call sees the raw text
+        feedback: >-
+          Triage gets `text`, which is already redacted. The trace got the original.
+      - text: The agent gets unredacted context
+        feedback: >-
+          Retrieval runs on redacted text here. The leak is two lines earlier.
+    fix: |
+      def handle(ticket):
+          text = redact_pii(ticket.text)
+          trace_start(ticket.id, prompt="support-answer@v7", text=text)
+
+  - type: explain-back
+    id: explain-demo-to-system
+    concept: aisys.production-pipeline
+    difficulty: 3
+    prompt: >-
+      An interviewer says: "Your demo works. What would you add before real customers use
+      it?" Give your answer in a few sentences.
+    rubric:
+      - Code owns the flow. A classifier routes, and the model only answers narrow questions.
+      - Personal data is redacted first, and risky actions pass a guard or a person.
+      - Evals gate every change, traces record versions, and budgets cap cost and time.
+    modelAnswer: >-
+      I'd stop letting one call decide everything. A classifier routes each ticket, and
+      unsure ones go to a person. Personal data is redacted before any call or log. The
+      agent runs with a step cap, and risky actions pass a guard or wait for approval.
+      Every change to a prompt or model runs the eval set in CI. Each call is traced with
+      its prompt version, cost and latency.
+
+recap:
+  - Let code own the flow, and ask the model only narrow questions.
+  - Give each risk a box, and each branch a fallback.
+  - Redact before anything leaves, and gate every change with evals.
+
+recall:
+  - id: card-who-decides
+    concept: aisys.production-pipeline
+    front: In a production AI pipeline, who takes each branch?
+    back: >-
+      Code. The model answers narrow questions, like a label, an action or a reply, and
+      code decides what happens next.
+  - id: card-demo-gaps
+    concept: aisys.demo-failure-modes
+    front: Name four failures a one-call demo has no place to catch.
+    back: >-
+      Tickets that need other paths, personal data in logs, agents that loop, prompt edits
+      that break answers, and runaway cost.
+  - id: card-pipeline-order
+    concept: aisys.production-pipeline
+    front: What runs first on every incoming ticket, and why?
+    back: >-
+      PII redaction, so no model call, log line or trace ever holds the raw personal data.
+
+references:
+  - kind: essay
+    title: Building effective agents
+    authors: Erik Schluntz and Barry Zhang
+    year: 2024
+    venue: Anthropic Engineering
+    url: https://www.anthropic.com/engineering/building-effective-agents
+    note: Workflows where code holds the path, and agents only where it can't.
+    primary: true
+    verified: true
+  - kind: docs
+    title: OWASP Top 10 for LLM Applications
+    authors: OWASP Gen AI Security Project
+    year: 2025
+    venue: OWASP
+    url: https://genai.owasp.org/llm-top-10/
+    note: The risks each box in the pipeline answers, from injection to excessive agency.
+    primary: true
+    verified: true
+  - kind: essay
+    title: Your AI Product Needs Evals
+    authors: Hamel Husain
+    year: 2024
+    venue: hamel.dev
+    url: https://hamel.dev/blog/posts/evals/
+    note: Traces, labels and evals as the loop that keeps a model feature working.
+    verified: true
+
+deepDive: >-
+  **In a system design round**, draw this pipeline first, then walk one request through
+  it. For each box, name what fails without it and what the box costs in latency. Redaction
+  and rules take milliseconds, a classifier tens of milliseconds, and the agent seconds.
+
+
+  **Synchronous or not.** Triage and guards sit on the request path, so they must be fast.
+  Evals, judge scoring of live samples and eval-set curation run beside it, on a schedule
+  or in CI, and never slow a user down.
+
+
+  **Fallbacks per box.** A classifier that times out sends the ticket to a person. A guard
+  that errors blocks the action rather than allowing it. A model that's overloaded falls
+  back to another model or a plain "we'll get back to you". Decide each one before launch,
+  not during the incident.

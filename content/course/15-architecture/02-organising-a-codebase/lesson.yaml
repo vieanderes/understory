@@ -1,0 +1,302 @@
+id: arch.project-structure
+title: Organising a codebase
+objective: Group code by feature, give each module one entry file a lint rule enforces, and find and break an import cycle.
+level: essential
+minutes: 10
+concepts: [arch.feature-folders, arch.public-module-api, arch.circular-dependencies]
+prerequisites: [arch.coupling-and-cohesion, tooling.quality-gates]
+opening:
+  text: >-
+    You'll lay out a codebase so a change lands in one folder, not five. And you'll fix the
+    crash that appears when two modules import each other.
+
+steps:
+  - type: prose
+    id: folders-by-feature
+    body: >-
+      Lesson 1 said to keep what changes together in one module. A **feature** is a job the
+      app does for someone, like bookings or invoices, and a feature's code changes together.
+
+
+      So use **feature folders**: `src/bookings/`, `src/invoices/`, `src/rooms/`. Each holds
+      its own routes, rules and queries. The other common layout groups files by kind:
+      `controllers/`, `models/`, `validators/`.
+
+  - type: multiple-choice
+    id: pick-folders-touched
+    concept: arch.feature-folders
+    difficulty: 1
+    language: bash
+    code: |
+      $ ls src
+      controllers/   models/   queries/   validators/
+      $ ls src/controllers
+      bookings.js   invoices.js   rooms.js
+      $ ls src/validators
+      bookings.js   invoices.js   rooms.js
+    question: Cancelling a booking needs a route, a model, a query and a check. How many folders change?
+    choices:
+      - text: One
+        feedback: >-
+          It should be one. Here each kind of file has its own folder, so the feature is
+          spread over all of them.
+      - text: Four
+        correct: true
+        feedback: >-
+          Right. One file in each. The feature has no home of its own.
+      - text: Three, one per feature
+        feedback: >-
+          The features are file names here, not folders. Cancelling only concerns bookings,
+          in every folder.
+
+  - type: prose
+    id: name-public-module-api
+    body: >-
+      A folder alone hides nothing: any file can still import any other. So give each module
+      a **public API**: one entry file, `index.js`, that re-exports what outsiders may use.
+      The rest is internal.
+
+
+      Then make it a rule. ESLint's `no-restricted-imports` fails the build on any import
+      that matches a pattern. `**/bookings/*` matches every file in bookings, and a pattern
+      that starts with `!` makes an exception.
+
+  - type: fill-blank
+    id: fill-restricted-imports
+    concept: arch.public-module-api
+    difficulty: 2
+    language: js
+    prompt: >-
+      Other folders may import `bookings/index.js`, and nothing else from bookings. Fill in
+      the two patterns.
+    template: |
+      export default [{
+        files: ['src/**/*.js'],
+        ignores: ['src/bookings/**'],   // bookings may use its own files
+        rules: {
+          'no-restricted-imports': ['error', {
+            patterns: [{
+              group: [{{1}}, {{2}}],
+              message: 'Import from bookings/index.js only.',
+            }],
+          }],
+        },
+      }];
+    blanks:
+      - key: '1'
+        answer: "'**/bookings/*'"
+      - key: '2'
+        answer: "'!**/bookings/index.js'"
+    bank:
+      - "'**/bookings/*'"
+      - "'**/invoices/*'"
+      - "'!**/bookings/index.js'"
+      - "'!**/bookings/internal/*'"
+
+  - type: ai-review
+    id: review-deep-import
+    concept: arch.public-module-api
+    difficulty: 3
+    language: js
+    request: Make an invoice for each booking, charged per night.
+    flawClass: logic
+    code: |
+      // src/invoices/make-invoice.js
+      import { findBooking } from '../bookings/index.js';
+      import { nightsBetween } from '../bookings/internal/dates.js';
+
+      export async function makeInvoice(bookingId) {
+        const booking = await findBooking(bookingId);
+        const nights = nightsBetween(booking.checkIn, booking.checkOut);
+        return { bookingId, nights, pence: nights * booking.nightlyPence };
+      }
+    prompt: >-
+      An assistant wrote this, and the tests pass. A month later the bookings team renames
+      `internal/dates.js`, and invoices break. Tap the line at fault.
+    lines: [3]
+    reasons:
+      - text: It reaches past the bookings entry file
+        correct: true
+        feedback: >-
+          Yes. Internal files can change without warning. Ask bookings to export it.
+      - text: Invoices should count the nights itself
+        feedback: >-
+          Then two modules hold the same date rule, and they'll drift apart. Reuse it, through
+          the front door.
+      - text: '`findBooking` doesn''t need `await`'
+        feedback: >-
+          It reads from storage, so it's async and the `await` is right. The trouble is the
+          other import.
+    fix: |
+      // bookings/index.js adds: export { nightsBetween } from './internal/dates.js';
+      import { findBooking, nightsBetween } from '../bookings/index.js';
+
+  - type: prose
+    id: what-a-cycle-is
+    body: >-
+      Sometimes two modules import each other: users imports orders, and orders imports
+      users. That's a **circular dependency**, or an import cycle. It can also run through
+      more files: A imports B, B imports C, C imports A.
+
+
+      Neither side can load first. JavaScript starts one, pauses at its import, and runs the
+      other. That one may read a value the paused module hasn't set yet.
+
+  - type: bug-hunt
+    id: hunt-cycle-crash
+    concept: arch.circular-dependencies
+    difficulty: 3
+    language: js
+    code: |
+      // users.js
+      import { ordersFor } from './orders.js';
+      export const DEFAULT_ROLE = 'customer';
+      export function badgeFor(userId) {
+        return ordersFor(userId).length > 10 ? 'regular' : 'new';
+      }
+
+      // orders.js
+      import { DEFAULT_ROLE } from './users.js';
+      const guestRole = DEFAULT_ROLE.toUpperCase();
+      export function ordersFor(userId) {
+        return [];
+      }
+    prompt: >-
+      `app.js` imports `users.js` and crashes: "ReferenceError: Cannot access 'DEFAULT_ROLE'
+      before initialization". Tap the line that reads too early.
+    lines: [10]
+    reasons:
+      - text: It reads a value from users while users is paused
+        correct: true
+        feedback: >-
+          Yes. Users stopped at its import, so `DEFAULT_ROLE` isn't set yet.
+      - text: '`DEFAULT_ROLE` is spelt differently in users'
+        feedback: >-
+          The spelling matches. The name exists; its value doesn't yet, because users hasn't
+          reached that line.
+      - text: Strings have no `toUpperCase` method
+        feedback: >-
+          They do. The crash comes before the method is ever called, while reading
+          `DEFAULT_ROLE`.
+
+  - type: multiple-choice
+    id: pick-cycle-fix
+    concept: arch.circular-dependencies
+    difficulty: 3
+    question: Which change breaks this cycle for good?
+    choices:
+      - text: Import `orders.js` first in `app.js`
+        feedback: >-
+          Most people try this, and it does run. The loop is still there, and the next
+          import order crashes it again.
+      - text: Move `DEFAULT_ROLE` into its own `roles.js`
+        correct: true
+        feedback: >-
+          Right. Both import `roles.js`, which imports nothing. No loop.
+      - text: Merge users and orders into one file
+        feedback: >-
+          That ends the cycle and the boundary with it. Now one file has two reasons to
+          change.
+      - text: Wrap the `import` in `try` and `catch`
+        feedback: >-
+          An `import` line can't sit inside `try`. And hiding the error would leave the loop
+          in place.
+
+  - type: explain-back
+    id: explain-cycle-harmless
+    concept: arch.circular-dependencies
+    difficulty: 4
+    prompt: >-
+      A teammate says an import cycle is harmless, because the app runs today. What would you
+      tell them?
+    rubric:
+      - It runs only because of the order files happen to load in, and a new import elsewhere can change that order and crash it.
+      - Modules in a cycle can't be loaded, tested or changed alone, so the boundary between them is gone.
+      - The fix is to move what both need into a module that imports neither, or to remove one direction.
+    modelAnswer: >-
+      It runs by luck. Which module loads first depends on who imports what, anywhere in the
+      app. Add one import in an unrelated file and the order flips, and a value gets read
+      before it's set. Even when it doesn't crash, the two modules can't be tested or
+      changed apart any more: they're one module in two files. I'd find what they share and
+      move it into a small module that imports neither of them.
+
+recap:
+  - Group code by feature, so one change touches one folder.
+  - Give each module one entry file, and let `no-restricted-imports` fail the build on anything deeper.
+  - Break an import cycle by moving what both sides need into a module that imports neither.
+
+recall:
+  - id: card-feature-folders
+    concept: arch.feature-folders
+    front: Why group code by feature and not by technical kind?
+    back: >-
+      A feature's files change together. In one folder, a change touches one place. Split by
+      kind, it touches every folder.
+  - id: card-public-api
+    concept: arch.public-module-api
+    front: What is a module's public API, and what keeps it honest?
+    back: >-
+      One entry file that re-exports what outsiders may use. A lint rule such as
+      `no-restricted-imports` fails the build on deeper imports.
+  - id: card-cycle
+    concept: arch.circular-dependencies
+    front: Why can an import cycle crash with "Cannot access before initialization"?
+    back: >-
+      One module pauses at its import while the other runs. If that one reads the paused
+      module's value, the value isn't set yet.
+  - id: card-cycle-fix
+    concept: arch.circular-dependencies
+    front: How do you break an import cycle for good?
+    back: >-
+      Move what both modules need into a third module that imports neither, or remove one of
+      the two directions. Reordering imports only hides it.
+
+references:
+  - kind: docs
+    title: no-restricted-imports
+    authors: OpenJS Foundation and ESLint contributors
+    venue: ESLint documentation
+    url: https://eslint.org/docs/latest/rules/no-restricted-imports
+    note: The `paths` and `patterns` options, including `group`, negated patterns and `message`.
+    primary: true
+    verified: true
+  - kind: docs
+    title: JavaScript modules, cyclic imports
+    authors: MDN contributors
+    venue: MDN Web Docs
+    url: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide/Modules#cyclic_imports
+    note: How a cycle loads, and why reading a binding before its module has run throws a ReferenceError.
+    primary: true
+    verified: true
+  - kind: paper
+    title: On the criteria to be used in decomposing systems into modules
+    authors: D. L. Parnas
+    year: 1972
+    venue: Communications of the ACM, 15(12)
+    url: https://doi.org/10.1145/361598.361623
+    note: Why modules should follow what changes together, not the steps of processing.
+    verified: true
+
+deepDive: >-
+  Both runs were real, on Node 24 and ESLint 9.39.5. The deep import failed with "import is
+  restricted from being used by a pattern", followed by our message. The import through
+  `index.js` passed. Node itself ran both files without complaint, which is the point: only
+  a tool makes the boundary real.
+
+
+  The cycle crashed with `ReferenceError: Cannot access 'DEFAULT_ROLE' before
+  initialization` when `app.js` imported users first. With `orders.js` imported first, the
+  same files logged `new`. That's why cycles survive review: they work until the load order
+  changes. Tools can find them for you. `import/no-cycle` from `eslint-plugin-import` fails
+  the lint, and `madge --circular` prints every loop in a project.
+
+
+  Entry files have a cost. A barrel that re-exports a whole folder can pull unused code
+  into a bundle, and slow a test runner that loads everything it sees. It also makes
+  cycles easier to create, since everything imports the barrel. Keep the entry file short.
+  Export what outsiders need, not everything you have.
+
+
+  Feature folders still need somewhere for shared code. Keep that small and boring: a date
+  helper, a money type. If `shared/` starts to hold business rules, a feature is hiding in
+  it. Give it a folder.

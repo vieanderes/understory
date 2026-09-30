@@ -1,0 +1,251 @@
+summary: >-
+  "Sign in with Google" is two standards stacked. **OAuth 2.0** lets a user give an app
+  limited access to something they own at another service without handing over their
+  password; its result is an **access token** for an API. **OpenID Connect** (OIDC) adds
+  identity on top: an **ID token**, a signed JWT that tells the app who signed in. Almost
+  every "Sign in with" button is OIDC running the authorisation code flow, with **PKCE**
+  guarding the code and `state` guarding the callback.
+
+
+  You reach for it when users already have an account elsewhere and you'd rather not store
+  passwords, and when your app needs to act on a user's data at another service, such as
+  reading their calendar. You don't write the protocol yourself: a library such as Auth.js
+  or the provider's SDK builds the redirect, swaps the code and verifies the token. Your job
+  is to configure it correctly and to understand each check well enough to spot when one is
+  missing.
+
+
+  **Passkeys** solve a different problem: they replace the password itself. A passkey is a
+  key pair made for one site; the site stores only the public key, and the browser will only
+  use the private key on the site it was made for. That makes passkeys resistant to phishing
+  in a way no password, and no one-time code, can be.
+remember:
+  - OAuth grants an app delegated access to an API through an access token; OpenID Connect adds an ID token that says who the user is.
+  - The authorisation code flow sends a one-time code through the browser and swaps it for tokens server to server, so tokens never appear in a URL.
+  - The `state` value ties a callback to a sign-in this browser started, which stops login CSRF; check it and use it once.
+  - PKCE sends a SHA-256 hash of a random verifier in the redirect and the verifier at the swap, so a stolen code is useless, and it's recommended for every client.
+  - Before trusting an ID token, verify its signature against the provider's keys and check `iss`, `aud`, `exp` and your `nonce`.
+  - Identify a user by the pair `iss` and `sub`, never by email, because emails change and can be unverified.
+  - A passkey is a per-site key pair, and the browser signs only for the site the passkey belongs to, which makes it phishing-resistant.
+  - The server verifies a passkey sign-in by checking the challenge, the origin, the relying party id hash, the user flags and the signature against the stored public key.
+sections:
+  - title: The requests, with PKCE, written out
+    body: |-
+      A library does this for you, but knowing the exact parameters lets you read a failing
+      flow in the network tab.
+
+      ```ts
+      import { createHash, randomBytes } from 'node:crypto';
+
+      const base64url = (bytes: Buffer) => bytes.toString('base64url');
+
+      export function startSignIn() {
+        const state = base64url(randomBytes(32));
+        const nonce = base64url(randomBytes(32));
+        const codeVerifier = base64url(randomBytes(32)); // 43 characters
+        const codeChallenge = base64url(createHash('sha256').update(codeVerifier).digest());
+
+        const url = new URL('https://accounts.example.com/authorize');
+        url.search = new URLSearchParams({
+          response_type: 'code',
+          client_id: 'recipe-box',
+          redirect_uri: 'https://recipes.example.com/callback',
+          scope: 'openid email',
+          state,
+          nonce,
+          code_challenge: codeChallenge,
+          code_challenge_method: 'S256',
+        }).toString();
+
+        // Save state, nonce and codeVerifier in the user's session before redirecting.
+        return { redirectTo: url.toString(), saved: { state, nonce, codeVerifier } };
+      }
+
+      export function tokenRequestBody(code: string, codeVerifier: string) {
+        return new URLSearchParams({
+          grant_type: 'authorization_code',
+          code,
+          redirect_uri: 'https://recipes.example.com/callback',
+          client_id: 'recipe-box',
+          code_verifier: codeVerifier,
+        });
+      }
+      ```
+
+      The token request is a `POST` to the provider's token endpoint with that body, sent as
+      `application/x-www-form-urlencoded`. A server-side app also authenticates itself with
+      its client secret. RFC 7636 gives a test vector: the verifier
+      `dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk` hashes to
+      `E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM`, and the code above produces exactly
+      that.
+
+      Three values guard three different things. `state` proves the callback belongs to a
+      sign-in this browser started. The PKCE verifier proves the party swapping the code is
+      the one that started the flow. The `nonce` comes back inside the ID token and proves
+      that token was minted for this sign-in, not replayed from an earlier one.
+
+      The provider also checks that `redirect_uri` exactly matches one you registered. Exact
+      matching matters: a loose pattern lets an attacker send codes to a page they control.
+  - title: Trusting an ID token
+    body: |-
+      An ID token is a JWT signed by the provider with a private key. The provider publishes
+      the matching public keys as a JSON Web Key Set, whose address is listed in its
+      discovery document at `/.well-known/openid-configuration` under `jwks_uri`. Checking a
+      token means:
+
+      - the signature verifies against a key from that set, with an algorithm you allow;
+      - `iss` is exactly the provider's issuer;
+      - `aud` contains your client id, so a token minted for another app is refused;
+      - `exp` hasn't passed;
+      - `nonce` equals the one you saved in the session.
+
+      With the `jose` library that is `jwtVerify(token, createRemoteJWKSet(new URL(jwksUri)),
+      { issuer, audience })`, plus your own nonce comparison. The key set is cached and
+      refetched when the provider rotates keys.
+
+      **Key your users on `iss` and `sub`.** `sub` is unique and stable only within one
+      issuer, and it's the only claim that is. An email address can change, can be reused
+      by a new person at some providers, and at some is never verified. Linking a new
+      sign-in to an existing account by matching email, without `email_verified`, lets an
+      attacker who registers your email at a lax provider take over your account.
+
+      When the token swap happens server to server over TLS, directly with the provider, the
+      transport already vouches for the token. Verifying it anyway costs little and protects
+      you when the code path changes later.
+  - title: Which grant for which job
+    body: |-
+      OAuth defines several ways to get a token. Current guidance, collected in RFC 9700,
+      the OAuth 2.0 Security Best Current Practice (2025), narrows them down.
+
+      - **Authorisation code with PKCE.** A user signs in through a browser. Use it for web
+        apps, single-page apps and mobile apps alike.
+      - **Client credentials.** No user at all: one of your services calls another with its
+        own identity, such as a nightly job calling a billing API.
+      - **Refresh token.** Swaps a long-lived refresh token for a new access token when the
+        old one expires, without sending the user back to the provider.
+      - **Device authorisation.** A TV or command-line tool shows a short code that the user
+        enters on their phone.
+
+      Two older grants are out. The **implicit** grant returned the access token in the URL
+      fragment, where browser history, extensions and referrer headers could leak it. The
+      **password** grant had the app collect the user's password, which defeats the point
+      of OAuth. The OAuth 2.1 draft removes both.
+
+      Scopes decide what an access token may do. Ask for the fewest that the feature needs,
+      `openid email` for sign-in alone, and ask for more later, when the user reaches the
+      feature that needs them. Users approve small requests more readily, and a leaked token
+      does less harm.
+  - title: How a passkey sign-in is verified
+    body: |-
+      At registration the device makes a key pair for the site, and the server stores the
+      credential id and the public key against the user. At sign-in, the server sends a
+      random challenge, the browser calls `navigator.credentials.get({ publicKey: ... })`,
+      and the device signs after a fingerprint, face or PIN. The browser, not the page,
+      writes the origin into the signed data. That's why a phishing page can't fake it.
+
+      ```ts
+      import { createHash, generateKeyPairSync, randomBytes, sign, verify, type KeyObject } from 'node:crypto';
+
+      const sha256 = (data: Buffer | string) => createHash('sha256').update(data).digest();
+      const RP_ID = 'recipes.example.com';
+      const ORIGIN = 'https://recipes.example.com';
+
+      // What the site stored at registration: the credential's public key.
+      const { publicKey, privateKey } = generateKeyPairSync('ec', { namedCurve: 'P-256' });
+
+      // The device's side, simplified: the browser fills in the origin itself.
+      function deviceSigns(challenge: string, origin: string, key: KeyObject) {
+        const clientDataJSON = Buffer.from(JSON.stringify({ type: 'webauthn.get', challenge, origin }));
+        const flags = Buffer.from([0x01 | 0x04]); // user present, user verified
+        const signCount = Buffer.alloc(4);
+        const authenticatorData = Buffer.concat([sha256(RP_ID), flags, signCount]);
+        const signature = sign('sha256', Buffer.concat([authenticatorData, sha256(clientDataJSON)]), key);
+        return { clientDataJSON, authenticatorData, signature };
+      }
+
+      // The server's side.
+      function verifyAssertion(
+        expectedChallenge: string,
+        a: ReturnType<typeof deviceSigns>,
+        storedKey: KeyObject,
+      ): boolean {
+        const client = JSON.parse(a.clientDataJSON.toString());
+        if (client.type !== 'webauthn.get') return false;
+        if (client.challenge !== expectedChallenge) return false; // fresh, one-time
+        if (client.origin !== ORIGIN) return false; // the phishing check
+        if (!a.authenticatorData.subarray(0, 32).equals(sha256(RP_ID))) return false;
+        const flags = a.authenticatorData[32] ?? 0;
+        if ((flags & 0x01) === 0 || (flags & 0x04) === 0) return false;
+        const signed = Buffer.concat([a.authenticatorData, sha256(a.clientDataJSON)]);
+        return verify('sha256', signed, storedKey, a.signature);
+      }
+
+      const challenge = randomBytes(32).toString('base64url');
+      verifyAssertion(challenge, deviceSigns(challenge, ORIGIN, privateKey), publicKey); // true
+      ```
+
+      Signed for `https://g00gle-login.example`, the same call returns `false`, and so does a
+      signature from a different key. Real WebAuthn stores the key in COSE format and has
+      more fields, so use a maintained library such as `@simplewebauthn/server` rather than
+      this code. The checks it makes are these.
+
+      Synced passkeys, kept in a platform password manager, survive a lost phone; device-bound
+      ones on a hardware key never leave it. Synced passkeys usually report a signature
+      counter of 0, so treat the counter as a hint, not a rule. Keep a recovery path that
+      isn't weaker than the passkey, or attackers will use the recovery path instead.
+pitfalls:
+  - '**Skipping the `state` check on the callback.** Any code is accepted, so an attacker can sign a victim into the attacker''s account. Compare it with the saved value and delete it after one use.'
+  - '**Matching users by email.** Emails change and some providers don''t verify them. Store and look up `iss` plus `sub`, and link accounts by email only when `email_verified` is true and the user confirms.'
+  - '**Treating an access token as proof of identity.** An access token says what an app may do at an API, and may not be meant for you at all. Sign users in from a verified ID token.'
+  - '**Registering loose redirect URIs.** A wildcard or prefix match can send codes to an attacker''s page. Register exact URIs, one per environment.'
+  - '**Putting the client secret in a browser or mobile app.** Anything shipped can be extracted. Use PKCE as a public client, or keep the secret on your server.'
+  - '**Asking for every scope up front.** Users refuse long consent screens, and a leaked token can do more. Ask for the minimum and request more when a feature needs it.'
+  - '**Reusing a passkey challenge.** A challenge that isn''t random and single-use lets a captured assertion be replayed. Generate one per attempt, store it server side, and delete it on use.'
+interview:
+  - question: Walk me through what happens when a user clicks "Sign in with Google".
+    answer: >-
+      It's the OpenID Connect authorisation code flow with PKCE. My server makes a random
+      `state`, `nonce` and PKCE verifier, saves them in the session, and redirects to Google
+      with the client id, exact redirect URI, `openid email` scope, the state, nonce and the
+      verifier's SHA-256 hash. The user authenticates and consents on Google's own page, so
+      I never see the password. Google redirects back with a one-time code and the state. I
+      check the state, then swap the code plus verifier at the token endpoint, server to
+      server. I verify the ID token's signature, `iss`, `aud`, `exp` and nonce, look the user
+      up by issuer and `sub`, and start my own session. In practice a library does this; I
+      configure and review it.
+  - question: What's the difference between OAuth and OpenID Connect?
+    answer: >-
+      OAuth is delegated authorisation, OpenID Connect is authentication built on top of it.
+      OAuth gives an app an access token to call an API on the user's behalf, such as reading
+      their calendar, and says nothing standard about who the user is. OIDC adds the
+      `openid` scope, a signed ID token with claims such as `iss`, `sub`, `aud` and `exp`, a
+      userinfo endpoint and discovery. The classic mistake is using a plain OAuth access
+      token as a login: the app can't tell who it was issued for, so a token obtained by
+      another app could be replayed. For sign-in, use OIDC and verify the ID token.
+  - question: What problem does PKCE solve, and why is it now recommended even for server-side apps?
+    answer: >-
+      PKCE makes an intercepted authorisation code worthless. The app sends a hash of a
+      random verifier with the redirect and the verifier itself at the swap, so only the
+      party that started the flow can redeem the code. It was designed for mobile and
+      single-page apps, which can't keep a client secret, where a malicious app could catch
+      the redirect. RFC 9700 recommends it for confidential clients too, because it also
+      defeats code injection, where an attacker plants a stolen code in a victim's session,
+      and it costs one hash. It complements `state` rather than replacing it.
+  - question: Why are passkeys phishing-resistant when one-time codes aren't?
+    answer: >-
+      Because the browser binds a passkey to the site it was created for and writes the real
+      origin into what the device signs. On a look-alike domain the browser finds no passkey
+      for that relying party, and even a relayed challenge would carry the wrong origin, so
+      the real server rejects it. A one-time code is a secret the user reads and types, so a
+      phishing page can collect it and replay it to the real site within its lifetime. And
+      the server holds only a public key, so a database breach leaks nothing reusable. The
+      weak spot moves to account recovery, which must not fall back to something phishable.
+  - question: A user signs in with Google and later with GitHub using the same email. Should you link the accounts automatically?
+    answer: >-
+      Not automatically on email alone. Identity in OIDC is the issuer plus `sub`; an email is
+      a mutable attribute that some providers don't verify. If GitHub's email isn't verified,
+      auto-linking lets anyone who adds your address to a new account take over yours. I'd
+      link only when the provider asserts the email is verified, and preferably after the
+      user proves control of the existing account, by signing in with it first. The
+      trade-off is friction: some users end up with two accounts, which is recoverable,
+      whereas a takeover isn't.

@@ -1,0 +1,218 @@
+summary: >-
+  Attackers don't start with a clever exploit. They start by looking: what does this app give
+  away, which inputs does it trust, and which small weakness leads to a bigger one. Testing
+  your own app the same way is how you find those weaknesses before someone else does. The
+  lesson covers the legal line, a leaky error reply, mass assignment and responsible
+  disclosure.
+
+
+  These notes add how attacks chain small bugs into serious ones, how defenders use the kill
+  chain and MITRE ATT&CK to decide where to notice an attacker, a script that runs
+  reconnaissance against your own app, and how authorised testing and bug bounties work in
+  practice.
+
+
+  Reach for this mindset whenever you design or review a feature: ask what a stranger would
+  learn from it and what they would try next. It doesn't replace secure defaults, reviews or
+  tests. It tells you where to point them. And the whole playbook applies only to systems
+  you own or have written permission to test.
+remember:
+  - Testing a system is lawful only when it's yours or you hold written permission with a scope, whatever your intent.
+  - Real breaches are usually chains of small flaws, so a "low" finding that enables the next step deserves a fix.
+  - Reconnaissance feeds on what your app volunteers, such as stack traces, version headers, source maps and guessable ids.
+  - Vertical escalation gains a higher role and horizontal escalation reaches a peer's data, and both come from a missing server-side check.
+  - The kill chain and MITRE ATT&CK name the stages of an attack so defenders can ask at which stage they would notice.
+  - An authorised test proves each finding with test accounts and minimal evidence, never with real users' data.
+  - Report a flaw privately through the owner's channel, such as `/.well-known/security.txt` or a bug bounty, and agree a date before going public.
+sections:
+  - title: How small bugs chain into a breach
+    body: |-
+      Scanners and triage often rate findings one at a time. Attackers don't. They look for
+      a path where each step hands them what the next step needs. Three findings that each
+      look minor can add up to a full account takeover.
+
+      ```text
+      1. Error reply leaks an internal user id and the ORM name     (rated low)
+      2. Login says "no such user" vs "wrong password"              (rated low)
+      3. GET /api/users/:id/export has no ownership check           (rated medium)
+      -> list valid accounts, read their ids from errors, export their data
+      ```
+
+      Each step removes guesswork for the next. The leak turns an unknown id into a known
+      one. The login message confirms which accounts exist. The missing check then does the
+      damage. Fixing any one link breaks this chain, and fixing the access check breaks
+      every chain that ends there.
+
+      That gives you two rules for triage. First, rate a finding by what it **enables**, not
+      only by what it does alone. An information leak next to an access-control gap is not
+      low. Second, prioritise the links many chains share. A server-side ownership check on
+      every object read is one of those, and so is a uniform login reply.
+
+      This is also why defence in depth works. Every layer an attacker must pass is another
+      link that has to hold for them, and another place you can catch them.
+  - title: The kill chain and ATT&CK, for defenders
+    body: |-
+      Two models give names to the stages of an attack. You use them to plan detection, not
+      to attack anything.
+
+      The **Cyber Kill Chain**, published by Lockheed Martin, has seven stages:
+      reconnaissance, weaponisation, delivery, exploitation, installation, command and
+      control, and actions on objectives. Its lesson is that an attacker has to succeed at
+      every stage, while you only need to stop one.
+
+      **MITRE ATT&CK** is a larger, public catalogue built from real incidents. It groups
+      behaviour into *tactics*, the attacker's goal at a step, such as Initial Access,
+      Privilege Escalation, Lateral Movement or Exfiltration. Under each tactic sit
+      *techniques*, the ways that goal is reached, each with an id. T1078, Valid Accounts,
+      covers signing in with stolen credentials. T1190, Exploit Public-Facing Application,
+      covers flaws in a web app like yours.
+
+      As an application engineer you use ATT&CK in three ways. You map your detections to
+      techniques and look for stages where you'd see nothing. You write threat models in a
+      shared vocabulary your security team already uses. And you read incident reports,
+      which often cite technique ids, to see which of them apply to your stack.
+
+      The models have limits. The kill chain was written for intrusions into networks, so it
+      fits a stolen session in a web app loosely. ATT&CK is broad and can turn into a
+      box-ticking exercise. Treat both as a checklist of questions: at which stage would we
+      notice, and who would be told?
+  - title: Reconnaissance against your own app
+    body: |-
+      You can automate the first look an attacker takes. This script starts a deliberately
+      chatty server and audits its replies for the classic leaks. Point `audit` at your own
+      app in development or staging instead.
+
+      ```js
+      import { createServer } from 'node:http';
+
+      const app = createServer((req, res) => {
+        res.setHeader('X-Powered-By', 'Express');
+        if (req.url === '/api/orders/abc') {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'invalid input syntax for type integer: "abc"\n    at /srv/app/src/orders.js:41:13' }));
+          return;
+        }
+        if (req.url === '/app.js') {
+          res.writeHead(200, { 'Content-Type': 'text/javascript' });
+          res.end('console.log(1);\n//# sourceMappingURL=app.js.map');
+          return;
+        }
+        res.writeHead(404);
+        res.end();
+      });
+
+      const LEAKY_HEADERS = ['x-powered-by', 'server', 'x-aspnet-version'];
+      const LEAKY_BODY = [
+        [/\bat \/[\w/.-]+:\d+:\d+/, 'stack frame with a file path'],
+        [/syntax for type|SQLSTATE|ORA-\d{5}/i, 'database error text'],
+        [/sourceMappingURL=/, 'public source map'],
+      ];
+
+      async function audit(base, paths) {
+        const findings = [];
+        for (const path of paths) {
+          const res = await fetch(new URL(path, base));
+          const body = await res.text();
+          for (const name of LEAKY_HEADERS) {
+            if (res.headers.has(name)) findings.push(`${path}: header ${name}: ${res.headers.get(name)}`);
+          }
+          for (const [pattern, label] of LEAKY_BODY) {
+            if (pattern.test(body)) findings.push(`${path}: ${label}`);
+          }
+        }
+        return findings;
+      }
+
+      app.listen(0, async () => {
+        const { port } = app.address();
+        console.log((await audit(`http://127.0.0.1:${port}`, ['/api/orders/abc', '/app.js'])).join('\n'));
+        app.close();
+      });
+      ```
+
+      Saved as `recon.mjs` and run with Node 24, it prints five findings: the header on both
+      paths, the stack frame, the database error text and the source map. The bad input
+      `abc` is the point. Malformed values are what make apps throw revealing errors.
+
+      Wire a check like this into CI against a staging deploy, and it stops a leak from
+      coming back.
+  - title: How authorised testers work
+    body: |-
+      A professional test starts with paperwork. The **rules of engagement** name the
+      systems in scope, the methods allowed, the time window, who to call if something
+      breaks, and what is off limits, such as denial of service or contacting staff. Anything
+      not listed is out of scope.
+
+      Testers then work from a model, not at random. They list entry points, roles and
+      trust boundaries, and for each one ask what happens with the wrong user, the wrong
+      type, a missing value or a replayed request. Most serious findings in web apps come
+      from that second account: create two test users and try to reach one's data as the
+      other.
+
+      Evidence must be minimal. A screenshot showing a second test account's order proves an
+      access-control flaw. Downloading a thousand real customers' orders proves the same
+      thing and creates a breach. Good testers stop at proof, record exact requests and
+      timestamps, and report anything critical at once rather than at the end.
+
+      A **bug bounty** is a standing, public version of that scope. Its policy lists the
+      domains in scope, the bug classes it pays for, the ones it excludes, and often a safe
+      harbour promise not to pursue good-faith research that follows the rules. Your own
+      programme can start smaller: a `security.txt` file that tells people where to report.
+
+      ```text
+      Contact: mailto:security@example.com
+      Expires: 2027-06-30T23:00:00.000Z
+      Policy: https://example.com/security-policy
+      Preferred-Languages: en
+      Canonical: https://example.com/.well-known/security.txt
+      ```
+
+      RFC 9116 requires `Contact` and `Expires`, and recommends an expiry less than a year
+      ahead, so a stale file doesn't point reporters at an abandoned inbox.
+pitfalls:
+  - '**Treating permission as implied.** Being a customer, or a friend saying "sure", feels like consent. It isn''t a scope. Get written permission that names systems, methods and dates, or test only your own.'
+  - '**Closing low findings one at a time.** Each looks harmless alone. Ask what the finding enables next, and prioritise links that many chains pass through, such as missing ownership checks.'
+  - '**Proving a flaw with real data.** Pulling real records feels like the strongest evidence. It turns a test into a breach. Use two test accounts and stop at the smallest proof.'
+  - '**Hiding the leak but keeping the cause.** Removing `X-Powered-By` while stack traces still reach the client changes nothing. Send a generic reply from one error handler and log details on the server.'
+  - '**Having no front door for reports.** Without a published contact, a researcher who finds a flaw may give up or go public. Publish `security.txt`, answer quickly and agree a disclosure date.'
+interview:
+  - question: How would you go about testing the security of your own web application?
+    answer: >-
+      I'd start from a model of the app, not a scanner. First, reconnaissance: what the app
+      reveals in errors, headers, source maps, and ids. Then I'd list entry points and roles
+      and test each one with two test accounts, trying to reach one user's data as the other
+      and to change fields I shouldn't, like `role`. That covers horizontal and vertical
+      escalation, where most serious web bugs live. I'd add malformed input to every
+      endpoint to see what fails open or leaks. Automated scanners and dependency audits run
+      in CI alongside this, but they miss logic flaws. Findings get rated by what they
+      enable, not alone. For a high-risk release I'd also bring in an external tester with a
+      signed scope, because I'd be blind to my own assumptions.
+  - question: Why would you fix a low-severity finding, such as a verbose error message?
+    answer: >-
+      Because attackers chain findings, and a low one often supplies the next step. A stack
+      trace that leaks an internal id, a library version or a file path removes guesswork.
+      Next to a missing ownership check, it turns a flaw that's hard to find into one anybody can use. So I
+      rate findings by what they enable in context, not in isolation. The fix is usually
+      cheap too: one central error handler that logs details server-side and returns a
+      generic message. The trade-off is time. I'd still fix the access-control flaw first,
+      because it's the link many chains share, and batch cheap leak fixes behind it.
+  - question: What is MITRE ATT&CK, and how would you use it as an application engineer?
+    answer: >-
+      It's a public catalogue of real attacker behaviour, grouped into tactics, the goal at a
+      stage, and techniques, how that goal is reached, each with an id. As an engineer I use
+      it defensively. I map our detections to techniques, for example Valid Accounts for
+      stolen credentials or Exploit Public-Facing Application for web flaws, and look for
+      stages where we'd see nothing. It also gives threat models and incident reports a
+      shared vocabulary with the security team. The limit is breadth: it tends to turn into
+      a coverage spreadsheet. I'd focus on the handful of techniques that fit our
+      architecture and make sure each has a detection and an owner.
+  - question: A researcher emails you saying they found a vulnerability in your app. What do you do?
+    answer: >-
+      Acknowledge quickly, thank them, and move it into a private triage process. I'd confirm
+      the report on a test account, rate it by impact and reach, and fix the most serious
+      issues first, telling the researcher when to expect a fix. If users' data may have been
+      exposed, it becomes an incident, with logs checked and legal notification duties
+      considered. We'd agree a disclosure date, credit them if they want it, and pay if we
+      run a bounty. What I wouldn't do is threaten them. That discourages the next report,
+      and the flaw stays. To make this routine, publish `security.txt` with a monitored
+      contact and a clear policy.

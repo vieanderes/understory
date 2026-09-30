@@ -1,0 +1,335 @@
+summary: >-
+  Generators and decorators are the two Python features that turn up in every AI codebase.
+  A generator is a function that pauses at each `yield` and resumes when asked for the next
+  value, so it can hand on a streamed reply piece by piece without holding all of it. A
+  decorator is a function that wraps another function, so retries, logging, timing and
+  caching live in one place instead of in every call.
+
+
+  Both rest on ideas you know from JavaScript. A generator is Python's iterator protocol
+  written as a function, the same idea as `function*` and `Symbol.iterator`. A decorator is
+  a higher-order function with a shorthand, `@retry` above `def` meaning `f = retry(f)`.
+  What's new is how much Python leans on them: `for` loops, `sum`, `"".join` and most of
+  the standard library consume iterators, and frameworks such as FastAPI and pytest are
+  built on decorators.
+
+
+  Reach for a generator when values arrive over time or don't fit in memory: streamed
+  tokens, lines of a large file, pages of an API, batches of documents to embed. Use a list
+  when you need the values twice, their length, or random access. Reach for a decorator
+  when the same behaviour wraps many functions. Avoid it when the behaviour belongs to one
+  function only, where a plain call inside the body is clearer.
+remember:
+  - A generator function returns a generator object without running its body, and the body runs up to the next `yield` each time a value is asked for.
+  - A generator can be consumed once, and a second loop over it gets nothing and raises no error.
+  - A `for` loop calls `iter()` once, then `next()` until `StopIteration`, which is the whole iterator protocol.
+  - Generators are lazy, so a chain of them processes one item at a time in constant memory.
+  - '`@decorator` above `def f` means `f = decorator(f)`, and a decorator with arguments is a function that returns the decorator.'
+  - Put `@functools.wraps(func)` on every wrapper, so the name, docstring and `__wrapped__` of the original survive.
+  - Retry only errors that can succeed later, back off exponentially with random jitter and a cap, and honour `retry-after` when the server sends it.
+  - The Anthropic SDK already retries twice, so a retry decorator on top multiplies attempts unless you lower `max_retries`.
+sections:
+  - title: The iterator protocol underneath
+    body: |-
+      An **iterable** is anything `iter()` accepts; an **iterator** is the object that
+      `iter()` returns, with a `__next__` method that hands out values and raises
+      `StopIteration` when it runs out. A `for` loop is that protocol in disguise.
+
+      ```python
+      def countdown(n):
+          print("starting")
+          while n > 0:
+              yield n
+              n -= 1
+
+
+      gen = countdown(2)       # prints nothing: the body hasn't started
+      print(iter(gen) is gen)  # True: a generator is its own iterator
+      print(next(gen))         # starting, then 2
+      print(next(gen))         # 1
+      print(next(gen, "done")) # done: the default replaces StopIteration
+
+      # What `for x in items:` does
+      items = ["tea", "milk"]
+      it = iter(items)
+      while True:
+          try:
+              x = next(it)
+          except StopIteration:
+              break
+          print(x)             # tea, then milk
+      ```
+
+      A list is iterable but not an iterator: every `iter(items)` gives a fresh iterator
+      that starts at the front, which is why you can loop over a list twice. A generator
+      returns itself from `iter()`, so the second loop continues where the first stopped,
+      at the end. That's the "used once" rule from the lesson, explained.
+
+      JavaScript has the same design with different names. `function*` and `yield` make a
+      generator, `[Symbol.iterator]()` plays the role of `iter()`, and `next()` returns
+      `{ value, done }` where Python raises `StopIteration`. A JavaScript generator is also
+      used up after one loop. The one Python extra is the generator expression,
+      `(t.upper() for t in pieces)`, a generator without a `def`.
+  - title: Lazy pipelines for streamed text
+    body: |-
+      Generators compose. Each stage pulls one item from the stage before, so a chain
+      works on one item at a time and nothing is stored that isn't needed. That suits a
+      streamed reply: pieces arrive at arbitrary boundaries, but a voice or a moderation
+      check wants whole sentences.
+
+      ```python
+      import itertools
+
+
+      def sentences(pieces):
+          buffer = ""
+          for piece in pieces:
+              buffer += piece
+              while ". " in buffer:
+                  sentence, buffer = buffer.split(". ", 1)
+                  yield sentence + "."
+          if buffer.strip():
+              yield buffer.strip()
+
+
+      def numbered(lines):
+          for number, line in enumerate(lines, start=1):
+              yield f"{number}: {line}"
+
+
+      stream = iter(["Tides rise tw", "ice a day. The moon ", "pulls the sea. That's it"])
+      for line in numbered(sentences(stream)):
+          print(line)
+      # 1: Tides rise twice a day.
+      # 2: The moon pulls the sea.
+      # 3: That's it
+
+      docs = (f"doc-{n}" for n in range(7))
+      for batch in itertools.batched(docs, 3):
+          print(batch)
+      # ('doc-0', 'doc-1', 'doc-2')
+      # ('doc-3', 'doc-4', 'doc-5')
+      # ('doc-6',)
+
+      print(list(itertools.islice(itertools.count(1), 3)))  # [1, 2, 3]
+      ```
+
+      `itertools.batched`, new in Python 3.12, is what you want for sending documents to
+      an embeddings endpoint in groups. `islice` takes the first few values of an endless
+      generator, and `chain` joins several iterables into one.
+
+      `yield from other` hands on every value of another iterable, so a generator can
+      delegate to a helper: `yield from sentences(pieces)` inside a larger generator. It
+      also passes `send()` and `close()` through to the inner generator.
+  - title: A generator's lifecycle, and closing it early
+    body: |-
+      A paused generator holds its local variables and its place in the code. If the
+      consumer stops early, the generator is left paused. Its cleanup, the `finally` block
+      or the end of a `with`, runs only when it's closed: by `close()`, or when Python
+      garbage-collects it.
+
+      ```python
+      def reply_pieces():
+          print("stream opened")
+          try:
+              for piece in ["Once", " upon", " a", " time"]:
+                  yield piece
+          finally:
+              print("stream closed")
+
+
+      gen = reply_pieces()
+      for piece in gen:
+          print(piece)
+          if piece == " upon":
+              break
+      print("after the loop")
+      gen.close()
+      # stream opened
+      # Once
+      #  upon
+      # after the loop
+      # stream closed
+      ```
+
+      This matters for streamed replies. The lesson's `reply_pieces` yields inside
+      `with client.messages.stream(...)`. If the user cancels and your loop breaks, the
+      HTTP connection stays open until the generator is closed. In a web handler, close it
+      explicitly, or wrap it in `contextlib.closing(gen)` and loop inside a `with`, so the
+      connection is released on time.
+
+      Two rarer methods complete the picture. `gen.send(value)` resumes the generator and
+      makes the paused `yield` expression evaluate to `value`, which lets a caller talk
+      back. `gen.close()` raises `GeneratorExit` at the paused `yield`, which is what
+      triggered the `finally` above. You'll rarely write `send` in application code, but
+      it's how coroutines grew out of generators before `async def` existed.
+  - title: Decorators with arguments, and a production retry
+    body: |-
+      A decorator that takes settings needs one more layer: `@retry(attempts=5)` first
+      calls `retry(attempts=5)`, which returns the real decorator. The wrapper is a
+      **closure**: it remembers `func` and the settings after the outer functions have
+      returned.
+
+      The lesson's backoff waits 1, 2, 4 seconds. Production code adds a cap, so the wait
+      can't grow without bound, and **full jitter**: a random wait between zero and the
+      exponential value, so many clients don't retry in the same instant.
+
+      ```python
+      import functools
+      import random
+      import time
+
+
+      class RateLimitError(Exception):
+          pass
+
+
+      def retry(attempts=4, base=1.0, cap=20.0, on=(RateLimitError,),
+                sleep=time.sleep, rand=random.uniform):
+          def decorator(func):
+              @functools.wraps(func)
+              def wrapper(*args, **kwargs):
+                  for attempt in range(attempts - 1):
+                      try:
+                          return func(*args, **kwargs)
+                      except on:
+                          sleep(rand(0, min(cap, base * 2 ** attempt)))
+                  return func(*args, **kwargs)
+              return wrapper
+          return decorator
+
+
+      waits = []
+      calls = iter([RateLimitError(), RateLimitError(), "a short summary"])
+
+
+      @retry(sleep=waits.append, rand=lambda low, high: high)  # no randomness, to show the ceilings
+      def summarise(text):
+          """Summarise text with a model."""
+          outcome = next(calls)
+          if isinstance(outcome, Exception):
+              raise outcome
+          return outcome
+
+
+      print(summarise("minutes"))                    # a short summary
+      print(waits)                                   # [1.0, 2.0]
+      print(summarise.__name__, summarise.__doc__)   # summarise Summarise text with a model.
+      print(summarise.__wrapped__.__name__)          # summarise
+      ```
+
+      `except on:` works because `except` accepts a tuple of exception classes. Passing
+      `sleep` and `rand` in makes the timing testable without waiting, as the lesson's
+      tests do.
+
+      `functools.wraps` copies `__name__`, `__doc__`, `__qualname__` and `__module__`, and
+      sets `__wrapped__` to the original. Logs, tracebacks and pytest output then name the
+      real function, and `__wrapped__` lets a test call it without the retries.
+
+      Stacked decorators apply bottom up: with `@log_calls` above `@retry`, `retry` wraps
+      first and `log_calls` wraps the result. So one log line covers all the attempts.
+      Swap them, and every attempt is logged.
+  - title: Retrying well, and the JavaScript version
+    body: |-
+      A retry decorator is a policy. Four questions decide whether it helps or hurts.
+
+      **What's retryable?** A `429`, a `5xx`, a timeout and a dropped connection can
+      succeed later. A `400` or `401` can't: retrying repeats the same mistake and wastes
+      quota. Catch the specific classes, never `Exception`.
+
+      **How long to wait?** If the response carries `retry-after`, wait exactly that. The
+      Anthropic SDK does this for you, reading the header before its own backoff.
+      Otherwise use capped exponential backoff with jitter, as above.
+
+      **How many layers retry?** The SDK retries twice by default. A decorator allowing
+      four attempts on top gives up to twelve requests. Pick one layer: set `max_retries=0`
+      on the client and own the policy, or leave it to the SDK and use your decorator for
+      work the SDK can't see, such as a whole pipeline step.
+
+      **Is it safe to repeat?** Reading and generating text is. Charging a card or sending
+      an email isn't, unless the request carries an idempotency key the server
+      recognises. Also bound the total time: a user-facing request with five retries and
+      a 20-second cap can hang for over a minute.
+
+      In TypeScript you write the same thing as a plain higher-order function, because
+      TypeScript's decorator syntax only applies to classes and their members, not to
+      standalone functions.
+
+      ```ts
+      function retry<A extends unknown[], R>(fn: (...args: A) => Promise<R>, attempts = 3) {
+        return async (...args: A): Promise<R> => {
+          for (let i = 0; i < attempts - 1; i++) {
+            try {
+              return await fn(...args);
+            } catch {
+              await new Promise((r) => setTimeout(r, Math.random() * 1000 * 2 ** i));
+            }
+          }
+          return fn(...args);
+        };
+      }
+      ```
+
+      Python's `@` is that call with nicer syntax, `f = retry(f)`, and it works on any
+      function or class.
+pitfalls:
+  - '**Looping over a generator twice.** The second loop gets nothing, silently. Store the values with `list(...)` if you need them again, or collect them during the first loop.'
+  - '**Calling `len()` on a generator.** Generators have no length, so it raises `TypeError`. Count while iterating, or turn it into a list if it fits in memory.'
+  - '**Expecting a generator function to run when called.** `countdown(3)` returns a generator and runs none of the body, so a `print` or a check at its top waits until the first `next()`. Validate arguments in a plain function that then returns the generator.'
+  - '**Breaking out of a stream without closing it.** A `with` inside a paused generator keeps its connection open. Close the generator, or loop inside `with contextlib.closing(gen):`.'
+  - '**A wrapper that forgets `return`.** The caller gets `None`. Always `return func(*args, **kwargs)`.'
+  - '**Leaving out `functools.wraps`.** Every decorated function then calls itself `wrapper` in logs and tracebacks, and tools that read the docstring or signature see the wrapper''s. Add it to every wrapper.'
+  - '**Retrying every exception.** A bad request or a bug in your code is retried until the attempts run out, then fails anyway, slower. Catch only errors that can succeed later.'
+  - '**Backoff without jitter or a cap.** Clients that back off in lockstep hit the limit together, and uncapped doubling reaches minutes after a few attempts. Randomise each wait and cap it.'
+interview:
+  - question: What's the difference between a generator and a list, and when would you use each?
+    answer: >-
+      A list holds every value in memory at once; a generator produces them one at a time,
+      on demand. A generator's body pauses at each `yield`, keeping its local state, and
+      resumes on the next `next()`. That makes it the right choice for data that arrives
+      over time or doesn't fit in memory: streamed model output, large files, paginated
+      API results. Chains of generators process one item at a time in constant memory.
+      The costs: it can be consumed once, it has no length or indexing, and errors surface
+      only when you iterate, which can be far from where you created it. So I use a list
+      when the data is small and I need to read it twice, count it or index into it.
+  - question: Write a retry decorator that takes arguments. How does it work?
+    answer: >-
+      It's three nested functions. `retry(attempts=4)` runs first and returns a decorator.
+      The decorator receives `func` and returns a wrapper. The wrapper loops: it calls
+      `func` inside `try` for all but the last attempt, catches only retryable errors,
+      sleeps, and runs the last attempt outside `try` so its error reaches the caller. The
+      settings and `func` stay available because the wrapper is a closure over them. I add
+      `functools.wraps(func)` so names and docstrings survive, and I inject `sleep` so
+      tests don't wait. For the waits I use capped exponential backoff with full jitter,
+      and honour `retry-after` if the error carries it. When not to: if the SDK already
+      retries, I'd tune it there rather than stack a second layer.
+  - question: Why add jitter to exponential backoff?
+    answer: >-
+      To stop clients retrying in lockstep. If a burst of requests fails together, say a
+      rate limit hits a hundred workers, plain backoff makes all of them retry at exactly
+      1 second, then 2, then 4, so each retry is another synchronised burst that fails
+      again. Full jitter picks each wait at random between zero and the exponential ceiling,
+      which spreads the retries out and lets most succeed. A cap keeps any single wait
+      reasonable. The trade-off is predictability: individual waits vary, and the average
+      is about half the ceiling. When the server sends `retry-after`, I follow that
+      instead, because it knows when capacity returns.
+  - question: What does `functools.wraps` do, and what goes wrong without it?
+    answer: >-
+      It copies the wrapped function's metadata onto the wrapper: `__name__`, `__doc__`,
+      `__qualname__`, `__module__`, and it sets `__wrapped__` pointing at the original.
+      Without it, every decorated function reports itself as `wrapper`. Logs and
+      tracebacks name the wrong function, docs tools lose the docstring, and frameworks
+      that inspect functions see the wrapper's details instead of the original's.
+      `inspect.signature` follows `__wrapped__`, so it reports the real parameters, and
+      tests can call `func.__wrapped__` to skip the decorator. There's no real downside,
+      so it belongs on every wrapper by habit.
+  - question: How does a `for` loop work in Python?
+    answer: >-
+      It calls `iter()` on the object once to get an iterator, then calls `next()` on that
+      iterator until it raises `StopIteration`, which the loop swallows and treats as the
+      end. Anything that implements `__iter__` works in a `for` loop, which is why lists,
+      dicts, files and generators all do. A list hands out a fresh iterator each time, so
+      it can be looped over again; a generator is its own iterator, so it's used up after
+      one pass. JavaScript's `for...of` is the same design with `Symbol.iterator` and
+      `{ value, done }`. One edge: a `StopIteration` raised inside a generator's body is
+      turned into a `RuntimeError`, so a bug can't silently end a loop early.

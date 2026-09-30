@@ -1,0 +1,182 @@
+summary: >-
+  A database is a program whose whole job is to keep data safe while many people read and
+  change it at once. Postgres, the one this course uses, keeps data in tables of typed
+  columns and answers questions written in SQL. Your app never opens its files. It connects
+  to the Postgres server, sends a statement, and gets rows back.
+
+
+  It exists because a plain file fails the moment an app gets real. Two writers overwrite
+  each other, a crash leaves half a write on disk, and finding one row means reading all of
+  them. A database solves all three with transactions, a write-ahead log and indexes, so
+  your code doesn't have to.
+
+
+  Reach for a relational database such as Postgres by default for any app with users,
+  orders, bookings or anything else that relates to something else. Reach for something
+  else when the shape of the problem says so: SQLite for a database inside one app or
+  phone, a key-value store such as Redis for a cache, a search engine for full-text
+  ranking. Even then, Postgres usually stays the source of truth.
+remember:
+  - A database keeps data correct under many concurrent requests, survives crashes, and finds rows fast, which a file on disk does not.
+  - SQL is declarative, so you describe the rows you want and the database's planner decides how to fetch them.
+  - Postgres runs as a server, and your app talks to it over a connection by sending SQL statements and reading back rows.
+  - Every column has a type, and the type is a rule that Postgres enforces on every write, whatever code sends it.
+  - Postgres folds unquoted names to lower case, so `Title` and `title` are the same column but `"Title"` is a different one.
+  - Store money as integer minor units or `numeric`, never as a floating-point type, because floats can't hold most decimal fractions exactly.
+  - A committed change is written to the write-ahead log and flushed to disk before Postgres reports success, which is why a crash doesn't lose it.
+sections:
+  - title: What happens when you send a statement
+    body: |-
+      Your app opens a **connection** to the Postgres server, usually over TCP on port 5432.
+      Postgres starts a separate backend process for each connection, which is why
+      connections are costly and apps share a small pool of them. The pooling lesson later
+      in this chapter covers that.
+
+      Each statement then goes through four stages:
+
+      - **Parse.** The text becomes a tree. A typo such as `SELEC` fails here, before
+        anything is read.
+      - **Analyse and rewrite.** Names are looked up in the catalogue, so `column "titel"
+        does not exist` comes from this stage. Views are expanded into their queries.
+      - **Plan.** The planner considers ways to run the query, such as reading the whole
+        table or using an index, estimates the cost of each from table statistics, and picks
+        the cheapest.
+      - **Execute.** The chosen plan runs and rows stream back to the client.
+
+      The planning stage is what "declarative" buys you. You never write "open the index,
+      walk to this key, then fetch the page". You say which rows you want, and the same
+      query gets faster when someone adds an index, with no change to your code.
+
+      `EXPLAIN` shows the plan without running it:
+
+      ```sql
+      CREATE TABLE books (id integer PRIMARY KEY, title text NOT NULL);
+      EXPLAIN SELECT title FROM books WHERE id = 3;
+      ```
+
+      On Postgres 18 this prints an `Index Scan using books_pkey on books` line: the primary
+      key came with an index, and the planner used it. The lesson on reading `EXPLAIN`
+      goes deeper.
+  - title: Types are rules, and a few choices matter
+    body: |-
+      A column's type decides what may be stored in it and how it compares and sorts. Most
+      tables need only a handful:
+
+      - `integer` or `bigint` for counts and ids. `bigint` for any id that could pass two
+        billion.
+      - `text` for strings. Postgres stores `text` and `varchar(n)` the same way, so `text`
+        with a check constraint is the usual choice when a limit matters.
+      - `boolean`, `date`, and `timestamptz` for a moment in time.
+      - `numeric` for exact decimals, `jsonb` for documents, `uuid` for random ids.
+
+      Two of these save real bugs. Floating-point numbers can't hold most decimal fractions,
+      so money drifts:
+
+      ```sql
+      SELECT 0.1::float8 + 0.2::float8 AS float_sum,
+             0.1::numeric + 0.2::numeric AS numeric_sum;
+      ```
+
+      The first column is `0.30000000000000004`, the second is `0.3`. Store prices as
+      integer pence in a `bigint`, or as `numeric(12, 2)`.
+
+      `timestamptz` stores an absolute moment, converted to UTC on the way in and shown in
+      the session's time zone on the way out. Plain `timestamp` stores a wall-clock reading
+      with no zone, so the same value means different moments in London and New York. Use
+      `timestamptz` for anything that happened.
+
+      ```sql
+      SET TIME ZONE 'Europe/London';
+      SELECT '2026-09-29 09:00:00+00'::timestamptz AS shown_in_london;
+      ```
+
+      That prints `2026-09-29 10:00:00+01`, the same instant in British Summer Time.
+  - title: Names, quotes and case
+    body: |-
+      Postgres folds every unquoted name to lower case. `SELECT Title FROM Books` looks for
+      a column `title` in a table `books`. Double quotes turn folding off, so a name created
+      in quotes must be quoted, with the same case, for ever after:
+
+      ```sql
+      CREATE TABLE "Loans" ("BookId" integer);
+      SELECT "BookId" FROM "Loans";
+      SELECT bookid FROM "Loans";
+      ```
+
+      The second select fails with `column "bookid" does not exist`, because the real name
+      has capitals. This bites when a tool or ORM creates tables with mixed-case names.
+      The convention that avoids it: lower-case `snake_case` for every table and column,
+      and no quotes.
+
+      Single quotes are for values and double quotes are for names. `WHERE author = "Austen"`
+      doesn't compare with the text Austen. It looks for a column called Austen and fails.
+  - title: Relational, document or key-value
+    body: |-
+      Databases differ mainly in the shape of data they hold and the questions they answer
+      well.
+
+      - **Relational** (Postgres, MySQL, SQLite): tables linked by keys, queried with SQL.
+        Strong at data that relates to other data and at questions nobody planned for, such
+        as "which customers ordered twice last month".
+      - **Document** (MongoDB, Firestore): each record is a JSON-like document. Good when a
+        record is read and written as one unit and joins are rare.
+      - **Key-value** (Redis, DynamoDB in its simplest use): fetch a value by its key, very
+        fast. Good for caches, sessions and counters, poor at ad hoc questions.
+
+      Postgres covers much of the document case too. A `jsonb` column stores a document,
+      supports indexing, and sits beside ordinary columns in the same transaction:
+
+      ```sql
+      CREATE TABLE events (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, body jsonb NOT NULL);
+      INSERT INTO events (body) VALUES ('{"type": "signup", "plan": "free"}');
+      SELECT body ->> 'plan' AS plan FROM events WHERE body ->> 'type' = 'signup';
+      ```
+
+      That's why many teams start with Postgres alone and add a specialised store only when
+      a measured need appears.
+pitfalls:
+  - '**Keeping app data in a JSON file "for now".** It works in development with one user and fails silently with two. Start with a database, even SQLite, from the first feature that saves anything.'
+  - '**Double quotes around text values.** `WHERE name = "Ana"` asks for a column called Ana. Text values take single quotes.'
+  - '**Creating mixed-case names.** A table made as `"UserAccounts"` must be quoted in every query for ever. Use lower-case `snake_case` and no quotes.'
+  - '**Storing money in `real` or `double precision`.** Sums drift by fractions of a penny and reports stop reconciling. Use integer minor units or `numeric`.'
+  - '**Using `timestamp` for events.** Without a zone, a value means a different moment on every server. Use `timestamptz`.'
+  - '**`SELECT *` in application code.** It fetches columns you don''t use and changes shape when a column is added. Name the columns the code needs.'
+interview:
+  - question: Why would you use a relational database rather than keeping data in files or a document store?
+    answer: >-
+      Because most application data relates to other data, and a relational database keeps
+      it correct under concurrency. Files give you no isolation between writers, no atomic
+      multi-step change and no way to find a row without reading everything. A relational
+      database gives transactions, constraints that reject bad data whatever code sends it,
+      indexes, and SQL for questions nobody planned. A document store fits data read and
+      written as one self-contained unit with few relationships. I'd default to Postgres,
+      use `jsonb` for the parts that really are documents, and add a specialised store only
+      for a measured need such as caching or full-text search.
+  - question: What does it mean that SQL is declarative?
+    answer: >-
+      You state which rows you want, not the steps to get them, and the planner chooses the
+      steps. For `SELECT * FROM orders WHERE customer_id = 42`, Postgres may scan the table
+      or use an index, depending on statistics about the data. The benefit is that
+      performance work, such as adding an index, needs no change to queries. The trade-off
+      is that the plan can change when data grows or statistics go stale, so a query that
+      was fast can become slow without a deploy. That's why you read plans with `EXPLAIN`
+      and keep statistics fresh.
+  - question: How does Postgres make sure a committed transaction survives a crash?
+    answer: >-
+      Through the write-ahead log. Before Postgres reports a commit, it writes a record of
+      the change to the WAL and flushes it to disk. The table files themselves change in memory
+      first and reach disk later, through the background writer and at checkpoints. After a crash, Postgres replays the
+      WAL from the last checkpoint and restores every committed change. The same log feeds
+      replicas and point-in-time recovery. The trade-off is the flush on every commit; you
+      can relax it with `synchronous_commit = off`, which risks losing the last moment of
+      commits in a crash but never corrupts data.
+  - question: How would you store prices and timestamps in Postgres?
+    answer: >-
+      Prices as integer minor units in a `bigint`, or as `numeric`, and times as
+      `timestamptz`. Floating-point types can't represent most decimal fractions, so sums
+      drift and reports stop matching payments. Integer pence are exact and fast; `numeric`
+      is exact and handles currencies with other precisions. `timestamptz` stores an
+      absolute instant in UTC and displays it in the session's zone, so servers in different
+      zones agree. Plain `timestamp` has no zone and invites bugs. The exception is a
+      wall-clock time that isn't an instant, such as "the shop opens at 09:00", which fits
+      `time` or `timestamp`.

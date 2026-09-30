@@ -1,0 +1,264 @@
+id: db.constraints
+title: Constraints as the last line of defence
+objective: Close the gap between checking and writing with `UNIQUE` and conditional updates, so two requests at once can't break a rule.
+level: essential
+minutes: 10
+concepts: [db.unique-under-concurrency, db.inventory-invariant]
+prerequisites: [db.transactions]
+opening:
+  text: >-
+    You'll see why "check first, then save" lets duplicates and oversold tickets through when two
+    requests arrive together. Then you'll make the database refuse them, whatever code sends them.
+
+steps:
+  - type: prose
+    id: the-gap
+    body: >-
+      A sign-up form checks the email is free, then inserts. It works every time you test it.
+
+
+      In production, two requests arrive in the same instant. Both check: free. Both insert.
+      Now one email has two accounts. The gap sits between two of your own statements, so no
+      amount of care in the app closes it. Watch it happen next.
+
+  - type: lab
+    id: lab-check-then-insert
+    concept: db.unique-under-concurrency
+    lab: isolation-anomaly-stepper
+    intro: >-
+      A room takes three bookings and has two. Each session counts the bookings, then inserts
+      if the count is under three. Step the two sessions and watch the count.
+    preset:
+      scenario: check-then-insert
+      level: read-committed
+      hideSwitcher: true
+    checkpoint:
+      question: Both sessions counted two bookings, and both inserted. Why did nothing stop the second?
+      difficulty: 2
+      choices:
+        - text: Only the app knew the rule, and each check passed
+          correct: true
+          feedback: >-
+            Right. The database was never told about the limit, so it accepted both.
+        - text: Each session saw the other's uncommitted booking
+          feedback: >-
+            Postgres never shows uncommitted rows. Each count missed the other's insert.
+        - text: The second count ran after the first commit
+          feedback: >-
+            Both counts ran before either insert. That's the gap.
+    fallback:
+      type: multiple-choice
+      id: pick-why-both-inserted
+      concept: db.unique-under-concurrency
+      difficulty: 2
+      language: sql
+      code: |
+        -- Two sessions, at the same moment:
+        SELECT count(*) FROM users WHERE email = 'sam@example.com';  -- both see 0
+        INSERT INTO users (email) VALUES ('sam@example.com');         -- both run
+      question: '`email` has no `UNIQUE` rule. Why does Sam end up with two accounts?'
+      choices:
+        - text: Both checks ran before either insert
+          correct: true
+          feedback: >-
+            Right. Each saw a free email, because the other hadn't inserted yet.
+        - text: The second check was cached
+          feedback: >-
+            Nothing was cached. The row didn't exist yet when both checked.
+        - text: '`count(*)` skipped a NULL email'
+          feedback: >-
+            Sam's email isn't NULL. Both counts were honestly zero at the time.
+
+  - type: prose
+    id: unique-under-concurrency
+    body: >-
+      Move the rule into the database. With `email text UNIQUE`, the second insert waits for the
+      first to finish, then fails with `duplicate key value violates unique constraint`. One
+      account, guaranteed.
+
+
+      Your app catches that error and shows "that email is taken". Or it skips the duplicate
+      quietly with `INSERT ... ON CONFLICT (email) DO NOTHING`.
+
+  - type: sql
+    id: ignore-repeat-sign-up
+    concept: db.unique-under-concurrency
+    difficulty: 2
+    prompt: >-
+      People double-click "Join the waitlist". Run it: the repeat is refused with an error. Make
+      a repeat sign-up do nothing instead, so the page never shows an error.
+    setup: |
+      CREATE TABLE waitlist (
+        email text PRIMARY KEY,
+        joined_at timestamptz NOT NULL DEFAULT '2026-09-25 09:00+00'
+      );
+      INSERT INTO waitlist (email) VALUES ('ana@example.com');
+    starter: |
+      INSERT INTO waitlist (email) VALUES ('ana@example.com');
+      SELECT * FROM waitlist;
+    solution: |
+      INSERT INTO waitlist (email) VALUES ('ana@example.com')
+      ON CONFLICT (email) DO NOTHING;
+      SELECT * FROM waitlist;
+    checks:
+      query: SELECT * FROM waitlist ORDER BY email
+    showSchema: true
+    hints:
+      - The clause goes at the end of the `INSERT`, before the semicolon.
+      - '`ON CONFLICT (email) DO NOTHING`.'
+
+  - type: prose
+    id: the-invariant-in-the-schema
+    body: >-
+      Tickets have the same gap. Two buyers read "1 left", and both buy. The rule "never sell
+      more than you have" is an **invariant**, something that must always be true.
+
+
+      Put it in the write itself: `UPDATE events SET tickets_left = tickets_left - 1 WHERE id =
+      1 AND tickets_left > 0`. When nothing is left, the update matches no row and reports
+      `UPDATE 0`. A `CHECK (tickets_left >= 0)` backs it up.
+
+  - type: sql
+    id: sell-only-if-left
+    concept: db.inventory-invariant
+    difficulty: 3
+    prompt: >-
+      Jazz night is sold out, yet this sale goes through and the count goes below zero. Change
+      the update so it only sells while tickets are left.
+    setup: |
+      CREATE TABLE events (id integer PRIMARY KEY, title text NOT NULL, tickets_left integer NOT NULL);
+      INSERT INTO events VALUES (1, 'Jazz night', 0), (2, 'Poetry reading', 5);
+    starter: |
+      UPDATE events SET tickets_left = tickets_left - 1
+      WHERE id = 1
+      RETURNING *;
+    solution: |
+      UPDATE events SET tickets_left = tickets_left - 1
+      WHERE id = 1 AND tickets_left > 0
+      RETURNING *;
+    checks:
+      query: SELECT * FROM events ORDER BY id
+    showSchema: true
+    hints:
+      - The `WHERE` picks the event. Add a second condition about the tickets.
+      - '`AND tickets_left > 0`. When it matches nothing, `RETURNING` shows no rows.'
+
+  - type: ai-review
+    id: review-check-allows-zero
+    concept: db.inventory-invariant
+    difficulty: 3
+    language: sql
+    request: Stop a booking from taking more seats than the event has.
+    flawClass: logic
+    code: |
+      CREATE TABLE events (
+        id integer PRIMARY KEY,
+        capacity integer NOT NULL,
+        booked integer NOT NULL DEFAULT 0,
+        CHECK (booked < capacity)
+      );
+    prompt: >-
+      An assistant wrote this. Bookings stop at the limit, and the test passes. Then a 20-seat
+      event can never sell its 20th seat. Tap the line at fault.
+    lines: [5]
+    reasons:
+      - text: The rule should allow `booked` to equal `capacity`
+        correct: true
+        feedback: >-
+          Yes. `<` refuses the last seat. `<=` lets it sell and refuses the next.
+      - text: '`booked` should start at 1'
+        feedback: >-
+          Then every event would be one seat short from the start. The comparison is the bug.
+      - text: The check belongs in the app, not the table
+        feedback: >-
+          The app can check too. The table's rule is the one that holds under load. Its edge
+          is wrong.
+    fix: |
+      CREATE TABLE events (
+        id integer PRIMARY KEY,
+        capacity integer NOT NULL,
+        booked integer NOT NULL DEFAULT 0,
+        CHECK (booked <= capacity)
+      );
+
+  - type: explain-back
+    id: explain-why-not-app-only
+    concept: db.unique-under-concurrency
+    difficulty: 4
+    prompt: >-
+      A teammate says the sign-up form already checks that an email is unused, so a `UNIQUE`
+      constraint is redundant. Why does the duplicate still get in?
+    rubric:
+      - The app's check and its insert are two steps, and another request can run between them.
+      - Two requests can both see the email as free and both insert.
+      - '`UNIQUE` is enforced inside the database on the write itself, so the second insert fails.'
+    modelAnswer: >-
+      The form's check reads, then a separate statement writes. Two sign-ups arriving together
+      both read before either writes. Both see the email free, and both insert. No app code can
+      close a gap between two of its own statements. `UNIQUE` sits inside the database, on the
+      write. The app's check is for a nice message; the constraint is for the truth.
+
+recap:
+  - Expect "check, then write" to fail when two requests arrive together.
+  - Let `UNIQUE` refuse duplicates, and use `ON CONFLICT` to handle them calmly.
+  - Put stock rules in the write itself, with `WHERE ... > 0` and a `CHECK`.
+
+recall:
+  - id: card-check-then-insert
+    concept: db.unique-under-concurrency
+    front: Why can't a `SELECT` followed by an `INSERT` prevent duplicates?
+    back: >-
+      Another request can insert between the two. Both see nothing, both write.
+  - id: card-on-conflict
+    concept: db.unique-under-concurrency
+    front: How do you make a repeated insert of the same email do nothing instead of failing?
+    back: "`INSERT ... ON CONFLICT (email) DO NOTHING`, with a `UNIQUE` or primary key on `email`."
+  - id: card-inventory
+    concept: db.inventory-invariant
+    front: How does an `UPDATE` refuse to sell a ticket that isn't there?
+    back: >-
+      Add `AND tickets_left > 0` to its `WHERE`. When sold out, it matches no row and reports
+      `UPDATE 0`.
+
+references:
+  - kind: docs
+    title: 5.5. Constraints
+    authors: The PostgreSQL Global Development Group
+    venue: PostgreSQL 18 documentation
+    url: https://www.postgresql.org/docs/18/ddl-constraints.html
+    note: '`CHECK`, `UNIQUE` and keys, enforced on every write.'
+    primary: true
+    verified: true
+  - kind: docs
+    title: INSERT
+    authors: The PostgreSQL Global Development Group
+    venue: PostgreSQL 18 documentation
+    url: https://www.postgresql.org/docs/18/sql-insert.html
+    note: The `ON CONFLICT` clause, with `DO NOTHING` and `DO UPDATE`.
+    verified: true
+  - kind: docs
+    title: 13.2. Transaction Isolation
+    authors: The PostgreSQL Global Development Group
+    venue: PostgreSQL 18 documentation
+    url: https://www.postgresql.org/docs/18/transaction-iso.html
+    note: How a second insert of the same key waits for the first, then fails.
+    verified: true
+
+deepDive: >-
+  A **partial unique index** applies `UNIQUE` to some rows only. `CREATE UNIQUE INDEX ON
+  subscriptions (user_id) WHERE status = 'active'` lets a user keep many cancelled
+  subscriptions but only one active one.
+
+
+  `ON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name` is an **upsert**: insert, or update
+  the row that's already there. `EXCLUDED` is the row you tried to insert.
+
+
+  An exclusion constraint generalises `UNIQUE`. With the `btree_gist` extension,
+  `EXCLUDE USING gist (room_id WITH =, during WITH &&)` refuses two bookings of one room whose
+  times overlap.
+
+
+  The room-capacity case in the lab has no one-row fix like `UNIQUE`. Keep a `bookings_left`
+  counter updated with the conditional update, or run the check and insert at serializable
+  isolation, as the next lesson shows.

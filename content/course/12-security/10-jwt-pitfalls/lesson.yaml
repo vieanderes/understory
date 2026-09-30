@@ -1,0 +1,277 @@
+id: security.jwt-pitfalls
+title: JWT pitfalls
+objective: "Read what a JWT reveals, verify one with a library and pinned settings, keep it where scripts can't reach, and plan for logout."
+level: advanced
+minutes: 10
+concepts: [security.jwt-verification, security.token-storage, security.token-revocation]
+prerequisites: [security.xss-and-csp, security.encryption-and-tls, backend.sessions-and-tokens]
+opening:
+  text: >-
+    You'll read a JWT without any key, then verify one the way an attacker can't slip past.
+    You'll also keep it out of reach of scripts, and make logout mean something.
+
+steps:
+  - type: prose
+    id: what-a-jwt-is
+    body: >-
+      A **JWT** (JSON Web Token) is a signed note the server hands out at login. It's three
+      parts joined by dots:
+
+
+      ```text
+
+      eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiI0MiIsInJvbGUiOiJtZW1iZXIifQ.qOLqej7dWJ47...
+
+      ```
+
+
+      The **header** names the algorithm. The **payload** holds **claims**, facts such as
+      `"sub": "42"` (who) and `"exp"` (expiry). The **signature** proves the server wrote them. Each part is **base64url**: text rewritten with
+      only letters, digits, `-` and `_`, so it fits in a URL.
+
+  - type: multiple-choice
+    id: pick-payload-part
+    concept: security.jwt-verification
+    difficulty: 1
+    language: text
+    code: |
+      eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiI0MiIsInJvbGUiOiJtZW1iZXIifQ.qOLqej7dWJ47
+    question: 'Which part holds `"role": "member"`?'
+    choices:
+      - text: The middle part
+        correct: true
+        feedback: >-
+          Right. The payload sits between the two dots, and it holds the claims.
+      - text: The first part
+        feedback: >-
+          That's the header. It only says which algorithm signed the token.
+      - text: The last part
+        feedback: >-
+          That's the signature. It proves who wrote the claims, but doesn't carry them.
+
+  - type: prose
+    id: reading-a-payload
+    body: >-
+      Here's the surprise. Base64url is an encoding, not encryption. Anyone can turn it back
+      into text, with no key.
+
+
+      In a browser, `atob` does that. Take the middle part with `token.split(".")[1]`, decode
+      it, and `JSON.parse` gives you the claims. Signed means nobody can change the token
+      unnoticed. It doesn't mean nobody can read it.
+
+  - type: code-challenge
+    id: write-read-payload
+    concept: security.jwt-verification
+    difficulty: 2
+    language: ts
+    editable: '15-16'
+    prompt: >-
+      Write `readPayload(token)`. Throw `Error("not a JWT")` unless the token has three
+      dot-separated parts. Otherwise decode the middle part with `fromBase64Url` and return
+      the parsed object. The tests use real signed tokens.
+    hints:
+      - '`split(".")` gives an array of the parts. Check its length first.'
+      - '`fromBase64Url` turns the middle part into JSON text, and `JSON.parse` does the rest.'
+      - 'Start with `const parts = token.split(".");`'
+
+  - type: prose
+    id: verify-with-jose
+    body: >-
+      So reading a token proves nothing. Before you trust a claim, you **verify** it. Use a
+      library for that, such as `jose`:
+
+
+      ```js
+
+      const { payload } = await jwtVerify(token, secretKey, {
+        algorithms: ["HS256"],
+        issuer: "https://login.example",
+        audience: "notes-api",
+      });
+
+      ```
+
+
+      It checks the signature with the one algorithm you allow, and the expiry. It checks who
+      issued it (`iss`) and which API it's for (`aud`). Any failure throws. A tampered payload fails the
+      signature. A header saying `"alg": "none"` is refused.
+
+  - type: fill-blank
+    id: fill-jwt-verify
+    concept: security.jwt-verification
+    difficulty: 2
+    language: js
+    prompt: >-
+      A bookings API trusts only tokens it can verify, signed with HS256 and issued for it.
+      Fill the gaps.
+    template: |
+      const { payload } = await {{1}}(token, secretKey, {
+        {{2}}: ["HS256"],
+        issuer: "https://login.example",
+        {{3}}: "bookings-api",
+      });
+    blanks:
+      - key: '1'
+        answer: jwtVerify
+      - key: '2'
+        answer: algorithms
+      - key: '3'
+        answer: audience
+    bank: [jwtVerify, decodeJwt, algorithms, alg, audience, subject]
+
+  - type: prose
+    id: where-the-token-lives
+    body: >-
+      Where the browser keeps the token matters too. `localStorage` is readable by every
+      script on your page: `localStorage.getItem("token")`.
+
+
+      That includes a script slipped in through XSS, from lesson 2. It sends the token home,
+      and the attacker uses it from anywhere until it expires. A cookie marked `HttpOnly`
+      still travels with each request, but no script can read it. Add `Secure` and
+      `SameSite=Lax`, and the token stays out of reach.
+
+  - type: ai-review
+    id: review-token-in-localstorage
+    concept: security.token-storage
+    difficulty: 3
+    language: js
+    request: Keep people signed in after they reload the page.
+    flawClass: security
+    code: |
+      async function signIn(email, password) {
+        const res = await fetch("/api/login", {
+          method: "POST",
+          body: JSON.stringify({ email, password }),
+        });
+        const { token } = await res.json();
+        localStorage.setItem("token", token);
+      }
+    prompt: >-
+      An assistant wrote this, and reloads keep the user signed in. What would a security
+      reviewer flag? Tap the line at fault.
+    lines: [7]
+    reasons:
+      - text: Any script on the page can read the token
+        correct: true
+        feedback: >-
+          Yes. One XSS carries it away. Let the server set an `HttpOnly` cookie instead.
+      - text: '`localStorage` is cleared on reload'
+        feedback: >-
+          It survives a reload, which is why the assistant chose it. Scripts reading it is the risk.
+      - text: The token should go through `JSON.stringify` first
+        feedback: >-
+          A token is already a string. Storing it as text is fine; storing it where scripts reach isn't.
+    fix: |
+      async function signIn(email, password) {
+        // The server replies with:
+        // Set-Cookie: token=...; HttpOnly; Secure; SameSite=Lax
+        await fetch("/api/login", {
+          method: "POST",
+          body: JSON.stringify({ email, password }),
+        });
+      }
+
+  - type: prose
+    id: revocation
+    body: >-
+      The server checks a JWT by its signature alone, so it can't forget one. A stolen token
+      works until `exp`, even after logout.
+
+
+      The usual plan: access tokens that live 5 to 15 minutes. A **refresh token**, stored on
+      the server, lets the browser get new ones, and you can delete it. For emergencies, keep a
+      short **deny list** of token ids (the `jti` claim) and refuse those at once.
+
+  - type: explain-back
+    id: explain-stolen-laptop
+    concept: security.token-revocation
+    difficulty: 3
+    prompt: >-
+      A user's laptop is stolen while they're signed in. Access tokens are JWTs that last 15
+      minutes. How do you lock the thief out without logging out everyone?
+    rubric:
+      - A JWT stays valid until it expires, with no session on the server to delete.
+      - Delete that user's refresh tokens, so no new access tokens can be made.
+      - The current access token dies within 15 minutes, or a deny list by `jti` stops it now.
+    modelAnswer: >-
+      The access token on the laptop is valid until its `exp`, because the server only checks
+      the signature. So I delete that user's refresh tokens on the server. The thief can't get
+      a new access token, and the one they have runs out within 15 minutes. If that's too long,
+      I add its `jti` to the deny list. Rotating the signing key would work too, but it signs
+      out every user.
+
+recap:
+  - Treat a JWT payload as public, and trust it only after verifying.
+  - Verify with a library, pinning the algorithm, issuer and audience.
+  - Keep tokens in `HttpOnly` cookies, and plan logout with short tokens and refresh tokens.
+
+recall:
+  - id: card-payload-readable
+    concept: security.jwt-verification
+    front: Why must a JWT payload never hold a secret?
+    back: >-
+      It's only base64url, signed but not encrypted. Anyone holding the token can read it.
+  - id: card-verify-order
+    concept: security.jwt-verification
+    front: What does verifying a JWT check, besides the signature?
+    back: >-
+      `exp` for the expiry, `iss` for who issued it, and `aud` for which API it's for, with the
+      algorithm fixed by your server.
+  - id: card-token-storage
+    concept: security.token-storage
+    front: Why keep a token in an `HttpOnly` cookie rather than `localStorage`?
+    back: >-
+      Any script can read `localStorage`, so one XSS steals the token. No script can read an
+      `HttpOnly` cookie.
+  - id: card-revocation
+    concept: security.token-revocation
+    front: How do you make logout real when access tokens are JWTs?
+    back: >-
+      Keep access tokens short-lived and delete the server-side refresh token. A `jti` deny
+      list covers emergencies.
+
+references:
+  - kind: rfc
+    title: 'RFC 8725: JSON Web Token Best Current Practices'
+    authors: Yaron Sheffer, Dick Hardt and Michael B. Jones
+    year: 2020
+    venue: IETF
+    url: https://www.rfc-editor.org/rfc/rfc8725
+    note: Algorithm verification, audience checks and explicit typing, with the attacks behind each.
+    primary: true
+    verified: true
+  - kind: rfc
+    title: 'RFC 7519: JSON Web Token (JWT)'
+    authors: Michael B. Jones, John Bradley and Nat Sakimura
+    year: 2015
+    venue: IETF
+    url: https://www.rfc-editor.org/rfc/rfc7519
+    note: The registered claims `exp`, `nbf`, `iss`, `aud` and `jti`, and what each means.
+    primary: true
+    verified: true
+  - kind: docs
+    title: 'Function: jwtVerify()'
+    authors: Filip Skokan
+    venue: jose documentation
+    url: https://github.com/panva/jose/blob/main/docs/jwt/verify/functions/jwtVerify.md
+    note: Verifies the signature and the claims in one call, with a shared secret or a public key.
+    verified: true
+
+deepDive: >-
+  Every behaviour here was run on Node 24 with jose 6.2.12. A payload changed to
+  `role: 'admin'` failed with `ERR_JWS_SIGNATURE_VERIFICATION_FAILED`. A wrong audience
+  failed with `ERR_JWT_CLAIM_VALIDATION_FAILED`, an expired token with `ERR_JWT_EXPIRED`, and
+  an `alg: none` token with `ERR_JOSE_ALG_NOT_ALLOWED`. `decodeJwt` returns the claims without
+  checking anything, which is exactly what `readPayload` does.
+
+
+  Why pin the algorithm? With public-key tokens (RS256), a verifier that lets the header
+  choose can be tricked into running HMAC with the public key as the secret. Anyone has that
+  key, so anyone can sign. This is algorithm confusion, and `algorithms: ["RS256"]` ends it.
+
+
+  `atob` expects plain base64, so swap `-` for `+` and `_` for `/` before calling it. An `HttpOnly` cookie doesn't make XSS harmless: an injected script can still
+  send requests from the open page. It can't carry the token away to use later. A JWT that
+  must hide its contents needs encryption, a JWE, not a signed JWS.

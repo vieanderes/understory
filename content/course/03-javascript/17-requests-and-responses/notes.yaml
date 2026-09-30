@@ -1,0 +1,265 @@
+summary: >-
+  The web runs on **HTTP**, a request and response protocol. A client sends a request: a
+  method, a URL, headers and sometimes a body. A server sends back one response: a status
+  code, headers and usually a body. Every page load, form, search box and call to an AI model
+  API is some version of that exchange, and the browser's Network panel shows every one of
+  them.
+
+
+  The parts carry meaning that code relies on. The **method** says what kind of operation
+  this is, and whether it's safe to repeat. The **status code** says how it went, in families
+  your error handling can branch on. **Headers** carry everything about the message that
+  isn't the content: its format, caching rules, credentials, and permission to read it from
+  another origin. The **body** is usually JSON text, which you parse into data.
+
+
+  This lesson is the vocabulary for the rest of the chapter and for the backend chapters. In
+  interviews it comes up as "PUT or PATCH?", "401 or 403?", "what's idempotent?" and, most of
+  all, "explain CORS". CORS is the browser deciding whether your page may read a response from
+  another origin, and it's the source of the most common error message in front-end work.
+remember:
+  - A status code proves the server answered, so a 404 or 500 is a response, while a network failure produces no status at all.
+  - 2xx means success, 3xx means go elsewhere or use your cache, 4xx means the client's request was wrong, and 5xx means the server failed.
+  - GET, HEAD, PUT and DELETE are idempotent, so repeating them leaves the same state, while POST is not, which is why retrying a POST needs care.
+  - 401 means "we don't know who you are, authenticate", and 403 means "we know who you are, and you're not allowed".
+  - "An origin is scheme, host and port together, and the browser blocks a page from reading cross-origin responses unless the server sends `Access-Control-Allow-Origin`."
+  - "A cross-origin request with a JSON `Content-Type`, a custom header or a method like PUT triggers an `OPTIONS` preflight that the server must approve first."
+  - CORS protects users in the browser, not your server, because any non-browser client ignores it completely.
+  - "Build query strings with `URL` and `URLSearchParams`, and remember every value you read back from them is a string."
+sections:
+  - title: Methods and the promises they make
+    body: |-
+      Each method carries two properties that clients, proxies and browsers rely on.
+
+      A **safe** method only reads: GET, HEAD and OPTIONS. Browsers prefetch safe links and
+      crawlers follow them, so a GET must never change data. A "delete" link that works by GET
+      will one day be clicked by a bot.
+
+      An **idempotent** method has the same effect whether you send it once or five times.
+      GET, HEAD, PUT and DELETE are idempotent. POST is not, and PATCH is not guaranteed to
+      be.
+
+      - `GET /bookings/42` reads the booking. No body.
+      - `POST /bookings` creates a new booking. Sent twice, you get two bookings.
+      - `PUT /bookings/42` replaces the booking with the full body you send. Sent twice, same
+        result.
+      - `PATCH /bookings/42` changes only the fields you send. Whether a repeat is harmless
+        depends on the change: "set nights to 3" is, "add one night" isn't.
+      - `DELETE /bookings/42` removes it. A second call may return 404, but the state is the
+        same: gone.
+      - `HEAD` is GET without the body, handy for checking a size or whether a file changed.
+      - `OPTIONS` asks what's allowed; browsers send it for CORS preflights.
+
+      Idempotency matters most when a request times out. You don't know whether the server
+      got it. Retrying a PUT is fine. Retrying a POST might charge a card twice. The common
+      fix is an `Idempotency-Key` header: the client sends a unique ID per operation, and the
+      server stores the result under that key, so a retry returns the first result instead of
+      doing the work again. Payment APIs use this convention widely.
+  - title: The status codes worth knowing by heart
+    body: |-
+      The family tells your code what to do next. The specific code tells a person why.
+
+      - **200 OK**: the result is in the body. **201 Created**: something new exists, often
+        with a `Location` header pointing to it. **204 No Content**: it worked, and there's
+        no body, so don't try to parse one.
+      - **301** and **308** mean moved for good; **302** and **307** mean moved for now. The
+        7 and 8 versions promise to keep the method and body, which matters for a POST.
+        **304 Not Modified** means "your cached copy is still fine".
+      - **400 Bad Request**: malformed input. **401 Unauthorized**: not authenticated, despite
+        the name. **403 Forbidden**: authenticated, not permitted. **404 Not Found**.
+        **409 Conflict**: clashes with the current state, such as booking a room that was
+        taken a second ago. **422 Unprocessable Content**: well-formed but fails validation.
+        **429 Too Many Requests**: slow down, often with a `Retry-After` header.
+      - **500 Internal Server Error**: a bug on the server. **502 Bad Gateway** and **504
+        Gateway Timeout**: a proxy in front couldn't get a good answer from the server behind
+        it. **503 Service Unavailable**: overloaded or down for maintenance.
+
+      These families map onto retry decisions. A 4xx will fail the same way again until the
+      request changes, so don't retry it, with the exception of 429 after waiting. A 502, 503
+      or 504 is often temporary, so a retry with backoff is reasonable, as long as the method
+      is idempotent or the request carries an idempotency key.
+
+      Servers sometimes lie: some APIs return 200 with `{"error": ...}` in the body. Treat the
+      status as the first check, not the only one, and validate the body's shape too.
+  - title: Headers that do real work
+    body: |-
+      Header names are case-insensitive, so `content-type` and `Content-Type` are the same
+      header. The ones you'll meet most:
+
+      - `Content-Type` says what format the body is in, on requests and responses:
+        `application/json`, `text/html; charset=utf-8`, `multipart/form-data`.
+      - `Accept` says which formats the client would like back.
+      - `Authorization` carries credentials, commonly `Bearer <token>` for API calls.
+      - `Cookie` on requests and `Set-Cookie` on responses carry session state.
+      - `Cache-Control` says who may store a response and for how long.
+      - `ETag` is a version tag for a response. The client sends it back in `If-None-Match`,
+        and if nothing changed, the server replies 304 with no body.
+
+      A conditional request, written out:
+
+      ```http
+      GET /catalogue/books/12 HTTP/1.1
+      Host: library.example
+      Accept: application/json
+      If-None-Match: "v7"
+
+      HTTP/1.1 304 Not Modified
+      ETag: "v7"
+      Cache-Control: max-age=60
+      ```
+
+      The body never travels, which saves bandwidth on data that rarely changes. Browsers do
+      this automatically for resources they've cached.
+
+      Bodies are text or bytes, so structured data is serialised, usually as JSON. JSON has
+      rules that catch people out: no `undefined`, functions or dates.
+
+      ```js
+      const booking = {
+        guest: "Sam",
+        nights: 2,
+        arrives: new Date("2026-10-01T14:00:00Z"),
+        notes: undefined,
+        total: NaN,
+        confirm() {},
+      };
+      const text = JSON.stringify(booking);
+      console.log(text);
+      // {"guest":"Sam","nights":2,"arrives":"2026-10-01T14:00:00.000Z","total":null}
+
+      const back = JSON.parse(text);
+      console.log(typeof back.arrives); // string
+
+      try {
+        JSON.parse("<!DOCTYPE html><h1>502 Bad Gateway</h1>");
+      } catch (error) {
+        console.log(error.name); // SyntaxError
+      }
+      console.log(JSON.parse('{"id": 9007199254740993}').id); // 9007199254740992
+      ```
+
+      Dates come back as strings, so convert them yourself. An HTML error page isn't JSON,
+      so parsing it throws. And integers beyond `Number.MAX_SAFE_INTEGER` lose precision, which
+      is why many APIs send large IDs as strings.
+  - title: Building and reading URLs without string glue
+    body: |-
+      The `URL` class parses and builds URLs, and its `searchParams` property is a
+      `URLSearchParams` that handles encoding for you. It works the same in browsers and in
+      Node.
+
+      ```js
+      const url = new URL("https://shop.example/search?q=fish+%26+chips&page=2#top");
+      console.log(url.origin); // https://shop.example
+      console.log(url.pathname); // /search
+      console.log(url.searchParams.get("q")); // fish & chips
+      console.log(url.searchParams.get("page")); // 2 (a string)
+      console.log(url.hash); // #top
+
+      url.searchParams.set("page", "3");
+      url.searchParams.append("tag", "hot food");
+      console.log(url.href);
+      // https://shop.example/search?q=fish+%26+chips&page=3&tag=hot+food#top
+      ```
+
+      Three details matter in practice. Every value read back is a string, so convert
+      `page` with `Number` before doing maths. The hash after `#` never reaches the server;
+      it stays in the browser. And a relative URL needs a base: `new URL("/search", location.origin)`
+      in a page.
+
+      Never build a URL by pasting user text into a template. Besides breaking on `&` and
+      spaces, it lets a value inject extra parameters, such as a search for `tea&admin=true`.
+      Encoding keeps a value as one value.
+  - title: CORS and the preflight
+    body: |-
+      Browsers enforce the **same-origin policy**: a page may send requests anywhere, but
+      script may only read responses from its own origin. An origin is scheme, host and port,
+      so `https://shop.example`, `http://shop.example` and `https://api.shop.example` are three
+      different origins.
+
+      **CORS** (Cross-Origin Resource Sharing) is how a server opts in. It adds response
+      headers saying which origins may read the response. If they're missing or don't match,
+      your script never sees the response: the `fetch` rejects with a `TypeError`, and the
+      real reason appears only in the console.
+
+      Some requests count as **simple**: GET, HEAD or POST, with only basic headers, and a
+      `Content-Type` of `text/plain`, `multipart/form-data` or
+      `application/x-www-form-urlencoded`. The browser sends those directly and checks the
+      response headers afterwards. Anything else, such as a JSON body, an `Authorization`
+      header, or PUT and DELETE, first triggers a **preflight**: an automatic `OPTIONS` request
+      asking permission.
+
+      ```http
+      OPTIONS /api/bookings HTTP/1.1
+      Origin: https://shop.example
+      Access-Control-Request-Method: POST
+      Access-Control-Request-Headers: content-type, authorization
+
+      HTTP/1.1 204 No Content
+      Access-Control-Allow-Origin: https://shop.example
+      Access-Control-Allow-Methods: GET, POST, PUT, DELETE
+      Access-Control-Allow-Headers: content-type, authorization
+      Access-Control-Max-Age: 600
+      ```
+
+      Only if the preflight passes does the real POST go out, and its response needs
+      `Access-Control-Allow-Origin` too. `Max-Age` lets the browser cache the approval.
+
+      Cookies need extra consent on both sides: `credentials: "include"` in `fetch`, and
+      `Access-Control-Allow-Credentials: true` from the server, which must then name the
+      origin exactly instead of using `*`.
+
+      Remember what CORS is not. It isn't server security: curl, a backend or a script ignore
+      it, and a simple request still reaches your server and runs. It protects users, by
+      stopping a malicious page from reading their data from another site with their cookies.
+      Fix CORS errors on the server, or by sending requests through your own backend, never by
+      disabling checks in the browser.
+pitfalls:
+  - "**Treating a 4xx or 5xx as \"the request didn't arrive\".** A status code only exists because the server answered. Branch on the status family, and keep \"no response at all\" as a separate, network-level case."
+  - "**Changing data with GET.** Prefetchers, crawlers and link previews send GET freely. Use POST, PUT, PATCH or DELETE for anything that changes state."
+  - "**Retrying a POST blindly after a timeout.** The first attempt may have worked, so a retry can create a duplicate order. Retry only idempotent requests, or send an `Idempotency-Key` the server deduplicates on."
+  - "**Parsing every body as JSON.** A 204 has no body, and a 502 from a proxy is usually HTML, so `JSON.parse` throws a `SyntaxError`. Check the status, and the `Content-Type`, before parsing."
+  - "**Trying to fix CORS in the front end.** `mode: \"no-cors\"` doesn't grant access; it gives you an opaque response you can't read. The server has to send the right `Access-Control-Allow-*` headers, or your own backend must make the call."
+  - "**Using 401 when you mean 403.** A 401 tells the client to log in again, which loops forever if the user is logged in but not allowed. Send 403 for a known user without permission."
+interview:
+  - question: Explain CORS. Why do we get CORS errors, and how do you fix one?
+    answer: >-
+      CORS is how a server tells the browser which other origins may read its responses. By
+      default the same-origin policy lets a page send cross-origin requests but not read the
+      answers, so a page on `shop.example` can't read `api.other.example` unless that server
+      replies with `Access-Control-Allow-Origin` naming it. For anything beyond a simple
+      request, such as JSON bodies, auth headers, or PUT, the browser first sends an `OPTIONS`
+      preflight, and the server must approve the method and headers. The fix is always on
+      the server: configure allowed origins, methods and headers, and credentials if cookies
+      are involved, where `*` isn't allowed. The key point is that CORS protects users in the
+      browser. It doesn't protect the server, since curl ignores it.
+  - question: What's the difference between PUT, PATCH and POST?
+    answer: >-
+      They differ in meaning and in idempotency. POST asks the server to process something,
+      usually creating a new resource whose URL the server picks; sending it twice creates two.
+      PUT replaces the resource at a URL the client names with the full representation sent,
+      so repeating it leaves the same state: it's idempotent. PATCH applies a partial change,
+      and it's idempotent only if the change is, like "set status to shipped" rather than
+      "increment quantity". That matters for retries after a timeout: I can safely retry a
+      PUT or DELETE, while a POST needs an idempotency key so the server can recognise the
+      duplicate. PUT's trade-off is that clients must send the whole object, so a stale
+      client can overwrite fields another client changed.
+  - question: When would you return 401 versus 403, and 400 versus 422?
+    answer: >-
+      401 means the request isn't authenticated: no token, or an expired one, so the client
+      should log in or refresh credentials. 403 means the server knows who you are and you
+      still may not do this, so logging in again won't help. Mixing them up causes login loops
+      or confusing messages. For input, 400 is for requests the server can't parse at all,
+      such as invalid JSON or a missing required parameter. 422 is for well-formed input that
+      fails business validation, such as a checkout date before the check-in date. Many APIs
+      use 400 for both, which is acceptable if the body explains the error consistently. What
+      matters most is that clients can branch on the family and read a clear error body.
+  - question: Which failed requests should a client retry?
+    answer: >-
+      Retry only when the failure is likely temporary and a repeat is safe. Network errors,
+      timeouts, 502, 503 and 504 are usually transient, so I retry those with exponential
+      backoff and jitter, and a cap on attempts. A 429 means wait, honouring `Retry-After`
+      if present. Other 4xx codes won't change on a retry, since the request itself is wrong,
+      so I surface them instead. Safety depends on the method: GET, PUT and DELETE are
+      idempotent, so repeats are harmless, while a POST needs an idempotency key or the retry
+      might duplicate the action. The trade-off is load: aggressive retries during an outage
+      make it worse, which is why backoff and limits matter.

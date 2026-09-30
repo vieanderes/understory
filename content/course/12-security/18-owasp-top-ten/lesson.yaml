@@ -1,0 +1,330 @@
+id: security.owasp-top-ten
+title: "Capstone: audit an app"
+objective: "Audit a small app for the flaws this chapter taught, name each fix, make a check fail closed, and review AI-written code with a security eye."
+level: essential
+minutes: 10
+concepts: [security.security-review, security.fail-closed]
+prerequisites: [security.supply-chain, security.attacker-playbook, security.jwt-pitfalls]
+opening:
+  text: >-
+    A book club app launches on Monday, and you're doing its security review. You'll find the
+    flaws this chapter taught, name each fix, and close the one a flaky database would open.
+
+steps:
+  - type: prose
+    id: the-audit
+    body: >-
+      A **security review** reads code the way an attacker would, with a checklist. Yours is
+      this chapter, the OWASP map from its first lesson.
+
+
+      For each piece of code, ask two questions. What input from outside reaches it? And which
+      flaw from the list could that input trigger? The app is small: a review list, a search, a
+      delete button and some settings.
+
+  - type: bug-hunt
+    id: audit-review-list
+    concept: security.security-review
+    difficulty: 1
+    language: js
+    code: |
+      function showReviews(reviews) {
+        const list = document.querySelector("#reviews");
+        for (const review of reviews) {
+          list.innerHTML += `<li>${review.text}</li>`;
+        }
+      }
+    prompt: Members write the reviews. Tap the line an attacker would use.
+    lines: [4]
+    reasons:
+      - text: A review is read as HTML and can run
+        correct: true
+        feedback: >-
+          Right, that's XSS. Build the `li` and set its `textContent`.
+      - text: The loop should use `forEach`
+        feedback: >-
+          Either loop works. The danger is how each review lands in the page.
+      - text: '`querySelector` could return `null`'
+        feedback: >-
+          That would be a crash, not a way in. Look at what reaches `innerHTML`.
+    fix: |
+      function showReviews(reviews) {
+        const list = document.querySelector("#reviews");
+        for (const review of reviews) {
+          const item = document.createElement("li");
+          item.textContent = review.text;
+          list.append(item);
+        }
+      }
+
+  - type: bug-hunt
+    id: audit-search
+    concept: security.security-review
+    difficulty: 2
+    language: js
+    code: |
+      async function searchBooks(title) {
+        // title comes straight from the search box
+        const { rows } = await pool.query(
+          `SELECT id, title FROM books WHERE title = '${title}'`,
+        );
+        return Response.json(rows);
+      }
+    prompt: Tap the line an attacker could use through the search box.
+    lines: [4]
+    reasons:
+      - text: The title is glued into the SQL
+        correct: true
+        feedback: >-
+          Yes, injection. Use `WHERE title = $1` and pass `[title]`.
+      - text: '`title` might be empty'
+        feedback: >-
+          Then nothing matches, which is harmless. The glued SQL is the door.
+      - text: The reply should hide the ids
+        feedback: >-
+          Book ids aren't secret here. The query itself can be rewritten.
+    fix: |
+      async function searchBooks(title) {
+        // title comes straight from the search box
+        const { rows } = await pool.query(
+          "SELECT id, title FROM books WHERE title = $1",
+          [title],
+        );
+        return Response.json(rows);
+      }
+
+  - type: ai-review
+    id: audit-ai-delete
+    concept: security.security-review
+    difficulty: 3
+    language: js
+    request: Add an endpoint so members can delete their review.
+    flawClass: security
+    code: |
+      async function deleteReview(request, session) {
+        if (!session) {
+          return Response.json({ error: "Sign in" }, { status: 401 });
+        }
+        const { reviewId } = await request.json();
+        await pool.query("DELETE FROM reviews WHERE id = $1", [reviewId]);
+        return new Response(null, { status: 204 });
+      }
+    prompt: >-
+      An assistant wrote this. It checks sign-in and uses `$1`, so it looks careful. Tap the
+      line at fault.
+    lines: [6]
+    reasons:
+      - text: Any member can delete anyone's review
+        correct: true
+        feedback: >-
+          Yes. Add `AND author_id = $2` with `session.userId`, and answer `404` if nothing matched.
+      - text: The `$1` should be glued in
+        feedback: >-
+          That would add injection. `$1` is the safe part of this line.
+      - text: '`204` should be `200`'
+        feedback: >-
+          `204` means "done, nothing to send back". It fits a delete.
+    fix: |
+      async function deleteReview(request, session) {
+        if (!session) {
+          return Response.json({ error: "Sign in" }, { status: 401 });
+        }
+        const { reviewId } = await request.json();
+        const { rowCount } = await pool.query(
+          "DELETE FROM reviews WHERE id = $1 AND author_id = $2",
+          [reviewId, session.userId],
+        );
+        return new Response(null, { status: rowCount === 1 ? 204 : 404 });
+      }
+
+  - type: bug-hunt
+    id: audit-browser-config
+    concept: security.security-review
+    difficulty: 2
+    language: js
+    code: |
+      // sent to every browser that opens the app
+      export const browserConfig = {
+        appName: "Book club",
+        mapsKey: process.env.MAPS_PUBLIC_KEY,
+        databaseUrl: process.env.DATABASE_URL,
+      };
+    prompt: Every visitor downloads this object. Tap the line that must not be in it.
+    lines: [5]
+    reasons:
+      - text: The database address and password reach every browser
+        correct: true
+        feedback: >-
+          Right. Keep it on the server, and rotate it, since it has shipped.
+      - text: The maps key is a secret too
+        feedback: >-
+          Maps keys for browsers are public by design, and limited to your site.
+      - text: '`appName` reveals the product'
+        feedback: >-
+          The name is on every page anyway. The database URL is the leak.
+    fix: |
+      // sent to every browser that opens the app
+      export const browserConfig = {
+        appName: "Book club",
+        mapsKey: process.env.MAPS_PUBLIC_KEY,
+      };
+
+  - type: prose
+    id: fail-closed
+    body: >-
+      One more question for every check: what happens when the check itself breaks? The
+      database times out, or a lookup throws.
+
+
+      A check that says "yes" on error **fails open**: an outage becomes a way in. A check that
+      says "no" on error **fails closed**. People may be refused for a minute, but nobody gets
+      access they shouldn't.
+
+  - type: ai-review
+    id: review-fail-open
+    concept: security.fail-closed
+    difficulty: 3
+    language: js
+    request: Write canEdit(user, bookId), and don't let a flaky database break editing.
+    flawClass: security
+    code: |
+      async function canEdit(user, bookId) {
+        try {
+          const book = await db.books.find(bookId);
+          return book.ownerId === user.id;
+        } catch (err) {
+          log.warn("permission check failed", err);
+          return true;
+        }
+      }
+    prompt: >-
+      An assistant wrote this, and the tests for owners and strangers pass. During a database
+      outage, everyone can edit everything. Tap the line at fault.
+    lines: [7]
+    reasons:
+      - text: An error grants permission instead of refusing it
+        correct: true
+        feedback: >-
+          Yes. It fails open. Return `false`, and let the user retry.
+      - text: The warning should be logged as an error
+        feedback: >-
+          A louder log is fine, but people still get in. The return value is the hole.
+      - text: '`===` should be `==`'
+        feedback: >-
+          Strict equality is right for ids. The bug only shows when the lookup throws.
+    fix: |
+      async function canEdit(user, bookId) {
+        try {
+          const book = await db.books.find(bookId);
+          return book.ownerId === user.id;
+        } catch (err) {
+          log.warn("permission check failed", err);
+          return false;
+        }
+      }
+
+  - type: code-challenge
+    id: write-fail-closed
+    concept: security.fail-closed
+    difficulty: 3
+    language: ts
+    prompt: >-
+      Write `isAllowed(check)`. `check` is an async permission check. Resolve `true` only when
+      it resolves exactly `true`. If it throws, or resolves anything else, such as `undefined`
+      or `'yes'`, resolve `false`.
+    hints:
+      - Call `check()` inside `try`, and `await` it.
+      - Compare the result with `=== true`, so `'yes'` doesn't count.
+      - The `catch` block returns `false`.
+
+  - type: prose
+    id: prompt-injection-next
+    body: >-
+      You can now review an app for the flaws attackers use most. One more is growing fast:
+      **prompt injection**. A language model reads text, such as an email, with instructions
+      hidden inside. Then it follows them as if you'd written them.
+
+
+      It's injection again: data treated as commands. Chapter 20 teaches it, and chapter 21 adds
+      guardrails and human approval around what a model may do.
+
+  - type: explain-back
+    id: explain-audit-report
+    concept: security.security-review
+    difficulty: 4
+    prompt: >-
+      Write the two-line summary for the team. Which finding would you fix first before Monday,
+      and why that one?
+    rubric:
+      - Names one finding and its fix, such as the missing ownership check on delete.
+      - Ranks by harm and reach, for example any member deleting any review, or a leaked database URL.
+      - Says secrets that already shipped must be rotated, not only removed.
+    modelAnswer: >-
+      First, the database URL in the browser config. Anyone can read it, so it's already
+      leaked: remove it and rotate the password today. Next, the delete endpoint, which lets any
+      member delete anyone's review; add the author check. Then the XSS and the glued search,
+      which have one-line fixes.
+
+recap:
+  - Audit code by asking what outside input reaches it, and which known flaw it could trigger.
+  - Name the fix for XSS, injection, a missing ownership check and a leaked secret.
+  - Make every security check fail closed, so an outage never becomes a way in.
+
+recall:
+  - id: card-audit-question
+    concept: security.security-review
+    front: What two questions do you ask of each piece of code in a security review?
+    back: >-
+      What input from outside reaches it, and which known flaw could that input trigger?
+  - id: card-looks-careful
+    concept: security.security-review
+    front: A delete handler checks sign-in and uses `$1`. What might it still be missing?
+    back: >-
+      An ownership check: `AND author_id = $2`, so members can delete only their own rows.
+  - id: card-fail-closed
+    concept: security.fail-closed
+    front: What does it mean for a permission check to fail closed?
+    back: >-
+      If the check errors or can't decide, it refuses access, so an outage never lets anyone in.
+
+references:
+  - kind: spec
+    title: OWASP Top 10:2025
+    authors: OWASP Foundation
+    year: 2025
+    venue: owasp.org
+    url: https://owasp.org/Top10/2025/
+    note: The ten categories this audit's checklist comes from.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Secure Code Review
+    authors: OWASP
+    venue: OWASP Cheat Sheet Series
+    url: https://cheatsheetseries.owasp.org/cheatsheets/Secure_Code_Review_Cheat_Sheet.html
+    note: How to read code for security flaws, entry point by entry point.
+    primary: true
+    verified: true
+  - kind: spec
+    title: 'LLM01:2025 Prompt Injection'
+    authors: OWASP Gen AI Security Project
+    year: 2025
+    venue: genai.owasp.org
+    url: https://genai.owasp.org/llmrisk/llm01-prompt-injection/
+    note: The first risk on OWASP's list for apps built on language models.
+    verified: true
+
+deepDive: >-
+  A real audit ends in a report: each finding with where it is, how bad it is, how to
+  reproduce it on a test account, and the fix. Rank by harm times reach. A flaw every visitor
+  can use outranks one that needs an admin's password.
+
+
+  Reviewing AI-written code needs the same checklist, applied harder. Assistants write code
+  that passes the happy-path test: signed in, parameterised, tidy. The missing check is the
+  usual gap, because no test asked for it. Write the stranger test before you accept the code.
+
+
+  OWASP keeps a separate Top 10 for apps built on language models, led by prompt injection,
+  sensitive information disclosure and excessive agency. The AI chapters teach each one where
+  you build the thing it protects.

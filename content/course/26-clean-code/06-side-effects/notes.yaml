@@ -1,0 +1,301 @@
+summary: >-
+  A side effect is anything a function does besides returning its result: writing to a
+  database, sending an email, changing the page, changing an argument or a module variable.
+  A hidden input is anything it reads besides its arguments: the clock, a random number, an
+  environment variable, shared state. A **pure function** has neither, so the same arguments
+  always give the same result, and you can check it with plain values.
+
+
+  Programs exist to have effects, so the goal isn't to remove them. The goal is to put them
+  in one place. The **functional core, imperative shell** pattern keeps every decision in pure
+  functions and wraps them in a thin shell that gathers inputs, calls the core and carries out
+  what it decided. The core gets fast, exact unit tests. The shell stays small enough that a
+  few integration tests cover it.
+
+
+  These notes add what the lesson leaves out: how to inject the clock, randomness and I/O,
+  how a core can return effects as data, the JavaScript methods that mutate when you don't
+  expect it, how to stop async races, and why the effects that remain at the edge should be
+  idempotent so a retry is safe.
+remember:
+  - A pure function's result depends only on its arguments, and it changes nothing its caller can observe.
+  - Keep decisions in a pure core and put fetching, the clock, randomness and writes in a thin shell around it.
+  - The clock, `Math.random()`, environment variables and module state are hidden inputs, so pass them in as values or small functions.
+  - "`sort`, `reverse`, `splice` and `push` change the array in place, while `toSorted`, `toReversed`, `toSpliced`, `with`, `map` and spread return new ones."
+  - A spread, `Object.assign` and `Object.freeze` are all shallow, so nested objects stay shared.
+  - Shared mutable state plus `await` is a race, because another call can run and change the state while the first one waits.
+  - An idempotent operation has the same effect whether it runs once or several times, which makes retries safe.
+sections:
+  - title: Injecting the clock, randomness and I/O
+    body: |-
+      A hidden input makes a function impossible to pin in a test. The fix is **dependency
+      injection**: the function receives what it needs instead of reaching for it. You don't
+      need a framework. An argument or a small object of functions is enough.
+
+      ```ts
+      interface Deps {
+        now: () => number;
+        newId: () => string;
+      }
+
+      interface Booking {
+        id: string;
+        roomId: string;
+        createdAt: number;
+      }
+
+      function createBooking(roomId: string, deps: Deps): Booking {
+        return { id: deps.newId(), roomId, createdAt: deps.now() };
+      }
+
+      // Production wiring, in the shell.
+      const realDeps: Deps = { now: Date.now, newId: () => crypto.randomUUID() };
+      console.log(createBooking('room-4', realDeps).roomId); // room-4
+
+      // In a test, every input is pinned.
+      const fixed: Deps = { now: () => 1_700_000_000_000, newId: () => 'b-1' };
+      console.log(createBooking('room-4', fixed));
+      // { id: 'b-1', roomId: 'room-4', createdAt: 1700000000000 }
+      ```
+
+      Pass a **value** such as `now: number` when the function needs the time once. Pass a
+      **function** such as `now: () => number` when it needs a fresh reading more than once,
+      or when the caller shouldn't decide the moment.
+
+      Injection beats mocking the global. Test tools can fake `Date` or `Math.random`, and
+      that's useful for code you can't change. But a faked global is invisible in the
+      function's signature, leaks between tests if not restored, and couples the test to how
+      the function reads time. An explicit parameter documents the dependency and needs no
+      clean-up.
+
+      The same idea scales up. A repository, an email sender or a payment gateway passed in
+      through a constructor is the same move, applied to I/O. The Architecture module calls
+      the interface a port and each implementation an adapter.
+  - title: A core that returns effects as data
+    body: |-
+      The lesson's shell calls the core and then acts. A stronger version lets the core
+      decide the effects too, and return them as plain objects. The shell only interprets
+      them. Now even "send an email to these people and record it" is a pure, testable
+      decision.
+
+      ```ts
+      interface Loan {
+        id: string;
+        email: string;
+        dueAt: number;
+        remindedAt: number | null;
+      }
+
+      type Effect =
+        | { kind: 'email'; to: string; subject: string }
+        | { kind: 'markReminded'; loanId: string; at: number };
+
+      const DAY = 86_400_000;
+
+      // Core: decides what should happen. No I/O, no clock.
+      function planReminders(loans: Loan[], now: number): Effect[] {
+        return loans
+          .filter((loan) => loan.dueAt < now && (loan.remindedAt === null || now - loan.remindedAt >= 7 * DAY))
+          .flatMap((loan): Effect[] => [
+            { kind: 'email', to: loan.email, subject: 'Your book is overdue' },
+            { kind: 'markReminded', loanId: loan.id, at: now },
+          ]);
+      }
+
+      // Shell: gathers inputs, calls the core, performs the effects.
+      async function runReminders(io: {
+        loadLoans: () => Promise<Loan[]>;
+        sendEmail: (to: string, subject: string) => Promise<void>;
+        markReminded: (loanId: string, at: number) => Promise<void>;
+      }) {
+        const effects = planReminders(await io.loadLoans(), Date.now());
+        for (const effect of effects) {
+          if (effect.kind === 'email') await io.sendEmail(effect.to, effect.subject);
+          else await io.markReminded(effect.loanId, effect.at);
+        }
+      }
+      ```
+
+      A test of `planReminders` passes three loans and a fixed `now`, then compares the
+      returned array with `toEqual`. It covers "never reminded", "reminded three days ago"
+      and "not yet due" without a mail server or a database.
+
+      The shell has almost no branches, so there's little in it to get wrong. The trade-off
+      is indirection: for a two-line handler, an effect type is ceremony. Reach for it when
+      the decisions are the valuable, bug-prone part, such as billing, scheduling or
+      permissions.
+  - title: Hidden mutation in JavaScript
+    body: |-
+      Arrays and objects are passed by reference, so a function that changes its argument
+      changes the caller's data. Several built-in methods mutate, and the names don't warn
+      you.
+
+      ```js
+      const prices = [300, 100, 200];
+      const sorted = prices.sort((a, b) => a - b);
+      console.log(prices); // [100, 200, 300]  the original changed
+      console.log(sorted === prices); // true, same array
+
+      const scores = [3, 1, 2];
+      const ordered = scores.toSorted((a, b) => a - b);
+      console.log(scores, ordered); // [3, 1, 2] [1, 2, 3]
+      console.log(scores.toReversed(), scores.with(0, 9)); // [2, 1, 3] [9, 1, 2]
+
+      const order = { id: 'o1', lines: [{ sku: 'mug', qty: 1 }] };
+      const copy = { ...order };
+      copy.lines.push({ sku: 'tea', qty: 2 });
+      console.log(order.lines.length); // 2  the spread copied only the top level
+
+      const deep = structuredClone(order);
+      deep.lines.push({ sku: 'cake', qty: 1 });
+      console.log(order.lines.length, deep.lines.length); // 2 3
+
+      const frozen = Object.freeze({ tags: ['new'] });
+      frozen.tags.push('sale');
+      console.log(frozen.tags); // ['new', 'sale']  freeze is shallow too
+      ```
+
+      The mutating array methods are `push`, `pop`, `shift`, `unshift`, `splice`, `sort`,
+      `reverse`, `fill` and `copyWithin`. The copying partners `toSorted`, `toReversed`,
+      `toSpliced` and `with` arrived in ES2023 and run in Node 20 and later.
+
+      To change nested data without mutation, copy each level you touch:
+      `{ ...order, lines: [...order.lines, newLine] }`. `structuredClone` makes a full deep
+      copy, but it can't copy functions or class methods, so keep it for plain data.
+
+      In TypeScript, `readonly string[]` or `ReadonlyArray` in a parameter makes the
+      compiler reject `push` and `sort` on it. It's a compile-time promise only, and it
+      costs nothing at runtime.
+  - title: Races on shared state, and how to stop them
+    body: |-
+      The lesson's search bug came from a module variable that two overlapping calls shared.
+      Removing the shared variable fixed the heading. A second race remains: responses can
+      arrive out of order, so the slow "cat" results can land after the fast "cats"
+      results and overwrite them.
+
+      The usual guard is **latest request wins**. Each call remembers its own number and
+      drops its result if a newer call has started.
+
+      ```ts
+      const delays: Record<string, number> = { cat: 50, cats: 10 };
+      const fetchResults = (text: string) =>
+        new Promise<string[]>((resolve) => setTimeout(() => resolve([`${text} result`]), delays[text]));
+
+      let latest = 0;
+      const shown: string[] = [];
+
+      async function search(text: string) {
+        const mine = ++latest;
+        const results = await fetchResults(text);
+        if (mine !== latest) return; // a newer search started while this one waited
+        shown.push(`Results for "${text}": ${results.join(', ')}`);
+      }
+
+      await Promise.all([search('cat'), search('cats')]);
+      console.log(shown); // [ 'Results for "cats": cats result' ]
+      ```
+
+      `latest` is still shared, but only as a counter that each call reads after its own
+      `await`, which is the point. In a browser you can also cancel the older request with an
+      `AbortController`, passing its `signal` to `fetch`. That saves bandwidth as well as
+      correctness. In React, the same idea appears as an effect's clean-up function setting
+      an `ignore` flag.
+
+      The general rule: after any `await`, treat every piece of shared state as possibly
+      changed. Read what you need into local variables before the `await`, or check again
+      after it.
+  - title: Idempotent effects at the edge
+    body: |-
+      The shell is where things fail: a timeout, a dropped connection, a crash between two
+      writes. The safe response is often to retry, and a retry is only safe if the effect is
+      **idempotent**: running it twice has the same effect as running it once.
+
+      Some operations are idempotent by nature. Setting a field to a value, `PUT` of a whole
+      resource and `DELETE` by id all end in the same state however often they run. Others
+      aren't: `POST` to create an order, incrementing a counter and charging a card. For
+      those, the client sends an **idempotency key**, a unique id per logical operation, and
+      the server remembers the result for each key.
+
+      ```ts
+      interface Charge {
+        id: string;
+        amountPence: number;
+      }
+
+      const byKey = new Map<string, Charge>();
+      let nextId = 1;
+      let charged = 0;
+
+      // The client sends the same key on every retry of one payment.
+      function chargeCard(idempotencyKey: string, amountPence: number): Charge {
+        const earlier = byKey.get(idempotencyKey);
+        if (earlier) return earlier; // a retry: answer again, charge nothing
+        charged += amountPence;
+        const charge = { id: `ch_${nextId++}`, amountPence };
+        byKey.set(idempotencyKey, charge);
+        return charge;
+      }
+
+      console.log(chargeCard('order-42', 1999)); // { id: 'ch_1', amountPence: 1999 }
+      console.log(chargeCard('order-42', 1999)); // { id: 'ch_1', amountPence: 1999 }
+      console.log(charged); // 1999, not 3998
+      ```
+
+      In production the map is a database table with a unique constraint on the key, so two
+      concurrent retries can't both insert. Keys usually expire after a day or so.
+
+      Purity and idempotency are different ideas. A pure function has no effects at all. An
+      idempotent operation has effects, but repeating it adds none. A clean design has a pure
+      core and an idempotent shell.
+pitfalls:
+  - "**Calling a function pure because it changes nothing.** A function that reads `Date.now()` or a module variable changes nothing, yet two calls can disagree. Purity needs both halves: no effects and no hidden inputs."
+  - "**Sorting the caller's array.** `items.sort()` inside a helper reorders the list the caller is still showing. Use `toSorted`, or copy first with `[...items].sort()`."
+  - "**Trusting a spread for a deep copy.** `{ ...cart }` shares `cart.lines` with the original, so pushing to the copy's lines changes both. Copy each nested level you change, or use `structuredClone` for plain data."
+  - "**Mocking the global clock instead of passing time in.** A faked `Date` hides the dependency and leaks between tests if a clean-up is missed. Add a `now` parameter to the core and keep the real clock in the shell."
+  - "**A shell that grows decisions.** When `if` statements creep into the handler that fetches and saves, they escape the unit tests. Move each new rule into the core and keep the shell a straight line."
+  - "**Retrying a non-idempotent call.** Retrying a card charge or an order `POST` after a timeout can charge twice, because the first attempt may have worked. Send an idempotency key and let the server return the earlier result."
+  - "**Reading shared state after an `await`.** Another call may have changed it while this one waited. Copy what you need into a local before the `await`, or check that your call is still the latest after it."
+interview:
+  - question: What is a pure function, and why does it matter in a real codebase?
+    answer: >-
+      A pure function returns a result that depends only on its arguments and has no
+      observable side effects. That buys three things. Tests become exact: give it inputs,
+      compare the output, no set-up, mocks or clean-up. Reasoning becomes local: you can
+      read the function without knowing what ran before it, which removes a whole class of
+      order-dependent bugs. And it's safe to cache, retry or run in parallel. In a real
+      system you can't make everything pure, since the app must read the clock and write to
+      a database. So I aim for a pure core holding the business rules, such as pricing or
+      scheduling, with effects kept in a thin shell. The cost is some extra parameters, such
+      as passing `now`, which I think is cheap for what it buys.
+  - question: Explain functional core, imperative shell. How would you apply it to an existing handler?
+    answer: >-
+      It splits code into a pure core that makes every decision and a thin shell that does
+      the I/O around it. For an existing request handler, I first find the hidden inputs:
+      the clock, random ids, config, the data it loads. I move the logic that uses them into
+      a function that takes them as arguments and returns a result, or even a list of effects
+      to perform. The handler shrinks to load, call the core, save and respond. Then the
+      rules get fast unit tests with fixed times, and the handler needs one or two
+      integration tests. I do it in small steps under characterisation tests, since the
+      handler probably has none. The trade-off is indirection, so for a trivial handler with
+      no real rules I'd leave it alone.
+  - question: How do you test code that depends on the current time or on randomness?
+    answer: >-
+      I make time and randomness inputs rather than things the code reaches for. If the code
+      needs the time once, it takes `now` as a value. If it needs fresh readings, it takes a
+      `clock` function, and the same goes for an id or random-number generator. Production
+      passes `Date.now` and `crypto.randomUUID`, and tests pass fixed values, so I can test
+      exactly one day late or the moment an offer expires. Faking the global `Date` with
+      the test runner's fake timers also works, and I use it for code that schedules
+      `setTimeout` or when I can't change the signature. But it hides the dependency and must
+      be restored after each test, so for new code I prefer explicit injection.
+  - question: What does idempotent mean, and where do you need it?
+    answer: >-
+      An operation is idempotent if doing it twice has the same effect as doing it once.
+      You need it wherever a retry can happen, which in distributed systems is everywhere:
+      clients retry on timeouts, queues deliver at least once, users double-click. `PUT` and
+      `DELETE` are idempotent by design. Creating an order or charging a card isn't, so I'd
+      have the client send an idempotency key per logical operation and store the result
+      against it, with a unique constraint so concurrent retries can't both succeed. A retry
+      then returns the stored result instead of charging again. It's related to purity but
+      different: a pure function has no effects, while an idempotent operation has effects
+      that don't stack. Keys cost storage, so they usually expire after a day or so.

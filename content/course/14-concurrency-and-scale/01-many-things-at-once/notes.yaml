@@ -1,0 +1,251 @@
+summary: >-
+  A server has two ways to do many things at once. **Concurrency** keeps several tasks in
+  progress over the same period by taking turns on one thread, which works because most
+  of a request is waiting on a database, a disk or a model API. **Parallelism** runs work at
+  the same instant on separate cores. Concurrency overlaps waiting. Only parallelism
+  overlaps computing.
+
+
+  Node is built around concurrency. Your JavaScript runs on one thread per process, and an
+  event loop switches between requests at every `await`. That's why one small process can
+  hold thousands of open connections. It's also why a single stretch of heavy computing,
+  such as parsing a huge JSON body or building a PDF, freezes every request on that
+  process until it ends.
+
+
+  To use more cores, you run more copies of the server behind a load balancer, or move
+  heavy computing to worker threads. Copies share nothing in memory, so anything they must
+  agree on lives in a shared store. Before you add copies, find out where the time goes: if
+  requests are slow because they wait on the database, more copies add load to the thing
+  that's already the bottleneck.
+remember:
+  - Concurrency overlaps waiting on one thread, and parallelism overlaps computing on several cores.
+  - Work that mostly waits on a network, a disk or a database is I/O-bound, and work that mostly computes is CPU-bound.
+  - An `async` function runs synchronously until its first `await`, so marking CPU work `async` doesn't move it off the thread.
+  - While JavaScript computes, the event loop can't run any other callback, so every request on that process waits.
+  - Microtasks, such as promise callbacks, all run before the next timer or I/O callback, so an endless chain of them starves the loop.
+  - Each server copy has its own memory, so counters, sessions and caches that must agree go in a shared store.
+  - More copies help CPU-bound load and hurt when the shared database is the bottleneck, so measure before you scale.
+  - Little's law says requests in flight equal arrival rate times time per request, which sizes pools and limits.
+sections:
+  - title: What the thread does while you wait
+    body: |-
+      When your code awaits a database reply, nothing in JavaScript is waiting. Node hands
+      the socket to the operating system, which watches thousands of connections at once
+      (epoll on Linux, kqueue on macOS). The thread returns to the **event loop**, which
+      runs whichever callback is ready next. When the reply arrives, the loop resumes your
+      function after its `await`.
+
+      ```js
+      const wait = (ms) => new Promise((done) => setTimeout(done, ms));
+
+      async function handle(name, dbMs) {
+        console.log(`${name}: start`);
+        await wait(dbMs); // the database call: the thread is free here
+        console.log(`${name}: reply`);
+      }
+
+      handle("A", 50);
+      handle("B", 10);
+      console.log("both started");
+      // A: start
+      // B: start
+      // both started
+      // B: reply
+      // A: reply
+      ```
+
+      Some work can't be handed to the operating system that way. File system calls,
+      `dns.lookup`, and the async versions of `crypto.pbkdf2`, `crypto.scrypt` and `zlib` run
+      on libuv's **thread pool**, four threads by default, sized with the
+      `UV_THREADPOOL_SIZE` environment variable. That pool is why a burst of password hashes
+      can queue behind each other even though your code never blocks: four run, the rest
+      wait for a pool thread.
+
+      The part that trips people up is the other direction. An `async` function doesn't
+      start on another thread. Its body runs synchronously, on the caller's thread, until the
+      first `await`:
+
+      ```js
+      async function looksAsync() {
+        console.log("body runs now");
+        let total = 0;
+        for (let i = 0; i < 1e8; i++) total += i; // no await yet: this blocks the caller
+        await null;
+        console.log("after the first await");
+        return total;
+      }
+
+      const promise = looksAsync();
+      console.log("caller continues");
+      await promise;
+      // body runs now
+      // caller continues
+      // after the first await
+      ```
+
+      "caller continues" only prints once the whole loop has finished. `async` changes how
+      a result is delivered, not where the work runs.
+  - title: Microtasks, macrotasks and starving the loop
+    body: |-
+      The event loop keeps two kinds of queue. **Macrotasks** are timers, I/O callbacks and
+      `setImmediate`. **Microtasks** are promise callbacks and anything passed to
+      `queueMicrotask`. After each macrotask, the loop drains the microtask queue
+      completely before it looks at the next timer or socket.
+
+      ```js
+      setTimeout(() => console.log("4 timer (a macrotask)"), 0);
+      Promise.resolve().then(() => console.log("2 promise callback (a microtask)"));
+      queueMicrotask(() => console.log("3 queued microtask"));
+      console.log("1 synchronous code");
+
+      // Microtasks that keep queueing microtasks starve everything else.
+      let rounds = 0;
+      function again() {
+        rounds += 1;
+        if (rounds < 1_000_000) queueMicrotask(again);
+        else console.log("microtasks done, timer still waiting");
+      }
+      queueMicrotask(again);
+      // 1 synchronous code
+      // 2 promise callback (a microtask)
+      // 3 queued microtask
+      // microtasks done, timer still waiting
+      // 4 timer (a macrotask)
+      ```
+
+      The timer asked for 0 ms and ran last, after a million microtasks. The same happens
+      with a loop of `await` over values that are already resolved, such as items from an
+      in-memory array: each `await` is only a microtask, so the loop never lets a socket
+      callback in. It doesn't block in the `while (true)` sense, but it holds the thread
+      until it ends.
+
+      Node adds `process.nextTick`, a queue that runs before promise microtasks in CommonJS
+      code. At the top level of an ES module the order can come out differently, so don't
+      build logic on it. For "let other work in now", `setImmediate` is the tool: it
+      schedules a macrotask after the loop's I/O phase, so waiting socket callbacks get a
+      turn first. Splitting a long job into chunks
+      with `setImmediate` between them keeps a server answering, at the cost of a longer
+      total time for that one job.
+  - title: Seeing blocking in production
+    body: |-
+      A blocked loop doesn't show up as high latency on one endpoint. It shows up as every
+      endpoint on a copy getting slow at the same moment, including the health check. The
+      direct measure is **event loop delay**: how late a timer fires compared with when it
+      was due. Node measures it for you.
+
+      ```js
+      import { monitorEventLoopDelay } from "node:perf_hooks";
+
+      const delay = monitorEventLoopDelay({ resolution: 10 });
+      delay.enable();
+
+      function computeFor(ms) {
+        const end = Date.now() + ms;
+        while (Date.now() < end) {} // stands in for a big JSON.parse or a PDF build
+      }
+
+      setTimeout(() => computeFor(300), 100);
+
+      setTimeout(() => {
+        delay.disable();
+        console.log("p50 ms", (delay.percentile(50) / 1e6).toFixed(1));
+        console.log("max ms", (delay.max / 1e6).toFixed(1));
+      }, 1000);
+      // p50 about 10 ms (the sampling resolution), max about 300 ms
+      ```
+
+      The median stays near the sampling interval, and the maximum shows the 300 ms block.
+      Values are in nanoseconds, hence the division. In a real service you export the p99
+      and max as metrics and alert when they climb. A second signal,
+      `performance.eventLoopUtilization()`, reports the share of time the loop was busy
+      rather than idle. Near 1 means the process is CPU-bound: more copies or worker
+      threads will help. Low utilisation with slow responses means the time goes to waiting,
+      and the fix is on the other side: a slow query, a missing index, a saturated pool.
+
+      A CPU profile then names the culprit. `node --cpu-prof` writes a profile you can open
+      in Chrome DevTools. The usual suspects are synchronous APIs (`readFileSync`,
+      `pbkdf2Sync`), `JSON.parse` or `JSON.stringify` of multi-megabyte payloads, big
+      regular expressions on user input, and sorting or grouping large arrays in the
+      request path.
+  - title: Copies, capacity and what must leave memory
+    body: |-
+      A busy app runs several copies of the server, called instances, replicas, pods or
+      dynos depending on the platform. A load balancer spreads requests across them, and any
+      request can land on any copy. So the rule from the twelve-factor app holds: processes
+      are stateless, and state lives in a backing service.
+
+      What has to move out of memory:
+
+      - **Sessions.** Store them in the database or Redis, or use signed cookies, or a user
+        logs in on one copy and is a stranger on the next.
+      - **Counters and rate limits.** An in-memory limit of 100 a minute becomes 400 with
+        four copies. Count in one shared place, atomically.
+      - **Caches.** An in-memory cache is fine as long as a stale or missing entry is
+        acceptable, because each copy fills and expires its own at different times.
+      - **Background timers.** A `setInterval` that sends a daily email runs once per copy,
+        so four copies send four emails. Scheduled work needs one owner.
+      - **Uploaded files.** Write them to object storage, not the local disk.
+
+      Copies also multiply connections. Each copy has its own database pool, so eight copies
+      with a pool of 10 open up to 80 connections, and PostgreSQL's default
+      `max_connections` is 100. Scaling out without checking that sum ends in "too many
+      connections" errors at the worst moment.
+
+      **Little's law** gives the capacity picture: requests in flight equal the arrival rate
+      times the time each one takes. At 200 requests a second and 100 ms each, about 20 are
+      in progress at any moment. If each holds a database connection for the whole request,
+      you need about 20 connections across all copies, plus headroom for bursts. When the
+      database slows to 500 ms, the same traffic needs 100. That's why a slow database
+      makes everything queue: the time per request rises, and the number in flight rises
+      with it.
+pitfalls:
+  - '**Wrapping CPU work in `Promise.all` to make it parallel.** It looks like the I/O case, so people expect the same speed-up. All the computing still runs on one thread, one item after another. Move it to worker threads or other copies.'
+  - '**Assuming `async` moves work off the thread.** The body runs synchronously until the first `await`, so a heavy loop inside an `async` function blocks the caller. Only a worker thread or another process runs JavaScript in parallel.'
+  - '**Using synchronous APIs in a request handler.** `readFileSync`, `pbkdf2Sync` and friends are convenient in scripts and freeze a server for everyone. Use the async versions, which run on the thread pool or the operating system.'
+  - '**Keeping shared state in a module variable.** It works on a laptop with one process and splits into one value per copy in production. Put counters, sessions and rate limits in the database or Redis.'
+  - '**Adding copies when the database is the bottleneck.** More copies send more queries at once and open more connections, which makes a struggling database slower. Check event loop utilisation and query times first, then fix the query or add capacity where the time goes.'
+  - '**Forgetting that every copy runs its timers.** A `setInterval` job runs once per copy. Give scheduled work a single owner, such as a job scheduler or a database lease.'
+interview:
+  - question: What's the difference between concurrency and parallelism?
+    answer: >-
+      Concurrency is having several tasks in progress over the same period; parallelism is
+      executing several at the same instant. A Node server is concurrent: one thread takes
+      turns between requests at every `await`, so their waits overlap while the database or
+      a model API works. That's enough for I/O-bound work, which is most web traffic.
+      Parallelism needs more than one core running code at once, through worker threads,
+      more processes or more machines, and it's what CPU-bound work such as image
+      processing or report building needs. You can have concurrency without parallelism,
+      which is the Node default, and the distinction tells you which fix applies: overlap
+      waits with async code, spread computing over cores.
+  - question: How can Node serve thousands of connections on a single thread?
+    answer: >-
+      Because almost all of that time is waiting, and waiting doesn't need a thread. Node
+      hands sockets to the operating system's event notification, epoll or kqueue, and the
+      event loop runs callbacks only when data is ready. Each request uses the thread for a
+      few milliseconds of actual JavaScript and then yields at an `await`. File system calls,
+      `dns.lookup` and some crypto go to libuv's thread pool instead, four threads by
+      default. The weakness is the flip side: any long synchronous computation, like a huge
+      `JSON.parse` or a synchronous hash, stops every connection on that process. So I watch
+      event loop delay as a metric, and move CPU-heavy work to worker threads or a separate
+      service.
+  - question: Our API is slow at peak. Someone proposes doubling the instances. How do you decide?
+    answer: >-
+      I'd find out where the time goes before adding anything. If event loop utilisation is
+      high and CPU is pegged, requests are waiting for their turn on a busy thread, and more
+      instances genuinely add capacity. If utilisation is low but responses are slow, the time
+      is spent waiting on something shared, usually the database. Doubling instances then
+      doubles concurrent queries and connections: with a pool of 10 each, 20 instances
+      would already exceed Postgres's default of 100 connections. There the fix is the slow
+      query, an index, caching or a read replica. I'd also check that the service is
+      stateless first, because in-memory sessions, counters or timers break or duplicate
+      as soon as there's a second copy.
+  - question: Why does one slow endpoint make the health check fail?
+    answer: >-
+      Because they share the thread. If the slow endpoint computes synchronously, say two
+      seconds of PDF building, the event loop can't run the health handler until it's done,
+      so the load balancer sees a timeout and may mark the instance unhealthy, pushing its
+      traffic onto the others, which then block the same way. The diagnosis is event loop
+      delay spiking on every endpoint at once. The fix is to take the computing off the
+      main thread with a worker pool or a job queue, or to break it into chunks that yield
+      with `setImmediate`. Scaling out alone only spreads the stalls around.

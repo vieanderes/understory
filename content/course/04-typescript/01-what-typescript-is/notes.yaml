@@ -1,0 +1,187 @@
+summary: >-
+  TypeScript is JavaScript with type annotations, plus a program that reads them before
+  anything runs. The **type checker** compares every value with what its type promises and
+  reports each mismatch as a type error. Then the annotations are deleted and plain
+  JavaScript is left to run. Nothing about the running program changes.
+
+
+  That split is the whole model. TypeScript is a tool for the time you spend writing and
+  reviewing code: it catches typos, missing values and wrong kinds of data in your editor and
+  in the build. It adds no checks, no conversions and no speed cost while the program runs,
+  because by then the types are gone. This is **type erasure**.
+
+
+  So the checker is only as good as what it can see. Your own code, typed well, is covered.
+  Values from outside, such as a server's reply, a form or an old script, reach your code
+  unchecked. You'll close that gap at the boundary later in the chapter. For now, keep two
+  questions apart: "does it compile?" and "is this value right at run time?"
+remember:
+  - The type checker reads your code before it runs, and the running program has no types at all.
+  - Compiling does two separate jobs, checking and emitting JavaScript, and `tsc` emits JavaScript even when checking fails unless you set `noEmitOnError`.
+  - 'Types never convert values, so `total: number` does not turn `"12"` into `12`.'
+  - Node 24, esbuild and other fast tools strip types without checking them, so a project still needs `tsc --noEmit` in its build or CI.
+  - A few features, such as `enum` and `namespace`, generate real JavaScript, so they can't be stripped, and `erasableSyntaxOnly` forbids them.
+  - Because types are erased, you can't test a value against a type while the program runs; you write a runtime check instead.
+  - TypeScript is deliberately not fully sound, and `any`, `as` and unchecked index reads are the usual holes.
+sections:
+  - title: What tsc does, and what it doesn't
+    body: |-
+      `tsc` is the TypeScript compiler. It reads your files, builds a model of every name and
+      its type, checks them, then writes JavaScript. The check and the output are independent.
+      A type error is a report, not a stop sign:
+
+      ```ts
+      function addDelivery(total: number): number {
+        return total + 3.5;
+      }
+      addDelivery("12");
+      ```
+
+      ```text
+      esm.ts(4,13): error TS2345: Argument of type 'string' is not assignable to parameter of type 'number'.
+      ```
+
+      The error names the file, the line and column, an error code and the message. `tsc`
+      exits with a non-zero code, which fails a CI job, but it still writes this:
+
+      ```js
+      "use strict";
+      function addDelivery(total) {
+          return total + 3.5;
+      }
+      addDelivery("12");
+      ```
+
+      Three settings change that behaviour. `noEmitOnError` writes nothing when there are
+      errors. `noEmit` only checks, which is how most projects use `tsc` today, with a
+      bundler producing the real output. `target` decides which JavaScript syntax comes out,
+      for example `es2022`.
+
+      Two things `tsc` never does. It doesn't add polyfills: if you call a function the
+      browser lacks, the output calls it anyway. And it doesn't insert runtime checks. A
+      parameter typed `number` gets no `typeof` test in the output. If you want the program to
+      reject a bad value while it runs, you write that check yourself.
+  - title: Erasure in Node 24 and in bundlers
+    body: |-
+      Node 24 runs a `.ts` file directly. It replaces the type syntax with spaces and runs
+      what's left. It never checks the types, so this file runs happily:
+
+      ```ts
+      type Booking = { nights: number; total: number };
+
+      function nightly(booking: Booking): number {
+        return booking.total / booking.nights;
+      }
+
+      const fromOldScript: any = { nights: "3", total: 270 };
+      console.log(nightly({ nights: 3, total: 270 })); // 90
+      console.log(nightly(fromOldScript)); // 90, because "/" converts "3" to a number
+      console.log(nightly({ nights: 0, total: 270 })); // Infinity
+      ```
+
+      Bundlers and transpilers such as esbuild, SWC and Babel work the same way. They look at
+      one file at a time and delete the types, which is why they are fast. The checking is a
+      separate step: run `tsc --noEmit` in your editor, before commits and in CI.
+
+      Stripping only works for syntax that is purely a type. An `enum` compiles to a real
+      object, so Node refuses it:
+
+      ```text
+      SyntaxError [ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX]: TypeScript enum is not supported in strip-only mode
+      ```
+
+      The `erasableSyntaxOnly` setting makes the checker reject `enum`, `namespace` with code
+      inside, and constructor parameter properties such as `constructor(private id: string)`.
+      A union of string literals, `type Status = "draft" | "sent"`, does the job of most enums
+      and erases cleanly.
+
+      Erasure also explains an error you'll meet when you try to test a type at run time:
+
+      ```ts
+      type Price = { pence: number };
+      function isPrice(value: unknown): boolean {
+        return value instanceof Price;
+        // 'Price' only refers to a type, but is being used as a value here.
+      }
+      ```
+
+      `instanceof` needs something that exists while the program runs, such as a class. A
+      `type` doesn't. To test a shape, you check its properties with `typeof` and `in`.
+  - title: Where the checker's promise stops
+    body: |-
+      TypeScript chooses convenience over total safety in a few places. The language calls
+      these unsound spots: code that type-checks and still fails at run time. A senior
+      engineer knows them by name.
+
+      ```ts
+      const names: string[] = [];
+      const first = names[0]; // typed string, holds undefined
+      console.log(first.toUpperCase());
+      // TypeError: Cannot read properties of undefined (reading 'toUpperCase')
+      ```
+
+      This compiles under `strict`. Reading an array by index gives the item type, even when
+      the index is past the end. The `noUncheckedIndexedAccess` setting adds `undefined` to
+      every index read, and the checker then reports `'first' is possibly 'undefined'`.
+
+      The other common holes:
+
+      - `any` switches checking off for a value and everything it touches.
+      - `as` tells the checker to believe you, with no check behind it.
+      - `JSON.parse` and `response.json()` return `any`, so outside data arrives unchecked.
+      - Plain JavaScript callers, such as an old script on the page, never went through the
+        checker at all.
+
+      The practical rule: trust types inside your own well-typed code, and check values at
+      run time wherever they enter from outside. Tighten the settings, `strict` and
+      `noUncheckedIndexedAccess`, to shrink the holes you can close.
+pitfalls:
+  - '**Believing a type converts a value.** `total: number` only states what the value should be. If `"12"` arrives from a form, it stays text and `+` joins. Convert at the edge with `Number(value)` and check the result.'
+  - '**Shipping code with type errors because it built.** `tsc` writes JavaScript even when checking fails, and Node or a bundler never checks at all. Make `tsc --noEmit` a required step in CI, or set `noEmitOnError`.'
+  - '**Using `enum` in code that Node runs directly.** Node 24 strips types and rejects syntax that generates code. Use a union of string literals, or turn on `erasableSyntaxOnly` so the checker warns you first.'
+  - '**Silencing errors with `// @ts-ignore`.** It hides the error forever, even after the code changes. Fix the cause, or use `// @ts-expect-error` with a reason, which fails once the error is gone.'
+  - '**Thinking a clean build means no type bugs at run time.** Data from `JSON.parse`, `fetch` and plain scripts was never checked. Validate it where it enters the program.'
+interview:
+  - question: What happens to TypeScript types when your code runs?
+    answer: >-
+      Nothing, because they no longer exist. Compiling checks the types and then erases them,
+      so the running program is plain JavaScript. That has three consequences I design
+      around. First, types add no runtime cost and no runtime safety: a parameter typed
+      `number` gets no check in the output. Second, I can't branch on a type at run time; I
+      can't use `instanceof` with a `type` or read a generic parameter. I check the shape
+      with `typeof`, `in` or a schema library instead. Third, anything the checker never saw,
+      such as a server's JSON or a plain script, can still be the wrong kind. So I validate
+      at the boundary. The trade-off is deliberate: erasure keeps the output identical to
+      hand-written JavaScript and lets any tool strip types quickly.
+  - question: What's the difference between running tsc and running a .ts file through Node, esbuild or Babel?
+    answer: >-
+      `tsc` type-checks; the others only strip types. `tsc` builds a model of the whole
+      program across files, so it can report that a caller in one file passes the wrong
+      type to a function in another. Node 24, esbuild, SWC and Babel look at one file at a
+      time and delete the type syntax, which is much faster but checks nothing. Most
+      projects combine them: a fast transpiler or bundler produces the output, and
+      `tsc --noEmit` runs in the editor and in CI as the gate. Per-file stripping has limits:
+      it can't handle syntax that needs type information or generates code, like `enum`.
+      Settings such as `isolatedModules` and `erasableSyntaxOnly` make the checker flag
+      those cases, so both tools agree.
+  - question: Is TypeScript type-safe? Where can it be wrong?
+    answer: >-
+      It's safe enough to catch most mistakes, but it's intentionally not sound. The
+      designers chose to accept some wrong programs to keep JavaScript patterns
+      convenient. The holes I watch for: `any`, which turns checking off and spreads through
+      everything it touches; `as`, which asserts a type without checking it; array and
+      record index reads, which are typed as the item even when the key is missing; and
+      external data, since `JSON.parse` returns `any`. I close what I can with settings:
+      `strict`, `noUncheckedIndexedAccess`, and a lint rule against `any`. What I can't close
+      with settings I close with runtime validation at the boundary. The cost of stricter
+      settings is more narrowing code, which I think is worth it on a team.
+  - question: Why would a team adopt TypeScript, and what does it cost?
+    answer: >-
+      It moves a whole class of bugs from production to the editor. Misspelt properties,
+      missing `null` checks and wrong argument types are reported as you type. The types
+      also act as documentation that can't drift, and they make refactoring safe: rename a
+      property and the checker lists every place to fix. Editor completion gets much
+      better. The costs are a build step, a learning curve for advanced types, and time
+      spent typing awkward library code. There's also false confidence: types say nothing
+      about data from outside, so you still need runtime validation and tests. For anything
+      beyond a small script with one author, I'd pay those costs.

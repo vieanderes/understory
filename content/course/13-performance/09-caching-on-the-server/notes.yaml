@@ -1,0 +1,293 @@
+summary: >-
+  A server-side cache keeps the result of slow or expensive work, a database query, a call
+  to another API, a model call, so the next request with the same inputs gets it at once.
+  The usual shape is **cache-aside**: look in the cache, and on a miss do the work and store
+  the result with a TTL. It can turn a 400 ms page into a 5 ms one and cut a model bill
+  sharply, but every cached value is a copy that can go out of date.
+
+
+  The hard part is never storing things. It's the key, the lifetime and the invalidation.
+  The key must include every input that changes the result, or users see each other's
+  data. The TTL bounds how long a mistake can live. And a write must delete the cached copy,
+  in a way that survives concurrent requests and several servers.
+
+
+  These notes add the caching patterns and where each fits, the cache stampede and
+  single-flight, the invalidation races that catch experienced teams, how Redis is used as
+  a shared cache, and how to key and store model answers. Cache when reads far outnumber
+  writes and slightly old data is acceptable. Don't cache to hide a query that an index
+  would fix.
+remember:
+  - Cache-aside reads the cache first, loads from the source on a miss and stores the result with a TTL.
+  - A cache key must contain every input that changes the result, including the user whenever the data is personal.
+  - On a write, update the database and then delete the cache entry, rather than writing the new value into the cache.
+  - A TTL is the safety net that bounds how long any stale value can survive, even when an invalidation is missed.
+  - A cache stampede is many requests missing the same key at once, and single-flight lets one load run while the rest wait for its promise.
+  - An in-process cache is per server, so a shared store such as Redis is needed when every instance must see the same value and the same delete.
+  - A cache must be optional, so when it's down or slow, the app falls back to the source instead of failing.
+  - Cache model answers only when inputs repeat exactly, keyed by model, full prompt and settings, and scoped to the user when the prompt holds their data.
+sections:
+  - title: Caching patterns and where the cache lives
+    body: |-
+      Four patterns describe how reads and writes meet the cache.
+
+      - **Cache-aside** (lazy loading): the app reads the cache, and on a miss loads from
+        the database and fills the cache. Writes go to the database and delete the entry.
+        Only data somebody asked for is cached. It's the default choice.
+      - **Read-through**: the same, but a library or the cache itself does the loading, so
+        the app only ever talks to the cache.
+      - **Write-through**: every write updates the database and the cache together. Reads
+        are always warm, at the cost of caching data nobody reads.
+      - **Write-behind**: writes go to the cache and reach the database later, in batches.
+        Fast, and data is lost if the cache dies first. Rare outside metrics and counters.
+
+      Where the cache lives is a separate choice. An **in-process** `Map` or LRU answers in
+      well under a microsecond with no network, but each server has its own copy, and a
+      restart empties it. A **shared cache** such as Redis costs a network round trip,
+      usually well under a millisecond inside one data centre, and every server sees the
+      same entries and the same deletes. Busy systems often use both: a tiny in-process
+      cache with a TTL of a few seconds in front of Redis, which absorbs the hottest keys.
+
+      Negative results deserve caching too. If a lookup for a missing product returns
+      nothing, store that "not found" with a short TTL. Otherwise a bot requesting random
+      ids sends every request to the database.
+
+      Measure the **hit rate**, hits divided by all lookups. A cache that hits 20% of the
+      time adds a round trip to 80% of requests for little gain, which usually means the key
+      is too specific or the TTL too short.
+  - title: The stampede, and single-flight
+    body: |-
+      When a popular entry expires, every request that arrives before it's refilled misses.
+      If the load takes 200 ms and 1,000 requests a second want that key, 200 of them run
+      the same slow query at once, which can topple the database the cache was protecting.
+      That's a **cache stampede**, also called a thundering herd.
+
+      The fix inside one process is **single-flight**: keep the promise of the load that's
+      already running, and hand it to everyone else who misses.
+
+      ```ts
+      function cached<T>(load: (key: string) => Promise<T>, ttlMs: number) {
+        const values = new Map<string, { value: T; expires: number }>();
+        const inFlight = new Map<string, Promise<T>>();
+
+        return async function get(key: string): Promise<T> {
+          const hit = values.get(key);
+          if (hit && hit.expires > Date.now()) return hit.value;
+
+          const pending = inFlight.get(key);
+          if (pending) return pending; // join the load already running
+
+          const promise = load(key)
+            .then((value) => {
+              values.set(key, { value, expires: Date.now() + ttlMs });
+              return value;
+            })
+            .finally(() => inFlight.delete(key)); // a failure is not cached
+          inFlight.set(key, promise);
+          return promise;
+        };
+      }
+
+      let loads = 0;
+      const slowStock = async (sku: string) => {
+        loads++;
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        return { sku, inStock: 12 };
+      };
+
+      const getStock = cached(slowStock, 30_000);
+      const results = await Promise.all(Array.from({ length: 500 }, () => getStock("mug-blue")));
+      console.log(results.length, loads); // 500 1
+      ```
+
+      Run it as an ES module, for example `npx tsx stock.mts`. The `finally` matters: if the
+      load fails, every waiter gets the error, and the next request tries again instead of
+      being served a cached failure.
+
+      Across many servers, each process still loads once, so ten servers means ten loads.
+      That's usually fine. For very expensive work, add a short lock in Redis so only one
+      server rebuilds, or refresh popular entries in the background before they expire so
+      they never go cold. Also add **jitter** to TTLs, for example 5 minutes plus or minus
+      10%, so entries written together don't all expire in the same second.
+  - title: Invalidation races
+    body: |-
+      "Delete after write" has two subtle rules.
+
+      **Delete, don't set.** If a write puts the new value into the cache, two concurrent
+      writers can finish in the opposite order in the cache from the database:
+
+      ```text
+      writer A: UPDATE price = 10
+      writer B: UPDATE price = 12        database now says 12
+      writer B: cache.set(price, 12)
+      writer A: cache.set(price, 10)     cache says 10, until the TTL
+      ```
+
+      Deleting has no ordering problem: both deletes leave the entry empty, and the next
+      read loads 12.
+
+      **Delete after the transaction commits.** Delete before the commit, and a reader can
+      refill the cache with the old row in between. Delete from inside a transaction that
+      later rolls back, and you only lose a cache hit, which is harmless.
+
+      Even delete-after-commit has a rare race with a slow reader:
+
+      ```text
+      reader:  cache miss, SELECT price  -> 10
+      writer:  UPDATE price = 12, COMMIT, cache.delete(price)
+      reader:  cache.set(price, 10)      stale until the TTL
+      ```
+
+      The reader's read and its cache write straddle the whole write. It's uncommon, which
+      is exactly why the TTL matters: it caps the damage. Where it matters more, some teams
+      delete a second time a moment after the write, or store a version number with each
+      value and refuse to overwrite a newer version with an older one.
+
+      **Versioned keys** avoid deletes altogether. Keep a version counter per entity or per
+      group, such as `catalogue:v42:product:812`. A write bumps the version, and old keys are
+      never asked for again and expire on their own. This works well for invalidating a whole
+      group at once, such as every cached page of a category.
+
+      Finally, find every write path. A price can change through the admin screen, a bulk
+      import and a nightly job. Invalidation that lives in one of them only is the usual
+      cause of "the cache is wrong sometimes".
+  - title: Redis as the shared cache
+    body: |-
+      Redis keeps keys and values in memory and answers in well under a millisecond. For
+      caching you need a handful of commands:
+
+      ```text
+      SET product:812 '{"name":"Blue mug","pence":1200}' EX 300   store for 300 seconds
+      GET product:812                                              the JSON, or (nil)
+      DEL product:812                                              invalidate
+      TTL product:812                                              seconds left, -2 if missing
+      SET lock:product:812 worker-3 NX EX 10                       take a lock only if free
+      ```
+
+      `EX` sets the TTL in the same command as the value, so there's never a key without an
+      expiry. `NX` means "only if the key doesn't exist", which makes a short lock for
+      rebuilding an expensive entry on one server only.
+
+      Values are strings, so you store JSON, and parsing it on every hit costs CPU for large
+      values. Keep cached values small and specific: the fields the page needs, not a whole
+      object graph.
+
+      Set a memory limit and an eviction policy, or Redis stops accepting writes when it's
+      full. The default policy, `noeviction`, returns errors on writes at the limit. A pure
+      cache usually wants `maxmemory-policy allkeys-lru`, which evicts the least recently
+      used keys. If the same Redis also holds data that must not vanish, such as sessions
+      or queues, use a separate instance for the cache.
+
+      Treat Redis as optional in the request path. Give cache calls a short timeout, tens of
+      milliseconds, and on an error or timeout, go to the database. A cache that takes the
+      site down when it fails has made the site less reliable. Watch the database load when
+      Redis restarts cold, though: it's a stampede on every key at once.
+  - title: Keying and storing model answers
+    body: |-
+      A cached model answer is only correct if everything that shaped it is in the key: the
+      model name, the system prompt, the full message list, any tool definitions, and
+      settings such as `temperature` and the token limit. Long prompts make long keys, so
+      hash a canonical form. Object key order must not change the hash, so sort keys first:
+
+      ```ts
+      import { createHash } from "node:crypto";
+
+      function canonical(value: unknown): string {
+        if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+        if (value && typeof value === "object") {
+          const entries = Object.entries(value).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+          return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonical(v)}`).join(",")}}`;
+        }
+        return JSON.stringify(value);
+      }
+
+      function answerKey(scope: string, request: object): string {
+        const digest = createHash("sha256").update(canonical(request)).digest("hex");
+        return `llm:v1:${scope}:${digest}`;
+      }
+
+      const request = {
+        model: "some-model",
+        system: "Answer questions about the library catalogue.",
+        messages: [{ role: "user", content: "Which books are about trains?" }],
+        temperature: 0,
+      };
+      const sameFieldsReordered = { temperature: 0, messages: request.messages, system: request.system, model: request.model };
+      console.log(answerKey("public", request) === answerKey("public", sameFieldsReordered)); // true
+      console.log(answerKey("public", request) === answerKey("public", { ...request, temperature: 0.7 })); // false
+      console.log(answerKey("public", request) === answerKey("user:42", request)); // false
+      ```
+
+      The `scope` is `public` only when the prompt holds nothing personal; otherwise it's the
+      user id. The `v1` lets you drop every entry at once when you change the prompt
+      template.
+
+      Two things often get confused. **Response caching**, above, skips the model call
+      entirely and returns a stored answer. **Prompt caching** at the provider still runs
+      the call but reuses the processing of a long, repeated prefix, so it's cheaper and
+      starts sooner, and the answer is freshly generated.
+
+      Cache answers where repeating one is acceptable: summaries of a fixed document,
+      classifications, embeddings of the same text. For open chat, exact repeats are rare
+      and a stored answer can feel robotic, so the hit rate may not justify it.
+pitfalls:
+  - '**Leaving an input out of the key.** Cache `report(userId, month)` under `month` and every user gets the first user''s report. Build the key from every argument, and add the user whenever the data is personal.'
+  - '**Writing the new value into the cache on update.** Concurrent writers can leave the cache holding the older value. Delete the entry after the database commit and let the next read load it.'
+  - '**No TTL, or only a TTL.** Without a TTL, a missed invalidation lives for ever. With only a TTL, every write shows stale data until expiry. Use both: delete on write, TTL as the safety net.'
+  - '**Caching a failure.** Storing a rejected promise or an error result serves the outage long after it''s over. Remove the in-flight entry on failure, and cache "not found" only on purpose with a short TTL.'
+  - '**An in-process cache on many servers.** A delete on one server leaves the others stale. Use a shared store, or keep local TTLs to a few seconds.'
+  - '**Making the cache a hard dependency.** If every request fails when Redis does, the cache made the system less reliable. Time out quickly and fall back to the source.'
+  - '**Caching to hide a slow query.** A missing index still hurts every miss and every write path. Fix the query first, then cache what''s still expensive.'
+interview:
+  - question: How would you add caching to a slow product page, and keep prices correct?
+    answer: >-
+      Cache-aside in Redis, keyed by product id, with a TTL of a few minutes and a delete on
+      every write. A read checks Redis, and on a miss runs the query and stores the result
+      with `SET ... EX`. Every path that changes a product, the admin form, imports and
+      background jobs, deletes the key after the transaction commits, so the next read loads
+      the new price. The TTL caps how long a missed invalidation or a race can show a wrong
+      price. I'd add single-flight so an expiry on a popular product runs one query, not
+      hundreds, and treat Redis as optional with a short timeout. If prices are
+      legally binding at checkout, I'd read them from the database there regardless, because
+      a cache is for display, not for charging.
+  - question: What is a cache stampede, and how do you prevent it?
+    answer: >-
+      It's many requests missing the same key at the same moment, usually when a hot entry
+      expires, so they all run the expensive load together and can overwhelm the database.
+      Inside one process, single-flight fixes it: the first miss stores the promise of its
+      load, and later misses await that promise, so the work runs once. Across servers, a
+      short Redis lock with `SET NX EX` lets one instance rebuild while others serve the old
+      value or wait briefly. Refreshing hot keys in the background before they expire avoids
+      cold misses entirely, and jittered TTLs stop many keys expiring in the same second.
+      The trade-off is complexity: for cheap loads or low traffic, a plain TTL is fine.
+  - question: Why delete the cache entry on write instead of updating it?
+    answer: >-
+      Because deletes can't be applied in the wrong order, and updates can. If two writers
+      set prices 10 then 12 in the database but their cache writes land as 12 then 10, the
+      cache holds 10 until the TTL. Two deletes in any order leave the entry empty, and the
+      next read loads the committed value. Deleting also avoids caching data nobody reads.
+      The delete must come after the commit, or a reader can refill the cache with the old
+      row in between. There's still a rare race where a slow reader writes a value it read
+      before the update, so a TTL stays as the safety net, and versioned values can close
+      the gap where it matters.
+  - question: In-process cache or Redis?
+    answer: >-
+      It depends on whether every server must agree. An in-process cache is the fastest
+      possible, with no network and no serialisation, but each instance has its own copy, so
+      a delete on one leaves the others stale, and a deploy empties them all. Redis costs a
+      round trip, usually well under a millisecond, and gives every instance the same
+      entries and the same invalidation, and survives app restarts. I'd use in-process for
+      data that's the same everywhere and changes rarely, such as feature flags or
+      configuration, with a short TTL. I'd use Redis for per-entity data that changes and
+      must be invalidated. For very hot keys, both: a few seconds locally in front of Redis.
+  - question: How would you cache LLM responses in a product?
+    answer: >-
+      Only where exact inputs repeat, with a key that captures everything that shaped the
+      answer. I'd hash a canonical form of the model, system prompt, messages, tools and
+      settings such as temperature, scope the key to the user if the prompt includes their
+      data, and add a version to drop everything when the prompt template changes.
+      Good candidates are summaries of fixed documents, classifications and embeddings.
+      Separately, I'd use the provider's prompt caching for long shared prefixes, which cuts
+      cost and latency without returning stored answers. The risks are leaking one user's
+      answer to another through a key that's too broad, and serving outdated answers after
+      the underlying data changes, so entries get TTLs and invalidation like any other cache.

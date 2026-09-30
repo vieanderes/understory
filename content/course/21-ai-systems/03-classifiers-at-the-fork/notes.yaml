@@ -1,0 +1,222 @@
+summary: >-
+  A classifier picks one label from a fixed list and says how sure it is. In an AI pipeline
+  it sits at every fork where one fuzzy question decides the branch: which category, how
+  urgent, does a person need to see this, is the agent finished. Its answer is a number, so
+  code can compare it with a threshold and take the branch.
+
+
+  This replaces the demo habit of asking a large model "what should we do?" and parsing its
+  prose. Splitting the decision into forks makes each branch explicit, testable and cheap.
+  A small trained classifier answers in milliseconds for a tiny fraction of a large model's
+  cost, so the expensive model runs only when there is text to write.
+
+
+  Start with a prompted LLM held to the label list by structured output: it works on day
+  one without data. Log its answers, have people correct a sample, and train a small model
+  on embeddings once you have a few hundred labels. Don't reach for a classifier when a
+  rule decides the fork exactly, such as "the order is older than 30 days"; code is cheaper
+  and never wrong about that.
+remember:
+  - A classifier returns a label and a probability from a fixed list, and code, not the model, takes the branch.
+  - Never act on the top label alone; compare its probability with a threshold chosen for the cost of being wrong.
+  - Start with a prompted LLM limited to the labels, then train a small model on embeddings from its corrected logs.
+  - Softmax probabilities over exclusive labels add up to 1, while independent yes-or-no questions each get their own probability.
+  - Give the label set an "other" or unsure path, because real traffic always contains cases no label fits.
+  - Judge a classifier by precision and recall per label, since accuracy hides a rare class it never catches.
+  - One call can answer several questions about the same input, which is cheaper and keeps the answers consistent.
+sections:
+  - title: A classifier on embeddings, from scratch
+    body: |-
+      The middle option, a small model on embeddings, is less mysterious than it sounds. An
+      embedding turns each ticket into a list of numbers. Tickets about the same thing land
+      near each other. The simplest classifier averages the embeddings of each label's
+      examples into a **centroid**, measures how close a new ticket is to each, and turns the
+      similarities into probabilities with **softmax**.
+
+      ```python
+      import math
+
+
+      def softmax(scores: dict[str, float]) -> dict[str, float]:
+          top = max(scores.values())
+          exp = {label: math.exp(s - top) for label, s in scores.items()}  # minus top avoids overflow
+          total = sum(exp.values())
+          return {label: e / total for label, e in exp.items()}
+
+
+      def cosine(a: list[float], b: list[float]) -> float:
+          dot = sum(x * y for x, y in zip(a, b))
+          return dot / (math.sqrt(sum(x * x for x in a)) * math.sqrt(sum(y * y for y in b)))
+
+
+      def centroid(vectors: list[list[float]]) -> list[float]:
+          return [sum(column) / len(vectors) for column in zip(*vectors)]
+
+
+      # Toy three-number embeddings of labelled tickets. Real ones have hundreds of numbers.
+      labelled = {
+          "refund": [[0.9, 0.1, 0.0], [0.8, 0.2, 0.1]],
+          "question": [[0.1, 0.9, 0.1], [0.2, 0.8, 0.0]],
+          "spam": [[0.0, 0.1, 0.9], [0.1, 0.0, 0.8]],
+      }
+      centroids = {label: centroid(vs) for label, vs in labelled.items()}
+
+
+      def classify(vector: list[float], sharpness: float = 10.0) -> dict[str, float]:
+          sims = {label: sharpness * cosine(vector, c) for label, c in centroids.items()}
+          return softmax(sims)
+
+
+      probs = classify([0.7, 0.3, 0.1])
+      label = max(probs, key=probs.get)
+      print(label, {k: round(v, 2) for k, v in probs.items()})
+      # refund {'refund': 0.98, 'question': 0.01, 'spam': 0.0}
+      ```
+
+      In practice you'd fit logistic regression on the same embeddings, which learns a
+      weight per dimension instead of a plain average. The shape is identical: a score per
+      label, then softmax. Notice the `sharpness` knob. It changes how confident the output
+      looks without changing which label wins, which is exactly why the next lesson checks
+      whether the probabilities can be trusted.
+  - title: Getting a probability out of a prompted LLM
+    body: |-
+      A prompted model held to an `enum` gives you a valid label, but no calibrated number.
+      There are three common ways round that.
+
+      First, ask for several samples at a non-zero temperature and use the share that agree,
+      often called **self-consistency**. It costs one call per sample.
+
+      ```python
+      from collections import Counter
+
+
+      def vote(samples: list[str]) -> tuple[str, float]:
+          label, count = Counter(samples).most_common(1)[0]
+          return label, count / len(samples)
+
+
+      print(vote(["refund", "refund", "complaint", "refund", "refund"]))  # ('refund', 0.8)
+      label, share = vote(["refund", "complaint", "question"])
+      print(label, round(share, 2))  # refund 0.33, a three-way split: unsure
+      ```
+
+      Second, some providers expose the probability the model gave each output token. Where
+      that exists, the probability of the label's first token is a usable score. Check what
+      your provider offers rather than assuming it.
+
+      Third, and usually best, treat the prompted model as a labeller, not the long-term
+      classifier. Log every label, have people correct a sample, and train a small model on
+      embeddings from the corrected set. This is a form of **distillation**: the small model
+      learns the large one's behaviour, answers in milliseconds and gives real per-label
+      probabilities. Asking a model to write "confidence: 0.9" in its answer is not one of
+      these methods; that number is generated text, not a measurement.
+  - title: Designing the label set
+    body: |-
+      The labels matter more than the model. Three decisions come up every time.
+
+      **Exclusive or independent.** If a ticket belongs to exactly one category, use softmax
+      over the labels, so the probabilities add up to 1. If several can be true at once, such
+      as "mentions a legal threat" and "is urgent", ask separate yes-or-no questions, each
+      with its own probability. That is why the lesson's triage returns `legal_threat` and
+      `needs_human` as single numbers beside the category distribution.
+
+      **An exit for the unexpected.** Real traffic contains cases no label fits: a job
+      application in the support inbox, a message in another language. Without an `other`
+      label the classifier forces them into the nearest category with confidence. Add
+      `other`, and route it to a person.
+
+      **Labels a person can apply.** If two annotators disagree on half the cases, no model
+      will do better. Write a one-line definition per label with an example of each, and
+      measure how often two people agree on a sample before training anything. Merge labels
+      that people can't tell apart, and split a label only when the branches differ.
+  - title: Evaluating a classifier per label
+    body: |-
+      Accuracy, the share of labels that were right, hides the failures that matter. If 95%
+      of tickets are questions, a classifier that always says "question" scores 95% and never
+      catches a refund. Measure **precision and recall per label** on a labelled test set
+      the model never trained on.
+
+      ```python
+      from collections import Counter
+
+      truth = ["refund", "refund", "refund", "question", "question", "question", "question", "spam"]
+      pred = ["refund", "refund", "question", "question", "question", "refund", "question", "spam"]
+
+      pairs = Counter(zip(truth, pred))
+      for label in ["refund", "question", "spam"]:
+          tp = pairs[(label, label)]
+          predicted = sum(n for (t, p), n in pairs.items() if p == label)
+          actual = sum(n for (t, p), n in pairs.items() if t == label)
+          print(f"{label:9} precision {tp / predicted:.2f}  recall {tp / actual:.2f}")
+      print("accuracy", sum(t == p for t, p in zip(truth, pred)) / len(truth))
+      # refund    precision 0.67  recall 0.67
+      # question  precision 0.75  recall 0.75
+      # spam      precision 1.00  recall 1.00
+      # accuracy 0.75
+      ```
+
+      The `pairs` counter is a **confusion matrix**: it shows which label gets mistaken for
+      which. Here one refund was called a question and one question a refund. Those two
+      errors cost very different amounts, which is why the threshold for the automatic
+      branch is chosen per label, in the next lesson. Keep the test set stable and version
+      it, so a new classifier is compared on the same cases.
+  - title: Cascades, and when the large model still decides
+    body: |-
+      Classifiers and large models work best together in a **cascade**. The small classifier
+      answers first. When it is confident, code acts on it. When it isn't, the case moves up
+      to the large model, or to a person. Most traffic is routine, so most requests never
+      pay for the expensive step.
+
+      The lesson's agent example is a cascade inside a loop. After each tool result, one
+      cheap call answers "which action next?", "is the task done?" and "is it stuck?". A
+      clear answer lets the harness act without the large model. A near tie hands the turn
+      to the large model, which can reason about the specific case.
+
+      The trade-off is a second source of error. A confidently wrong classifier skips the
+      escalation, so the cascade is only as good as the classifier's calibration at its
+      threshold. Monitor the share of traffic at each level: if escalations drift up, the
+      traffic has changed and the classifier needs new labels.
+pitfalls:
+  - '**Acting on the top label whatever its probability.** `max()` always returns a label, even at 0.41. Check the winning probability against a threshold before any action, and send near ties to a person.'
+  - '**Trusting a confidence the model wrote.** "Confidence: 0.95" in a model''s reply is generated text, not a measured probability. Use votes over samples, token probabilities where the provider offers them, or a trained classifier.'
+  - '**No exit label.** Without `other`, a message that fits nothing gets forced into a category, often confidently. Add an unsure path and route it to a person.'
+  - '**Reporting accuracy on imbalanced traffic.** A rare, costly class can have zero recall behind 95% accuracy. Report precision and recall per label.'
+  - '**Testing on the training data.** A classifier scores well on the tickets it learned from. Hold out a test set, keep it stable across versions, and add new real failures to it.'
+  - '**A classifier where a rule would do.** "Order older than 30 days" is a comparison, not a fuzzy question. Use code for exact rules and classifiers only for judgement.'
+interview:
+  - question: Why use a small classifier instead of asking the large model what to do with each ticket?
+    answer: >-
+      Because each fork becomes a number my code can compare, test and trace, and it's far
+      cheaper. One large call hides every decision in free text, so I can't tell which
+      decision went wrong, set how sure it must be, or test branches alone. A trained
+      classifier over embeddings answers in milliseconds with a probability per label, so
+      the large model only runs when there's a reply to write. I'd still use the large model
+      where the classifier is unsure, as a cascade. When not to: before there's any labelled
+      data, a prompted model held to the label list is the pragmatic start, and its logged
+      labels become the training set.
+  - question: How would you get a confidence score out of an LLM used as a classifier?
+    answer: >-
+      Not by asking it to write one; that number is generated text. I'd use one of three
+      approaches. Sample several answers and take the share that agree, which works with any
+      provider but multiplies cost. Use token probabilities if the provider exposes them,
+      reading the probability of the label's first token. Or, best in the long run, log the
+      model's labels, correct a sample by hand and train a small classifier on embeddings,
+      which gives real per-label probabilities in milliseconds. Whichever I choose, I'd check
+      calibration on labelled data before putting a threshold on it.
+  - question: How do you evaluate a ticket classifier before it goes live?
+    answer: >-
+      On a held-out labelled set, with precision and recall per label and a confusion
+      matrix, not overall accuracy. Accuracy hides rare classes: if refunds are 3% of
+      traffic, a model that never predicts refund still looks 97% accurate. Per-label
+      numbers show that, and the confusion matrix shows which mistakes happen, such as
+      refunds labelled as questions. I'd weight them by cost: a wrong automatic refund is
+      worse than a question sent to a person. Before launch I'd run it in shadow mode on live
+      traffic, logging its decisions without acting, and compare with what people decided.
+  - question: When is a classifier the wrong tool for a decision point?
+    answer: >-
+      When the decision is exact. If the rule is "orders older than 30 days can't be
+      refunded", that's a date comparison: code is instant, free and never wrong. Classifiers
+      are for fuzzy questions such as intent, urgency or tone, where no rule captures the
+      meaning. Many forks combine both: a classifier decides the ticket is a refund request,
+      then code checks the order date and amount. The mistake is asking a model a question
+      the database already answers exactly, which adds cost, latency and a chance of error.

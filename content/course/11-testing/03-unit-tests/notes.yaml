@@ -1,0 +1,290 @@
+summary: >-
+  A unit test checks one piece of logic in isolation, fast enough that you run hundreds of
+  them on every save. A good one has three parts, arrange, act and assert. It fails for one
+  reason, and its name says which. It gives the same result every time, on any machine, in
+  any order.
+
+
+  The lesson covers the shape of a test, boundary values and mutation testing. These notes
+  add what makes a suite pleasant to live with: keeping tests independent, table-driven
+  tests with `it.each` so a boundary list costs one line per case, and control over the
+  things that make tests flaky, which are time, timers and randomness.
+
+
+  Determinism is the part interviewers push on. A test that sometimes fails is worse than
+  no test, because people learn to rerun it instead of reading it. Almost every flaky unit
+  test comes from a hidden input: the clock, a random number, shared state or test order.
+  Make each one an explicit input and the flakiness goes.
+remember:
+  - A unit test arranges inputs, acts by calling the unit once, and asserts on the outcome, and should fail for exactly one reason.
+  - Tests must not depend on each other, so build fresh state in each test or in `beforeEach`, never share mutable objects between tests.
+  - Use `it.each` with a table of cases to test every boundary without copying the test body, and put the values in the test name.
+  - A flaky unit test almost always has a hidden input, the clock, randomness, shared state or order, and the fix is to make it explicit.
+  - '`vi.useFakeTimers()` replaces `setTimeout`, `setInterval` and `Date`, `vi.setSystemTime` sets the clock, and `vi.advanceTimersByTime` fires due timers without waiting.'
+  - Restore real timers and mocks in `afterEach`, or one test's fake clock leaks into the next.
+  - Use `vi.advanceTimersByTimeAsync` when the code awaits between timers, because a timer scheduled after an `await` doesn't exist yet when the sync version runs.
+  - Several assertions in one test are fine when they describe one outcome, and wrong when they check separate behaviours.
+sections:
+  - title: One reason to fail, and tests that don't touch each other
+    body: |-
+      "One assertion per test" is a common rule and a slightly wrong one. The real rule is
+      **one reason to fail**: a test checks one behaviour, so a red test names one broken
+      rule. Checking both fields of one returned object is one behaviour. Checking that an
+      order is priced, then emailed, then logged in one test is three.
+
+      The second rule is **independence**. Each test must pass alone, in any order, and in
+      parallel with the others. The usual breach is shared mutable state:
+
+      ```ts
+      import { beforeEach, describe, expect, test } from 'vitest';
+
+      function createBasket() {
+        const lines: { sku: string; qty: number }[] = [];
+        return {
+          add(sku: string, qty = 1) {
+            const line = lines.find((l) => l.sku === sku);
+            if (line) line.qty += qty;
+            else lines.push({ sku, qty });
+          },
+          count: () => lines.reduce((n, l) => n + l.qty, 0),
+        };
+      }
+
+      describe('basket', () => {
+        let basket: ReturnType<typeof createBasket>;
+
+        beforeEach(() => {
+          basket = createBasket(); // fresh for every test
+        });
+
+        test('adding the same item twice merges the lines', () => {
+          basket.add('mug');
+          basket.add('mug');
+          expect(basket.count()).toBe(2);
+        });
+
+        test('starts empty', () => {
+          expect(basket.count()).toBe(0);
+        });
+      });
+      ```
+
+      Create the basket once at the top of the `describe` instead and "starts empty" fails
+      whenever it runs after the other test. Vitest runs the tests in a file in order by
+      default, so that bug can hide for months until someone adds `--sequence.shuffle`, runs
+      one test alone with `-t`, or reorders the file.
+
+      A good failure message also comes from the matcher. `expect(basket.count()).toBe(2)`
+      prints "expected 1 to be 2". `expect(basket.count() === 2).toBe(true)` prints
+      "expected false to be true", which tells you nothing. Keep the value you care about
+      inside `expect`.
+  - title: Table-driven tests with it.each
+    body: |-
+      Boundary testing produces lists of near-identical tests. `it.each` runs one body over
+      a table, one reported test per row. Take a library late fee: 20p a day, capped at
+      500p, whole days only.
+
+      ```ts
+      import { describe, it, test, expect } from 'vitest';
+
+      export function lateFeePence(daysLate: number): number {
+        if (!Number.isInteger(daysLate)) throw new RangeError('whole days only');
+        if (daysLate <= 0) return 0;
+        return Math.min(daysLate * 20, 500);
+      }
+
+      describe('lateFeePence', () => {
+        it.each([
+          { days: -3, fee: 0 },
+          { days: 0, fee: 0 },
+          { days: 1, fee: 20 },
+          { days: 24, fee: 480 },
+          { days: 25, fee: 500 },
+          { days: 26, fee: 500 },
+        ])('late by $days charges $fee', ({ days, fee }) => {
+          expect(lateFeePence(days)).toBe(fee);
+        });
+
+        it('refuses part of a day', () => {
+          expect(() => lateFeePence(1.5)).toThrow(RangeError);
+        });
+      });
+      ```
+
+      With `--reporter verbose` each row is its own line, such as
+      `late by 25 charges 500`, so a failure names the exact case. Objects with `$name`
+      placeholders read better than arrays with `%i`, and they survive someone adding a
+      column.
+
+      The table is the specification. Each boundary shows up as a pair: 0 and 1 around
+      "free", 24, 25 and 26 around the cap. A reviewer can check the rule against the rows
+      without reading any logic. The error case stays a separate test, because it's a
+      different behaviour with a different assertion. Don't force it into the table with a
+      flag.
+
+      Vitest also has `test.for`, which passes each row whole instead of spreading an array
+      into arguments, and gives the test context as a second argument. For object rows the
+      two behave the same.
+  - title: Taking control of time
+    body: |-
+      Code that reads the clock or waits on a timer is slow and flaky to test for real. Fake
+      timers replace `setTimeout`, `setInterval` and `Date` with versions the test drives.
+      Here a booking system holds a seat for ten minutes:
+
+      ```ts
+      import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
+
+      const HOLD_MS = 10 * 60 * 1000;
+
+      function holdSeat(seat: string, release: (seat: string) => void) {
+        const expiresAt = new Date(Date.now() + HOLD_MS);
+        const timer = setTimeout(() => release(seat), HOLD_MS);
+        return { expiresAt, confirm: () => clearTimeout(timer) };
+      }
+
+      describe('holdSeat', () => {
+        beforeEach(() => {
+          vi.useFakeTimers();
+          vi.setSystemTime(new Date('2026-03-01T18:00:00Z'));
+        });
+
+        afterEach(() => {
+          vi.useRealTimers();
+        });
+
+        test('stamps the hold ten minutes from now', () => {
+          const hold = holdSeat('A1', () => {});
+          expect(hold.expiresAt.toISOString()).toBe('2026-03-01T18:10:00.000Z');
+        });
+
+        test('releases the seat when ten minutes pass', () => {
+          const released: string[] = [];
+          holdSeat('A1', (seat) => released.push(seat));
+
+          vi.advanceTimersByTime(HOLD_MS - 1);
+          expect(released).toEqual([]);
+
+          vi.advanceTimersByTime(1);
+          expect(released).toEqual(['A1']);
+        });
+
+        test('keeps the seat once the booking is confirmed', () => {
+          const released: string[] = [];
+          const hold = holdSeat('A1', (seat) => released.push(seat));
+
+          hold.confirm();
+          vi.advanceTimersByTime(HOLD_MS);
+          expect(released).toEqual([]);
+        });
+      });
+      ```
+
+      Ten minutes pass in microseconds. The test at `HOLD_MS - 1` is a boundary test on
+      time: it proves the seat isn't released a millisecond early.
+
+      Async code needs the async variant. `vi.advanceTimersByTime` only fires timers that
+      already exist. In a retry loop that does `await call()` and then `await sleep(1000)`,
+      the sleep's timer is created after a promise settles, so the sync call finds nothing
+      to fire. `await vi.advanceTimersByTimeAsync(3000)` lets pending promises settle
+      between timers, and the retries run.
+
+      Passing the clock in, as the next lesson shows, is still the cleaner design where you
+      own the code. Fake timers are for code you can't change, and for real timers such as
+      debounces and timeouts.
+  - title: Randomness and other hidden inputs
+    body: |-
+      Randomness is a hidden input like the clock. The design fix is the same: accept the
+      source as a parameter with a sensible default.
+
+      ```ts
+      import { afterEach, expect, test, vi } from 'vitest';
+
+      function pickWinner(entries: string[], random: () => number = Math.random) {
+        return entries[Math.floor(random() * entries.length)];
+      }
+
+      afterEach(() => {
+        vi.restoreAllMocks();
+      });
+
+      test('picks by the number it is given', () => {
+        expect(pickWinner(['Ana', 'Ben', 'Cy'], () => 0.99)).toBe('Cy');
+      });
+
+      test('can pin Math.random when you cannot pass one in', () => {
+        vi.spyOn(Math, 'random').mockReturnValue(0);
+        expect(pickWinner(['Ana', 'Ben', 'Cy'])).toBe('Ana');
+      });
+      ```
+
+      `Math.random` returns a number from 0 up to, but not including, 1. The values 0 and
+      0.99 sit at either end of that range, so these tests also show the index never runs
+      off either end of the list.
+
+      Other hidden inputs to hunt for when a test flakes:
+
+      - **Time zone and locale.** `toLocaleDateString()` gives different text in London and
+        in Los Angeles, and a CI runner is often set to UTC. Pass the time zone and locale,
+        or set `TZ` for the test run.
+      - **Object and set ordering assumptions.** Sort before comparing when order isn't part
+        of the contract, or use `expect.arrayContaining`.
+      - **The file system and network.** They don't belong in a unit test. Put them behind
+        an interface and hand the unit a stand-in.
+      - **Leftover state.** A module-level cache or a global that one test fills and the
+        next reads. Reset it in `beforeEach`, or better, don't keep it at module level.
+
+      A good habit when a test flakes: don't rerun it until it passes. Find the hidden input
+      and make it explicit. The flake was telling you the code has a dependency you didn't
+      design.
+pitfalls:
+  - "**Sharing one object across tests.** A test passes alone and fails after another one mutates the object. Create fresh state in each test or in `beforeEach`."
+  - "**Asserting on a boolean you computed.** `expect(a === b).toBe(true)` fails with 'expected false to be true'. Put the real value in `expect` so the message shows it."
+  - "**Testing several behaviours in one test.** The first failure hides the rest, and the name can't describe them all. Split them, one behaviour per test."
+  - "**Forgetting to restore real timers.** A fake clock left on makes later tests hang on a `setTimeout` that never fires. Call `vi.useRealTimers()` in `afterEach`."
+  - "**Using `advanceTimersByTime` on code that awaits between timers.** The next timer doesn't exist yet, so nothing happens. Use `await vi.advanceTimersByTimeAsync(ms)`."
+  - "**Rerunning a flaky test until it goes green.** The hidden input is still there and will fail in CI again. Find it, the clock, randomness, order or shared state, and pass it in."
+  - "**Copying a test body for each boundary.** Ten near-identical tests drift apart. Use `it.each` with a table and name each row by its values."
+interview:
+  - question: What makes a good unit test?
+    answer: >-
+      It's fast, deterministic, independent, and it fails for one reason with a message
+      that says what broke. Concretely: arrange the inputs, call the unit once, assert on
+      the observable outcome. The name states the rule and the case, such as "a
+      five-year-old pays the child price". It checks behaviour, not private details, so it
+      survives refactoring. It builds its own state, so it passes alone and in any order.
+      It controls its inputs, including the clock and randomness, so it passes on any
+      machine at any time. And it has been seen to fail. The trade-off with making tests
+      very small is that you can end up testing trivia; I aim each test at a rule someone
+      would care about if it broke.
+  - question: How do you test code that depends on the current time?
+    answer: >-
+      Preferably by making time an input, and otherwise with fake timers. If I own the code,
+      I pass the clock in, as a `Date` or a `now()` function with a default, so each test
+      picks its own moment and nothing global changes. For code that uses real timers, such
+      as a hold that expires after ten minutes, I use `vi.useFakeTimers()`, set the start
+      with `vi.setSystemTime`, and move time with `vi.advanceTimersByTime`, testing both one
+      millisecond before the deadline and on it. If the code awaits between timers I use the
+      async variant, because a timer created after an `await` doesn't exist when the sync
+      call runs. Real timers get restored in `afterEach`, or the fake clock leaks into other
+      tests.
+  - question: A test fails in CI about once in twenty runs. How do you approach it?
+    answer: >-
+      I treat it as a bug with a hidden input and look for which one, rather than adding a
+      retry. First I try to reproduce it: run it alone, run the file with
+      `--sequence.shuffle`, run it many times in a loop, run it with `TZ` set to another
+      zone. Order-dependent failures point to shared state; time-dependent ones to a real
+      clock, a time zone or a race with a timer; random ones to an unseeded random source.
+      Then I make that input explicit: fresh state per test, an injected clock, a fixed
+      random source, awaited promises. Quarantining the test is a fair short-term move so it
+      stops blocking others, but only with a ticket, because a flaky test that everyone
+      reruns teaches the team to ignore red.
+  - question: When would you use a parametrised test?
+    answer: >-
+      When several cases share the same act and assert and differ only in data, which is
+      almost always boundary and equivalence-class testing. With `it.each` I write a table
+      of inputs and expected outputs, one reported test per row, named from the values, so a
+      failure says "late by 25 charges 500" rather than "test 5". The table doubles as a
+      readable specification: a reviewer can check the rule against the rows. I don't use it
+      when the cases need different assertions or setup, such as an error case next to
+      normal values. Forcing those into one table with flags and conditionals makes the test
+      body a program of its own, and a test should have no logic worth testing.

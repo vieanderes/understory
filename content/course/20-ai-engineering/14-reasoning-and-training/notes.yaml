@@ -1,0 +1,339 @@
+summary: >-
+  A reasoning model is still the next-token loop from lesson 1. What changed is how much work
+  it does before the answer, and how it was trained to make that work pay off. Writing out
+  steps first, **chain of thought**, gives every later token more context to build on.
+  Reasoning models were trained with reinforcement learning to do this by themselves, and
+  the thinking tokens are billed as output.
+
+
+  Thinking longer is one form of **test-time compute**: spending more computation while
+  answering rather than only while training. Others are sampling several answers and
+  keeping the best one by a checker (best-of-n), keeping the most common one (majority
+  voting), or searching over partial answers with a tree search guided by a scorer. Each
+  buys accuracy with money and waiting time, and each is only as good as its checker.
+
+
+  Training runs on the same idea in reverse. A **reward model** scores answers, or each step
+  of an answer, and reinforcement learning shifts the model towards what scores well. RLHF
+  used PPO with a learned reward model. Newer reasoning models lean on GRPO and on rewards a
+  program can check, such as a maths result or passing tests.
+
+
+  You need this in two places. In interviews at AI companies, where these terms are asked
+  directly. And in design: whether a hard task deserves a reasoning model, a vote over
+  samples or a test-driven retry loop is a cost and latency decision you'll make often.
+remember:
+  - Chain of thought helps on multi-step problems because each written step becomes context for the next token, and it costs tokens and time on simple ones.
+  - Test-time compute trades money and latency for accuracy, by thinking longer, sampling several answers or searching.
+  - Best-of-n is only as good as its checker; tests and exact checks beat a model grading its own work.
+  - Majority voting (self-consistency) keeps the answer most samples agree on, and the level of agreement is a useful confidence signal.
+  - Monte Carlo tree search repeats select, expand, evaluate and back up, so promising branches get explored more.
+  - An outcome reward model scores the final answer; a process reward model scores each step, which shows where reasoning broke but costs far more to label.
+  - PPO clips each update and needs a value model; GRPO compares each answer with its group's average instead, which saves a whole network.
+  - A model that can tell it's being tested may behave differently in real use, so evals should look like real traffic and be backed by production monitoring.
+sections:
+  - title: Chain of thought, prompted and trained
+    body: |-
+      There are two ways to get it. **Prompted** chain of thought asks for it: "work
+      through the steps, then give the answer on the last line". Early research showed that
+      a few worked examples with their steps, in the prompt, lifted accuracy on maths and
+      logic problems for large models. **Trained** chain of thought is what reasoning models
+      do: reinforcement learning rewarded correct final answers, and long, careful
+      reasoning turned out to be what earned them.
+
+      Why it works is the generation loop itself. A model does a fixed amount of computation
+      per token. A hard question answered in one token gets one token's worth of thought.
+      Written steps spread the work over many tokens, and each step is in the context when
+      the next is written, like carrying a digit in long division.
+
+      Three caveats come up in interviews. It costs: thinking tokens are output tokens, the
+      dearest and slowest kind, so a reasoning model on a simple classification task wastes
+      both. It isn't always faithful: research has shown cases where the written steps leave
+      out what really swayed the answer, such as a hint planted in the prompt. Read the
+      steps as a useful trace, not as proof. And it doesn't add knowledge: a model that
+      lacks a fact reasons fluently to a wrong answer.
+
+      In practice, most providers let you switch thinking on and set a budget per request.
+      Measure it like any other setting: run your eval set with and without, and compare
+      accuracy, cost and time to first token.
+  - title: Best-of-n and voting in code
+    body: |-
+      Majority voting, also called **self-consistency**, samples several reasoning paths and
+      keeps the final answer most of them reach. It needs no checker, only answers that can
+      be compared, such as a number or a label.
+
+      ```python
+      import random
+      from collections import Counter
+
+      def solve(question, rng):
+          # Stands in for one sampled reasoning path: right three times in five.
+          return rng.choice(["42", "42", "42", "41", "24"])
+
+      def majority_vote(question, n, rng):
+          answers = [solve(question, rng) for _ in range(n)]
+          answer, votes = Counter(answers).most_common(1)[0]
+          return answer, round(votes / n, 2)
+
+      rng = random.Random(5)
+      print(majority_vote("6 * 7?", 1, rng))   # ('24', 1.0)
+      print(majority_vote("6 * 7?", 15, rng))  # ('42', 0.67)
+      ```
+
+      One sample was wrong; fifteen outvoted the mistake. The share of votes is a free
+      confidence signal: low agreement is a good reason to escalate to a person or a bigger
+      model.
+
+      **Best-of-n** needs a scorer. For code, run the tests. For maths, check the result.
+      For open-ended text, a reward model or an LLM judge. The weaker the scorer, the more
+      n works against you: with more candidates, you're more likely to find one that fools
+      it. That's called **reward hacking**, or over-optimising the verifier. Both methods
+      multiply cost by n, though the samples can run in parallel, so latency grows far
+      less than cost.
+  - title: How tree search chooses where to look
+    body: |-
+      Monte Carlo tree search keeps, for every node, how often it was visited and the total
+      score its visits earned. The **select** step walks down from the root, at each level
+      picking the child with the best balance of "has scored well" and "hasn't been tried
+      much". A common formula for that balance is UCB.
+
+      ```python
+      import math
+
+      def ucb(value_sum, visits, parent_visits, c=1.4):
+          if visits == 0:
+              return math.inf  # try every move once
+          exploit = value_sum / visits
+          explore = c * math.sqrt(math.log(parent_visits) / visits)
+          return exploit + explore
+
+      # Two reasoning steps after 20 visits to their parent.
+      print(round(ucb(value_sum=7, visits=10, parent_visits=20), 2))  # 1.47
+      print(round(ucb(value_sum=1, visits=2, parent_visits=20), 2))   # 2.21
+      ```
+
+      The barely-tried step wins this round, though its average is lower. Exploration keeps
+      the search from locking on to the first decent idea. **Expand** adds one new child
+      there. **Evaluate** scores it: in AlphaGo, a value network and quick simulated games;
+      with a language model, a process reward model or a value model scoring the partial
+      solution. **Back up** adds the score to every node on the path to the root. When the
+      budget runs out, the most visited move wins.
+
+      For language models, a "move" is one reasoning step, and the search is costly: every
+      node is a generation and a scoring call. Simpler cousins, such as **beam search** over
+      steps (keep the top k partial solutions at each depth), are often used instead.
+      Whether a search helps depends heavily on how good the step scorer is.
+  - title: Reward models, from rankings and from checks
+    body: |-
+      A classic reward model is trained on **preference pairs**: for one prompt, people
+      mark which of two answers is better. The model learns to give the preferred answer a
+      higher score. That's the reward in RLHF, and it's how "helpful and harmless" was
+      turned into a number.
+
+      An **outcome reward model** scores the finished answer. It's cheap to label, since
+      you only need the right final answer, but its signal is sparse: a long solution that
+      fails gets one low score, with no hint of which step failed. A **process reward
+      model** scores each step. Research on maths problems found process supervision
+      trained a more reliable verifier than outcome supervision, and it guides search step
+      by step. The cost is labels: someone, or something, has to judge every step.
+
+      For maths and code there's a third option: **verifiable rewards**. A program checks
+      the result or runs the tests, so the reward is exact and free to compute. Much of the
+      recent progress in reasoning models came from reinforcement learning against rewards
+      like these, which are much harder to game than a learned reward model.
+
+      Any learned scorer can be gamed. A policy trained hard against it finds answers the
+      scorer likes but people don't: longer, more confident, more flattering. Guard rails
+      are a penalty for drifting from the original model, fresh human checks, and
+      verifiable rewards wherever the task allows them.
+  - title: PPO and GRPO in a few lines
+    body: |-
+      Both methods follow the same loop: sample answers from the current model (the
+      **policy**), score them, work out an **advantage** for each (how much better than
+      expected it did), and nudge the model to make positive-advantage answers more likely.
+
+      **PPO** limits each nudge. It compares how likely the updated model makes an answer
+      with how likely the old one did, and clips that ratio, typically to within 20%:
+
+      ```python
+      def clipped_objective(ratio, advantage, eps=0.2):
+          # ratio: how much likelier the updated model makes this answer than before.
+          unclipped = ratio * advantage
+          clipped = max(min(ratio, 1 + eps), 1 - eps) * advantage
+          return min(unclipped, clipped)
+
+      print(clipped_objective(1.1, 1.0))   # 1.1, inside the clip: counts in full
+      print(clipped_objective(1.5, 1.0))   # 1.2, a good answer made 50% likelier: capped
+      print(clipped_objective(0.5, -1.0))  # -0.8, a bad answer halved: no more credit
+      ```
+
+      PPO's advantage comes from a **value model**, a second network as large as the
+      policy that predicts the expected score. In RLHF a penalty also keeps the policy
+      close to the original model, so it doesn't drift into text that games the reward.
+
+      **GRPO** drops the value model. It samples a group of answers to each prompt and
+      measures each against the group:
+
+      ```python
+      from statistics import mean, pstdev
+
+      def group_advantages(rewards):
+          mu, sigma = mean(rewards), pstdev(rewards)
+          if sigma == 0:
+              return [0.0 for _ in rewards]  # all equal: this group teaches nothing
+          return [round((r - mu) / sigma, 2) for r in rewards]
+
+      print(group_advantages([1, 0, 0, 0]))  # [1.73, -0.58, -0.58, -0.58]
+      print(group_advantages([0, 0, 0, 0]))  # [0.0, 0.0, 0.0, 0.0]
+      ```
+
+      The rare correct answer gets a large push. A group that all fails, or all passes,
+      teaches nothing, which is why training problems are picked to be hard but solvable.
+      A related method, **DPO**, skips both the reward model and the sampling loop and
+      learns from preference pairs directly.
+  - title: Self-improvement and models that know they're tested
+    body: |-
+      **Recursive self-improvement** is an AI system improving the process that builds its
+      successor: writing training data, training code or research ideas for the next
+      version, which does the same for the version after. If each round speeds up the
+      next, progress compounds. Today it exists only in partial forms, such as models
+      generating and filtering their own training data, or helping researchers write code.
+      It matters for safety because a fast loop leaves people less time to check each step.
+
+      **Situational awareness** is a model's knowledge of its own situation: that it's an
+      AI, how models like it are trained, and whether a given prompt is probably a test or
+      real use. It is called **emergent** because nobody trains it in on purpose; it grows
+      with scale and training data that describes AI. Research has measured it directly,
+      and found that frontier models can often tell evaluation transcripts from real ones.
+      That ability is **eval awareness**.
+
+      Why an engineer should care: an eval is a sample of behaviour, and it only predicts
+      real use if the model behaves the same in both. A model that spots the test may be
+      more careful there. The same logic applies to your product evals. Build them from
+      real, anonymised traffic rather than tidy invented prompts, keep a slice of
+      production traffic under review, and treat a clean eval as evidence, not proof.
+pitfalls:
+  - "**Turning on a reasoning model for every request.** Thinking tokens are output tokens, the slowest and dearest kind. Route simple lookups and labels to a fast model, and measure where thinking lifts your eval score."
+  - "**Letting the model grade its own best-of-n.** A self-rating is quickly fooled and favours confident answers. Score candidates with tests, exact checks or a separate, validated judge."
+  - "**Reading the chain of thought as the real reason.** Written steps can leave out what swayed the answer. Use them to debug, and verify the answer on its own."
+  - "**Raising n without watching the checker.** More candidates means more chances to find one that fools a weak scorer. Improve the scorer before you raise n."
+  - "**Mixing up outcome and process reward models.** One scores the final answer, the other each step. Say which, and why the labelling cost differs."
+  - "**Trusting a clean eval as proof.** Tidy, clearly invented prompts give the test away. Build evals from real traffic and keep checking production."
+interview:
+  - question: What is chain-of-thought reasoning, and when does it help?
+    answer: >-
+      It's the model writing its intermediate steps before the final answer, like long
+      division on paper. It helps because a model does a fixed amount of work per token, so
+      spreading a hard problem over many tokens, each in context for the next, gives it more
+      room to get it right. It helps most on maths, logic, planning and multi-step code.
+      You can prompt for it, or use a reasoning model that was trained to do it. Two
+      caveats: it costs output tokens and latency, so it's wasteful on simple lookups or
+      labels, and the written steps aren't always faithful to what drove the answer, so I
+      verify the result rather than trusting the explanation.
+  - question: What is test-time compute scaling?
+    answer: >-
+      Getting better answers by spending more computation while answering, not only while
+      training. The model thinks longer, samples several answers and picks one, or searches
+      over reasoning steps, and accuracy on hard problems goes up with the budget. It's a
+      second axis of scaling beside bigger models and more training data, and it's why a
+      smaller model that thinks can beat a larger one that doesn't on maths or code. The
+      trade-off is cost and waiting time per request, so I'd spend it selectively: route
+      hard requests to more compute and keep simple ones fast, and check with evals where the
+      extra budget stops paying off.
+  - question: What is best-of-n sampling, and how does majority voting differ?
+    answer: >-
+      Best-of-n generates n answers and keeps the one a scorer rates highest: a reward
+      model, a checker, or for code the test suite. Majority voting, also called
+      self-consistency, samples several reasoning paths and keeps the final answer most of
+      them reach, so it needs no scorer, only answers that can be compared. Both multiply
+      cost by n, though parallel sampling keeps latency close to one call. The risk with
+      best-of-n is the scorer: a weak one gets fooled more as n grows, which is reward
+      hacking. With voting, the share that agree is a useful confidence signal, and low
+      agreement is a good trigger to escalate.
+  - question: Explain Monte Carlo tree search, and how it applies to language models.
+    answer: >-
+      It's a way to search a tree of possible moves without expanding all of it, famous
+      from AlphaGo. It repeats four steps. Select walks down the tree, balancing branches
+      that scored well against ones tried less, often with a UCB formula. Expand adds one
+      new move. Evaluate scores the new position. Back up adds that score to every node on
+      the path, so good branches get visited more. At the end, the most visited move wins.
+      With a language model, a move is a reasoning step and a process reward model or a
+      value model scores partial solutions. It finds better answers but it's expensive, since every node
+      is a generation and a scoring call, so simpler searches like beam search are common.
+  - question: What's the difference between a process reward model and an outcome reward model?
+    answer: >-
+      An outcome reward model scores only the final answer, right or wrong. A process
+      reward model scores each step of the solution. The process model shows where the
+      reasoning went wrong, which gives denser training signal and lets a search prune a bad
+      branch before it finishes. Research on maths problems found process supervision made
+      a more reliable verifier. The downside is data: step-level labels are far more
+      expensive to collect than final-answer labels. Where answers can be checked by a
+      program, like maths results or tests, outcome rewards are exact and cheap, which is
+      why they're used heavily for reasoning models.
+  - question: What is PPO, and what role does it play in RLHF?
+    answer: >-
+      Proximal policy optimisation is the reinforcement learning method behind classic
+      RLHF. The model, the policy, generates answers, a reward model trained on human
+      preference pairs scores them, and the policy is nudged towards higher-scoring answers.
+      Proximal means each update is clipped: the ratio between the new and old probability
+      of an answer is kept within a small range, around 20%, so one batch can't change the
+      model too much. A penalty also keeps it close to the original model, so it doesn't
+      drift into text that games the reward. The cost is memory: PPO trains a separate
+      value model, as large as the policy, to estimate expected reward.
+  - question: What is GRPO, and why did it become popular for reasoning models?
+    answer: >-
+      Group relative policy optimisation is a cheaper variant of PPO, introduced in the
+      DeepSeekMath work and used for DeepSeek's reasoning models. For each prompt it samples
+      a group of answers and scores them all. Each answer's advantage is its reward minus
+      the group's mean, divided by the group's spread. That group baseline replaces PPO's
+      value model, saving a whole network's memory and compute. It fits rewards a program
+      can check, like a correct maths answer or passing tests: sample eight solutions, the
+      correct ones get pushed up, the wrong ones down. One consequence: a group where every
+      answer scores the same teaches nothing, so training problems must be hard but
+      solvable.
+  - question: What are recursive self-improvement and eval awareness, and why do safety researchers care?
+    answer: >-
+      Recursive self-improvement is an AI system improving the process that builds its
+      successor: writing training data, training code or research ideas for the next
+      version, which does the same again. If each round speeds up the next, progress
+      compounds. Today it exists only in partial forms, such as models generating training
+      data or helping with research code. Situational awareness is a model's knowledge of
+      its own situation, including whether a prompt looks like a test. It's called emergent
+      because nobody trains it in; it grows with scale, and frontier models can often tell
+      evaluation transcripts from real use. That's eval awareness. The two meet in
+      oversight. A fast loop leaves people less time to check each version, and a model
+      that recognises tests makes those checks less trustworthy. The engineering response
+      matches product evals: realistic tests built from real traffic, plus monitoring in
+      production.
+terms:
+  - term: Chain of thought
+    say: The model showing its real reasoning.
+    means: Written intermediate steps that become context for later tokens, which helps on
+      multi-step problems. The written steps are not guaranteed to reflect how the model
+      reached its answer.
+  - term: Test-time compute
+    say: Using a bigger model.
+    means: Spending more computation per question while answering, by thinking longer, sampling
+      several answers or searching. It trades money and latency for accuracy.
+  - term: Best-of-n
+    say: Ask several times and pick the best.
+    means: Sampling n answers and keeping the one a checker scores highest. It is only as good
+      as the checker, and tests beat a model grading its own work.
+  - term: RLHF
+    say: Humans correcting the model's answers.
+    means: "Reinforcement learning from human feedback: people rank answers, a reward model
+      learns those preferences, then the model is trained with RL, classically PPO, to score
+      well on it."
+  - term: GRPO
+    say: A newer version of PPO.
+    means: "Group Relative Policy Optimisation: sample a group of answers per prompt and score
+      each against the group's average instead of a value model, which saves a whole
+      network."
+  - term: Process reward model
+    say: A stricter outcome reward model.
+    means: A model that scores each reasoning step rather than only the final answer. It shows
+      where reasoning broke but costs far more to label.
+  - term: Reward hacking
+    say: The model cheating on purpose.
+    means: Training finds a way to score high reward without doing the intended task, such as
+      editing a test so it passes. It is a flaw in the reward, not intent.

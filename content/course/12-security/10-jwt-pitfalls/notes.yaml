@@ -1,0 +1,291 @@
+summary: >-
+  A JWT is a set of claims (who you are, what you may do, until when) with a signature, so a
+  server can check it without looking anything up. That property is the whole appeal: any
+  service holding the key can verify a request on its own. It is also the source of every
+  pitfall. The token is readable by anyone, the verifier trusts whatever the token says about
+  itself unless you stop it, and a token the server can't look up is a token the server can't
+  forget.
+
+
+  The lesson covers reading a payload, verifying with pinned settings, storage in `HttpOnly`
+  cookies and the basics of revocation. These notes open the verifier up: every check it must
+  make and in which order, how algorithm confusion, `alg: none` and a hostile `kid` work so
+  you can test for them, what JWE adds over JWS, and refresh token rotation with reuse
+  detection, which is how short-lived access tokens stay usable.
+
+
+  Reach for JWTs when several services must verify identity without a shared session store,
+  or when a third party issues the token, as in OAuth and OpenID Connect. For one web app
+  talking to its own backend, an opaque session id in a cookie is simpler and revocable by
+  deleting a row. Many teams would be better off with sessions.
+remember:
+  - A signed JWT is readable by anyone, so never put secrets, or personal data you wouldn't show the user, in the payload.
+  - The server decides the algorithm; the token's `alg` header is only checked against that allow-list, never obeyed.
+  - Verify the signature first, then `exp`, `nbf`, `iss`, `aud` and the token type, and treat any failure as a rejected request.
+  - Bind each key to one algorithm, and look up `kid` in a fixed map of trusted keys, never as a path, a query or a URL.
+  - A JWT can't be revoked by the server, so keep access tokens short (5 to 15 minutes) and revoke the server-side refresh token.
+  - Refresh token rotation issues a new refresh token on every use, and a reused old one revokes the whole family.
+  - An `HttpOnly`, `Secure`, `SameSite` cookie keeps the token away from scripts, but cookies bring CSRF back into scope.
+  - JWS signs so nobody can change the claims; JWE encrypts so nobody can read them; most access tokens only need JWS.
+sections:
+  - title: Every check a verifier makes, in order
+    body: |-
+      A library such as `jose` does all of this in one call. Writing it out once shows what
+      "verify" means and why the order matters. Nothing in the payload is trusted until the
+      signature holds.
+
+      ```js
+      import { createHmac, timingSafeEqual } from 'node:crypto';
+
+      // For reading only: in production, call a maintained library such as jose.
+      const b64json = (part) => JSON.parse(Buffer.from(part, 'base64url').toString('utf8'));
+      const hs256 = (key, input) => createHmac('sha256', key).update(input).digest();
+
+      function verifyHs256(token, key, { issuer, audience, leewaySeconds = 30, now = Date.now() }) {
+        const parts = token.split('.');
+        if (parts.length !== 3) throw new Error('malformed');
+        const [h, p, s] = parts;
+        const header = b64json(h);
+        if (header.alg !== 'HS256') throw new Error('algorithm not allowed'); // pinned by the server
+        if (header.typ !== 'at+jwt') throw new Error('wrong token type');
+        const expected = hs256(key, `${h}.${p}`);
+        const given = Buffer.from(s, 'base64url');
+        if (given.length !== expected.length || !timingSafeEqual(given, expected)) {
+          throw new Error('bad signature');
+        }
+        // Only now is the payload worth reading.
+        const claims = b64json(p);
+        const t = Math.floor(now / 1000);
+        if (typeof claims.exp !== 'number' || t >= claims.exp + leewaySeconds) throw new Error('expired');
+        if (typeof claims.nbf === 'number' && t < claims.nbf - leewaySeconds) throw new Error('not yet valid');
+        if (claims.iss !== issuer) throw new Error('wrong issuer');
+        const aud = Array.isArray(claims.aud) ? claims.aud : [claims.aud];
+        if (!aud.includes(audience)) throw new Error('wrong audience');
+        return claims;
+      }
+      ```
+
+      Run against test tokens, an `alg: none` token fails with "algorithm not allowed", a
+      token for `billing-api` with "wrong audience", an hour-old one with "expired", and an
+      ID token (`typ: JWT`) with "wrong token type".
+
+      Some details worth saying out loud. `exp` and `nbf` are seconds, not milliseconds, and a
+      small **leeway** absorbs clock drift between servers. A missing `exp` is a rejection,
+      not a token that lives for ever. `aud` may be a string or an array. The **explicit
+      type** check comes from RFC 8725: it stops a token minted for one purpose, such as an
+      OpenID Connect ID token, being replayed as an access token when both share a key.
+      `at+jwt` is the type RFC 9068 defines for OAuth access tokens. The comparison uses
+      `timingSafeEqual`, so response time doesn't reveal how many bytes matched.
+  - title: Algorithm confusion, alg none and a hostile kid
+    body: |-
+      All three attacks share one root: the verifier lets the token describe how it should be
+      checked.
+
+      **`alg: none`** is a legal value in the JWS spec for tokens protected some other way.
+      A verifier that obeys the header skips the signature entirely. **Algorithm confusion**
+      targets public-key tokens. The issuer signs with RS256 and verifiers hold the public
+      key. If a verifier calls a generic `verify(token, key)` that picks HMAC or RSA from the
+      header, an attacker sends `alg: HS256` and signs with the public key's text as the HMAC
+      secret. The public key is public, so anyone can produce a valid-looking token.
+
+      The fix is to bind each key to exactly one algorithm, and to test that binding.
+
+      ```js
+      import { generateKeyPairSync, createHmac, createVerify, createSign } from 'node:crypto';
+
+      const { publicKey, privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+      const enc = (o) => Buffer.from(JSON.stringify(o)).toString('base64url');
+
+      // Each key id maps to one key and the one algorithm it may be used with.
+      const trusted = new Map([['2026-09', { alg: 'RS256', key: publicKey }]]);
+
+      function verifySignature(token) {
+        const [h, p, s] = token.split('.');
+        const header = JSON.parse(Buffer.from(h, 'base64url').toString());
+        const entry = trusted.get(header.kid);
+        if (!entry) throw new Error('unknown key');
+        if (header.alg !== entry.alg) throw new Error('algorithm does not match key');
+        const ok = createVerify('RSA-SHA256').update(`${h}.${p}`).verify(entry.key, Buffer.from(s, 'base64url'));
+        if (!ok) throw new Error('bad signature');
+        return JSON.parse(Buffer.from(p, 'base64url').toString());
+      }
+
+      // A real token from the issuer.
+      const input = `${enc({ alg: 'RS256', kid: '2026-09' })}.${enc({ sub: '42' })}`;
+      const good = `${input}.${createSign('RSA-SHA256').update(input).sign(privateKey, 'base64url')}`;
+      console.log(verifySignature(good).sub); // 42
+
+      // Regression test for algorithm confusion: an HMAC keyed with the public key must fail.
+      const pem = publicKey.export({ type: 'spki', format: 'pem' });
+      const forgedInput = `${enc({ alg: 'HS256', kid: '2026-09' })}.${enc({ sub: '1', role: 'admin' })}`;
+      const forged = `${forgedInput}.${createHmac('sha256', pem).update(forgedInput).digest('base64url')}`;
+      try {
+        verifySignature(forged);
+        console.log('ACCEPTED');
+      } catch (e) {
+        console.log(e.message); // algorithm does not match key
+      }
+      ```
+
+      **`kid`** is attacker-controlled text. Verifiers have been caught reading it as a file
+      path (`../../dev/null` gives an empty key) or pasting it into SQL. Treat it as a key into
+      a map you built. The headers `jku` and `x5u` name a URL to fetch keys from; honouring
+      them lets the token choose its own trust anchor. Fetch the JWKS only from the issuer URL
+      you configured and cache it. Refetch when an unknown `kid` arrives, since that's how a
+      rotation shows up, but with a cooldown, so a flood of made-up ids can't hammer the
+      issuer.
+  - title: HS256 or RS256, JWS or JWE
+    body: |-
+      **HS256** uses one shared secret to sign and verify. Every service that can verify can
+      also mint tokens, so a leak anywhere is a leak of the issuer's power. It suits one
+      service that issues and checks its own tokens. The secret must be long and random, at
+      least 256 bits; a short one can be brute-forced offline from any token, because the
+      attacker can test guesses without talking to you.
+
+      **RS256**, **ES256** and **EdDSA** sign with a private key that only the issuer holds.
+      Verifiers get the public key, usually from a JWKS endpoint. A compromised verifier can't
+      forge tokens. This is the right shape for anything with several services or a separate
+      login server, and it's what OAuth and OpenID Connect providers use. ES256 and EdDSA give
+      much shorter keys and signatures than RSA.
+
+      Everything so far is a **JWS**, a signed token of three parts. A **JWE** has five parts
+      (header, encrypted key, IV, ciphertext, tag) and hides the claims from anyone without the
+      decryption key. Use it when a token must pass through a party that shouldn't read it,
+      such as a browser carrying claims meant only for a backend. When both are needed, the
+      usual order is sign, then encrypt, known as a nested JWT.
+
+      Often the better answer to "the payload is sensitive" is not JWE but a smaller payload.
+      Put an opaque user id in `sub` and look the rest up. Or skip JWTs for that hop and use an
+      opaque reference token the resource server introspects with the issuer.
+  - title: Short-lived access, rotating refresh, reuse detection
+    body: |-
+      Short access tokens limit how long a stolen one works. Something must mint new ones
+      without asking for the password every ten minutes: the **refresh token**. It's opaque,
+      stored server-side (as a hash), and sent only to the token endpoint.
+
+      **Rotation** issues a fresh refresh token on every use and marks the old one spent. Now
+      a stolen refresh token has a tell: sooner or later both the thief and the real user
+      present tokens from the same family. The second use of a spent token means someone else
+      has a copy, so the server revokes the entire family and both must sign in again.
+
+      ```js
+      import { randomBytes, createHash } from 'node:crypto';
+
+      // Server-side store. Only hashes are kept, so a database leak doesn't hand out live tokens.
+      const tokens = new Map(); // hash -> { userId, familyId, used, expiresAt }
+      const hash = (t) => createHash('sha256').update(t).digest('hex');
+      const DAY = 24 * 60 * 60 * 1000;
+
+      function issue(userId, familyId = randomBytes(8).toString('hex')) {
+        const token = randomBytes(32).toString('base64url');
+        tokens.set(hash(token), { userId, familyId, used: false, expiresAt: Date.now() + 30 * DAY });
+        return token;
+      }
+
+      function revokeFamily(familyId) {
+        for (const [h, t] of tokens) if (t.familyId === familyId) tokens.delete(h);
+      }
+
+      function refresh(token) {
+        const record = tokens.get(hash(token));
+        if (!record || record.expiresAt < Date.now()) return { error: 'sign in again' };
+        if (record.used) {
+          // A spent token came back: two parties hold this family. Kill it for both.
+          revokeFamily(record.familyId);
+          return { error: 'sign in again' };
+        }
+        record.used = true;
+        return { refreshToken: issue(record.userId, record.familyId), accessToken: '(short-lived JWT)' };
+      }
+
+      const first = issue('user-42');
+      const second = refresh(first).refreshToken; // the real browser rotates
+      const stolenCopy = first; // an attacker copied the first one earlier
+
+      console.log(refresh(stolenCopy)); // { error: 'sign in again' }: reuse detected
+      console.log(refresh(second)); // { error: 'sign in again' }: the whole family is gone
+      ```
+
+      One production wrinkle: two browser tabs refreshing at the same moment look exactly like
+      reuse. Real implementations allow a grace period of a few seconds in which the previous
+      token still returns the same new pair. Logout deletes the family. "Sign out everywhere"
+      deletes every family for the user.
+  - title: Cookies, localStorage and CSRF
+    body: |-
+      The storage question is about which attack you'd rather defend against. A token in
+      `localStorage` or a JavaScript variable is readable by any script on the page, so one XSS
+      exfiltrates it and the attacker replays it from their own machine. A token in an
+      `HttpOnly` cookie can't be read by scripts, but the browser attaches it automatically,
+      which is exactly what CSRF abuses.
+
+      The cookie route is the better default for a browser app, because CSRF has solid,
+      mechanical defences and XSS is much harder to rule out. Set it like this:
+
+      ```http
+      Set-Cookie: __Host-session=eyJhbGciOi...; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=900
+      ```
+
+      `HttpOnly` hides it from scripts. `Secure` sends it only over HTTPS. `SameSite=Lax`
+      stops it riding along on cross-site POSTs, the classic CSRF shape. The `__Host-` prefix
+      makes the browser refuse the cookie unless it's `Secure`, has `Path=/` and has no
+      `Domain`, so a subdomain can't plant or overwrite it. For state-changing endpoints, add a
+      CSRF token or check the `Origin` header as well, because `Lax` still allows top-level GET
+      navigations.
+
+      Put the refresh token in its own cookie scoped to the refresh endpoint with
+      `Path=/auth/refresh`, so it isn't sent with every request. Native mobile apps have no
+      cookie jar worth the name and keep tokens in the platform keychain instead.
+
+      Neither option makes XSS harmless. An injected script can still call your API from the
+      open page while the user is there. The cookie only stops it taking the token away to use
+      later.
+pitfalls:
+  - '**Decoding instead of verifying.** `decodeJwt` or `atob` reads claims without checking anything, so a forged `role: "admin"` passes. Only trust claims returned by the verify call.'
+  - '**Letting the header choose the algorithm.** A generic verify that obeys `alg` accepts `none` or an HMAC signed with the public key. Pass an `algorithms` allow-list and bind each key to one algorithm.'
+  - '**Skipping `aud` and `iss`.** A valid token from the same login server but meant for another API gets accepted. Always pin issuer and audience, and check the token type.'
+  - '**A short or guessable HS256 secret.** Anyone holding one token can guess secrets offline until the signature matches. Use at least 256 random bits from a secrets manager, or switch to an asymmetric algorithm.'
+  - '**Long-lived access tokens because refresh is work.** A 24-hour JWT stays valid for 24 hours after it is stolen or the user logs out. Keep access tokens to minutes and rotate refresh tokens.'
+  - '**Moving to cookies and forgetting CSRF.** An automatically sent cookie reopens cross-site request forgery. Use `SameSite=Lax` or `Strict`, plus a CSRF token or `Origin` check on state-changing routes.'
+interview:
+  - question: What are the most common JWT vulnerabilities, and how do you prevent them?
+    answer: >-
+      Almost all of them come from trusting the token to describe how it should be checked.
+      `alg: none` skips the signature. Algorithm confusion gets an RS256 verifier to run HMAC
+      with the public key as the secret. A `kid` used as a file path or in SQL becomes
+      injection, and `jku` lets the token pick its own key server. The fixes: pin allowed
+      algorithms on the server, bind each key to one algorithm, look `kid` up in a fixed map,
+      and fetch JWKS only from a configured issuer. Then validate claims: `exp`, `nbf` with a
+      little leeway, `iss`, `aud` and the token type, per RFC 8725. Beyond that, weak HS256
+      secrets can be brute-forced offline. I'd use a maintained library like `jose` and write
+      negative tests for each of these.
+  - question: JWTs or server-side sessions for a web app? Defend your choice.
+    answer: >-
+      For one web app and its own backend, I'd choose server-side sessions: an opaque id in an
+      `HttpOnly` cookie, looked up in Redis or the database. Logout and "revoke this device"
+      are a delete, the cookie is tiny, and nothing about the user is readable in transit. The
+      lookup costs a millisecond or two. JWTs earn their place when many services must verify
+      identity without sharing a session store, or when a separate identity provider issues
+      tokens, as with OAuth and OpenID Connect. Then I'd use short-lived asymmetric access
+      tokens, rotating refresh tokens and a small deny list for emergencies. The trade-off is
+      statelessness against revocability; most apps need revocability more.
+  - question: How do you implement logout and revocation when access tokens are JWTs?
+    answer: >-
+      You accept that an access token lives until `exp` and make that short, then control
+      everything around it. Access tokens last 5 to 15 minutes. Refresh tokens are opaque,
+      stored hashed on the server and rotated on every use. Logout deletes the refresh token
+      family, so no new access tokens can be minted. For emergencies, such as a stolen laptop
+      or a fired employee, a deny list keyed by `jti` or by user id with an issued-after
+      timestamp blocks current tokens at once; it stays small because entries only live until
+      the tokens expire. Rotating the signing key is the nuclear option, since it signs out
+      everyone. The cost is a lookup on each request for the deny list, which is why it's kept
+      tiny.
+  - question: Explain refresh token rotation with reuse detection.
+    answer: >-
+      Every time a client uses a refresh token, the server issues a new one and marks the old
+      one as spent, keeping them linked in a family. If a spent token is ever presented again,
+      two parties hold copies: the real client and whoever stole it. The server can't tell
+      which is which, so it revokes the whole family and both must sign in again. That turns a
+      silent, long-lived theft into a detected one, usually within one refresh cycle. Tokens are
+      stored as hashes so a database leak doesn't expose live ones. The practical catch is
+      concurrency: two tabs refreshing at once look like reuse, so implementations allow a
+      short grace window where the previous token returns the same new pair.

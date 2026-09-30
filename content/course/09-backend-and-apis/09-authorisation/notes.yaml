@@ -1,0 +1,226 @@
+summary: >-
+  Authentication tells the server who is asking. **Authorisation** decides whether that
+  caller may do this action to this particular thing. The two are separate checks, and the
+  second is the one teams forget: an endpoint that checks a session and then returns any
+  record whose id you name lets every signed-in user read everyone's data. That bug, an
+  insecure direct object reference or IDOR, is the most common serious flaw in real APIs.
+
+
+  The lesson's two tools cover most products. **Ownership checks** put the caller into the
+  lookup, so a record that isn't theirs is never found. **Roles** bundle permissions, so
+  staff can read any order and only some can refund, without a special case per person. Both
+  follow one principle: deny by default, and grant explicitly.
+
+
+  These notes go further: pushing the check into the SQL so the read and the write can't be
+  split, the models beyond roles (attributes and relationships), the three kinds of broken
+  access control an API can have, and how to test a permission rule so it stays right as
+  the product grows.
+remember:
+  - Authentication says who the caller is; authorisation decides whether they may do this action to this resource, and every endpoint needs both.
+  - An IDOR is an endpoint that acts on any id the caller supplies without checking the caller may touch that record.
+  - Put the ownership condition inside the query, as `WHERE id = $1 AND owner_id = $2`, so a foreign record is never loaded and there is no second check to forget.
+  - Answer a record the caller may not see with 404, so the response doesn't confirm it exists, and use 403 when they can see it but not do this action.
+  - Deny by default, so a new action or a new role has no access until someone grants it.
+  - Take the caller's id and role from the server-side session, never from the request body, a header or a query parameter.
+  - Random ids such as UUIDs make guessing harder but don't replace the check, because ids leak through links, emails and other responses.
+  - Check authorisation on every read and write path, including list, search, export and bulk endpoints, not only the single-record route.
+sections:
+  - title: The check belongs in the query
+    body: |-
+      With a database, the ownership check moves into SQL. That does more than save a line:
+      the check and the action become one statement, so nothing can happen between them.
+
+      ```sql
+      CREATE TABLE orders (
+        id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        owner_id bigint NOT NULL,
+        status text NOT NULL DEFAULT 'paid',
+        total_pence integer NOT NULL
+      );
+      CREATE INDEX orders_owner_id_idx ON orders (owner_id);
+
+      -- Read one: Ana (user 1) asks for order 2, which is Ben's. No rows.
+      SELECT id, status, total_pence FROM orders WHERE id = $1 AND owner_id = $2;
+
+      -- Cancel: ownership, state and change in one statement.
+      UPDATE orders SET status = 'cancelled'
+      WHERE id = $1 AND owner_id = $2 AND status = 'paid'
+      RETURNING id, status;
+
+      -- List: the same filter, and an index so it stays fast.
+      SELECT id, total_pence FROM orders WHERE owner_id = $1 ORDER BY id;
+      ```
+
+      Run on PostgreSQL 18 with three orders, Ana's request for Ben's order returns no rows,
+      and her cancel of Ben's order updates none. Your handler turns zero rows into a 404.
+
+      The alternative, loading the order and then comparing `order.ownerId` in code, works
+      until someone adds a new route and forgets the comparison. It also has a gap: the
+      order can change between the read and the write. The one-statement version can't
+      forget and can't race.
+
+      In a multi-tenant product the same idea applies one level up. Every table carries a
+      `tenant_id`, and every query filters by it. PostgreSQL's row-level security can
+      enforce that inside the database itself, so even a query that forgets the filter
+      returns nothing; the databases chapter covers it.
+  - title: Beyond roles, with rules that read the record
+    body: |-
+      Pure roles answer "may staff refund?". Real rules often depend on the record too: a
+      customer may cancel their own order, but only while it's still `paid`. Checking
+      attributes of the user, the resource and the situation is called **attribute-based
+      access control**, ABAC. A small policy table handles both.
+
+      ```ts
+      type Role = 'customer' | 'staff' | 'admin';
+      interface User { id: number; role: Role; }
+      interface Order { id: number; ownerId: number; status: 'paid' | 'shipped' | 'cancelled'; }
+      type Action = 'read' | 'cancel' | 'refund' | 'delete';
+
+      // Each rule says who may do an action, given the facts about the order.
+      type Rule = (user: User, order: Order) => boolean;
+      const own: Rule = (user, order) => order.ownerId === user.id;
+
+      const policy: Record<Role, Partial<Record<Action, Rule>>> = {
+        customer: {
+          read: own,
+          cancel: (user, order) => own(user, order) && order.status === 'paid',
+        },
+        staff: {
+          read: () => true,
+          refund: (_user, order) => order.status !== 'cancelled',
+        },
+        admin: {
+          read: () => true,
+          refund: (_user, order) => order.status !== 'cancelled',
+          delete: () => true,
+        },
+      };
+
+      export function can(user: User, action: Action, order: Order): boolean {
+        const rule = policy[user.role][action];
+        return rule ? rule(user, order) : false; // nothing granted means no
+      }
+      ```
+
+      A missing entry is a refusal, so deny by default is built in.
+
+      A third model, **relationship-based access control**, ReBAC, answers "is this user
+      connected to this object?": a document shared with a team the user belongs to, a
+      folder inherited from its parent. Google's Zanzibar paper described it at scale, and
+      open-source systems such as OpenFGA and SpiceDB implement it. Reach for it when
+      sharing and hierarchies dominate; for most apps, roles plus ownership plus a few
+      attribute rules are enough.
+  - title: Three ways access control breaks in an API
+    body: |-
+      The OWASP API Security Top 10 (2023) splits broken authorisation into three entries,
+      and each needs its own check.
+
+      - **Object level** (API1, BOLA, the same thing as IDOR). The caller may use the
+        endpoint, but not on this record. `GET /orders/7` returns Ben's order to Ana. Fixed
+        by ownership in the query.
+      - **Object property level** (API3). The caller may touch the record, but not every
+        field. A customer updating their order's delivery note also sends `"status":
+        "refunded"`, or the response includes another customer's email. Fixed by a schema
+        per operation for input and named fields for output.
+      - **Function level** (API5). The caller may not use the endpoint at all. A customer
+        calls `POST /admin/refunds` because the route only checked for a session. Fixed by a
+        role or permission check on every privileged route.
+
+      The status codes follow from who may know what. **401** means the server doesn't know
+      who you are: no session, or an expired one. **403** means it knows, and the answer is
+      no. **404** fits when revealing that the record exists would itself leak something:
+      order ids, account names, whether a document exists. A common split is 404 for records
+      the caller can't see at all, and 403 for records they can see but can't change, such
+      as a staff member without refund rights looking at an order they can read.
+
+      Watch the indirect paths. Search endpoints, CSV exports, GraphQL fields, bulk actions,
+      webhooks you send and file download links all read the same data, and each needs the
+      same filter.
+  - title: Testing authorisation as a matrix
+    body: |-
+      Authorisation bugs hide in combinations nobody tried. A table of role, action,
+      ownership and state, each with the expected answer, makes the rule readable and fails
+      loudly when someone changes it.
+
+      ```ts
+      import assert from 'node:assert/strict';
+
+      const ana = { id: 1, role: 'customer' } as const;
+      const priya = { id: 9, role: 'staff' } as const;
+      const anaPaid = { id: 10, ownerId: 1, status: 'paid' } as const;
+      const anaShipped = { id: 11, ownerId: 1, status: 'shipped' } as const;
+      const benPaid = { id: 12, ownerId: 2, status: 'paid' } as const;
+
+      const cases = [
+        [ana, 'read', anaPaid, true],
+        [ana, 'read', benPaid, false],
+        [ana, 'cancel', anaPaid, true],
+        [ana, 'cancel', anaShipped, false],
+        [ana, 'refund', anaPaid, false],
+        [priya, 'read', benPaid, true],
+        [priya, 'refund', benPaid, true],
+        [priya, 'delete', benPaid, false],
+      ] as const;
+
+      for (const [user, action, order, expected] of cases) {
+        assert.equal(can(user, action, order), expected, `${user.role} ${action} order ${order.id}`);
+      }
+      ```
+
+      Run against the policy above, all eight cases pass. The negative rows matter most:
+      most authorisation tests only prove that the right person gets in, and the bug is
+      always that the wrong person does too.
+
+      Test at the HTTP level as well. For each endpoint, sign in as a second user and try
+      the first user's ids. That one test catches IDORs that unit tests of `can` never see,
+      because the handler forgot to call it.
+pitfalls:
+  - '**Checking that someone is signed in and stopping there.** A session proves identity, not permission. Every handler that takes an id must also check that the caller may act on that record.'
+  - '**Filtering the single-record route but not the list.** `GET /orders/:id` checks ownership while `GET /orders`, search or export returns everyone''s. Apply the same filter to every read path.'
+  - '**Reading the role or user id from the request.** A `role` field in the body or an `X-User-Id` header is written by the client. Take both from the session the server stored.'
+  - '**Loading, checking in code, then writing.** A new route can skip the check, and the record can change in between. Put ownership and state in the `WHERE` of the write itself.'
+  - '**Relying on UUIDs to hide records.** Ids leak through shared links, emails and logs. Keep the check; random ids are only defence in depth.'
+  - '**Hiding admin buttons instead of protecting admin routes.** The route is still callable with `curl`. Check the permission on the server for every privileged endpoint.'
+  - '**Getting `&&` and `||` wrong in a refusal.** "Refuse unless staff and paid" is `!staff || !paid`. Write the rule as a positive `can` function with tests for each combination.'
+interview:
+  - question: What is an IDOR, and how do you prevent it across a whole codebase?
+    answer: >-
+      An IDOR is an endpoint that acts on whatever id the caller supplies without checking
+      the caller may touch that record, so a signed-in user reads another user's order by
+      changing a number. Preventing it once is a `WHERE owner_id = $2`; preventing it
+      everywhere needs structure. I'd route all data access through a repository whose
+      functions take the caller as an argument and always scope the query, so there's no
+      unscoped `findById` to reach for. In a multi-tenant system I'd add PostgreSQL row-level
+      security as a backstop. And I'd have a test per endpoint that signs in as a second
+      user and tries the first user's ids. Random ids help a little but aren't the fix.
+  - question: When would you return 403, and when 404, for a record the caller can't access?
+    answer: >-
+      404 when the caller has no right to know the record exists, 403 when they can see it
+      but not perform this action. If Ana asks for Ben's order, a 403 confirms order 7 is
+      real, and repeated across ids that maps the table and its growth. With the owner in the
+      query, she gets the same 404 as for an id that was never used. A staff member who can
+      read an order but lacks refund rights gets a 403, because the order's existence isn't
+      a secret from them and the message helps them ask for access. 401 is different again:
+      the server doesn't know who you are.
+  - question: How would you design permissions for an app where customers, support staff and admins act on orders?
+    answer: >-
+      Roles mapped to named permissions, plus ownership and state rules, with deny by
+      default. Customers get "read own" and "cancel own while paid"; support gets "read any"
+      and "refund"; admins add "delete". The check is one `can(user, action, resource)`
+      function backed by a policy table, so every handler asks the same question and the
+      rules live in one reviewable place. The role comes from the server-side session. The
+      ownership part also goes into queries, so lists are filtered, not only single reads.
+      I'd test it as a matrix of role, action, owner and state. If sharing between users or
+      teams became central, I'd look at relationship-based access control rather than
+      piling on roles.
+  - question: What's the difference between RBAC and ABAC, and when do you need ABAC?
+    answer: >-
+      RBAC grants permissions to roles and roles to users, so the question is "does this
+      role hold this permission?". ABAC evaluates attributes of the user, the resource and
+      the context, such as "the order's owner is the caller and its status is paid" or
+      "only during business hours from the office network". You need attributes as soon as
+      a rule depends on the specific record, which is almost immediately: ownership itself
+      is an attribute rule. Most real systems are a hybrid, roles for the coarse cut and a
+      few attribute conditions on top. Pure ABAC with a policy language is more flexible but
+      harder to audit, so I'd only adopt one when the rules outgrow code.

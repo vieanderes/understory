@@ -1,0 +1,286 @@
+summary: >-
+  Structured output is how a model's reply becomes data your program can act on. You give
+  the model a schema, it writes JSON that fits, and your code parses it into a typed object.
+  Without it you're parsing prose, and a polite "Sure, here's the JSON" breaks the parser.
+
+
+  There are three levels of help. Prompting for JSON works most of the time. Provider
+  structured output, where supported, constrains decoding so only schema-valid tokens can be
+  written. And validation in your own code, with Pydantic or similar, checks every reply
+  whatever produced it. The first two make good replies likely; only the third makes your
+  code safe.
+
+
+  Reach for structured output whenever code consumes the reply: classification, extraction
+  from documents, form filling, routing, any value that flows into a database or an API
+  call. Don't use it for text a person reads, where forcing JSON adds cost and can make the
+  writing worse. And remember what a schema can't do: it checks shape, never whether a
+  refund is sensible or whether this user may ask for it.
+remember:
+  - Model output is untrusted input, so every reply is validated in code before anything acts on it.
+  - Constrained decoding masks out tokens that would break the schema, so the reply parses, but only when it finishes normally.
+  - A schema checks shape, never sense, so business rules like "refund no more than the order total" live in your code.
+  - A reply cut off by `max_tokens` or a refusal can still break the shape, so check the stop reason before parsing.
+  - On a validation failure, retry once or twice with the invalid reply and the error, then fail loudly instead of guessing.
+  - Retry format errors, but never retry a broken business rule, because a model asked again may produce a different wrong value that passes.
+  - Design schemas for the model, with enums instead of free strings, an explicit way to say unknown, and field descriptions.
+sections:
+  - title: How constrained decoding works
+    body: |-
+      Lesson 1 showed that each step produces a probability for every token. Constrained
+      decoding adds one step before the draw: the provider works out which tokens would
+      keep the output valid for the schema and removes all others. Providers typically
+      compile the schema into a grammar for this, and that is why a model under a schema
+      can't write `Sure` first. A toy version with one enum field:
+
+      ```python
+      import random
+
+      ALLOWED = ['"billing"', '"delivery"', '"product"']
+      VOCAB = ['Sure', '!', '"', 'bill', 'ing', 'deliv', 'ery', 'prod', 'uct', ' ']
+
+      def model(text):
+          # A chatty stub: left alone, it prefers to start with "Sure".
+          return {tok: (5.0 if tok == "Sure" else 1.0) for tok in VOCAB}
+
+      def allowed_next(text):
+          # Keep a token only if the text stays a prefix of some allowed value.
+          return sorted(tok for tok in VOCAB if any(v.startswith(text + tok) for v in ALLOWED))
+
+      def constrained_generate(rng):
+          text = ""
+          while text not in ALLOWED:
+              weights = model(text)
+              options = allowed_next(text)
+              text += rng.choices(options, weights=[weights[t] for t in options])[0]
+          return text
+
+      rng = random.Random(1)
+      print([constrained_generate(rng) for _ in range(5)])
+      # ['"product"', '"delivery"', '"billing"', '"billing"', '"product"']
+      ```
+
+      Three consequences follow. The constraint guarantees syntax, not judgement: the model
+      still picks among valid values by its own probabilities, so when it misjudges, a
+      wrong category comes out as cleanly as a right one. Generation can still stop early,
+      at `max_tokens` or in a refusal, and then the guarantee doesn't hold. And providers usually support only part
+      of JSON Schema, and a new schema can make the first request slower while its grammar
+      is built, so check the documentation for the model you use.
+  - title: Designing schemas the model fills well
+    body: |-
+      A schema is also a prompt. The field names, types and descriptions are all text the
+      model reads, so design them for it.
+
+      ```python
+      from typing import Literal, Optional
+      from pydantic import BaseModel, Field, ValidationError
+
+      class Ticket(BaseModel):
+          category: Literal["billing", "delivery", "product", "other"]
+          urgent: bool
+          order_id: Optional[str] = Field(
+              description="The order number if the email gives one, otherwise null")
+
+      print(Ticket.model_validate_json('{"category": "billing", "urgent": true, "order_id": null}'))
+      # category='billing' urgent=True order_id=None
+
+      for bad in [
+          'Sure! {"category": "billing", "urgent": true, "order_id": null}',
+          '{"category": "refund", "urgent": true, "order_id": null}',
+          '{"category": "billing", "urgent": true, "order_id": "A1',
+      ]:
+          try:
+              Ticket.model_validate_json(bad)
+          except ValidationError as error:
+              print(error.errors()[0]["type"], "|", isinstance(error, ValueError))
+      # json_invalid | True
+      # literal_error | True
+      # json_invalid | True
+      ```
+
+      Prefer a `Literal` enum to a free string, so your code never meets `"Billing "` or
+      `"payments"`. Give an escape value such as `"other"`, and make fields the email might
+      not contain nullable. Without a legal way to say "not there", the model invents an
+      order number that fits the type. Here `order_id` has no default, so the model must
+      decide and write `null` explicitly rather than leave it out.
+
+      Order matters because the model writes left to right. A field written first
+      conditions every later one. Some teams put a short `reason` field before the
+      decision so the model reasons before committing; that can help on hard judgements,
+      at the cost of more output tokens. Keep money in integer minor units, dates as ISO
+      strings, and nesting shallow.
+  - title: The four layers of trust
+    body: |-
+      Think of each reply passing four gates, and know which tool owns each one.
+
+      1. **Syntax**: is it JSON at all? Constrained decoding or the parser.
+      2. **Shape**: the right fields and types? The schema, checked by Pydantic.
+      3. **Sense**: do the values fit the world, like an amount within the order total or
+         a date in the future? Your code, against your data.
+      4. **Permission**: may this user cause this effect? Your code, from the logged-in
+         identity, never from anything the model wrote.
+
+      Only the first two are about format, so only failures there are worth a retry. A
+      value that breaks a business rule goes to a person or is refused. Asking again
+      invites a different value that happens to pass, which is how a talked-up refund
+      slips through.
+
+      ```python
+      from types import SimpleNamespace as Obj
+      from pydantic import BaseModel, ValidationError
+
+      class Refund(BaseModel):
+          order_id: str
+          amount_pence: int
+
+      ORDERS = {"A17": {"total_pence": 900, "customer": "c1"}}
+
+      class NeedsHuman(Exception):
+          pass
+
+      def check_refund(refund, customer):
+          order = ORDERS.get(refund.order_id)
+          if order is None or order["customer"] != customer:
+              raise NeedsHuman("unknown order for this customer")
+          if not 0 < refund.amount_pence <= order["total_pence"]:
+              raise NeedsHuman("amount outside the order total")
+          return refund
+
+      def ask_refund(client, messages, customer, attempts=2):
+          messages = list(messages)
+          for _ in range(attempts):
+              reply = client.create(messages=messages, max_tokens=300)
+              text = "".join(b.text for b in reply.content if b.type == "text")
+              if reply.stop_reason == "max_tokens":
+                  # Cut off: asking again with the same budget fails the same way.
+                  raise NeedsHuman("reply cut off; raise max_tokens or shorten the task")
+              try:
+                  refund = Refund.model_validate_json(text)
+              except ValidationError as error:
+                  messages += [
+                      {"role": "assistant", "content": text},
+                      {"role": "user", "content": f"Invalid: {error.errors()[0]['msg']}. Reply with only the JSON."},
+                  ]
+                  continue
+              return check_refund(refund, customer)  # a rule break is never retried
+          raise NeedsHuman(f"no valid reply after {attempts} attempts")
+
+      class Stub:
+          def __init__(self, *replies):
+              self.replies = list(replies)
+          def create(self, **request):
+              text, stop = self.replies.pop(0)
+              return Obj(content=[Obj(type="text", text=text)], stop_reason=stop)
+
+      ask = [{"role": "user", "content": "Refund my order A17"}]
+      print(ask_refund(Stub(('{"order_id": "A17", "amount_pence": "nine"}', "end_turn"),
+                            ('{"order_id": "A17", "amount_pence": 900}', "end_turn")), ask, "c1"))
+      # order_id='A17' amount_pence=900
+      for replies, customer in [
+          ([('{"order_id": "A17", "amount_pence": 90000}', "end_turn")], "c1"),
+          ([('{"order_id": "A1', "max_tokens")], "c1"),
+          ([('{"order_id": "A17", "amount_pence": 500}', "end_turn")], "c2"),
+      ]:
+          try:
+              ask_refund(Stub(*replies), ask, customer)
+          except NeedsHuman as reason:
+              print("needs a person:", reason)
+      # needs a person: amount outside the order total
+      # needs a person: reply cut off; raise max_tokens or shorten the task
+      # needs a person: unknown order for this customer
+      ```
+  - title: Retries, cost and what to log
+    body: |-
+      The repair retry works because the model sees its own reply and the precise error.
+      Pydantic's messages are specific ("Input should be a valid integer"), which is the
+      feedback you want to pass on. Send a short, clean error, not a full stack trace, and
+      never echo secrets or other users' data in it.
+
+      Each retry is a full extra call: the whole conversation again as input, plus the new
+      output. So cap attempts at two or three, and treat a rising retry rate as a signal,
+      not a cost of doing business. It usually means the prompt, the schema or the model
+      changed. Log for every structured call: the prompt version, the schema name, the stop
+      reason, token counts, whether validation passed on the first try, and the error types
+      when it didn't. Those few fields turn "the AI is flaky" into a chart you can act on.
+
+      When a provider or model doesn't support schemas, the fallback is the one the lesson
+      named: ask for JSON only, show one example, validate, retry with the error. Stripping
+      a Markdown code fence before parsing is a common patch, fine as long as validation
+      still runs after it. Many providers also let you force the model to call a tool whose
+      input schema is your output shape, another route to structured output that the next
+      lesson's tool use makes clear.
+
+      Finally, fail loudly. When attempts run out, raise an error your caller handles:
+      show the user a clear message, queue the item for a person, or fall back to a
+      default that is safe by design. Never guess a value from a half-parsed reply.
+pitfalls:
+  - "**Parsing the whole reply with `json.loads`.** A friendly preamble or a code fence breaks it at the first character. Use structured output where available, ask for JSON only, and validate with a schema."
+  - "**Trusting a schema-valid reply.** A £900 refund on a £9 order is a perfectly valid integer. Check values against your own data and rules before acting."
+  - "**Ignoring the stop reason.** A reply cut off by `max_tokens` is half an object, and a retry with the same budget fails the same way. Check the stop reason first, and raise the budget or shorten the task."
+  - "**Retrying business-rule failures.** Asking again until a value passes is how a manipulated amount gets through. Retry only format errors; send rule breaks to a person or refuse."
+  - "**No way to say unknown.** Required string fields make the model invent values that fit the type. Add an `other` enum value and nullable fields for data that may be missing."
+  - "**Endless retries.** Each attempt resends the whole conversation, so a loop without a cap burns money on a broken prompt. Cap at two or three attempts and alert on the retry rate."
+  - "**Assuming every schema feature is supported.** Providers support subsets of JSON Schema, and names change between SDK versions. Check the docs for the model you call, and keep your own validation either way."
+interview:
+  - question: How do you get reliable structured data out of an LLM?
+    answer: >-
+      Constrain the output where I can, and validate it in code every time. I define the
+      shape once, as a Pydantic model, and use the provider's structured output so decoding
+      can only produce schema-valid JSON. Then I validate anyway, because a reply cut off by
+      `max_tokens`, a refusal, or a model without schema support can still break the shape.
+      On a validation error I retry once with the invalid reply and the error message, then
+      fail loudly. After that come checks the schema can't express: values against my data,
+      and whether this user may cause the effect. The trade-off is latency and cost for
+      retries, so I cap them and watch the first-try pass rate.
+  - question: Your provider guarantees schema-conformant output. Why keep Pydantic validation?
+    answer: >-
+      Because the guarantee covers syntax on a normal finish, and my code needs more than
+      that. A reply that stops at `max_tokens` or ends in a refusal isn't covered. Providers
+      support only part of JSON Schema, so some constraints I care about, like ranges or
+      cross-field rules, may not be enforced. I may switch models or providers, and the
+      validation layer keeps my code correct through that. And most importantly, a schema
+      checks shape, not sense: a well-formed refund can be for the wrong order or the wrong
+      amount. Validation is cheap compared with the cost of acting on a bad value, so it
+      stays at the boundary.
+  - question: When a model's output fails validation, what do you do?
+    answer: >-
+      Retry format failures once or twice with feedback, and never retry business-rule
+      failures. For a parse or schema error, I send the conversation plus the invalid reply
+      as an assistant turn and a short user message quoting the validation error. Models
+      usually fix it on the first retry. First I check the stop reason: a truncated reply
+      needs a bigger budget or a smaller task, not a retry. If the value is well formed but
+      breaks a rule, such as a refund above the order total, I refuse or route it to a
+      person, because asking again only samples until something passes. When attempts run
+      out I raise, log the error type, and alert if the retry rate climbs.
+  - question: How would you design the schema for classifying support tickets?
+    answer: >-
+      Enums for anything my code branches on, an explicit escape value, and nullable fields
+      for data that may be absent. So `category` is a `Literal` of the real queues plus
+      `other`, `urgent` is a boolean, and `order_id` is a required but nullable string with
+      a description saying to use null when the email gives none. That stops the model
+      inventing an order number to satisfy the type. Field descriptions carry the
+      definitions the model needs, and I keep nesting shallow. If the judgement is hard, a
+      short reason field before the category can improve accuracy, at the price of more
+      output tokens, so I'd test it on a labelled set before keeping it.
+terms:
+  - term: Structured output
+    say: Asking for JSON in the prompt.
+    means: A provider feature that constrains the reply to a JSON schema you supply, so the text
+      parses into a typed object when the reply finishes normally.
+  - term: Constrained decoding
+    say: A guarantee that the answer is right.
+    means: At each step, tokens that would break the schema are masked out before sampling. It
+      guarantees shape, never sense, and only for a reply that isn't cut off.
+  - term: Tool use
+    say: The model calls your function.
+    means: The model replies with a request naming a tool and its arguments. Your code validates
+      it, runs it and sends the result back. Also called function calling.
+  - term: Validation
+    say: Unneeded once the provider guarantees the schema.
+    means: Checking every reply in your own code, with Pydantic or similar, before anything acts
+      on it. It catches truncated replies, refusals and business rules a schema can't
+      express.
+  - term: Stop reason
+    say: A detail you can ignore.
+    means: Why generation ended, such as a finished turn, `max_tokens`, a tool request or a
+      refusal. Check it before parsing, because a cut-off reply is not a finished one.

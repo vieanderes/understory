@@ -1,0 +1,293 @@
+id: scale.queues-and-workers
+title: Queues and workers
+objective: Move long jobs to a queue, acknowledge only after the work, and retry or park failures.
+level: advanced
+minutes: 10
+concepts: [scale.queues, scale.at-least-once, scale.visibility-timeout, scale.dead-letter-queue]
+prerequisites: [scale.idempotency, backend.webhooks]
+opening:
+  text: >-
+    You'll move slow AI work, like transcribing an hour of audio, out of the request and
+    into a queue. And no job will vanish when a worker crashes halfway.
+
+steps:
+  - type: prose
+    id: jobs-that-outlive-a-request
+    body: |-
+      Transcribing an hour of audio with a model takes minutes. No request should wait that
+      long. So the endpoint stores a **job**, a small record of work to do, in a **queue**:
+      a durable list of jobs. It answers `202 Accepted` with the job's id at once.
+
+      ```js
+      const job = await queue.add("transcribe", { audioUrl });
+      return Response.json({ jobId: job.id }, { status: 202 });
+      ```
+
+      A **worker**, a separate process, takes jobs and runs them. The page polls `GET /jobs/:id`.
+
+  - type: multiple-choice
+    id: pick-model-api-down
+    concept: scale.queues
+    difficulty: 1
+    question: The model API is down for ten minutes. What happens to uploads meanwhile?
+    choices:
+      - text: They're accepted, and transcribed once it's back
+        correct: true
+        feedback: >-
+          Right. The endpoint only stores a job. The worker runs it later.
+      - text: They fail until the model API is back
+        feedback: >-
+          That's what calling the model inside the request would do. Here the endpoint never calls it.
+      - text: They're accepted, and the jobs are lost
+        feedback: >-
+          The queue is durable. A job stays until a worker finishes it.
+
+  - type: prose
+    id: acknowledge-after-the-work
+    body: >-
+      When a worker finishes a job, it **acknowledges** it, or **acks** for short: it tells
+      the queue "done, delete it". Until then, the job stays in the queue.
+
+
+      So the order matters. Ack after the work. A worker that acks first and then crashes
+      has told the queue a job is done that never ran.
+
+  - type: bug-hunt
+    id: hunt-ack-before-work
+    concept: scale.at-least-once
+    difficulty: 2
+    language: js
+    code: |
+      while (true) {
+        const job = await queue.receive();
+        await queue.ack(job.id);
+        const text = await transcribe(job.data.audioUrl);
+        await saveTranscript(job.data.uploadId, text);
+      }
+    prompt: >-
+      Every deploy restarts the worker. After each one, a few uploads never get a transcript,
+      and no job is left in the queue. Tap the line at fault.
+    lines: [3]
+    reasons:
+      - text: The job is acked before it's transcribed
+        correct: true
+        feedback: >-
+          Yes. A restart mid-job leaves an acked job that never finished. Ack last.
+      - text: '`while (true)` never lets the worker stop'
+        feedback: >-
+          A worker loops for as long as it runs. The loop is fine; the order inside it isn't.
+      - text: '`saveTranscript` should run before `transcribe`'
+        feedback: >-
+          There's nothing to save until the model has answered. Look at when the queue hears "done".
+    fix: |
+      while (true) {
+        const job = await queue.receive();
+        const text = await transcribe(job.data.audioUrl);
+        await saveTranscript(job.data.uploadId, text);
+        await queue.ack(job.id); // only now is it done
+      }
+
+  - type: prose
+    id: at-least-once
+    body: >-
+      While a worker holds a job, the queue hides it from other workers for a set time: the
+      **visibility timeout**. No ack in time, because the worker crashed or the job ran long,
+      and the job reappears for another worker.
+
+
+      A crash after the work looks the same as one before it. So the queue resends: delivery
+      is **at-least-once**. A job can run twice, so its handler must be idempotent.
+
+  - type: multiple-choice
+    id: pick-exactly-once
+    concept: scale.at-least-once
+    difficulty: 3
+    question: A queue product promises "exactly-once delivery". How should your handler treat jobs?
+    choices:
+      - text: Still make it safe to run a job twice
+        correct: true
+        feedback: >-
+          Right. A crash before the ack still means a second run. Keep the handler idempotent.
+      - text: Trust the promise and skip the checks
+        feedback: >-
+          The queue can't know your work finished before a crash. The repeat still comes.
+      - text: Ack first, so the job can't repeat
+        feedback: >-
+          That trades a repeat for a lost job, the bug you found earlier.
+
+  - type: prose
+    id: retries-and-dead-letters
+    body: >-
+      A failed job goes back on the queue, and waits longer after each failure: the backoff
+      from Rate limits. Some jobs can never succeed, such as audio that was deleted. Retried
+      for ever, they waste workers.
+
+
+      So cap the attempts. Past the cap, move the job to a **dead-letter queue**: a separate
+      list where it stops looping and waits for a person. Alert when it grows.
+
+  - type: ai-review
+    id: review-swallowed-error
+    concept: scale.dead-letter-queue
+    difficulty: 3
+    language: js
+    request: Write the transcription worker. It mustn't crash when the model API is down.
+    flawClass: edge-case
+    code: |
+      // BullMQ, a queue library for Node, calls this for each job.
+      // A throw fails the attempt; a return acks the job.
+      const worker = new Worker("transcripts", async (job) => {
+        try {
+          const text = await transcribe(job.data.audioUrl);
+          await saveTranscript(job.data.uploadId, text);
+        } catch (error) {
+          console.error("transcription failed", error.message);
+        }
+      }, { connection });
+    prompt: >-
+      This came from a coding assistant. In testing the model API was up, so every job
+      completed. Then the API was down for an hour, and those uploads were never transcribed
+      or retried. Tap the line at fault.
+    lines: [7, 8]
+    reasons:
+      - text: The error is swallowed, so the job "completes"
+        correct: true
+        feedback: >-
+          Yes. Returning normally acks the job. Let the error throw, and the retries start.
+      - text: The worker needs a longer visibility timeout
+        feedback: >-
+          Each attempt returned quickly. Look at what it returned after a failure.
+      - text: '`console.error` blocks the event loop'
+        feedback: >-
+          One log line costs microseconds. The trouble is that logging was all it did.
+    fix: |
+      const worker = new Worker("transcripts", async (job) => {
+        // A throw fails the attempt, so the queue retries, then parks the job.
+        const text = await transcribe(job.data.audioUrl);
+        await saveTranscript(job.data.uploadId, text);
+      }, { connection });
+
+  - type: code-challenge
+    id: write-process-next
+    concept: scale.dead-letter-queue
+    difficulty: 4
+    language: ts
+    editable: '26-29'
+    prompt: >-
+      Fix `processNext`. It already takes the first due job. Ack it by pushing its id to
+      `queue.done`, but only after `handler(job)` succeeds.
+
+
+      If the handler throws, add one to `job.attempts`. At `maxAttempts`, push the job to
+      `queue.dead`. Otherwise set `runAt` to `now` plus the delay and push it back to
+      `waiting`. The delay starts at `baseDelayMs` and doubles each failure.
+    hints:
+      - Put `await handler(job)` in a `try`, and move the ack after it.
+      - In the `catch`, count the attempt first. Then decide between `dead` and `waiting`.
+      - "`2 ** n` is 2 to the power n. The delay is `queue.baseDelayMs * 2 ** (job.attempts - 1)`."
+
+  - type: explain-back
+    id: explain-at-least-once
+    concept: scale.visibility-timeout
+    difficulty: 4
+    prompt: >-
+      A worker transcribes a file, saves the transcript, then dies before acking. Why will
+      the queue run that job again, and what should the handler do about it?
+    rubric:
+      - The queue only learns a job is done from the worker's ack.
+      - With no ack before the visibility timeout ends, the job reappears and another worker runs it.
+      - So a job can run twice, and the handler must be idempotent, such as skipping a saved transcript.
+    modelAnswer: >-
+      The queue can't see the saved transcript. All it knows is that a worker took the job
+      and never said "done". When the visibility timeout runs out, the job becomes visible
+      again, and another worker runs it. Resending is the safe choice, because the other
+      choice is losing jobs. So the handler should check whether this upload already has a
+      transcript, and skip the model call if it does.
+
+recap:
+  - Answer `202` with a job id, and let a worker run long jobs from a queue.
+  - Ack only after the work, and expect a job to run twice when a worker dies.
+  - Back off between retries, cap them, and park the rest in a dead-letter queue.
+
+recall:
+  - id: card-why-queue
+    concept: scale.queues
+    front: Why put a long model call on a queue instead of in the request?
+    back: >-
+      The request answers at once, the job survives an outage, and workers run jobs at the
+      pace the model API allows.
+  - id: card-ack-last
+    concept: scale.at-least-once
+    front: What goes wrong if a worker acks a job before doing it?
+    back: >-
+      A crash after the ack loses the job. The queue thinks it's done, so nobody runs it.
+  - id: card-visibility-timeout
+    concept: scale.visibility-timeout
+    front: What is a visibility timeout?
+    back: >-
+      The time a received job stays hidden from other workers. Without an ack by then, it
+      reappears.
+  - id: card-dead-letter
+    concept: scale.dead-letter-queue
+    front: What is a dead-letter queue for?
+    back: >-
+      Jobs that failed every allowed attempt. They stop looping, and wait where a person can
+      inspect and retry them.
+
+references:
+  - kind: docs
+    title: Amazon SQS visibility timeout
+    authors: Amazon Web Services
+    venue: Amazon SQS Developer Guide
+    url: https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html
+    note: The term this lesson uses, from the service that named it. The default is 30 seconds.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Using dead-letter queues in Amazon SQS
+    authors: Amazon Web Services
+    venue: Amazon SQS Developer Guide
+    url: https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html
+    note: A dead-letter queue as a separate queue, filled once a message passes its receive count.
+    verified: true
+  - kind: docs
+    title: Retrying failing jobs
+    authors: BullMQ
+    venue: BullMQ documentation
+    url: https://docs.bullmq.io/guide/retrying-failing-jobs
+    note: Attempts, exponential backoff, and the failed set where jobs wait after their last attempt.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Stalled Jobs
+    authors: BullMQ
+    venue: BullMQ documentation
+    url: https://docs.bullmq.io/guide/workers/stalled-jobs
+    note: The job lock, its renewal, and how a job whose worker went quiet is queued again.
+    verified: true
+
+deepDive: >-
+  BullMQ keeps its jobs in Redis. It has no queue named "dead-letter": its failed set plays
+  that part, and jobs stay there until you retry or remove them. In Amazon SQS the
+  dead-letter queue is a real second queue, and a message moves there once it has been
+  received more times than `maxReceiveCount`.
+
+
+  They time out differently too. An SQS message reappears when its visibility timeout ends,
+  30 seconds by default, unless your code extends it. A BullMQ worker holds a lock on its
+  job and keeps renewing it while its event loop is free. So a BullMQ job stalls when the
+  process dies, or when CPU work blocks the loop for longer than the lock. That's one more
+  reason to keep CPU work off the main thread.
+
+
+  Real queues add a random part to each retry delay, so failed jobs don't all come back at
+  the same moment. Failure handling covers that jitter.
+
+
+  A database table can be the queue. Workers claim a row with `SELECT ... FOR UPDATE SKIP
+  LOCKED`, which skips rows another worker has locked. The row lock plays the visibility
+  timeout, and it ends with the transaction. Libraries such as pg-boss build on this.
+
+
+  Polling isn't the only way back to the page. The worker can also call a webhook, or push
+  progress over the realtime channel from the backend chapter.

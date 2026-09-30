@@ -1,0 +1,326 @@
+id: cloud.scaling-and-cost
+title: Scaling and cost
+objective: Scale in the order the bottlenecks appear, keep instances stateless, plan capacity, and catch a cost spike before the bill does.
+level: advanced
+minutes: 10
+concepts: [cloud.vertical-and-horizontal, cloud.statelessness, cloud.scaling-order, cloud.capacity-and-cost]
+prerequisites: [cloud.reverse-proxies, db.storage-and-pooling, testing.load-testing]
+opening:
+  text: >-
+    You'll grow an app when traffic grows, in the order that wastes the least money. You'll
+    also spot the machine nobody meant to pay for, before the bill arrives.
+
+steps:
+  - type: prose
+    id: two-ways-to-grow
+    body: >-
+      One server is too slow at peak. You have two ways to give it room.
+
+
+      **Vertical scaling** swaps it for a bigger machine: more CPU, more memory. It's a
+      setting in the provider's control panel, and your code doesn't change.
+
+
+      **Horizontal scaling** runs more **instances**, identical running copies of the app.
+      A **load balancer** in front spreads the requests across them.
+
+  - type: multiple-choice
+    id: pick-scale-first
+    concept: cloud.vertical-and-horizontal
+    difficulty: 1
+    question: A small app's one server hits 90% CPU at peak. What do you try first?
+    choices:
+      - text: A bigger machine
+        correct: true
+        feedback: >-
+          Yes. It's a settings change, and the code stays exactly as it is.
+      - text: Three instances behind a balancer
+        feedback: >-
+          That works later. It needs a balancer and code that copes with copies. A bigger box needs neither.
+      - text: Rewrite the app in a faster language
+        feedback: >-
+          Months of work for a problem a larger machine solves this afternoon.
+
+  - type: prose
+    id: name-statelessness
+    body: |-
+      Copies bring a catch. We ran three instances, each counting its own hits:
+
+      ```text
+      c803420d0f20 hits=1
+      172daa1148bc hits=1
+      9e10bf9336fb hits=1
+      c803420d0f20 hits=2
+      ```
+
+      Each copy kept its own count in memory. So make instances **stateless**: sessions,
+      carts and uploads live in a shared store, like the database or Redis. Then any copy
+      can serve anyone.
+
+  - type: ai-review
+    id: review-sessions-in-memory
+    concept: cloud.statelessness
+    difficulty: 3
+    language: js
+    request: Add login sessions to the booking API.
+    flawClass: logic
+    code: |
+      const sessions = new Map();
+
+      function logIn(userId) {
+        const id = crypto.randomUUID();
+        sessions.set(id, { userId, since: Date.now() });
+        return id;                       // sent back as a cookie
+      }
+
+      function userFor(sessionId) {
+        const session = sessions.get(sessionId);
+        return session ? session.userId : null;
+      }
+    prompt: >-
+      This worked on a laptop. Behind three instances, users are signed out at random, about
+      two clicks in three. Tap the line at fault.
+    lines: [1]
+    reasons:
+      - text: Sessions live in one instance's memory
+        correct: true
+        feedback: >-
+          Yes. The other two never saw it. Keep sessions in Redis or the database.
+      - text: '`randomUUID` ids can collide across instances'
+        feedback: >-
+          They're 122 random bits, so two never match. Where the ids are kept is the flaw.
+      - text: The balancer needs sticky sessions
+        feedback: >-
+          That hides it until an instance restarts, then everyone pinned to it is signed out.
+          Fix the state, not the routing.
+    fix: |
+      async function logIn(userId) {
+        const id = crypto.randomUUID();
+        await redis.set(`session:${id}`, userId, 'EX', 86400);   // shared by every instance
+        return id;
+      }
+
+  - type: prose
+    id: name-scaling-order
+    body: >-
+      A **bottleneck** is the one part everything else waits for. Adding instances only helps
+      when the app itself is that part.
+
+
+      So scale in order. Measure first, with a load test. Then fix the cheapest bottleneck
+      you found: a bigger machine, a missing index, a connection pool, a cache. Add
+      instances late. The databases chapter built the pool and the cache.
+
+  - type: bug-hunt
+    id: hunt-real-bottleneck
+    concept: cloud.scaling-order
+    difficulty: 3
+    language: bash
+    code: |
+      # 1 instance, 60 k6 users for 20 s
+      checks_succeeded...: 100.00% 2161 out of 2161
+      # 3 instances
+      checks_succeeded...: 71.30% 1670 out of 2342
+      # 6 instances
+      checks_succeeded...: 54.28% 709 out of 1306
+      # the database log, hundreds of times
+      FATAL:  sorry, too many clients already
+    prompt: >-
+      Each extra instance made things worse. Tap the line that names the real bottleneck.
+    lines: [8]
+    reasons:
+      - text: The database refuses connections beyond its limit
+        correct: true
+        feedback: >-
+          Yes. Every instance opens its own pool. Share one pooler, or add no instances.
+      - text: The load test sends too many users
+        feedback: >-
+          One instance served all 60 users with no failures. The users didn't change between runs.
+      - text: Six instances need a bigger balancer
+        feedback: >-
+          The balancer passed every request on. The failures came back from the database.
+    fix: |
+      # the fix was upstream of the app: a shared connection pool,
+      # then measure again before adding a single instance
+
+  - type: prose
+    id: name-capacity-plan
+    body: >-
+      Planning is a formula, not a guess. Measure what one instance serves. Take the forecast
+      peak and add **headroom**, a spare share for spikes. Divide, round up, and never run
+      fewer than two, so one failure isn't an outage.
+
+
+      Every machine is billed by the hour, so the plan is also your cost. A **GPU** machine,
+      built for the maths models run on, costs about fifty times a small server.
+
+  - type: code-challenge
+    id: write-capacity-plan
+    concept: cloud.capacity-and-cost
+    difficulty: 3
+    language: ts
+    prompt: >-
+      Write `capacityPlan(load, costs)`. `load` has `peakRps`, the measured `rpsPerInstance`,
+      and `headroomPercent`. `costs` has `pencePerInstance` a month, and `ordersPerMonth`.
+
+
+      Add the headroom to the peak, divide by one instance's rate, and round up. Never plan
+      fewer than 2 instances. Return `instances`, `monthlyPence` and `pencePerOrder`, which
+      is 0 when there are no orders. Throw if `rpsPerInstance` isn't above 0.
+
+
+      So a peak of 400, at 145 each, with 30% headroom, needs `4` instances.
+    hints:
+      - Keep the percentage whole. Multiply by `100 + headroomPercent`, then divide by 100.
+      - '`Math.ceil` rounds up, and `Math.max(2, n)` keeps the floor of two.'
+      - 'Start with `const target = (load.peakRps * (100 + load.headroomPercent)) / 100;`'
+
+  - type: bug-hunt
+    id: hunt-forgotten-gpu
+    concept: cloud.capacity-and-cost
+    difficulty: 3
+    language: text
+    code: |
+      resource          type         hours  tags              cost (USD)
+      web-1             t3.small     720    app=bookings      15.12
+      web-2             t3.small     720    app=bookings      15.12
+      db-main           db.t4g.med   720    app=bookings      47.52
+      model-api         tokens       -      app=bookings      412.80
+      gpu-test          g5.xlarge    720    (none)            724.32
+      backups           storage      -      app=bookings      9.40
+    prompt: >-
+      The monthly bill more than doubled. Tap the line nobody meant to pay for.
+    lines: [6]
+    reasons:
+      - text: A GPU machine ran all month with no owner tag
+        correct: true
+        feedback: >-
+          Yes. Someone tried a self-hosted model and never stopped it.
+      - text: The model tokens cost more than the servers
+        feedback: >-
+          That spend is real traffic with an owner. It's worth watching, but someone meant it.
+      - text: Two web servers where one would do
+        feedback: >-
+          Two is the floor, so one failure isn't an outage. They cost little and do real work.
+    fix: |
+      gpu-test          g5.xlarge    stopped  owner=ana, expires=2026-10-03
+      # plus a monthly budget with an alert at 80%, and every resource tagged
+
+  - type: explain-back
+    id: explain-catch-cost-spikes
+    concept: cloud.capacity-and-cost
+    difficulty: 4
+    prompt: >-
+      A GPU machine ran for a month before anyone noticed the bill. What two habits would
+      have caught it in days, and why?
+    rubric:
+      - A budget with an alert warns as spend passes a threshold, days into the month instead of at the bill.
+      - Tags such as owner and purpose on every resource show who to ask and let untagged spend stand out.
+      - Together they turn a surprise into a message to the right person while it's still cheap.
+    modelAnswer: >-
+      Set a monthly budget with an alert at, say, 50% and 80%. A GPU running round the clock
+      pushes spend past the first line within days, so someone hears early. And tag every
+      resource with an owner and a purpose. Then the alert has a name attached, and an
+      untagged machine stands out in the cost report. The test box would have been stopped
+      the first week.
+
+recap:
+  - Scale up first because it's a setting, and scale out with stateless instances when one machine isn't enough.
+  - Measure, then fix the cheapest bottleneck, and add instances only when the app itself is the limit.
+  - Plan capacity from one instance's measured rate plus headroom, and catch stray spend with budgets and tags.
+
+recall:
+  - id: card-vertical-horizontal
+    concept: cloud.vertical-and-horizontal
+    front: What does each way of scaling cost you?
+    back: >-
+      Vertical is one bigger machine: no code changes, but a ceiling and a single point of
+      failure. Horizontal adds machines, and needs stateless instances and a balancer.
+  - id: card-stateless
+    concept: cloud.statelessness
+    front: What makes an instance stateless?
+    back: >-
+      It keeps no session, file or counter of its own. Those live in a shared store, so any
+      instance can be added, removed or replaced.
+  - id: card-bottleneck-first
+    concept: cloud.scaling-order
+    front: Adding instances made more requests fail. What's the likely cause, and the next step?
+    back: >-
+      The bottleneck is behind the app, often database connections, and each instance adds
+      load to it. Measure, then fix that part, for example with a shared pool.
+  - id: card-capacity
+    concept: cloud.capacity-and-cost
+    front: How do you work out how many instances to run?
+    back: >-
+      Forecast peak plus headroom, divided by the rate one instance was measured to serve,
+      rounded up. Never fewer than two.
+  - id: card-stray-spend
+    concept: cloud.capacity-and-cost
+    front: Which two habits catch a forgotten machine before the monthly bill?
+    back: >-
+      A budget with alerts at thresholds, and tags such as owner on every resource, so
+      unowned spend stands out and has someone to ask.
+
+references:
+  - kind: docs
+    title: docker compose up
+    authors: Docker
+    venue: Docker Docs
+    url: https://docs.docker.com/reference/cli/docker/compose/up/
+    note: The `--scale` flag used to run three and six copies of one service.
+    primary: true
+    verified: true
+  - kind: essay
+    title: 'The Twelve-Factor App: VI. Processes'
+    authors: Adam Wiggins
+    venue: 12factor.net
+    url: https://12factor.net/processes
+    note: The case for stateless, share-nothing processes, with state in a backing service.
+    verified: true
+  - kind: docs
+    title: Managing your costs with AWS Budgets
+    authors: Amazon Web Services
+    venue: AWS Cost Management User Guide
+    url: https://docs.aws.amazon.com/cost-management/latest/userguide/budgets-managing-costs.html
+    note: Budgets with alerts at a threshold of actual or forecast spend.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Organizing and tracking costs using AWS cost allocation tags
+    authors: Amazon Web Services
+    venue: AWS Billing User Guide
+    url: https://docs.aws.amazon.com/awsaccountbilling/latest/aboutv2/cost-alloc-tags.html
+    note: Tags that let a cost report group spend by owner or project.
+    verified: true
+  - kind: docs
+    title: 19.3. Connections and Authentication
+    authors: The PostgreSQL Global Development Group
+    venue: PostgreSQL 17 Documentation
+    url: https://www.postgresql.org/docs/17/runtime-config-connection.html
+    note: '`max_connections`, and the slots reserved for superusers.'
+    verified: true
+
+deepDive: >-
+  Every run used Docker 28.3, Caddy 2.11 as the balancer, PostgreSQL 17.11 and k6 2.3, all
+  on one laptop. Each request ran `SELECT pg_sleep(0.05)` through a `pg` pool of 10
+  connections per instance. We set `max_connections=20` so the limit would bite early;
+  three of those are reserved for superusers. One instance served 2,161 requests in 20
+  seconds with no failures. Three instances wanted 30 connections: 672 of 2,342 requests
+  failed. Six wanted 60: 597 of 1,306 failed, and only 709 succeeded. The fix is a shared
+  pooler such as PgBouncer (db.storage-and-pooling), or fewer connections per instance.
+
+
+  The hit counter ran on the same setup at three instances, with Caddy's `dynamic a` upstreams
+  and `round_robin`. Caddy found the copies by the Compose service name.
+
+
+  Once one balancer carries everything, it becomes the single point of failure. Providers
+  sell managed balancers that are already redundant. On your own servers, two proxies share
+  a floating IP, moved by a tool such as keepalived.
+
+
+  The bill is made up from real list prices: a g5.xlarge (one NVIDIA A10G) was listed at
+  $1.006 an hour on demand, so a month of 720 hours is about $724. Prices vary by region
+  and change over time; check your provider's price list. Budgets on AWS, GCP and Azure
+  alert by email or a message queue, and some can stop resources, but none stop spend by
+  default.

@@ -1,0 +1,291 @@
+id: arch.layers
+title: Layers and thin handlers
+objective: Put each piece of code in its layer, keep handlers and components thin, and move a business rule where every entry point passes it.
+level: essential
+minutes: 10
+concepts: [arch.layering, arch.thin-handlers]
+prerequisites: [arch.project-structure, backend.first-endpoint, next.server-and-client-components]
+opening:
+  text: >-
+    You'll keep business rules in one place that every route, import and page has to pass.
+    Then a rule can't be skipped by the one entry point nobody tested.
+
+steps:
+  - type: prose
+    id: what-a-layer-is
+    body: >-
+      A web app does three kinds of work. Some code talks to the outside: an HTTP handler, a
+      React component. Some holds the **domain**: the business rules, like "a room takes 1 to
+      8 guests", with no web or database code in it. Some talks to the database.
+
+
+      Each kind is a **layer**. Each layer calls only the one below it: handler, then domain,
+      then data access.
+
+  - type: multiple-choice
+    id: pick-layer
+    concept: arch.layering
+    difficulty: 1
+    question: Where does "orders over £50 ship free" belong?
+    choices:
+      - text: In the domain
+        correct: true
+        feedback: >-
+          Right. It's a business rule, so every page and route should reach the same answer.
+      - text: In the checkout page component
+        feedback: >-
+          Then only that page knows it. The receipt email and the app would each need a
+          copy.
+      - text: In the SQL query
+        feedback: >-
+          The database layer stores and fetches. A pricing rule in a query is hard to find,
+          test or reuse.
+      - text: In the HTTP handler
+        feedback: >-
+          A handler translates HTTP. Put the rule there and anything that isn't that route
+          skips it.
+
+  - type: predict-output
+    id: predict-import-skips-rule
+    concept: arch.thin-handlers
+    difficulty: 2
+    language: js
+    code: |
+      const saved = [];
+
+      function postBooking(body) {          // the HTTP handler
+        if (body.guests > 8) return 422;    // the oak room seats 8
+        saved.push(body);
+        return 201;
+      }
+      function importCsv(lines) {           // added later, for bulk uploads
+        for (const line of lines) {
+          const [roomId, guests] = line.split(',');
+          saved.push({ roomId, guests: Number(guests) });
+        }
+      }
+      importCsv(['oak,30']);
+      console.log(saved.length);
+    question: The handler refuses 30 guests with a 422. What does the import log?
+    choices:
+      - text: '`0`, the room only seats 8'
+        feedback: >-
+          The room does. But that rule lives inside `postBooking`, and the import never goes
+          near it.
+      - text: '`1`'
+        correct: true
+        feedback: >-
+          Right. Thirty people in a room for eight. The rule guarded one door only.
+      - text: It throws, `guests` is a string
+        feedback: >-
+          `Number(guests)` converts it. Nothing throws. The booking is saved as if it were
+          fine.
+
+  - type: prose
+    id: name-thin-handlers
+    body: >-
+      The rule lived inside one handler, so the import never met it. A **thin handler** does
+      three things: it reads the request, makes one call into the domain, and turns the
+      result into a status and a body.
+
+
+      The rule lives in that domain function, so every entry point passes it. It's quicker to
+      test too. A plain function call needs no server.
+
+  - type: ai-review
+    id: review-bulk-cancel-skips-owner-check
+    concept: arch.thin-handlers
+    difficulty: 3
+    language: js
+    request: Add an endpoint that cancels several bookings in one request.
+    flawClass: security
+    code: |
+      // existing: DELETE /bookings/:id
+      async function cancelOne(req, res, session) {
+        const booking = await bookings.find(req.params.id);
+        if (booking.userId !== session.userId) return send(res, 403);
+        await bookings.markCancelled(booking.id);
+        send(res, 204);
+      }
+      // new: POST /bookings/cancel-many
+      async function cancelMany(req, res, session) {
+        for (const id of req.body.ids) {
+          await bookings.markCancelled(id);
+        }
+        send(res, 204);
+      }
+    prompt: >-
+      An assistant wrote `cancelMany`. The tester cancelled three of their own bookings, and
+      it worked. Nobody tried someone else's ids. Tap the line at fault.
+    lines: [11]
+    reasons:
+      - text: The loop should use `Promise.all`
+        feedback: >-
+          That's a speed choice, and a risky one. The flaw here is about who may cancel what.
+      - text: It cancels without the owner check
+        correct: true
+        feedback: >-
+          Yes. The rule lived in the other handler. Move it into one `cancelBooking(id, userId)`.
+      - text: '`204` should be `200`'
+        feedback: >-
+          `204 No Content` suits a cancel with nothing to return. The status is fine.
+    fix: |
+      // bookings/index.js: the rule, once, for every entry point
+      export async function cancelBooking(id, userId) {
+        const booking = await find(id);
+        if (booking.userId !== userId) return { ok: false, reason: 'not yours' };
+        await markCancelled(id);
+        return { ok: true };
+      }
+
+  - type: prose
+    id: components-are-a-layer
+    body: >-
+      A React component sits in the same outer layer: it talks to people. When a component
+      queries the database and works out a price itself, it skips the domain.
+
+
+      Then that price rule exists on one page only. The receipt email and the admin screen
+      each grow their own copy, and the copies drift apart.
+
+  - type: bug-hunt
+    id: hunt-rule-in-component
+    concept: arch.layering
+    difficulty: 3
+    language: jsx
+    code: |
+      import { db } from '../db/client.js';
+
+      export default async function OrderTotal({ orderId }) {
+        const { rows } = await db.query(
+          'SELECT pence, qty FROM order_lines WHERE order_id = $1', [orderId]);
+        let pence = 0;
+        for (const line of rows) pence = pence + line.pence * line.qty;
+        if (pence > 5000) pence = pence - 500;   // £5 off orders over £50
+        return <p>Total: £{(pence / 100).toFixed(2)}</p>;
+      }
+    prompt: >-
+      The order page shows £50.00. The receipt email for the same order says £55.00. Tap
+      the line that makes them disagree.
+    lines: [8]
+    reasons:
+      - text: The discount rule lives only in this component
+        correct: true
+        feedback: >-
+          Yes. The email never ran it. Ask the domain for the total, in both places.
+      - text: The sum should use `reduce`
+        feedback: >-
+          The loop adds up correctly. Both totals agree before the discount. Only one of them
+          applies it.
+      - text: The query should select every column
+        feedback: >-
+          The two columns are all the sum needs. The disagreement comes from a rule, not the
+          data.
+    fix: |
+      const pence = await orders.totalFor(orderId);   // the domain applies the discount
+
+  - type: code-challenge
+    id: write-book-room
+    concept: arch.thin-handlers
+    difficulty: 3
+    language: ts
+    prompt: >-
+      The guest rule, 1 to 8 guests, lives in `postBooking`, so `importCsv` skips it. Move
+      the rule into `bookRoom`, and make both entry points call `bookRoom`.
+
+
+      `postBooking` still answers `201` or `422`. `importCsv` saves the good lines and
+      returns the lines it refused.
+
+
+      So `importCsv(['oak,4', 'ash,0'], saved)` saves oak and returns `['ash,0']`.
+    hints:
+      - Start in `bookRoom`. Refuse before the `push`, and return a `reason`.
+      - Each entry point now turns a booking into one `bookRoom` call and reads `ok` from the result.
+      - 'In `postBooking`: `const result = bookRoom({ room: body.room, guests: body.guests }, saved);`'
+
+  - type: explain-back
+    id: explain-rule-in-handler
+    concept: arch.thin-handlers
+    difficulty: 4
+    prompt: >-
+      A refund limit is checked in the web handler. Months later, refunds over the limit
+      appear in the database. Why could the handler's check not stop them?
+    rubric:
+      - The rule lived in one HTTP handler, so it only guarded requests that came through that handler.
+      - Another entry point, such as an import, a job or a second endpoint, wrote refunds without passing it.
+      - Moving the rule into one domain function that every entry point calls closes the gap.
+    modelAnswer: >-
+      The check guarded one door. It sat inside a single handler, so only requests through
+      that route ever met it. Since then someone added another way in: a bulk endpoint, a
+      scheduled job, an admin script. That code saved refunds directly and never saw the
+      limit. Nothing was bypassed on purpose. The rule was in the wrong place. I'd move it
+      into a `refund` function in the domain, and have every handler call that.
+
+recap:
+  - Sort code into layers, handlers and components, the domain, and data access, each calling only the one below.
+  - Keep handlers and components thin, with one call into the domain.
+  - Put each business rule in one domain function that every entry point calls.
+
+recall:
+  - id: card-layers
+    concept: arch.layering
+    front: Name three layers of a web app, from the outside in.
+    back: >-
+      Handlers and components that talk to people and HTTP, the domain with the business
+      rules, and data access that talks to the database.
+  - id: card-domain
+    concept: arch.layering
+    front: What is the domain?
+    back: >-
+      The part of the code that holds the business rules, such as prices and limits, with no
+      web or database code in it.
+  - id: card-thin-handler
+    concept: arch.thin-handlers
+    front: What are the three jobs of a thin handler?
+    back: >-
+      Read the request, make one call into the domain, and turn the result into a status and
+      a body.
+  - id: card-second-entry-point
+    concept: arch.thin-handlers
+    front: What goes wrong when a business rule lives in an HTTP handler?
+    back: >-
+      Any other entry point skips it: an import, a job, a second endpoint. The rule also
+      needs a server to be tested.
+
+references:
+  - kind: essay
+    title: Presentation Domain Data Layering
+    authors: Martin Fowler
+    year: 2015
+    venue: martinfowler.com
+    url: https://martinfowler.com/bliki/PresentationDomainDataLayering.html
+    note: The three layers, and why each should know as little as it can about the one above.
+    primary: true
+    verified: true
+  - kind: paper
+    title: On the criteria to be used in decomposing systems into modules
+    authors: D. L. Parnas
+    year: 1972
+    venue: Communications of the ACM, 15(12)
+    url: https://doi.org/10.1145/361598.361623
+    note: Why modules should follow what changes together, not the steps of processing.
+    verified: true
+
+deepDive: >-
+  The import ran on Node 24 and logged `1`. Thirty guests went into a room for eight. The
+  same rule, called as a plain function, took well under a millisecond. Through a real HTTP
+  server it took about 26 ms, most of it the round trip. That's the other reason rules live
+  in plain functions: tests that don't need a server run hundreds of times faster.
+
+
+  A Next.js server component may query a database directly, as the Next.js chapter
+  mentioned. That's fine for reading data to show. The trouble starts when the component also decides
+  things, such as prices, limits or who may see what. Put those decisions in the domain and
+  call it from the component, the route handler and the email job alike.
+
+
+  Layers are about direction, not folders. You can keep feature folders from lesson 2 and
+  still have layers inside each feature: `bookings/handlers.js`, `bookings/rules.js`,
+  `bookings/queries.js`. The next lesson turns the last arrow round, so the domain doesn't
+  depend on the database either.

@@ -1,0 +1,274 @@
+id: backend.api-design
+title: API design
+objective: Name resources as nouns at stable URLs, filter a collection, and page a growing list with a cursor.
+level: essential
+minutes: 10
+concepts: [backend.resources, backend.pagination]
+prerequisites: [backend.http-in-depth]
+opening:
+  text: >-
+    You'll shape an API so a stranger can guess the next URL before reading your docs. And a
+    feed that grows while someone scrolls will never show them the same post twice.
+
+steps:
+  - type: prose
+    id: resources-and-urls
+    body: |-
+      An API is easiest to guess when its URLs name things, not actions. Each thing is a
+      **resource**, a noun at a stable address:
+
+      ```text
+      /orders              every order, the collection
+      /orders/42           one order
+      /orders/42/lines     the lines that belong to order 42
+      ```
+
+      The method says what to do, and the URL says to what. So it's `DELETE /orders/42`, never
+      `POST /deleteOrder`.
+
+  - type: fill-blank
+    id: fill-resource-routes
+    concept: backend.resources
+    difficulty: 1
+    language: http
+    prompt: >-
+      Lay out the routes for orders and the lines inside one. Nouns, plural, nested where a
+      thing belongs to another. Fill the gaps.
+    template: |
+      GET     /{{1}}
+      POST    /orders
+      GET     /orders/{{2}}
+      GET     /orders/42/{{3}}
+      DELETE  /orders/42/lines/7
+    blanks:
+      - key: '1'
+        answer: orders
+      - key: '2'
+        answer: '42'
+      - key: '3'
+        answer: lines
+    bank: [orders, getOrders, order, '42', 'id=42', lines, orderLines]
+
+  - type: prose
+    id: filtering
+    body: |-
+      To narrow a collection, the client adds a query string: `/orders?status=paid`. The
+      handler reads it with `searchParams`:
+
+      ```js
+      const url = new URL(request.url);
+      const status = url.searchParams.get("status");
+      ```
+
+      `get` returns the text after `status=`, or `null` when the client didn't send one. No
+      filter should mean every order, not none.
+
+  - type: ai-review
+    id: review-missing-filter
+    concept: backend.resources
+    difficulty: 2
+    language: js
+    request: Let GET /orders filter by status, like /orders?status=paid.
+    flawClass: edge-case
+    code: |
+      if (request.method === "GET" && url.pathname === "/orders") {
+        const status = url.searchParams.get("status");
+        const found = orders.filter((order) => order.status === status);
+        return Response.json(found);
+      }
+    prompt: >-
+      An assistant wrote this. `/orders?status=paid` returns the paid orders, and the test
+      passes. Then the orders page, which calls plain `/orders`, shows an empty list. Tap the
+      line at fault.
+    lines: [3]
+    reasons:
+      - text: With no filter, it compares every status with `null`
+        correct: true
+        feedback: >-
+          Yes. No order has a `null` status. Skip the filter when it's `null`.
+      - text: '`get` throws when `status` is missing'
+        feedback: >-
+          It doesn't throw. It returns `null`, and the filter then compares with `null`.
+      - text: '`filter` should be `find`'
+        feedback: >-
+          `find` returns one order. A filtered list needs `filter`; the problem is what it compares.
+    fix: |
+      if (request.method === "GET" && url.pathname === "/orders") {
+        const status = url.searchParams.get("status");
+        const found = status === null ? orders : orders.filter((order) => order.status === status);
+        return Response.json(found);
+      }
+
+  - type: prose
+    id: offset-pages
+    body: >-
+      A long list comes back a page at a time. The simplest way is an **offset**:
+      `?offset=0&limit=2` means "skip none, send two". The next page is `?offset=2&limit=2`,
+      "skip two, send two".
+
+
+      That works while the list stands still. A feed doesn't. It's newest first, and new
+      posts arrive at the top while someone is reading.
+
+  - type: predict-output
+    id: predict-offset-repeat
+    concept: backend.pagination
+    difficulty: 2
+    language: bash
+    code: |
+      $ curl "localhost:3101/posts/offset?offset=0&limit=2"
+      {"items":[{"id":5},{"id":4}],"nextOffset":2}
+      $ curl -X POST localhost:3101/posts
+      {"id":6}
+      $ curl "localhost:3101/posts/offset?offset=2&limit=2"
+    question: Someone published post 6 in between. Which posts does page two hold?
+    choices:
+      - text: '`4` and `3`'
+        correct: true
+        feedback: >-
+          Right. Post 6 pushed everything down one, so post 4 shows on both pages.
+      - text: '`3` and `2`'
+        feedback: >-
+          That's what you'd hope. But skipping two now skips 6 and 5, so it lands on 4 again.
+      - text: '`6` and `5`'
+        feedback: >-
+          Those are the new first page. Page two skips two posts from the top, whatever they are.
+
+  - type: prose
+    id: cursors
+    body: >-
+      The fix is **cursor pagination**. Each page carries a `nextCursor`, the id of its last
+      post. The client sends it back as `after`, and the server continues after that post,
+      wherever it now sits.
+
+
+      A new post above can't shift the page. An offset is still fine for a list that stands
+      still, like search results with page numbers.
+
+  - type: predict-output
+    id: predict-cursor-holds
+    concept: backend.pagination
+    difficulty: 2
+    language: bash
+    code: |
+      $ curl "localhost:3101/posts?limit=2"
+      {"items":[{"id":5},{"id":4}],"nextCursor":"4"}
+      $ curl -X POST localhost:3101/posts
+      {"id":6}
+      $ curl "localhost:3101/posts?limit=2&after=4"
+    question: Post 6 arrives again. Which posts come back after the cursor?
+    choices:
+      - text: '`3` and `2`'
+        correct: true
+        feedback: >-
+          Yes. The cursor names a post, not a position. A new post above changes nothing.
+      - text: '`4` and `3`'
+        feedback: >-
+          That's the offset bug. A cursor starts after the named post, so 4 stays behind.
+      - text: '`6` and `5`'
+        feedback: >-
+          Post 6 is above the cursor. The client asked for what follows 4, and only that.
+
+  - type: code-challenge
+    id: write-paginate
+    concept: backend.pagination
+    difficulty: 4
+    language: ts
+    prompt: >-
+      Write `paginate(posts, after, limit)`, returning `{ items, nextCursor }`. `posts` is the
+      whole feed in order. A cursor is a post's `id` as a string. `after` is a cursor, or
+      `null` for the first page.
+
+
+      Start after the post named by `after`. `posts.findIndex(fn)` gives the position of the
+      first post `fn` accepts, or `-1`. Take `limit` items. `nextCursor` is the last item's id,
+      or `null` when nothing follows the page. An unknown cursor gives an empty page with
+      `nextCursor: null`.
+    hints:
+      - Find where the cursor's post sits first, then start one after it.
+      - The page has a next cursor only if more posts remain beyond it.
+      - "Start with `let start = 0;` and set it from `findIndex` when `after` isn't `null`."
+
+  - type: explain-back
+    id: explain-cursor-vs-offset
+    concept: backend.pagination
+    difficulty: 3
+    prompt: >-
+      A teammate asks why the feed endpoint takes `after=<id>` instead of a page number. What
+      do you tell them?
+    rubric:
+      - An offset counts positions, and new posts at the top shift every position.
+      - So a reader sees a post twice, or misses one, while the feed grows.
+      - A cursor names the last post seen, so the next page starts after it wherever it moved.
+    modelAnswer: >-
+      A page number is an offset: skip this many posts. In a feed, new posts land on top while
+      someone scrolls. Every position shifts, so page two repeats a post they've seen, or
+      skips one. A cursor names the last post they saw. The server continues after that exact
+      post, wherever it now sits, so new posts can't move the page.
+
+recap:
+  - Name resources as plural nouns at stable URLs, nested where one belongs to another.
+  - "Filter a collection with a query string, and treat a missing filter as \"all\"."
+  - Page a growing feed with a cursor, and know when an offset is fine.
+
+recall:
+  - id: card-resource-urls
+    concept: backend.resources
+    front: What do `/orders`, `/orders/42` and `/orders/42/lines` each name?
+    back: >-
+      The collection, one item, and the collection that belongs to that item.
+  - id: card-filter-query
+    concept: backend.resources
+    front: How does a handler read `?status=paid`, and what comes back when it's missing?
+    back: >-
+      `new URL(request.url).searchParams.get("status")`. It returns `null` when the client
+      didn't send it.
+  - id: card-offset-bug
+    concept: backend.pagination
+    front: Why does offset pagination repeat or skip a row in a growing feed?
+    back: >-
+      An offset counts positions. A new row above the page shifts every position by one.
+  - id: card-cursor
+    concept: backend.pagination
+    front: What does a cursor name, and why does that fix the shift?
+    back: >-
+      A specific item. The next page starts after that item, wherever it now sits.
+
+references:
+  - kind: rfc
+    title: 'RFC 9110: HTTP Semantics'
+    authors: R. Fielding, M. Nottingham and J. Reschke (eds)
+    year: 2022
+    venue: IETF
+    url: https://www.rfc-editor.org/rfc/rfc9110
+    note: Resources and their identifiers (section 3.1), and the methods that act on them.
+    primary: true
+    verified: true
+  - kind: docs
+    title: 'URLSearchParams: get() method'
+    authors: MDN contributors
+    venue: MDN Web Docs
+    url: https://developer.mozilla.org/en-US/docs/Web/API/URLSearchParams/get
+    note: Reading one query parameter, and the `null` it returns when the name is missing.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Pagination
+    authors: Stripe
+    venue: Stripe API reference
+    url: https://docs.stripe.com/api/pagination
+    note: A real cursor API, with `starting_after` and `has_more`.
+    verified: true
+
+deepDive: >-
+  A cursor doesn't have to be an id. Sort by `created_at` then `id`, and encode both in the
+  cursor. Two posts made in the same second then still page correctly. Many APIs
+  base64-encode the cursor so clients treat it as opaque and never build one by hand.
+
+
+  Filters combine: `/orders?status=paid&since=2026-09-01`. Each is one more
+  `searchParams.get`, and each missing one means "don't filter on this".
+
+
+  Stripe's API is a good model to read. Its lists take `limit` and `starting_after`, an
+  object id, and answer with `has_more` instead of a next cursor. Same idea, different names.

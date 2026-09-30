@@ -1,0 +1,259 @@
+summary: >-
+  Ports and adapters, also called hexagonal architecture, turns the last arrow of a layered
+  app round. Instead of the domain importing the database, the domain declares a **port**,
+  an interface in its own words for what it needs, and an **adapter** implements that port
+  for one technology. The caller passes the adapter in, which is dependency injection, so
+  every source dependency points inward and the domain imports no framework, database or
+  network code.
+
+
+  The result is business rules that run anywhere: in production against PostgreSQL, in a
+  test against a `Map`, in a script against a file. Swapping a database, a mail provider or
+  a model means writing a new adapter, not editing the rules.
+
+
+  These notes cover the parts that decide whether the pattern pays off in a real codebase:
+  the composition root where adapters are chosen, contract tests that stop fakes drifting
+  from the real thing, how to shape a port, why the clock and random ids are ports too, and
+  when the pattern costs more than it gives.
+remember:
+  - The dependency rule says source code dependencies point inward, so the domain imports nothing from frameworks, databases or the network.
+  - A port is an interface the domain defines in its own vocabulary, and an adapter implements it for one technology.
+  - Dependency injection means a function receives what it depends on, so the caller or a test chooses the adapter.
+  - Adapters are chosen and wired in one place, the composition root, near the program's entry point.
+  - Run one contract test suite against both the in-memory fake and the real adapter, so the fake can't drift from production.
+  - Shape a port around what the domain needs, such as `countOpen(memberId)`, not around a table or a generic query method.
+  - Time, randomness and ids are dependencies too, and a `Clock` port makes date rules testable.
+  - A port costs a file and a hop, so add one where a rule deserves isolated tests or a technology is likely to change.
+sections:
+  - title: The composition root
+    body: |-
+      If every function receives its adapters, something has to create them. That place is
+      the **composition root**: one module near the entry point that reads configuration,
+      builds the adapters and hands them to the use cases. It's the only module that knows
+      which technologies the app uses.
+
+      ```ts
+      type Loan = { id: string; dueDay: number; renewals: number };
+      interface LoanStore {
+        find(id: string): Loan | undefined;
+        save(loan: Loan): void;
+      }
+      interface Clock {
+        today(): number;
+      }
+
+      // domain: rules only, adapters arrive as arguments
+      function renewLoan(loanId: string, deps: { loans: LoanStore; clock: Clock }) {
+        const loan = deps.loans.find(loanId);
+        if (!loan) return { ok: false as const, reason: 'no such loan' };
+        if (deps.clock.today() > loan.dueDay) return { ok: false as const, reason: 'overdue' };
+        const renewed = { ...loan, dueDay: loan.dueDay + 14, renewals: loan.renewals + 1 };
+        deps.loans.save(renewed);
+        return { ok: true as const, dueDay: renewed.dueDay };
+      }
+
+      // adapters
+      function memoryLoans(rows: Loan[]): LoanStore {
+        const table = new Map(rows.map((row) => [row.id, row]));
+        return { find: (id) => table.get(id), save: (loan) => void table.set(loan.id, loan) };
+      }
+      const systemClock: Clock = { today: () => Math.floor(Date.now() / 86_400_000) };
+
+      // composition root: the one place that picks technologies.
+      // In production this is where postgresLoans(pool) would be built instead.
+      function buildApp() {
+        const deps = { loans: memoryLoans([]), clock: systemClock };
+        return { renewLoan: (loanId: string) => renewLoan(loanId, deps) };
+      }
+
+      const app = buildApp();
+      console.log(app.renewLoan('l1')); // { ok: false, reason: 'no such loan' }
+
+      const fixedClock: Clock = { today: () => 95 };
+      const loans = memoryLoans([{ id: 'l1', dueDay: 100, renewals: 0 }]);
+      console.log(renewLoan('l1', { loans, clock: fixedClock })); // { ok: true, dueDay: 114 }
+      ```
+
+      Handlers receive the already-wired use cases, so they never import an adapter either.
+      Tests skip the root and call the domain with fakes, as the last two lines show.
+
+      Frameworks called DI containers automate this wiring by type or name. In TypeScript
+      most teams find a hand-written root clearer: it's plain code, the compiler checks it,
+      and you can read in one file what the app is made of.
+  - title: Contract tests keep fakes honest
+    body: |-
+      Domain tests use an in-memory adapter, which is fast and deterministic. The risk is
+      drift: the fake treats a missing loan as `undefined` while the real adapter throws, or
+      the fake updates in place while the real one inserts a duplicate. Every domain test
+      passes, and production breaks.
+
+      The fix is a **contract test**: one suite, written against the port, run against every
+      adapter. Here it runs against the `Map` fake and against SQLite through Node 24's
+      built-in `node:sqlite` module:
+
+      ```ts
+      import { DatabaseSync } from 'node:sqlite';
+      import assert from 'node:assert/strict';
+
+      type Loan = { id: string; dueDay: number; renewals: number };
+      interface LoanStore {
+        find(id: string): Loan | undefined;
+        save(loan: Loan): void;
+      }
+
+      function memoryLoans(): LoanStore {
+        const table = new Map<string, Loan>();
+        return { find: (id) => table.get(id), save: (loan) => void table.set(loan.id, loan) };
+      }
+
+      function sqliteLoans(db: DatabaseSync): LoanStore {
+        db.exec('CREATE TABLE loans (id TEXT PRIMARY KEY, due_day INTEGER, renewals INTEGER)');
+        const select = db.prepare('SELECT id, due_day, renewals FROM loans WHERE id = ?');
+        const upsert = db.prepare(
+          'INSERT INTO loans (id, due_day, renewals) VALUES (?, ?, ?) ' +
+            'ON CONFLICT (id) DO UPDATE SET due_day = excluded.due_day, renewals = excluded.renewals',
+        );
+        return {
+          find(id) {
+            const row = select.get(id) as { id: string; due_day: number; renewals: number } | undefined;
+            return row && { id: row.id, dueDay: row.due_day, renewals: row.renewals };
+          },
+          save(loan) {
+            upsert.run(loan.id, loan.dueDay, loan.renewals);
+          },
+        };
+      }
+
+      function loanStoreContract(name: string, makeStore: () => LoanStore) {
+        const store = makeStore();
+        assert.equal(store.find('missing'), undefined);
+        store.save({ id: 'l1', dueDay: 100, renewals: 0 });
+        store.save({ id: 'l1', dueDay: 114, renewals: 1 });
+        assert.deepEqual(store.find('l1'), { id: 'l1', dueDay: 114, renewals: 1 });
+        console.log(`${name}: contract passed`);
+      }
+
+      loanStoreContract('memory', () => memoryLoans());
+      loanStoreContract('sqlite', () => sqliteLoans(new DatabaseSync(':memory:')));
+      ```
+
+      The contract pins down exactly what the domain relies on: missing means `undefined`,
+      saving twice updates. The real adapter's run is slower and belongs with the
+      integration tests; the fake's run is instant. With both passing, domain tests against
+      the fake are trustworthy.
+  - title: Shaping a port
+    body: |-
+      A port is designed from the inside out. Start from what the rule needs and name it in
+      the domain's words. The lesson's loans port has `countOpen(memberId)` and `save(loan)`,
+      because that's all lending needs.
+
+      Two common shapes go wrong. The first is the **generic repository**: `query(sql)`,
+      `findWhere(filter)`, or a port that mirrors every column. It lets the domain phrase
+      questions in database terms, so the database leaks back in and a second adapter has
+      to emulate SQL. The second is the **fat port**: one `Storage` interface with forty
+      methods used by twenty rules. Every adapter and every fake must implement all forty,
+      and a rule's dependencies are no longer visible from its signature. Several small
+      ports, one per need, are easier to fake and to read.
+
+      A port also sets the unit of work. If the domain needs two writes to succeed together,
+      say so in the port, for example `lend(loan)` that records the loan and decrements
+      stock, or a `withTransaction(fn)` function whose callback receives the stores. The
+      adapter implements it with a real transaction; the fake runs the callback.
+
+      Performance lives in the adapter, not the port. The lesson's slow adapter fetched
+      every row to count one member's loans. The port was fine; the adapter used its
+      technology badly. That's why contract tests should also run against a realistic
+      amount of data now and then, not only three rows.
+  - title: The clock is a dependency
+    body: |-
+      Any rule that reads `Date.now()` or `new Date()` directly has a hidden dependency on
+      the real clock. Tests of "overdue after 14 days" then either wait 14 days, fake the
+      global timer, or pass only on certain dates.
+
+      Treat time like any other outside service: a `Clock` port with `now()` or
+      `today()`, a system adapter in production, and a fixed one in tests. The composition
+      root example above does this, and its last line tests renewal on day 95 without
+      touching the real date. The same goes for random numbers and generated ids: a rule
+      that creates a booking reference should receive an id generator, so a test can
+      predict the reference.
+
+      Test runners can fake timers globally, and that's useful for code you don't own. For
+      your own rules, an explicit port is clearer: the signature shows that time matters,
+      and nothing global has to be restored after the test.
+
+      Time zones belong in the adapter or at the edge too. The domain can work in whole
+      days or UTC instants; turning "today in London" into a day number is a translation
+      job, like turning a request into plain values.
+  - title: Driving and driven sides, and when to stop
+    body: |-
+      The original article distinguishes two kinds of port. **Driving** ports are how the
+      outside world calls in: an HTTP handler, a CLI command, a queue consumer and a test
+      all drive the same use cases. **Driven** ports are what the domain calls out to:
+      storage, email, payments, a model. Both kinds have adapters, and the domain sits in
+      the middle, unaware of either.
+
+      This is the same idea you'll meet as clean architecture or onion architecture. The
+      names differ; the dependency rule is the shared core.
+
+      The pattern has costs: an interface per dependency, a composition root, and an extra
+      hop when following a call from handler to SQL. For a small script or a CRUD screen
+      with no rules worth testing, that's overhead with no return. Signs it will pay off:
+
+      - the rules are valuable and change often, so fast isolated tests matter;
+      - a technology is likely to change, such as a provider or a model;
+      - the same use case has several entry points.
+
+      A pragmatic codebase often mixes styles: ports around the core domain and external
+      services, and direct database queries in simple read-only screens.
+pitfalls:
+  - '**Domain functions that take `req`, `res` or an ORM entity.** No import, but still coupled to a framework''s shapes. Pass plain values and return domain results.'
+  - '**Fakes that behave differently from real adapters.** Domain tests pass while production fails. Run one contract suite against every adapter.'
+  - '**A generic `query(sql)` port.** The database leaks back into the domain through the questions it asks. Name methods after domain needs.'
+  - '**One giant storage interface.** Every fake implements forty methods and no rule''s real dependencies are visible. Split ports by need.'
+  - '**Adapters imported from all over the code.** Wiring spreads and swapping means a search. Build adapters in one composition root and pass them in.'
+  - '**Reading `Date.now()` inside rules.** Date logic becomes untestable without global fakes. Inject a clock.'
+  - '**Ports around everything.** A CRUD screen with no rules gains nothing from three extra files. Apply the pattern where rules or change justify it.'
+interview:
+  - question: Explain hexagonal architecture, or ports and adapters, to someone who hasn't used it.
+    answer: >-
+      The business rules sit in the middle and depend on nothing technical. When a rule
+      needs something from outside, like storage or email, it declares a port: an interface
+      in domain terms such as `countOpen(memberId)`. Adapters implement ports for real
+      technologies, PostgreSQL in production and a `Map` in tests, and a composition root
+      passes them in. Incoming callers, like HTTP handlers or queue consumers, are adapters
+      on the other side. The payoff is fast tests of the rules and replaceable
+      infrastructure. The cost is extra interfaces and indirection, so I'd use it around a
+      domain with real rules, not a thin CRUD app where the rules are mostly the database's
+      constraints.
+  - question: How do you make sure an in-memory fake behaves like the real database adapter?
+    answer: >-
+      With a contract test suite written against the port and run against every adapter.
+      The suite pins down the behaviour the domain relies on: what a missing record
+      returns, whether saving twice updates, ordering, uniqueness. Running it against the
+      fake is instant; running it against the real adapter happens with the integration
+      tests on a real database. If both pass, domain tests against the fake are
+      trustworthy. Without it, fakes drift, for example returning `undefined` where the
+      real adapter throws, and the fast suite stays green while production breaks. The
+      trade-off is writing the contract once per port, which is small compared with
+      debugging a fake that lied.
+  - question: What is dependency injection, and do you need a DI container for it?
+    answer: >-
+      Dependency injection means a function or object receives its collaborators instead of
+      creating or importing them, so the caller decides which implementation runs. You
+      don't need a container. In TypeScript I usually pass dependencies as parameters or a
+      `deps` object and wire everything in one hand-written composition root at startup.
+      That's plain code the compiler checks, and one file shows what the app is built from.
+      Containers help in very large apps with many lifetimes and scopes, but they move
+      wiring into decorators or configuration, which makes errors appear at runtime and
+      hides the dependency graph. I'd start without one.
+  - question: How do you test business logic that depends on the current date?
+    answer: >-
+      Treat the clock as a dependency: define a `Clock` port with `now()` or `today()`, use
+      a system adapter in production and a fixed one in tests. A rule like "renewal is
+      refused once a loan is overdue" then takes a clock and can be tested for day 99, 100
+      and 101 in plain function calls, with no waiting and no global state. Random values
+      and generated ids get the same treatment. Global fake timers are the alternative and
+      are handy for code you don't control, but they must be restored and they hide the
+      dependency. An explicit clock makes time visible in the signature, which also helps
+      a reader see which rules depend on it.

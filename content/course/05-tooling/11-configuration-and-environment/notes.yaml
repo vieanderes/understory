@@ -1,0 +1,290 @@
+summary: >-
+  Configuration is everything that changes between the places your code runs: ports,
+  database addresses, API keys, feature switches. The code stays the same on your laptop,
+  on staging and in production. Only the configuration differs. The Twelve-Factor App calls
+  this strict separation of config from code, and it's why settings live in environment
+  variables rather than in source files.
+
+
+  Environment variables are simple and awkward in equal measure. Every value is a string,
+  any of them can be missing, and a typo fails silently. So a serious program reads them
+  once, at start-up, checks them against a schema, and hands the rest of the code a typed,
+  validated object. A bad setting then stops the program with a clear message, instead of
+  causing a strange bug an hour later.
+
+
+  Two lines matter most. One separates **build time** from **runtime**: a value baked into a
+  bundle is fixed and public, while a value read at start-up can change per server. The
+  other separates **public** from **secret**: a secret stays on the server, out of Git, out
+  of logs and out of anything a browser downloads.
+remember:
+  - Configuration that varies between deploys lives in the environment, never in the code, so one build can run everywhere.
+  - Every value in `process.env` is a string or `undefined`, and assigning a number stores its text.
+  - Read and validate the environment once at start-up, and fail fast with the names of the bad variables but never their values.
+  - '`node --env-file=.env` loads a file with no package, and a variable already set in the environment wins over the file.'
+  - Commit a `.env.example` with names and placeholders, and keep the real `.env` in `.gitignore`.
+  - A value written into a bundle at build time is fixed for that build and readable by anyone who downloads it.
+  - A secret never goes in Git, in logs, in error messages or in browser code, and a leaked one is rotated at once.
+  - '`z.coerce.number()` turns an empty string into `0` and `z.coerce.boolean()` turns `"false"` into `true`, so choose coercions with care.'
+sections:
+  - title: '`process.env` in Node 24, precisely'
+    body: |-
+      `process.env` is an object built from the environment the process started with. It
+      behaves like an ordinary object with one twist: every value you store becomes a
+      string.
+
+      ```bash
+      $ node -e 'process.env.N = 5; console.log(typeof process.env.N, process.env.N)'
+      string 5
+      $ node -e 'process.env.U = undefined; console.log(JSON.stringify(process.env.U))'
+      "undefined"
+      ```
+
+      That second line is a real trap: setting a variable to `undefined` stores the text
+      `"undefined"`, which is truthy. Use `delete process.env.U` to remove one.
+
+      Reading has the mirror trap. `PORT` arrives as text, so arithmetic on it joins strings:
+
+      ```bash
+      $ node --env-file=.env -e 'console.log(process.env.PORT + 1, Number(process.env.PORT) + 1)'
+      90901 9091
+      ```
+
+      A missing variable is `undefined`, and an empty one, `NAME=`, is `""`. Those are
+      different, and code that checks `if (process.env.NAME)` treats both as absent.
+
+      Child processes inherit the environment by default. A script that spawns another
+      command passes along every variable, secrets included:
+
+      ```bash
+      $ SECRET_TOKEN=abc node -e 'require("child_process").exec("node -e \"console.log(process.env.SECRET_TOKEN)\"", (e, out) => console.log("child sees:", out.trim()))'
+      child sees: abc
+      ```
+
+      That's usually what you want, since build tools rely on it. It's also why you think
+      twice before running untrusted scripts, such as a package's install script, in a shell
+      that holds production credentials.
+
+      Finally, reading `process.env.SOMETHING` deep inside the code is a smell. It hides a
+      dependency, makes tests set global state, and skips validation. Read once in one
+      module, validate, and import the result everywhere else.
+  - title: '`.env` files with Node''s built-in loader'
+    body: |-
+      Node 24 reads `.env` files itself. The format handles comments, quotes, multi-line
+      values and an optional `export` prefix:
+
+      ```bash
+      # .env
+      PORT=9090
+      GREETING="hello world" # trailing comment
+      MULTI="line one
+      line two"
+      export REGION=eu
+      EMPTY=
+      ```
+
+      Loaded with `node --env-file=.env`, those give `PORT: "9090"`, `GREETING: "hello
+      world"`, `MULTI: "line one\nline two"`, `REGION: "eu"` and `EMPTY: ""`.
+
+      The precedence rules, all checked on Node 24.21:
+
+      - A variable already in the environment wins. `PORT=1 node --env-file=.env` sees `1`.
+      - With several files, later ones win: `--env-file=.env --env-file=.env.local` takes
+        `PORT` from `.env.local`.
+      - A missing file is fatal. `node: nope.env: not found`, exit code 9.
+      - `--env-file-if-exists=.env.local` skips a missing file with a notice and carries on.
+
+      The flag belongs before the script name. `node server.js --env-file=.env` passes the
+      text to your script as an argument, and nothing is loaded.
+
+      Two functions do the same from code. `process.loadEnvFile('.env')` loads a file into
+      `process.env`, and it also leaves variables that are already set alone.
+      `util.parseEnv(text)` parses the format into a plain object without touching
+      `process.env`:
+
+      ```js
+      const { parseEnv } = require('node:util');
+      console.log(parseEnv('A=1\nB="two"\n')); // { A: '1', B: 'two' }
+      ```
+
+      Because the environment wins, a `.env` file is a set of defaults for local work, and
+      real servers set variables through their platform instead. Commit a `.env.example`
+      listing every name with a harmless placeholder, so a new teammate knows what to fill
+      in, and keep `.env` itself in `.gitignore`.
+  - title: A complete start-up check
+    body: |-
+      Here is a full environment module in TypeScript with zod 4. It collects every problem
+      at once, prints names and reasons without values, and exits with code 1.
+
+      ```ts
+      // env.ts
+      import { z } from 'zod';
+
+      const EnvSchema = z.object({
+        NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
+        PORT: z.coerce.number().int().min(1).max(65535).default(3000),
+        DATABASE_URL: z.url(),
+        EMAIL_API_KEY: z.string().min(20),
+        SEND_EMAILS: z.stringbool().default(false),
+      });
+
+      export type Env = z.infer<typeof EnvSchema>;
+
+      export function loadEnv(source: Record<string, string | undefined>): Env {
+        const result = EnvSchema.safeParse(source);
+        if (!result.success) {
+          // Names and reasons only: never echo the values, which may be secrets.
+          console.error('Invalid environment:\n' + z.prettifyError(result.error));
+          process.exit(1);
+        }
+        return result.data;
+      }
+
+      export const env = loadEnv(process.env);
+      ```
+
+      A broken start-up prints all three problems together, so you fix them in one go:
+
+      ```text
+      $ PORT=eighty DATABASE_URL=s3cret-not-a-url npx tsx env.ts
+      Invalid environment:
+      ✖ Invalid input: expected number, received NaN
+        → at PORT
+      ✖ Invalid URL
+        → at DATABASE_URL
+      ✖ Invalid input: expected string, received undefined
+        → at EMAIL_API_KEY
+      ```
+
+      The rejected URL text never appears. Taking the source as a parameter also makes the
+      function testable: pass a plain object, no global state.
+
+      Watch the coercions. `z.coerce` calls JavaScript's own conversion, which has
+      surprises. `Number("")` is `0`, so an empty `PORT=` becomes port 0 instead of an
+      error, which is why the schema adds `.min(1)`. `Boolean("false")` is `true`, so
+      `z.coerce.boolean()` turns `SEND_EMAILS=false` on. `z.stringbool()` is built for
+      this: it accepts `true`, `1`, `yes` and `on` as true, `false`, `0`, `no` and `off` as
+      false, and rejects anything else.
+  - title: Twelve-factor config, and one build for every server
+    body: |-
+      The Twelve-Factor App's config rule has a useful test: could you make the repository
+      public right now without leaking a credential? If not, config is mixed into code.
+
+      Config, in that sense, is what varies between deploys: addresses of backing services,
+      credentials, per-environment switches. It is not everything you might call a setting.
+      A route table or the list of supported languages is part of the app, the same
+      everywhere, and belongs in code.
+
+      The practical goal is to **build once and promote**. CI builds one artefact, tests it,
+      deploys it to staging, and then deploys that same artefact to production with
+      different environment variables. What you tested is what runs. The alternative, a
+      separate build per environment, means production runs a build nobody tested.
+
+      That goal decides where each value is read:
+
+      - **Server code** reads everything at runtime, from `process.env`, through the
+        start-up check.
+      - **Browser code** has no environment. Values reach it only if the bundler writes them
+        in, as `--define` or a framework's public prefix does. Those values are fixed per
+        build and readable by every visitor.
+
+      So browser code gets only public, build-independent values baked in. When browser
+      settings must differ per server without a rebuild, the server supplies them at
+      runtime: it renders them into the page, or serves them from an endpoint the app
+      fetches when it starts. Either way they're public, so they must never include a
+      secret.
+
+      The same thinking applies to feature switches. A switch read at start-up can change
+      with a restart. A switch baked in at build time needs a new build, and one that's
+      compiled away as dead code isn't even in the file to switch on.
+  - title: Handling secrets without leaking them
+    body: |-
+      A **secret** is any value that lets its holder act as you: an API key, a database
+      password, a signing key. The rules follow from where copies end up.
+
+      **Not in Git.** History keeps every version, and every clone has a full copy. Keep
+      `.env` in `.gitignore`, and let a secret scanner in CI or on the hosting service
+      catch mistakes.
+
+      **Not in logs or errors.** Logs are copied to services, shared in chat and kept for
+      months. Log the port, the region and the database host, never the whole config
+      object. Validation errors should name the variable, as zod's do, not echo its value.
+
+      **Not in the browser.** Anything in a bundle is public. When browser code needs a
+      service that requires a key, the browser calls your server, and your server calls the
+      service with the key. That extra hop is the whole point.
+
+      **Least privilege.** Use a separate key per environment, with only the permissions it
+      needs. A staging key that leaks shouldn't reach production data, and a read-only key
+      can't delete anything.
+
+      **Stored where the platform keeps secrets.** On real servers, set variables through
+      your hosting platform's settings or a secrets manager, not a `.env` file copied over.
+      CI services have their own encrypted secrets store for keys that tests or deploys
+      need.
+
+      **Rotation is normal.** Assume every secret will be replaced one day, and make that
+      cheap: one place to change it, a restart to pick it up. When one leaks, revoke it
+      first, then investigate. Deleting the commit or the message doesn't remove the copies.
+pitfalls:
+  - '**Treating `process.env` values as numbers or booleans.** They''re always strings, so `PORT + 1` gives `"90901"` and `"false"` is truthy. Convert once, in a schema, and use the typed result.'
+  - '**Coercing with `z.coerce.boolean()`.** It runs `Boolean(text)`, so every non-empty string, including `"false"` and `"0"`, becomes `true`. Use `z.stringbool()`.'
+  - '**Putting `--env-file` after the script name.** Node passes it to your script as an argument, and nothing loads. Write `node --env-file=.env server.js`.'
+  - '**Expecting `.env` to override the shell.** A variable already set wins, so a stale `export PORT=1` in your terminal beats the file. Check with `echo $PORT`, or open a fresh shell.'
+  - '**Logging the whole config at start-up.** It feels like helpful debugging, and it writes the database password into every log. Log only named, non-secret fields.'
+  - '**Giving a secret a public prefix.** `NEXT_PUBLIC_` and `VITE_` are promises, not checks: the value is written into the bundle. Keep keys unprefixed and call the service from your server.'
+interview:
+  - question: How do you manage configuration across development, staging and production?
+    answer: >-
+      I keep the code identical everywhere and put everything that varies in environment
+      variables, following the Twelve-Factor App. CI builds one artefact, and each
+      environment runs it with its own variables, so production runs exactly what staging
+      tested. Locally, a `.env` file supplies defaults, loaded with `node --env-file`, and a
+      committed `.env.example` documents every name. On servers, the platform or a secrets
+      manager sets the variables. At start-up, one module validates them with a schema and
+      exports a typed object, so a bad value stops the deploy immediately. The trade-off is
+      that browser code can't read the environment, so per-server browser settings need to
+      be served at runtime rather than baked into the bundle.
+  - question: Why validate environment variables at start-up rather than where they're used?
+    answer: >-
+      Because a bad setting should stop the deploy, not break a feature an hour later. If
+      each module reads `process.env` itself, a missing variable only surfaces when that
+      code path runs, maybe at 3am, as `undefined` or `NaN` far from the cause. Validating
+      once at start-up with a schema such as zod turns strings into typed values, applies
+      defaults, and reports every problem together with the variable names. The process
+      exits non-zero, so a platform with health checks can keep the old version running. It also gives the rest
+      of the code a typed object to import, which is easier to test than global state. The
+      cost is a little ceremony for new variables, which is worth it.
+  - question: Our frontend needs to call an API that requires a secret key. How do you do it?
+    answer: >-
+      Through my own server, because any key in browser code is public. Whatever the
+      bundler writes into the JavaScript, through `--define` or a public prefix like
+      `NEXT_PUBLIC_`, every visitor downloads and can read. So the browser calls an endpoint
+      on my server, and the server adds the key from its environment and calls the
+      third-party API. That hop also lets me check the user is signed in, rate-limit
+      requests and filter what comes back. Some services issue keys designed to be public,
+      restricted to certain domains or read-only data, and those can go in the bundle. The
+      trade-off is latency and a bit more code on the server, in exchange for keeping
+      control of the key.
+  - question: What's the difference between build-time and runtime configuration, and when does it matter?
+    answer: >-
+      Build-time values are written into the output when you build, while runtime values
+      are read each time the program starts. A bundler replacing `process.env.API_URL` with
+      a string makes that URL part of the file, identical on every server, and changing it
+      means rebuilding. A server reading `process.env.API_URL` at start-up can use a
+      different value on each machine with the same file. It matters most when you build
+      once and deploy to several environments: a baked-in staging URL ends up in
+      production. Build-time values do have uses, such as removing debug code in production
+      builds. I bake in only values that are public and truly the same everywhere, and read
+      the rest at runtime.
+  - question: Should the `.env` file be committed?
+    answer: >-
+      No, the real `.env` stays out of Git, and a `.env.example` goes in instead. The
+      real file holds local secrets and personal settings, and anything committed stays in
+      history for good, in every clone. The example file lists every variable name with a
+      harmless placeholder and a comment, so a new developer copies it and fills in their
+      own values. Node's `--env-file` treats the file as defaults, since variables already
+      set in the environment win, which suits local work. Production shouldn't use a
+      copied `.env` at all: the hosting platform or a secrets manager sets the variables.
+      If a real `.env` was ever committed, I rotate every secret in it, even after
+      removing the file.

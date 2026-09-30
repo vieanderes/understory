@@ -1,0 +1,352 @@
+summary: >-
+  A worker thread runs JavaScript in parallel with your main thread, on another core. It's
+  the answer to CPU-bound work in a process whose main thread must stay free: a Node
+  server that has to keep answering other requests, or a page that has to keep scrolling
+  and responding to taps. Workers share no variables with the main thread. They exchange
+  messages, which are copied, or transferred when the data is a large binary buffer.
+
+
+  The lesson covers blocking, the `error` event and message copies. These notes add a
+  complete worker in one file, a small reusable pool that survives a crashing worker, the
+  rules of what can cross between threads (copy, transfer or share), and the browser
+  version with a module worker and a transferred pixel buffer.
+
+
+  Use a worker for sustained computing: image and PDF work, parsing or transforming large
+  files, splitting documents into tokens, compression, heavy validation. Don't use one for
+  database queries, HTTP calls or file reads, which already overlap on the main thread,
+  and don't start a fresh worker per request: startup and copying cost more than small
+  jobs save. For work that takes seconds or minutes, a job queue with separate worker
+  processes is often the better home, because it survives restarts and scales on its own.
+remember:
+  - A worker thread runs JavaScript in parallel on another core, with its own event loop, memory and globals.
+  - Workers help CPU-bound work and don't help I/O-bound work, which already overlaps on the main thread.
+  - Messages are copied with the structured clone algorithm, so functions can't be sent and class instances arrive as plain objects.
+  - Transferring an `ArrayBuffer` moves its memory to the other thread without copying, and the sender's copy becomes empty.
+  - An uncaught exception in a worker emits `error` on the `Worker` object, and without a listener it crashes the main process.
+  - Keep a pool of workers, about one per core from `os.availableParallelism()`, instead of starting one per job.
+  - '`SharedArrayBuffer` shares memory between threads, and every shared update then needs `Atomics` to avoid lost updates.'
+  - A Web Worker has no `document` or `window`, so it computes and posts results back for the page to display.
+sections:
+  - title: A complete worker in one file
+    body: |-
+      The lesson's snippets show the pieces. Here they are as one runnable program. The same
+      file acts as main thread and worker: `isMainThread` tells it which it is, `workerData`
+      carries the job in, and `parentPort` sends the answer back.
+
+      ```js
+      import { Worker, isMainThread, parentPort, workerData } from "node:worker_threads";
+
+      function countPrimes(limit) {
+        let count = 0;
+        for (let n = 2; n < limit; n++) {
+          let prime = true;
+          for (let d = 2; d * d <= n; d++) if (n % d === 0) { prime = false; break; }
+          if (prime) count += 1;
+        }
+        return count;
+      }
+
+      if (isMainThread) {
+        // The main thread keeps a heartbeat, to show it stays free.
+        let beats = 0;
+        const heartbeat = setInterval(() => (beats += 1), 10);
+
+        const worker = new Worker(new URL(import.meta.url), { workerData: { limit: 3_000_000 } });
+        worker.once("message", (count) => {
+          clearInterval(heartbeat);
+          console.log(`primes: ${count}, heartbeats meanwhile: ${beats}`);
+        });
+        worker.once("error", (error) => console.error("worker failed:", error.message));
+        worker.once("exit", (code) => {
+          if (code !== 0) console.error(`worker stopped with exit code ${code}`);
+        });
+      } else {
+        parentPort.postMessage(countPrimes(workerData.limit));
+      }
+      // primes: 216816, heartbeats meanwhile: 53 in our run
+      ```
+
+      Fifty-odd heartbeats fired while the primes were counted, so the main thread stayed
+      free the whole time. Run `countPrimes` on the main thread instead and the heartbeat
+      stops until it returns.
+
+      Three events matter. `message` carries results. `error` fires when the worker throws
+      and nothing inside it catches the exception. `exit` fires whenever the thread ends,
+      with a non-zero code after an uncaught error or a `process.exit(1)` inside the
+      worker. A worker can also die for reasons that never produce a message, such as
+      running out of memory against its `resourceLimits`. So code waiting for a reply
+      should listen for `error` and `exit` as well, or a dead worker leaves a promise
+      pending for ever.
+  - title: A pool that survives a crash
+    body: |-
+      Starting a worker means a new V8 isolate: its own heap, its own copy of any modules
+      it imports. That takes milliseconds and memory, which is more than many jobs are
+      worth. A **pool** starts a fixed number of workers once and hands them jobs one at a
+      time. Libraries such as Piscina do this with more care; the core fits on a screen.
+
+      ```js
+      // hash-worker.js
+      import { parentPort } from "node:worker_threads";
+
+      parentPort.on("message", (text) => {
+        if (text === "") throw new Error("empty input");
+        let hash = 0;
+        for (let round = 0; round < 2_000_000; round++) {
+          for (const char of text) hash = (hash * 31 + char.charCodeAt(0)) >>> 0;
+        }
+        parentPort.postMessage(hash);
+      });
+      ```
+
+      ```js
+      import { Worker } from "node:worker_threads";
+      import { availableParallelism } from "node:os";
+
+      // A fixed set of workers, reused. Each runs one job at a time; extra jobs wait in a queue.
+      function createPool(file, size = availableParallelism()) {
+        const all = new Set();
+        const idle = [];
+        const queue = [];
+        let closing = false;
+
+        function spawn() {
+          const worker = new Worker(file);
+          all.add(worker);
+          worker.on("message", (result) => {
+            worker.job.resolve(result);
+            worker.job = null;
+            idle.push(worker);
+            drain();
+          });
+          worker.on("error", (error) => {
+            worker.job?.reject(error); // one job fails, not the process
+            worker.job = null;
+          });
+          worker.on("exit", () => {
+            all.delete(worker);
+            const at = idle.indexOf(worker);
+            if (at !== -1) idle.splice(at, 1);
+            if (!closing) {
+              idle.push(spawn()); // replace the dead worker so the pool keeps its size
+              drain();
+            }
+          });
+          return worker;
+        }
+
+        function drain() {
+          while (idle.length > 0 && queue.length > 0) {
+            const worker = idle.pop();
+            worker.job = queue.shift();
+            worker.postMessage(worker.job.input);
+          }
+        }
+
+        for (let i = 0; i < size; i++) idle.push(spawn());
+
+        return {
+          run: (input) =>
+            new Promise((resolve, reject) => {
+              queue.push({ input, resolve, reject });
+              drain();
+            }),
+          close: async () => {
+            closing = true;
+            await Promise.all([...all].map((worker) => worker.terminate()));
+          },
+        };
+      }
+
+      const pool = createPool(new URL("./hash-worker.js", import.meta.url), 2);
+      const results = await Promise.allSettled(["cart", "", "order", "invoice"].map(pool.run));
+      console.log(results.map((r) => (r.status === "fulfilled" ? r.value : r.reason.message)));
+      // [ 2889748480, 'empty input', 1836560384, 1043634176 ]
+      await pool.close();
+      ```
+
+      The empty string made its worker throw. That one job rejected, the worker was
+      replaced, and the other three jobs finished. A production pool adds what this one
+      leaves out: a bound on `queue` so a flood of jobs is refused rather than held in
+      memory, a timeout per job that terminates a stuck worker, and cancellation.
+  - title: Copy, transfer or share
+    body: |-
+      There are three ways for data to cross between threads, each with a different cost.
+
+      **Copy** is the default. `postMessage` uses the structured clone algorithm, the same
+      one behind the global `structuredClone`, so you can test what survives without a
+      worker:
+
+      ```js
+      class Money {
+        constructor(pence) { this.pence = pence; }
+        format() { return `£${(this.pence / 100).toFixed(2)}`; }
+      }
+
+      const copy = structuredClone({ price: new Money(1999), at: new Date(0), tags: new Set(["sale"]) });
+      console.log(copy.price instanceof Money, copy.price.pence); // false 1999: data kept, class lost
+      console.log(copy.at instanceof Date, copy.tags.has("sale")); // true true
+
+      try {
+        structuredClone({ onDone: () => {} });
+      } catch (error) {
+        console.log(error.name); // DataCloneError
+      }
+
+      // Transfer: the memory moves instead of being copied, and the sender loses it.
+      const pixels = new Uint8Array(8_000_000);
+      const moved = structuredClone(pixels, { transfer: [pixels.buffer] });
+      console.log(pixels.byteLength, moved.byteLength); // 0 8000000
+      ```
+
+      Dates, maps, sets, typed arrays and nested objects survive. Methods don't, so a class
+      instance arrives as a plain object and a function throws `DataCloneError`. Copying
+      also costs time in proportion to size, on both threads.
+
+      **Transfer** hands over an `ArrayBuffer` without copying. In a worker call, pass it in
+      the transfer list: `worker.postMessage(buffer, [buffer])`. The sender's view becomes
+      zero-length, so it can't read data it no longer owns. Use it for images, audio and
+      file contents.
+
+      **Share** with a `SharedArrayBuffer`, which both threads see at once. That brings back
+      the races from this chapter at the level of single numbers:
+
+      ```js
+      import { Worker, isMainThread, workerData } from "node:worker_threads";
+
+      // Four threads add 100,000 each to one shared counter.
+      if (isMainThread) {
+        const shared = new SharedArrayBuffer(8);
+        const counters = new Int32Array(shared); // [plain, atomic]
+        const workers = Array.from(
+          { length: 4 },
+          () => new Worker(new URL(import.meta.url), { workerData: shared }),
+        );
+        await Promise.all(workers.map((w) => new Promise((done) => w.once("exit", done))));
+        console.log("plain:", counters[0], "atomic:", counters[1]);
+        // plain: usually well under 400000, atomic: 400000
+      } else {
+        const counters = new Int32Array(workerData);
+        for (let i = 0; i < 100_000; i++) {
+          counters[0] = counters[0] + 1; // read, add, write: another thread can write in between
+          Atomics.add(counters, 1, 1); // one indivisible step
+        }
+      }
+      ```
+
+      Two runs printed 198,090 and 363,667 for the plain counter, and 400,000 both times
+      for the atomic one. Reach for shared memory only when copying is measurably the
+      bottleneck.
+  - title: Web Workers in the browser
+    body: |-
+      The browser version works the same way, with its own names. The page creates a
+      `Worker`, both sides call `postMessage`, and results arrive in `onmessage`. Inside the
+      worker, `self` is the global object, and there's no `document` or `window`. A module
+      worker can use `import`, and the `new URL(..., import.meta.url)` form lets bundlers
+      such as Vite and webpack find and bundle the worker file.
+
+      ```js
+      // invert-worker.js: runs off the page's thread, with no document or window
+      self.onmessage = (event) => {
+        const pixels = new Uint8ClampedArray(event.data);
+        for (let i = 0; i < pixels.length; i++) pixels[i] = 255 - pixels[i];
+        self.postMessage(pixels.buffer, [pixels.buffer]); // transfer it back, no copy
+      };
+      ```
+
+      ```js
+      // page.js, loaded as a module script
+      const worker = new Worker(new URL("./invert-worker.js", import.meta.url), { type: "module" });
+
+      function invert(buffer) {
+        return new Promise((resolve, reject) => {
+          worker.onmessage = (event) => resolve(new Uint8ClampedArray(event.data));
+          worker.onerror = (event) => reject(new Error(event.message));
+          worker.postMessage(buffer, [buffer]); // transfer: the page gives the memory away
+        });
+      }
+
+      const pixels = new Uint8ClampedArray([0, 100, 255, 255]);
+      const inverted = await invert(pixels.buffer);
+      console.log(pixels.byteLength, [...inverted]); // 0 [255, 155, 0, 0]
+      ```
+
+      We ran this pair in headless Chromium. The buffer travelled both ways without a copy,
+      and the page's own array was empty afterwards. This `invert` handles one job at a
+      time, because a new call replaces `onmessage`. For several jobs in flight, tag each
+      message with an id and keep a map from ids to pending promises.
+
+      Two browser rules differ from Node. `SharedArrayBuffer` is only available on pages
+      that are **cross-origin isolated**, which takes response headers such as
+      `Cross-Origin-Opener-Policy: same-origin` and
+      `Cross-Origin-Embedder-Policy: require-corp`. And drawing can move off the
+      page's thread too: `canvas.transferControlToOffscreen()` gives a worker an
+      `OffscreenCanvas` to render into.
+  - title: When a worker is the wrong tool
+    body: |-
+      Workers cost something on every job: a message copied in, a result copied out, and a
+      thread that has to be free. For a job of a millisecond or two, that overhead can match
+      the work, and the main thread would have been faster. Measure first. A job is worth
+      moving when it blocks the loop long enough to hurt the others, tens of milliseconds
+      or more on a busy server.
+
+      Some heavy work is already off the main thread. The async forms of `crypto.pbkdf2`,
+      `crypto.scrypt` and `zlib` run on libuv's thread pool, four threads by default. Use
+      those forms, not the `Sync` ones, before building anything.
+
+      For long work, such as rendering a video or processing a large upload, a worker
+      thread inside the web server has three weaknesses. It competes with request handling
+      for the same machine's cores. It dies with the server on every deploy or crash,
+      taking its job with it. And it scales only as the web tier scales. A **job queue**
+      with separate worker processes fixes all three: the request enqueues a job and
+      answers `202 Accepted`, and workers scale, retry and restart on their own. The queues
+      lesson builds that.
+
+      Rough guide:
+
+      - Under about 10 ms per call, keep it on the main thread.
+      - Tens of milliseconds to a few seconds, with a result the request needs: a worker
+        pool.
+      - Seconds to minutes, or work that must survive a restart: a queue and background
+        workers.
+      - Work that's the whole purpose of a service, such as image resizing at scale: its own
+        service, possibly in a language suited to the computing.
+pitfalls:
+  - '**Starting a new worker for every request.** Each worker is a new isolate with its own heap and module loading, which costs more than a small job saves. Start a pool once and reuse it.'
+  - '**Listening only for `message`.** A worker that throws, exits or runs out of memory never sends one, so the caller''s promise waits for ever or the process crashes. Handle `error` and `exit` too.'
+  - '**Moving I/O into workers to "make it parallel".** Queries and HTTP calls already overlap on the main thread, so workers only add startup and copying. Keep workers for CPU-bound work.'
+  - '**Sending huge objects back and forth.** Structured cloning costs time on both sides, and for a big payload it can erase the gain. Transfer `ArrayBuffer`s, or send ids and let the worker load the data itself.'
+  - '**Expecting class instances to survive a message.** They arrive as plain objects without methods, and functions throw `DataCloneError`. Send plain data and rebuild objects on the other side.'
+  - '**Touching the DOM from a Web Worker.** There''s no `document` there. Post the result to the page and update the DOM in the page''s handler.'
+interview:
+  - question: When would you use worker threads in Node, and when not?
+    answer: >-
+      For CPU-bound work that would otherwise block the event loop long enough to delay
+      other requests, such as image processing, PDF building or parsing large files. I'd run
+      them as a fixed pool, about one per core, so startup cost is paid once, and I'd handle
+      `error` and `exit` as well as `message`, so a crash rejects one job instead of taking
+      the process down. I wouldn't use them for database or HTTP calls, which already
+      overlap on the main thread, or for tiny jobs where copying costs more than the work.
+      For long or must-not-lose jobs, I'd prefer a queue with separate worker processes,
+      because a worker thread dies with the web server on every deploy and competes with
+      request handling for cores.
+  - question: How do threads communicate in JavaScript, and what does it cost?
+    answer: >-
+      By message passing. `postMessage` copies the data with the structured clone
+      algorithm, so each thread owns its own copy and there are no shared variables to race
+      on. The cost is copying time in proportion to size, and some things can't be copied:
+      functions throw a `DataCloneError`, and class instances lose their prototype. For
+      big binary data, an `ArrayBuffer` can be transferred instead, which moves the memory
+      without copying and leaves the sender with an empty buffer. `SharedArrayBuffer` shares
+      memory directly, but then every update needs `Atomics`, and you're back to low-level
+      races. I default to copying small messages and transferring large buffers.
+  - question: A PDF export endpoint makes the whole service slow. What do you do?
+    answer: >-
+      First confirm it's blocking: event loop delay spiking on every endpoint while exports
+      run, and a CPU profile pointing at the PDF code. Then take the work off the main
+      thread. If the export takes a second or two and the user waits for it, a worker pool
+      sized to the cores does it: the handler awaits a pool job and the loop stays free. If
+      exports take longer or come in bursts, I'd move them to a job queue: the endpoint
+      answers `202 Accepted` with a job id, background workers render the file, and the
+      client polls or gets notified. That also survives deploys and scales separately. Adding
+      more copies of the web server alone would only spread the stalls.

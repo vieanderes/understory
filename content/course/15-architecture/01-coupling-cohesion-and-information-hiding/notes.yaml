@@ -1,0 +1,219 @@
+summary: >-
+  Architecture starts with one question: when this decision changes, how many files change
+  with it? Coupling measures how far a change in one module forces changes in others.
+  Cohesion measures how closely the parts of one module serve one purpose. Information
+  hiding is the technique that improves both: find the decision most likely to change and
+  keep it behind an interface that won't.
+
+
+  The lesson shows the classic leak, a caller reading another module's data structure, and
+  the fix, a small set of functions that answer the caller's real question. These notes
+  add the tools JavaScript and TypeScript give you for hiding state, the different
+  strengths of coupling and how to rank them, and the judgement call of when a boundary is
+  worth drawing at all.
+
+
+  You reach for these ideas whenever a small change turns into a large diff, when a rename
+  breaks a file nobody opened, or when a pull request touches ten folders for one feature.
+  You don't reach for them to split code before you know what changes: a boundary drawn
+  early is usually drawn in the wrong place.
+remember:
+  - A module should hide the design decision most likely to change, and expose functions that stay the same when it does.
+  - Coupling is how much a change in one module forces a change in another; the goal is loose coupling to stable things, not zero coupling.
+  - Cohesion is how closely a module's parts serve one purpose, and a cohesive module has one reason to change.
+  - Returning a private array or object hands out the module's state, so return a copy, a read-only view, or an answer such as `total()`.
+  - Coupling to a function's name and arguments is weak and fine, coupling to a data shape is stronger, and coupling to private state or call order is the worst.
+  - A small change that needs edits in unrelated files is the symptom of coupling in the wrong place.
+  - Group what changes together, so a business rule gets its own module instead of living in `utils`.
+sections:
+  - title: The tools for hiding state in JavaScript and TypeScript
+    body: |-
+      The lesson hid a `Map` inside a closure. Classes give you the same guarantee with
+      private fields, written with a `#`. The runtime enforces them: outside code can't
+      read or even list them.
+
+      ```ts
+      class Cart {
+        #lines = new Map<string, { qty: number; pence: number }>();
+
+        add(name: string, qty: number, pence: number): void {
+          const line = this.#lines.get(name);
+          this.#lines.set(name, { qty: (line?.qty ?? 0) + qty, pence });
+        }
+
+        totalPence(): number {
+          let sum = 0;
+          for (const line of this.#lines.values()) sum += line.qty * line.pence;
+          return sum;
+        }
+
+        lines(): ReadonlyArray<Readonly<{ name: string; qty: number; pence: number }>> {
+          return [...this.#lines].map(([name, line]) => Object.freeze({ name, ...line }));
+        }
+      }
+
+      const cart = new Cart();
+      cart.add('tea', 2, 350);
+      cart.add('mug', 1, 800);
+      console.log(cart.totalPence()); // 1500
+      console.log(Object.keys(cart)); // [] : the private field isn't visible
+      ```
+
+      Three layers of protection are at work, and they differ. `#lines` is private at
+      runtime. `ReadonlyArray` and `Readonly` are TypeScript only: the compiler refuses a
+      write, but the JavaScript it emits has no protection at all. `Object.freeze` is
+      runtime protection for the returned objects, and in strict mode code (every ES module
+      is strict) a write to a frozen object throws a `TypeError`. In sloppy scripts the
+      write is silently ignored.
+
+      `Object.freeze` is also shallow. Freezing `{ limits: { maxItems: 10 } }` stops you
+      replacing `limits`, but `settings.limits.maxItems = 1000` still works. That's why the
+      example builds fresh objects for each line instead of freezing the internal ones.
+
+      The strongest option is often not to return data at all. If callers only ever wanted
+      a total, a count or "is this item in the cart", give them those methods. The fewer
+      facts leave the module, the fewer facts can be depended on.
+  - title: Ranking coupling by strength
+    body: |-
+      Coupling isn't one thing. It helps to rank the ways one module can depend on
+      another, from harmless to harmful, because it tells you which ones to fix first.
+
+      - **Name and signature.** `checkout` calls `cart.itemCount()`. If the name changes,
+        TypeScript or a failing import tells you at once. This is the coupling you want.
+      - **Meaning of values.** A function takes `status` and both sides agree that `2`
+        means "shipped". Rename nothing, change the meaning, and nothing warns you. Use
+        named constants or a union type such as `'pending' | 'shipped'`.
+      - **Data shape.** The caller reads `cart.items.length`, as in the lesson. A change of
+        structure breaks it silently, often producing `undefined` rather than an error.
+      - **Order of calls.** A module works only if you call `connect()`, then
+        `setUser()`, then `send()`. Forget one and it fails somewhere later. This is
+        sometimes called temporal coupling. The fix is an API where the wrong order can't
+        be written, such as `connect(user)` returning an object that has `send`.
+      - **Private state.** One module mutates another's internals, as the promotions
+        module did with `pop()`. Nothing can protect you here except hiding the state.
+
+      A useful habit in review: for each import in a changed file, ask which of these it
+      is. The first kind needs no comment. The last three deserve one.
+
+      The same ranking applies across services. Calling a documented API is name-and-
+      signature coupling. Reading another service's database tables is data-shape
+      coupling to its private state, which is why it's the first thing an architecture
+      review flags.
+  - title: Tell, don't ask
+    body: |-
+      Much data-shape coupling comes from one habit: asking a module for its data, deciding
+      something, then writing back. The decision lives in the caller, so the caller has to
+      know the data.
+
+      ```js
+      // asking: checkout knows how an order records payment
+      function checkoutAsking(order, pence) {
+        order.payments.push({ pence });
+        if (order.payments.reduce((s, p) => s + p.pence, 0) >= order.totalPence) {
+          order.status = 'paid';
+          order.paidAt = new Date();
+        }
+      }
+
+      // telling: the order decides, using its own data
+      function makeOrder(totalPence) {
+        let paidPence = 0;
+        let paidAt = null;
+        return {
+          recordPayment(pence) {
+            paidPence += pence;
+            if (paidAt === null && paidPence >= totalPence) paidAt = new Date();
+          },
+          isPaid: () => paidAt !== null,
+        };
+      }
+
+      const order = makeOrder(2000);
+      order.recordPayment(1500);
+      order.recordPayment(500);
+      console.log(order.isPaid()); // true
+      ```
+
+      The second version moves the rule to the module that owns the data. Now the order
+      can change how it stores payments, add partial refunds, or set `paidAt` differently,
+      and checkout never notices. It also makes an invalid state, `status` of `'paid'`
+      without a `paidAt`, impossible to create from outside.
+
+      This isn't a law. Reports, exports and screens legitimately need to read data. For
+      those, return a plain, stable snapshot designed for readers, not the internal
+      structure. The rule of thumb: reads can go through a snapshot, but decisions that
+      change the module's state belong inside it.
+  - title: When a boundary isn't worth it
+    body: |-
+      Every boundary costs something. An interface is one more thing to name, document and
+      keep stable. A call through it is one more hop when reading code. A premature one is
+      worse than none, because it guesses at what will change and usually guesses wrong,
+      and then every real change has to cross it.
+
+      A few signals that a boundary will pay for itself:
+
+      - The decision behind it is likely to change: a storage format, a third-party
+        service, a pricing rule, a model provider.
+      - Several callers need the same answer, so a shared rule would otherwise be copied.
+      - You want to test the logic without the thing it talks to.
+      - Two teams will work on either side.
+
+      Signals that it won't: there's one caller, the code is a short script, or the
+      "abstraction" is a wrapper whose methods mirror the library underneath one for one.
+      Such a wrapper hides nothing, because every caller still thinks in the library's
+      terms.
+
+      Duplication is a related trade. Two similar functions in two modules are coupled to
+      nothing. Merging them into one shared helper couples both modules to it, and if
+      their needs drift apart, the helper grows flags and branches. Many teams wait until
+      the third copy before extracting, and only extract when the copies change for the
+      same reason.
+pitfalls:
+  - '**Returning the internal array or object from a getter.** It feels like encapsulation because the field is private, but the caller now holds the live state. Return a copy or a frozen snapshot, or answer the question with a method.'
+  - '**Trusting `readonly` to protect data at runtime.** TypeScript''s `readonly` and `Readonly<T>` vanish when compiled, so plain JavaScript callers and `as` casts can still write. Use `#private` fields or `Object.freeze` when runtime safety matters.'
+  - '**Freezing only the top level.** `Object.freeze` is shallow, so nested objects stay writable. Build fresh objects for callers, or freeze each level you hand out.'
+  - '**A `utils` or `helpers` file that collects business rules.** Anything without a home lands there, and 30 importers end up depending on a pricing decision. Move each rule to the module whose changes it follows.'
+  - '**Splitting modules before you know what changes.** Early boundaries follow guesses, and real changes then cross them. Start with one module and split when a change shows you where the seam is.'
+  - '**Measuring coupling by counting imports.** Ten imports of stable functions are fine; one read of another module''s internals is not. Judge what each dependency is on, not how many there are.'
+interview:
+  - question: What's the difference between coupling and cohesion, and why do people mention them together?
+    answer: >-
+      Coupling is between modules: how much a change in one forces a change in another.
+      Cohesion is within a module: how closely its parts serve one purpose. They move
+      together because they're two views of the same choice, where you draw boundaries. If
+      things that change together sit in one module, that module is cohesive, and changes
+      rarely cross a boundary, so coupling is low. A shipping rule sitting in `utils` is
+      both low cohesion, since `utils` has many reasons to change, and high coupling, since
+      every importer of `utils` is now tied to pricing. The trade-off is that you can't get
+      coupling to zero: modules exist to be used. The aim is loose coupling to stable
+      interfaces.
+  - question: What does information hiding mean in practice, beyond making fields private?
+    answer: >-
+      It means each module hides a design decision that's likely to change, so the change
+      stays inside it. Private fields are a mechanism, not the goal. A cart with a private
+      `Map` that returns that `Map` from a getter hides nothing. In practice I ask what
+      might change, such as a storage format, a provider or a pricing rule, and design the
+      interface so none of it shows: callers get `itemCount()` or `total()`, not the
+      structure. I also prefer telling a module to do something over asking for its data
+      and deciding outside. The cost is some extra methods, and I don't hide decisions that
+      aren't going to change, because every interface has to be maintained.
+  - question: A one-line change to a data format needed edits in forty files. How would you diagnose and fix that?
+    answer: >-
+      Forty files knew the format, so the decision wasn't hidden anywhere. I'd first find
+      who reads it directly, with a search for the field names or the library import, and
+      check what each caller actually needs: often it's two or three questions, like a
+      total or a lookup. Then I'd give the owning module functions that answer those
+      questions, migrate callers to them in small steps, and finally make the raw data
+      private, or add a lint rule against the direct import, so the leak can't come back.
+      The trade-off is a migration period with both paths alive. I'd do it incrementally
+      rather than in one large change, so each step can be reviewed and reverted.
+  - question: How do you decide whether an abstraction is worth introducing?
+    answer: >-
+      I introduce one when it hides something likely to change, removes a rule that would
+      otherwise be copied, or lets me test logic without a slow dependency. A payment
+      provider behind an interface qualifies on all three. A wrapper whose methods mirror a
+      library one for one doesn't, because callers still think in the library's terms and
+      the swap it promises never gets easier. With one caller and no expected change, I
+      leave the code direct and wait for a second caller or a real change to show where the
+      seam is. The trade-off is between paying a small cost now and a larger refactor
+      later, and a wrong early abstraction is often the more expensive of the two.

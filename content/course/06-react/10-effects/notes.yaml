@@ -1,0 +1,274 @@
+summary: >-
+  Rendering in React is meant to be pure: given the same props and state, a component returns
+  the same JSX and touches nothing else. But real apps must talk to things React doesn't own: a
+  chat connection, a timer, a document listener, a third-party map widget, the tab title. An
+  **effect** is the escape hatch for that. It runs after React has updated the page, and it
+  keeps one outside system in step with the current props and state.
+
+
+  An effect has three parts. The setup starts the synchronisation, the cleanup stops it, and the
+  dependency array says which values the setup reads, so React knows when to stop and start
+  again. React compares each dependency with `Object.is` after every render. When one changed,
+  it runs the old cleanup, then the new setup. Strict Mode runs an extra setup and cleanup in
+  development to prove the pair is symmetric.
+
+
+  The most useful skill is knowing when not to write one. A value computed from props or state
+  belongs in the render. A response to a click belongs in the event handler. Resetting state on
+  a prop change belongs to a key. Effects are for synchronising with the outside world, and code
+  with fewer of them has fewer bugs.
+remember:
+  - An effect synchronises a component with a system outside React; if no outside system is involved, you almost certainly don't need one.
+  - React runs an effect after it commits the render to the page, and never during server rendering.
+  - The dependency array lists every reactive value the effect reads; React compares them with `Object.is` and re-synchronises when one changes.
+  - React runs the previous cleanup before each new setup and once more on unmount, and each cleanup sees the values of its own render.
+  - In development, Strict Mode runs setup, cleanup, setup on mount, so a missing or incomplete cleanup shows up at once.
+  - Each render's effect closes over that render's values, so a timer set up once reads stale state unless it uses an updater.
+  - Values derived from props or state are computed during render, and logic caused by a user action goes in the event handler.
+  - An object or function created during render is new every time, so as a dependency it makes the effect run after every render.
+sections:
+  - title: The lifecycle of one effect, render by render
+    body: |-
+      Think of each render as having its own effect, with its own copy of the props and state.
+      This chat room connects to whichever room it shows:
+
+      ```tsx
+      function ChatRoom({ room }: { room: string }) {
+        useEffect(() => {
+          const connection = createConnection(room);
+          connection.connect();
+          return () => connection.disconnect();
+        }, [room]);
+        return <h1>{room}</h1>;
+      }
+      ```
+
+      We rendered it with `room="general"`, rendered again with the same room, switched to
+      `"travel"` and unmounted it. The log read:
+
+      ```text
+      connect general
+      disconnect general
+      connect travel
+      disconnect travel
+      ```
+
+      The second render changed nothing, so React skipped the effect. The switch ran the
+      *previous* cleanup, which still holds the `general` connection in its closure, then the new
+      setup. The unmount ran the last cleanup. Under `<StrictMode>` the same mount logged
+      connect, disconnect, connect before anything else happened: a free test that the cleanup
+      really undoes the setup.
+
+      On timing: React runs effects after it commits changes to the DOM. For renders not caused
+      by an interaction, React generally lets the browser paint first. After a click it may run
+      the effect before the paint. Effects never run in `renderToString` or any server
+      render, so browser-only code such as `window` or `localStorage` is safe inside them.
+  - title: Synchronising, not reacting to lifecycle
+    body: |-
+      Older class components had `componentDidMount` and `componentWillUnmount`, and many people
+      still read effects as "run this on mount". That model breaks as soon as a prop changes. The
+      better question is: what outside system does this effect keep in step, and with which
+      values? Then the effect describes how to start syncing and how to stop, and React decides
+      when, as often as needed.
+
+      Two consequences follow. First, one effect per concern. A component that connects to a
+      room and also logs an analytics event has two effects, because they depend on different
+      values and have different cleanups. Merging them means reconnecting whenever the logging
+      value changes.
+
+      Second, you don't choose the dependencies; the code does. Every prop, state value or value
+      computed from them that the effect reads is a dependency. The `exhaustive-deps` lint rule
+      lists them for you. If the list makes the effect run too often, change the code so the effect reads less. Use an
+      updater instead of reading state, move an object inside the effect, or read the value from
+      an effect event.
+
+      ```tsx
+      // Runs after every render: options is a new object each time.
+      const options = { serverUrl, room };
+      useEffect(() => {
+        const connection = createConnection(options);
+        connection.connect();
+        return () => connection.disconnect();
+      }, [options]);
+
+      // Runs only when serverUrl or room changes: the effect builds its own object.
+      useEffect(() => {
+        const connection = createConnection({ serverUrl, room });
+        connection.connect();
+        return () => connection.disconnect();
+      }, [serverUrl, room]);
+      ```
+  - title: Reading the latest value without re-running, with useEffectEvent
+    body: |-
+      Sometimes an effect must read a value without reacting to it. A page logs a visit when its
+      URL changes, and the log should include the current number of cart items. Put `itemCount`
+      in the dependencies and a new visit is logged every time the cart changes. Leave it out and
+      the lint rule is right to complain: the effect would log a stale count.
+
+      React 19.2 added `useEffectEvent` for this. It wraps a function that always sees the latest
+      props and state, and it's not a dependency:
+
+      ```tsx
+      import { useEffect, useEffectEvent } from 'react';
+
+      function Page({ url, itemCount }: { url: string; itemCount: number }) {
+        const onVisit = useEffectEvent((visitedUrl: string) => {
+          logVisit(visitedUrl, itemCount);
+        });
+
+        useEffect(() => {
+          onVisit(url);
+        }, [url]);
+
+        return null;
+      }
+      ```
+
+      We rendered it with `/shoes` and a count of 1, then changed the count to 2, then moved to
+      `/hats` with 3. It logged `/shoes 1` and `/hats 3`, and nothing for the count change. The
+      effect is reactive to `url` only, while the logged count is always current.
+
+      The rules are strict. Call an effect event only from inside an effect. Don't pass it to
+      other components or hooks, and don't list it in dependencies. It's for the non-reactive
+      part of an effect's logic, not a way to hide dependencies you'd rather not think about.
+  - title: Effects you should delete
+    body: |-
+      Most unnecessary effects fall into a few shapes. Each has a better home.
+
+      Derived data: a total, a filtered list, a full name. Compute it during render. If it's
+      expensive, wrap it in `useMemo`. An effect that sets it shows the stale value for one
+      render and renders twice.
+
+      Resetting state when a prop changes: give the component a key tied to that prop.
+
+      Responding to a user action: sending a form, adding to a cart, showing a toast. Do it in
+      the event handler. An effect that watches a flag like `submitted` runs for reasons other
+      than the click, such as a remount, and loses the context of what the user did.
+
+      Telling the parent about a change: call the parent's callback in the same handler that
+      sets your state, so both update in one render.
+
+      ```tsx
+      // Avoid: the parent hears about it one render late.
+      function Toggle({ onChange }: { onChange: (on: boolean) => void }) {
+        const [isOn, setIsOn] = useState(false);
+        useEffect(() => {
+          onChange(isOn);
+        }, [isOn, onChange]);
+        return <button onClick={() => setIsOn(!isOn)}>{isOn ? 'On' : 'Off'}</button>;
+      }
+
+      // Better: one event, one render, both updated together.
+      function Toggle({ onChange }: { onChange: (on: boolean) => void }) {
+        const [isOn, setIsOn] = useState(false);
+        function flip() {
+          setIsOn(!isOn);
+          onChange(!isOn);
+        }
+        return <button onClick={flip}>{isOn ? 'On' : 'Off'}</button>;
+      }
+      ```
+
+      Chains of effects, where one effect sets state that triggers the next, are the same smell.
+      Compute what you can during render and do the rest in the handler that started it.
+  - title: useLayoutEffect, for measuring before paint
+    body: |-
+      `useLayoutEffect` has the same shape as `useEffect` but runs earlier: after React updates
+      the DOM and before the browser paints. State set inside it is applied before the user sees
+      anything. That matters when you need to measure the layout and then adjust it, such as
+      flipping a tooltip below its target when there's no room above.
+
+      ```tsx
+      function Tooltip({ text }: { text: string }) {
+        const ref = useRef<HTMLDivElement>(null);
+        const [above, setAbove] = useState(true);
+
+        useLayoutEffect(() => {
+          const box = ref.current?.getBoundingClientRect();
+          if (box && box.top < 0) setAbove(false);
+        }, [text]);
+
+        return (
+          <div ref={ref} className={above ? 'tip tip-above' : 'tip tip-below'}>
+            {text}
+          </div>
+        );
+      }
+      ```
+
+      With `useEffect`, the tooltip could paint above, off the screen, for one frame and then
+      jump. The price of `useLayoutEffect` is that it blocks painting while it runs, so slow work
+      inside it delays the whole update. Use it for measurement and position, keep it short, and
+      default to `useEffect` for everything else. Like `useEffect`, it doesn't run during server
+      rendering, so the server's HTML shows the first guess.
+pitfalls:
+  - >-
+    **No cleanup for a subscription.** Each re-run adds another listener or interval, so one key
+    press fires the handler twice. Return a function that removes exactly what the setup added.
+  - >-
+    **A stale closure in a long-lived callback.** An interval created with `[]` reads the
+    first render's state for ever. Use an updater, `setSeconds((s) => s + 1)`, or list the value
+    and let the effect restart.
+  - >-
+    **Silencing the dependency lint.** Leaving out a value the effect reads freezes it at an old
+    render. Restructure the effect so it reads less, or move the non-reactive part into an
+    effect event.
+  - >-
+    **Objects and functions as dependencies.** They're new every render, so the effect restarts
+    every render. Create them inside the effect, or depend on their primitive parts.
+  - >-
+    **Passing an async function to `useEffect`.** It returns a promise where React expects a
+    cleanup, and React warns. Define the async function inside the effect and call it.
+  - >-
+    **Using an effect for derived state.** `useEffect(() => setTotal(sum(items)), [items])`
+    renders twice and shows a stale total first. Compute `sum(items)` during render.
+  - >-
+    **Turning off Strict Mode to stop the double run.** The double run exposes a real bug that
+    also happens in production when dependencies change. Make the cleanup undo the setup.
+interview:
+  - question: What is `useEffect` for, and when shouldn't you use it?
+    answer: >-
+      It synchronises a component with something outside React, such as a network connection, a
+      subscription, a timer, a DOM API or a non-React widget. The setup starts syncing, the
+      cleanup stops it, and the dependency array tells React when to restart. I don't use it for values I can compute from props or state, which belong in render. Work
+      caused by a user action belongs in the event handler. Resetting state on a prop change is a key,
+      not an effect. The test I apply: if I removed React, would this code still be talking to
+      something external? If not, it probably isn't an effect. Fewer effects means fewer extra
+      renders and fewer timing bugs.
+  - question: Walk me through when an effect and its cleanup run.
+    answer: >-
+      After each commit, React compares every dependency with its previous value using
+      `Object.is`. If none changed, nothing runs. If one changed, React runs the previous
+      render's cleanup, then the new setup, so a chat effect disconnects from the old room before
+      connecting to the new one. On unmount it runs the last cleanup. Each cleanup closes over
+      its own render's values, which is why it disconnects the right room. With no array the
+      effect re-runs after every render, and with an empty array only on mount. In development,
+      Strict Mode adds a setup, cleanup, setup on mount to check the pair is symmetric.
+  - question: Why does React run my effect twice in development?
+    answer: >-
+      Strict Mode deliberately mounts, unmounts and remounts each component in development, so
+      every effect runs setup, cleanup, setup. It's a test. In production an effect also stops and restarts whenever its dependencies change. And
+      `<Activity mode="hidden">` cleans up a component's effects while keeping its state. So an
+      effect that breaks when run twice is already buggy. A missing
+      cleanup shows up immediately as two connections or two listeners. The fix is never to
+      disable Strict Mode or guard with a ref; it's to write a cleanup that fully undoes the
+      setup, or to make the setup idempotent. Production builds run each setup once.
+  - question: A counter in `setInterval` gets stuck at 1. Why, and how do you fix it?
+    answer: >-
+      The effect ran once with an empty dependency array, so the interval's callback closed over
+      the first render's `count`, which is 0. Every tick sets `0 + 1`, so the display stays at 1.
+      This is a stale closure: each render has its own values, and the callback belongs to the
+      first one. The best fix is an updater, `setCount((c) => c + 1)`, which asks React for the
+      latest value and needs no dependency, so the interval is created once. Adding `count` to
+      the dependencies also works, but it tears down and recreates the interval every second,
+      which can drift. If the callback must read other props, an effect event gives it the latest
+      values.
+  - question: What's the difference between `useEffect` and `useLayoutEffect`?
+    answer: >-
+      Timing. `useLayoutEffect` runs after React updates the DOM but before the browser paints,
+      and blocks the paint until it finishes. `useEffect` runs after the commit and usually after
+      the paint. I use `useLayoutEffect` only when I must measure layout and adjust it before the user sees a
+      frame, like positioning a tooltip or restoring scroll. Doing that in `useEffect` causes a
+      visible jump. Everything else goes in `useEffect`, because blocking
+      paint makes updates feel slower. Neither runs during server rendering, so the server's
+      HTML always shows the first-guess layout.

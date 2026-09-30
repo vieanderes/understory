@@ -1,0 +1,298 @@
+summary: >-
+  pandas is Python's library for tables. A DataFrame is a set of named columns, each a
+  typed array, sharing one **index** that labels the rows. You load a CSV, filter rows with
+  boolean masks, group and aggregate, and join tables, all as whole-column operations that
+  run in compiled code. It's SQL's `SELECT`, `WHERE`, `GROUP BY` and `JOIN`, in memory and
+  in Python.
+
+
+  For AI engineering the everyday use is evals and logs: one row per test case, prompt
+  version, category, pass or fail, latency, cost, judge score. pandas turns "is the new
+  prompt better?" into a per-category table, and shows the missing scores and the slices
+  where a version fails. Notebooks are where you explore that table.
+
+
+  Reach for it when data fits in memory and you want to slice it many ways. For a few
+  records inside a request handler, a list of dicts or a Pydantic model is clearer. For data
+  too big for memory, a database or a columnar engine is the better tool. pandas 3.0, the current version, made two big changes: text columns get a
+  real string type, and Copy-on-Write is always on.
+remember:
+  - A DataFrame is named, typed columns that share one index, and operations between Series align on index labels, not positions.
+  - '`loc` selects by label and includes the end of a slice, while `iloc` selects by position and excludes it.'
+  - Combine masks with `&`, `|` and `~` and bracket each comparison, because `and` and `or` need a single truth value.
+  - In pandas 3, Copy-on-Write is always on, so every filtered or selected object behaves as a copy, and chained assignment never changes the original.
+  - To change values in place, write in one step with `df.loc[mask, "column"] = value`.
+  - Aggregations such as `mean` and `count` skip missing values silently, so count them with `.isna().sum()` before you report an average.
+  - A merge multiplies rows when the key is duplicated on the other side, so pass `validate="many_to_one"` when you expect a lookup.
+  - '`apply` with a Python function runs once per row and is often hundreds of times slower than the vectorised column expression.'
+sections:
+  - title: The index and label alignment
+    body: |-
+      Every Series and DataFrame carries an **index**: labels for its rows. By default they
+      are 0, 1, 2, but after filtering or sorting they stay attached to their rows. That has
+      two consequences newcomers trip over.
+
+      ```python
+      import pandas as pd
+
+      df = pd.DataFrame(
+          {"category": ["refund", "billing", "refund", "billing"],
+           "passed": [True, False, True, True],
+           "latency_ms": [850, 2300, 700, 1200]},
+          index=[10, 20, 30, 40],
+      )
+      print(df.loc[20, "latency_ms"])  # 2300: by label
+      print(df.iloc[1]["latency_ms"])  # 2300: by position
+      print(df.loc[10:30, "latency_ms"].tolist())  # [850, 2300, 700]: label slices include the end
+      print(df.iloc[0:2]["latency_ms"].tolist())  # [850, 2300]: position slices exclude it
+
+      slow = df[df["latency_ms"] > 1000]
+      print(slow.index.tolist())  # [20, 40]: labels survive filtering
+      print(slow.reset_index(drop=True).index.tolist())  # [0, 1]
+
+      a = pd.Series([1, 2, 3], index=["x", "y", "z"])
+      b = pd.Series([10, 20, 30], index=["z", "y", "x"])
+      print((a + b).tolist())  # [31, 22, 13]: aligned by label, not position
+      print((a + b.iloc[:2]).tolist())  # [nan, 22.0, 13.0]: a missing label gives NaN
+      ```
+
+      First, `df[0]` or `series[0]` is ambiguous once the index is not 0 to n-1. Use `iloc`
+      for positions and `loc` for labels, always. Second, arithmetic between two Series
+      matches rows by label. That is a feature when you add this week's counts to last
+      week's by category. It's a trap when two columns come from differently filtered frames:
+      rows line up by label, not by order, and unmatched labels become NaN.
+
+      This is where pandas differs most from a JavaScript array of objects. There, position
+      is identity. Here the index is identity, and position is incidental. Call
+      `reset_index(drop=True)` when you want to go back to plain positions, for example
+      before combining with a NumPy array.
+  - title: Copy-on-Write in pandas 3
+    body: |-
+      Older pandas returned sometimes a view, sometimes a copy, and warned with
+      `SettingWithCopyWarning` when it couldn't tell. pandas 3.0 removed that uncertainty:
+      **Copy-on-Write** is always on and can't be turned off. Any object you get from
+      indexing or a method behaves as a new, independent object. Internally it may still
+      share memory, and the copy happens lazily, at the first write.
+
+      ```python
+      import pandas as pd
+
+      df = pd.DataFrame({"version": ["v1", "v2", "v2"], "latency_ms": [850, 2300, 700]})
+
+      df[df["version"] == "v2"]["latency_ms"] = 0  # chained: warns, changes nothing
+      print(df["latency_ms"].tolist())  # [850, 2300, 700]
+
+      v2 = df[df["version"] == "v2"]  # a new object that behaves as a copy
+      v2["latency_ms"] = 0  # no warning, and df is untouched
+      print(df["latency_ms"].tolist())  # [850, 2300, 700]
+
+      df.loc[df["version"] == "v2", "latency_ms"] = 0  # one step: this works
+      print(df["latency_ms"].tolist())  # [850, 0, 0]
+
+      print(hasattr(pd.errors, "SettingWithCopyWarning"))  # False: removed in 3.0
+      print(df["latency_ms"].to_numpy().flags.writeable)  # False: a read-only view
+      ```
+
+      The first assignment is **chained assignment**: two indexing steps, where the second
+      writes into the temporary result of the first. In pandas 3.0.6 it never updates `df`,
+      and pandas emits a `ChainedAssignmentError` warning (a warning, despite the name)
+      pointing you to `.loc`. The same goes for `df["col"][0] = x` and for
+      `df["col"].fillna(0, inplace=True)`. Write `df["col"] = df["col"].fillna(0)` instead.
+
+      Two more effects. `to_numpy()` may return a read-only view, so call `.copy()` before
+      editing the array in place. And defensive `.copy()` calls after filtering, common in
+      older code to silence the warning, are no longer needed.
+
+      pandas 3 also loads text as a dedicated string dtype, shown as `str` in `df.dtypes`,
+      instead of generic `object`. It stores missing text as NaN and rejects non-strings.
+  - title: groupby, agg and merge without surprises
+    body: |-
+      `groupby` is split, apply, combine: split rows by key, reduce each group, glue the
+      results into a table indexed by the key. **Named aggregation** gives one tidy table
+      with the columns you chose.
+
+      ```python
+      import pandas as pd
+
+      results = pd.DataFrame({
+          "case_id": [1, 2, 3, 4, 5, 6],
+          "version": ["v1", "v1", "v1", "v2", "v2", "v2"],
+          "passed": [True, False, True, True, True, False],
+          "judge_score": [0.9, None, 0.5, 0.8, None, 0.4],
+      })
+
+      summary = results.groupby("version").agg(
+          pass_rate=("passed", "mean"),
+          cases=("case_id", "size"),
+          scored=("judge_score", "count"),  # count skips NaN, size does not
+          mean_score=("judge_score", "mean"),
+      )
+      print(summary)
+      #          pass_rate  cases  scored  mean_score
+      # version
+      # v1        0.666667      3       2         0.7
+      # v2        0.666667      3       2         0.6
+
+      labels = pd.DataFrame({
+          "case_id": [1, 2, 3, 4, 7],
+          "category": ["refund", "billing", "refund", "billing", "refund"],
+      })
+      joined = results.merge(labels, on="case_id", how="left", validate="many_to_one", indicator=True)
+      print(joined["_merge"].value_counts().to_dict())
+      # {'both': 4, 'left_only': 2, 'right_only': 0}
+
+      dupes = pd.concat([labels, labels.iloc[[0]]])
+      try:
+          results.merge(dupes, on="case_id", validate="many_to_one")
+      except pd.errors.MergeError as error:
+          print(type(error).__name__)  # MergeError
+      print(len(results.merge(dupes, on="case_id")))  # 5: the duplicate label doubles case 1
+      ```
+
+      Put `cases` beside every rate. A pass rate of 1.0 from two cases means little, and a
+      table without counts hides that. Put `scored` beside `mean_score` so the gaps show.
+
+      `merge` defaults to an inner join, which drops unmatched rows without a word. Here that
+      would silently lose cases 5 and 6. A left join with `indicator=True` shows what didn't
+      match. `validate` turns a duplicated key, a common data bug, into an error instead of
+      extra rows. These are the same questions you ask of a SQL join: which side is kept,
+      and is the key unique?
+  - title: Missing values, NaN and pd.NA
+    body: |-
+      pandas marks missing numbers with NaN, a float value. That has side effects.
+
+      ```python
+      import numpy as np
+      import pandas as pd
+
+      tokens = pd.Series([120, None, 340])
+      print(tokens.dtype)  # float64: NaN forced the ints to float
+      nullable = pd.Series([120, None, 340], dtype="Int64")
+      print(nullable.dtype, nullable.tolist())  # Int64 [120, <NA>, 340]
+      print(np.nan == np.nan, pd.isna(pd.NA))  # False True
+      print(tokens.mean(), tokens.mean(skipna=False))  # 230.0 nan
+      print(tokens.fillna(0).mean())  # 153.33333333333334
+
+      tags = pd.Series(["Refund ", "billing", None, "REFUND"])
+      print(tags.str.strip().str.lower().tolist())  # ['refund', 'billing', nan, 'refund']
+      print(tags.str.contains("refund", case=False).tolist())  # [True, False, False, True]
+      ```
+
+      An integer column with one gap becomes float64, because NumPy integers have no
+      missing value. The nullable dtypes, `"Int64"`, `"Float64"` and `"boolean"` with capital
+      letters, use `pd.NA` instead and keep integers as integers.
+
+      NaN is not equal to itself, so `df[df["score"] == np.nan]` finds nothing. Use
+      `isna()` and `notna()`. Reductions skip missing values by default, so `mean` answers
+      a different question from the one you asked. Choose deliberately: drop the rows and
+      report how many, fill with a value that means something, or fail, as the lesson's fix
+      does.
+
+      The `.str` accessor applies string methods to a whole column and passes missing values
+      through. For a boolean result such as `contains`, a missing value counts as no match
+      in pandas 3's string dtype. Check which rows were missing before you read "not a
+      refund" as a fact.
+  - title: Vectorised columns, and apply as the slow path
+    body: |-
+      A column is a NumPy-style array, so arithmetic on whole columns runs in compiled code.
+      `apply(..., axis=1)` calls your Python function once per row and builds a Series for
+      each, which is far slower.
+
+      ```python
+      import time
+
+      import numpy as np
+      import pandas as pd
+
+      rng = np.random.default_rng(1)
+      df = pd.DataFrame({
+          "input_tokens": rng.integers(100, 4000, 200_000),
+          "output_tokens": rng.integers(10, 800, 200_000),
+      })
+
+      start = time.perf_counter()
+      slow = df.apply(lambda row: row["input_tokens"] * 3e-6 + row["output_tokens"] * 15e-6, axis=1)
+      apply_s = time.perf_counter() - start
+
+      start = time.perf_counter()
+      fast = df["input_tokens"] * 3e-6 + df["output_tokens"] * 15e-6
+      vector_s = time.perf_counter() - start
+
+      print(np.allclose(slow, fast))  # True
+      print(f"apply {apply_s:.2f}s, vectorised {vector_s * 1000:.1f}ms")
+      ```
+
+      On a laptop this printed a second or more for `apply` and a few milliseconds for the
+      column expression: the same answer, hundreds of times faster. The fix is nearly always
+      available. Use arithmetic and comparisons on columns, and `np.where` or `Series.where`
+      for conditions. The `.str` and `.dt` accessors handle text and dates. Use `map` with a
+      dict for lookups, and `groupby().transform` to compare each row with its group.
+
+      `apply` is still fine for a few thousand rows. It also suits work that is Python by
+      nature, such as parsing a JSON blob per row or calling a tokeniser. Calling a model per row
+      is a different problem: that is network-bound, and needs the bounded concurrency from
+      the asyncio lesson, not pandas.
+pitfalls:
+  - '**Chained assignment.** `df[mask]["col"] = value` writes into a temporary copy, and in pandas 3 it never changes `df`. Write in one step: `df.loc[mask, "col"] = value`.'
+  - '**Using `and` between masks, or dropping the brackets.** `and` raises "The truth value of a Series is ambiguous", and `df.a > 1 & df.b` parses as `df.a > (1 & df.b)`. Use `(df.a > 1) & df.b`.'
+  - '**Averaging over gaps.** `mean` skips NaN silently, so two missing judge scores out of five change the number without a trace. Report the count with `.count()` or `.isna().sum()` beside every average.'
+  - '**Joining on a duplicated key.** A repeated key on the right multiplies rows on the left, and counts and rates inflate. Pass `validate="many_to_one"` and check `len` before and after the merge.'
+  - '**Losing rows in an inner merge.** The default `how="inner"` drops unmatched rows silently. Use `how="left"` with `indicator=True` when every left row should survive.'
+  - '**Indexing by position with `[]` or `loc`.** After filtering, labels are no longer 0 to n-1, so `s[0]` may fail or hit the wrong row. Use `iloc` for positions.'
+  - '**Reaching for `apply` first.** A per-row Python function is the slowest way to compute a column. Write the column expression, and keep `apply` for work that has no vectorised form.'
+  - '**Trusting a notebook''s saved output.** Cells run out of order leave hidden state in the kernel. Restart and run all before quoting a number, and move code you rely on into a tested module.'
+interview:
+  - question: What changed with Copy-on-Write in pandas 3, and how does it affect code you write?
+    answer: >-
+      Every object derived from a DataFrame now behaves as an independent copy, so
+      modifying one can never change another. Before 3.0, indexing sometimes returned a view
+      and sometimes a copy, and `SettingWithCopyWarning` tried to guess when you had
+      expected the other. Now memory is shared until the first write, then copied lazily.
+      So chained assignment like `df[mask]["col"] = 0` never updates `df`, and pandas warns
+      with `ChainedAssignmentError`. In-place changes are written in one step with
+      `df.loc[mask, "col"] = 0`, and `df["col"].fillna(0, inplace=True)` becomes
+      `df["col"] = df["col"].fillna(0)`. The defensive `.copy()` calls in older code can go.
+      The trade-off is that `to_numpy()` may give a read-only array, so in-place NumPy edits
+      need an explicit copy.
+  - question: What's the difference between loc and iloc, and why does the index matter?
+    answer: >-
+      `loc` selects by index label and `iloc` by integer position. `loc` slices include the
+      end label, while `iloc` slices exclude the end, like Python lists. The index matters
+      because it follows rows through filtering and sorting, and because arithmetic between
+      Series aligns on it. After `df[df.passed]`, labels might be 3, 7 and 9, so position 0
+      is label 3. If I add two Series filtered differently, rows match by label and the
+      unmatched ones become NaN, not an error. I use `iloc` for positions, `loc` for labels
+      and writes, and `reset_index(drop=True)` before mixing with NumPy arrays or lists.
+      Alignment is the upside: adding two per-category tables lines up categories even in a
+      different order.
+  - question: You're comparing two prompt versions from an eval results table. How would you do it in pandas, and what could mislead you?
+    answer: >-
+      I'd group by version and category with named aggregation, and read the per-category
+      table before the overall number. Something like
+      `df.groupby(["version", "category"]).agg(pass_rate=("passed", "mean"), n=("case_id", "size"))`.
+      Several things mislead. Averages hide slices: a version can win overall and fail every
+      refund case. Small groups give noisy rates, so counts go beside every rate. Missing
+      judge scores are skipped by `mean`, so I report how many are missing, and fail if it's
+      more than a few. If I merge in labels, I validate the key and use a left join with an
+      indicator. Then duplicated or unmatched cases can't change the counts. I'd also check
+      both versions ran on the same case ids.
+  - question: How do you make slow pandas code fast?
+    answer: >-
+      Replace per-row Python with whole-column operations, and check the data types. The
+      usual culprit is `apply(axis=1)` or `iterrows`, which call Python once per row. Column
+      arithmetic, `np.where`, `.str` and `.dt` accessors, `map` with a dict and
+      `groupby().transform` cover most cases, often hundreds of times faster. Next, dtypes:
+      numbers stored as strings force slow paths, and the category dtype helps repeated
+      labels. Then I read only the columns I need. If it's still slow, or the data doesn't
+      fit in memory, pandas is the wrong tool. A database or a columnar engine is next.
+      I profile first, because the time often goes to reading the file, not the maths.
+  - question: Why can a Jupyter notebook show results that its code doesn't reproduce?
+    answer: >-
+      Because the kernel keeps state between cells, and cells can be run in any order and
+      edited after they ran. A variable defined in a deleted cell still exists. A cell run
+      twice may filter twice. The saved output shows what the kernel held then, not what the
+      code produces from a fresh start. Before trusting a number, I restart the kernel and
+      run all cells. For anything that feeds a decision, I move the logic into a tested
+      module. The notebook stays a thin layer that calls it and plots results.
+      Notebooks are good for exploring and poor as production code: they are hard to
+      review in diffs and to test.

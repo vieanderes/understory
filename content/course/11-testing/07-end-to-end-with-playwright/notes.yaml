@@ -1,0 +1,289 @@
+summary: >-
+  An end-to-end test drives your real app in a real browser, through the same buttons and
+  fields a customer uses, with every layer running behind it. It's the only test that proves
+  the pieces fit: the page, the API, the database, the session cookie and the CSS that decides
+  whether the button is even on screen. It's also the slowest and most fragile kind, so you
+  keep a handful, one per journey that would cost you money or trust if it broke: sign in,
+  search, checkout.
+
+
+  Playwright makes those tests dependable by building waiting into everything. Locators are
+  lazy descriptions that it resolves again on every use, actions wait until an element can be
+  acted on, and web-first assertions retry until they pass or time out. Each test gets a
+  fresh browser context, so tests can't leak cookies or storage into each other, and test
+  files run in parallel worker processes.
+
+
+  These notes cover how that waiting works, locators beyond `getByRole`, fixtures and
+  isolation, signing in once with `storageState`, stubbing networks you don't own, and the
+  tools for hunting a flaky test: retries, traces and `--repeat-each`.
+remember:
+  - An end-to-end test checks one real journey through every layer, so keep few of them and cover the rest with unit, component and contract tests.
+  - Before an action, Playwright waits until the element is visible, stable, enabled and not covered, and a web-first assertion such as `toHaveText` retries until it passes or times out.
+  - '`expect(await locator.textContent()).toBe(...)` reads once and never retries, so always assert on the locator itself: `await expect(locator).toHaveText(...)`.'
+  - Locators are strict, so an action on a locator that matches two elements fails, and you narrow it with `filter`, chaining or a better name rather than `.first()`.
+  - Every test gets a new browser context with its own cookies and storage, and tests must also own their data, so any test passes alone and in any order.
+  - Sign in once in a setup project, save the session with `storageState`, and load it in every test instead of logging in through the form each time.
+  - Stub third-party services with `page.route`, and control time with `page.clock`, because networks and clocks you don't own are classic sources of flakes.
+  - "Turn on retries with `trace: 'on-first-retry'` in CI, and treat every test reported as flaky as a bug to fix, not a pass."
+sections:
+  - title: How auto-waiting works
+    body: |-
+      A **locator** is a recipe, not an element. `page.getByRole('button', { name: 'Pay' })`
+      finds nothing when you write it. Each time you act or assert, Playwright runs the recipe
+      again against the current page. So a list that re-renders never leaves you holding a
+      stale element, the bug behind many Selenium flakes.
+
+      Before an action, Playwright runs **actionability checks**. For a click, the element
+      must be attached, visible, stable (not mid-animation), able to receive events (nothing
+      covers it) and enabled. For `fill`, it must also be editable. It retries the checks
+      until they pass or the action's timeout runs out, then reports which check failed and
+      for which locator.
+
+      **Web-first assertions** work the same way. `await expect(locator).toHaveText('Paid')`
+      retries until the text matches or the expect timeout, 5 seconds by default, runs out. The
+      test as a whole has 30 seconds by default. The non-retrying form is the classic mistake:
+
+      ```ts
+      // Reads once. If the page hasn't updated yet, it fails.
+      expect(await page.getByRole('status').textContent()).toBe('Basket: 1 item');
+
+      // Retries until it matches.
+      await expect(page.getByRole('status')).toHaveText('Basket: 1 item');
+      ```
+
+      For conditions that aren't about one element, two helpers retry any code:
+
+      ```ts
+      // Poll a value until it matches, here an API the page depends on.
+      await expect.poll(async () => (await request.get('/health')).status()).toBe(200);
+
+      // Retry a whole block until every assertion in it passes.
+      await expect(async () => {
+        await page.getByRole('button', { name: 'Refresh' }).click();
+        await expect(page.getByRole('status')).toHaveText(/ready/, { timeout: 1000 });
+      }).toPass({ timeout: 10_000 });
+      ```
+
+      Locators are also **strict**. An action on a locator that matches two elements fails
+      with `strict mode violation` instead of clicking whichever came first. A test in the
+      suite behind these notes clicked `getByRole('button', { name: 'Add to basket' })` on a
+      page with two products and got exactly that error. Strictness turns an ambiguous test
+      into a loud failure rather than a test that clicks the wrong product.
+  - title: Locators that stay stable
+    body: |-
+      Start from what the user sees, then narrow. `filter` keeps the matches that contain
+      some text or some other locator, and chaining searches inside a match:
+
+      ```ts
+      const toaster = page.getByRole('listitem').filter({ hasText: 'Toaster' });
+      await toaster.getByRole('button', { name: 'Add to basket' }).click();
+      await expect(page.getByRole('status')).toHaveText('Basket: 1 item');
+      ```
+
+      That reads like the instruction a person would follow: in the Toaster row, press Add.
+      It survives new products, reordering and restyling. `.first()`, `.nth(2)` and CSS
+      paths don't, because they encode position and markup.
+
+      A few more tools cover the rest. `getByRole` takes `exact: true` when a name is a
+      prefix of another, and `level` for headings. `getByLabel` finds form fields through
+      their label, and `getByPlaceholder` is a weaker fallback. `getByTestId` reads
+      `data-testid` by default, and the attribute can be changed with `testIdAttribute` in
+      the config; use it for things with no visible identity, such as a chart canvas.
+      `npx playwright codegen` records your clicks and suggests locators in this order,
+      which makes a good starting point for a new test.
+
+      A locator you can't write with role and name is often an accessibility bug: an icon
+      button with no `aria-label`, or an input with no label. Fix the markup, and both the
+      test and screen-reader users benefit.
+  - title: Fixtures, isolation and parallel workers
+    body: |-
+      A **fixture** is something a test asks for by name, like `page`, `context` or
+      `request`. Playwright creates it before the test and tears it down after. `page` and
+      `context` are created per test: a new **browser context**, like a fresh incognito
+      window, with its own cookies, local storage and cache. The browser itself is shared by
+      the tests in one worker, because launching it is the slow part.
+
+      You can add your own fixtures with `test.extend`. Code before `use()` is setup, code
+      after it is teardown, and teardown runs even when the test fails:
+
+      ```ts
+      import { test as base, expect, type Page } from '@playwright/test';
+
+      class Shop {
+        constructor(private readonly page: Page) {}
+        async add(product: string) {
+          await this.page
+            .getByRole('listitem')
+            .filter({ hasText: product })
+            .getByRole('button', { name: 'Add to basket' })
+            .click();
+        }
+        basket() {
+          return this.page.getByRole('status');
+        }
+      }
+
+      export const test = base.extend<{ shop: Shop }>({
+        shop: async ({ page }, use) => {
+          await page.route('https://rates.example.com/**', (route) =>
+            route.fulfill({ json: { rate: 1.17 } }),
+          );
+          await page.goto('/');
+          await use(new Shop(page));
+        },
+      });
+
+      test('two products make two items', async ({ shop }) => {
+        await shop.add('Kettle');
+        await expect(shop.basket()).toHaveText('Basket: 1 item');
+        await shop.add('Toaster');
+        await expect(shop.basket()).toHaveText('Basket: 2 items');
+      });
+      ```
+
+      Playwright runs test files in parallel, one per **worker**, and each worker is a
+      separate process. Tests inside a file run in order unless you set `fullyParallel: true`.
+      If a test fails, its worker is thrown away and a new one starts, so a broken state
+      can't spill into the next test.
+
+      A fresh context isolates the browser, not the server. Two tests that edit the same
+      account or buy the last item in the same database will collide once they run in
+      parallel. So each test creates the data it needs, with unique names or through an API
+      call in a fixture, and never depends on another test having run first.
+  - title: Sign in once with storageState
+    body: |-
+      Logging in through the form in every test is slow and makes every test fail when the
+      login page has a bug. Instead, a **setup project** signs in once and saves the session,
+      and the other projects start with it already loaded:
+
+      ```ts
+      // playwright.config.ts
+      import { defineConfig } from '@playwright/test';
+
+      export default defineConfig({
+        testDir: './tests',
+        fullyParallel: true,
+        forbidOnly: !!process.env.CI,
+        retries: process.env.CI ? 2 : 0,
+        use: { baseURL: 'http://localhost:4173', trace: 'on-first-retry' },
+        webServer: {
+          command: 'npm run start',
+          url: 'http://localhost:4173',
+          reuseExistingServer: !process.env.CI,
+        },
+        projects: [
+          { name: 'setup', testMatch: /auth\.setup\.ts/ },
+          {
+            name: 'chromium',
+            use: { storageState: 'playwright/.auth/user.json' },
+            dependencies: ['setup'],
+          },
+        ],
+      });
+      ```
+
+      ```ts
+      // tests/auth.setup.ts
+      import { test as setup, expect } from '@playwright/test';
+
+      setup('sign in', async ({ page }) => {
+        await page.goto('/login');
+        await page.getByLabel('Email').fill('sam@example.com');
+        await page.getByLabel('Password').fill(process.env.TEST_PASSWORD!);
+        await page.getByRole('button', { name: 'Sign in' }).click();
+        await expect(page.getByRole('heading', { name: 'Your orders' })).toBeVisible();
+        await page.context().storageState({ path: 'playwright/.auth/user.json' });
+      });
+      ```
+
+      The saved file holds cookies and local storage, which covers most sessions. Session
+      storage isn't saved. The file is a live login, so add `playwright/.auth` to
+      `.gitignore`. The setup waits for a page only a signed-in user sees before saving,
+      otherwise it can save the state from before the session cookie arrived.
+
+      Keep one real test of the login form itself. And if tests change server-side state
+      tied to the account, give each worker its own account, or they'll collide.
+  - title: Hunting a flaky test
+    body: |-
+      A flaky test passes and fails on the same code. Its causes fall into a few families,
+      each with a cure:
+
+      - **Timing.** Fixed sleeps, reading text once, clicking before hydration. Use
+        web-first assertions, and wait for a signal the page gives, like a visible heading.
+      - **Shared state.** Tests that share an account, a row or an order. Give each test its
+        own data, created in a fixture.
+      - **Order dependence.** A test that only passes after another. Run it alone with
+        `npx playwright test path/to/file.spec.ts:12`; if it fails there, it leans on an
+        earlier test.
+      - **Networks you don't own.** Payment sandboxes, maps, analytics. Stub them with
+        `page.route` and `route.fulfill`.
+      - **Time and place.** Dates near midnight, time zones, locales. Pin them with
+        `page.clock.setFixedTime(...)` or `page.clock.install(...)`, and with `timezoneId`
+        and `locale` in `use`.
+      - **Resource contention.** Too many workers on a small CI machine make everything
+        slow. Lower `workers` in CI before raising timeouts.
+
+      To find one, repeat it: `npx playwright test basket.spec.ts --repeat-each 20`. To see
+      what happened, keep a **trace**. With `trace: 'on-first-retry'`, the first retry of a
+      failing test is recorded: every action, a DOM snapshot before and after each, network
+      requests and console output. Open it with `npx playwright show-trace trace.zip`, or in
+      the HTML report. The trace shows the page at the moment of failure, which beats
+      guessing from a log.
+
+      With `retries` on, a test that fails then passes is marked **flaky** in the report and
+      the run stays green. That's a sensible safety net for shipping, and a dangerous one if
+      nobody reads the list. Track flaky tests like bugs, fix the cause, and don't raise
+      timeouts to hide a race.
+pitfalls:
+  - '**Adding `waitForTimeout` to fix a flake.** Any fixed number is too long on a fast run and too short on a slow one. Wait for a visible outcome with a web-first assertion.'
+  - '**Reading a value and asserting on it.** `expect(await locator.isVisible()).toBe(true)` checks once. Use `await expect(locator).toBeVisible()`, which retries.'
+  - '**Silencing strictness with `.first()`.** It hides an ambiguous locator and may click the wrong product. Narrow with `filter` or a more exact name.'
+  - '**Tests that depend on each other.** Test B passes only after test A created the order, so it fails alone, in parallel or after a reorder. Each test creates its own data.'
+  - '**Logging in through the form in every test.** Slow, and one login bug fails the whole suite. Sign in once in a setup project and load `storageState`.'
+  - '**Hitting real third-party services.** Their sandboxes are slow, rate limited and sometimes down. Stub them with `page.route`, and cover the integration with a contract test.'
+  - '**Reading a green run with retries as all good.** Flaky tests pass on retry and hide real races. Read the flaky list and fix each one.'
+  - '**Too many end-to-end tests.** Testing every validation rule through the browser makes a slow, brittle suite. Push detail down to unit and component tests and keep end-to-end for journeys.'
+interview:
+  - question: How do you keep an end-to-end suite from becoming flaky?
+    answer: >-
+      By removing the causes, not by adding retries. The biggest one is timing, so there are
+      no sleeps: every wait is a web-first assertion or an action that auto-waits, and tests
+      wait for a signal the user sees. Next is shared state, so every test creates its own
+      data and runs in its own browser context, which lets tests run in parallel and in any
+      order. Third-party services are stubbed with `page.route`, and time and locale are
+      pinned. In CI I turn on retries with traces on the first retry, so a flake produces a
+      trace I can open, and I treat the flaky report as a bug list. Retries alone keep the
+      build green while the race stays in the code.
+  - question: What does Playwright's auto-waiting actually wait for?
+    answer: >-
+      Two different things. Before an action like `click`, it runs actionability checks:
+      the element is attached, visible, stable rather than animating, not covered by
+      another element, and enabled, plus editable for `fill`. It retries those until they
+      pass or the timeout ends, then says which check failed. Separately, web-first
+      assertions such as `toHaveText` or `toBeVisible` retry the check until it passes or
+      the expect timeout, 5 seconds by default, ends. Locators are lazy, so each retry
+      re-queries the live page. What it doesn't do is wait for your app's own logic: if you
+      read a value with `textContent()` and assert on it, that's one read. So the rule is to
+      assert on locators, never on values you pulled out.
+  - question: How do you handle authentication in a large Playwright suite?
+    answer: >-
+      Sign in once, reuse the session. A setup project logs in through the real form, waits
+      for a page only a signed-in user sees, and saves `storageState` to a file, which holds
+      cookies and local storage. Every other project depends on setup and loads that file,
+      so tests start signed in and skip the form. That's faster and means one login bug
+      fails one test, not all of them. The file is a live credential, so it's gitignored,
+      and the password comes from a secret. If tests mutate account data, I give each worker
+      its own account so parallel tests don't collide. I still keep one test that exercises
+      the login form itself.
+  - question: When would you write an end-to-end test rather than a component or integration test?
+    answer: >-
+      When the risk is in how the pieces fit, on a journey that matters. Checkout, sign-up
+      and sign-in cross the browser, routing, the API, the session cookie and the database,
+      and only a real browser run proves they work together, including CSS that hides a
+      button on a phone. For logic, validation rules and edge cases I go lower, because a
+      component or unit test runs in milliseconds and says exactly what broke. For
+      agreement between services I use contract tests rather than spinning up everything.
+      The trade-off is that each end-to-end test costs seconds and has more ways to flake,
+      so I keep a small set of critical journeys, run them on every merge, and treat any
+      failure there as serious.

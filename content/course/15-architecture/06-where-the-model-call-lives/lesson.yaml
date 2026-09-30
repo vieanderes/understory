@@ -1,0 +1,276 @@
+id: arch.model-behind-a-port
+title: Where the model call lives
+objective: Put the call to a language model in one adapter behind a port, swap providers without touching the rules, and judge the swap with evals.
+level: advanced
+minutes: 10
+concepts: [arch.model-port, arch.evals-at-the-boundary]
+prerequisites: [arch.hexagonal, backend.calling-other-apis, testing.property-based]
+opening:
+  text: >-
+    You'll give your app's AI feature a boundary, so a new model provider is one new file.
+    And you'll know which test tells you the new provider is any good.
+
+steps:
+  - type: prose
+    id: model-is-outside
+    body: >-
+      In the backend chapter your server called a model's API: text out over HTTP, text back.
+      A **language model** is the program behind that API, and the company that runs it is
+      the **provider**.
+
+
+      To your architecture it's one more outside service, like the database. It's slow, it
+      costs money per call, it fails, and it will change. Providers ship new models every
+      few months.
+
+  - type: multiple-choice
+    id: pick-what-is-domain
+    concept: arch.model-port
+    difficulty: 1
+    question: A support app sends tickets to a model for a label. Which part belongs in the domain?
+    choices:
+      - text: Refund tickets go to the billing team
+        correct: true
+        feedback: >-
+          Right. That's a business rule. It stays true whichever model does the labelling.
+      - text: The provider's URL and API key
+        feedback: >-
+          Those change with the provider. They belong in the adapter that talks to it.
+      - text: The prompt that asks for a label
+        feedback: >-
+          Prompts are tuned per model, so they change when the model does. Keep them in the
+          adapter.
+      - text: Reading the label out of the reply
+        feedback: >-
+          Every provider shapes its reply differently. Parsing it is exactly the adapter's
+          job.
+
+  - type: prose
+    id: a-port-for-the-model
+    body: >-
+      So give the model a port, as in lesson 5. The rules say what they need, in their own
+      words:
+
+
+      ```ts
+      interface Classifier {
+        classify(ticket: string): Promise<'refund' | 'bug' | 'other'>;
+      }
+      ```
+
+
+      One adapter per provider fills it. It holds the URL, the key, the prompt and the reply
+      parsing. The rules get a classifier passed in, and never see a provider.
+
+  - type: bug-hunt
+    id: hunt-reply-shape-in-rule
+    concept: arch.model-port
+    difficulty: 2
+    language: js
+    code: |
+      // domain/route-ticket.js
+      export async function routeTicket(ticket, model) {
+        const reply = await model.send({ prompt: `Label as refund, bug or other: ${ticket}` });
+        const label = reply.output[0].text;
+        if (label === 'refund') return 'billing';
+        if (label === 'bug') return 'engineering';
+        return 'inbox';
+      }
+    prompt: >-
+      The team moves to provider B, whose reply has `choices`, not `output`. Every ticket
+      crashes. Tap the two lines that belong in an adapter.
+    lines: [3, 4]
+    reasons:
+      - text: They hold one provider's prompt and reply shape
+        correct: true
+        feedback: >-
+          Yes. Move both into provider A's adapter, and write one for B.
+      - text: The routing should use a `switch`
+        feedback: >-
+          A `switch` would route the same way. The routing is the part that should stay here.
+      - text: '`await` holds up every other ticket'
+        feedback: >-
+          Each call waits for its own reply only. Other tickets carry on. The crash comes from
+          the reply's shape.
+
+  - type: prose
+    id: evals-at-the-boundary
+    body: >-
+      Your unit tests hand `routeTicket` a fake classifier, so they're fast and never flaky.
+      They prove the rules. They can't tell you whether provider B labels tickets well.
+
+
+      That's the job of an **eval**, from the testing chapter: run the real adapter over
+      saved tickets whose right labels you know, and score the answers. The port is the
+      line between the two kinds of test.
+
+  - type: multiple-choice
+    id: pick-which-check
+    concept: arch.evals-at-the-boundary
+    difficulty: 2
+    question: You're moving triage to provider B. Which check tells you B labels tickets as well as A?
+    choices:
+      - text: An eval over 200 labelled tickets
+        correct: true
+        feedback: >-
+          Right. Same tickets, both adapters, compare the scores.
+      - text: The unit tests with the fake classifier
+        feedback: >-
+          They pass with any provider, because they never call one. They check your rules,
+          not the model.
+      - text: The type checker
+        feedback: >-
+          Both adapters return a label, so both type-check. Types can't tell a good label from
+          a bad one.
+      - text: Trying one ticket in the browser
+        feedback: >-
+          One ticket tells you little, and answers vary between runs. An eval scores many.
+
+  - type: ai-review
+    id: review-eval-uses-fake
+    concept: arch.evals-at-the-boundary
+    difficulty: 3
+    language: js
+    request: Write an eval so we can compare providers A and B.
+    flawClass: logic
+    code: |
+      import { routeTicket } from '../domain/route-ticket.js';
+      import { labelledTickets } from './labelled-tickets.js';
+
+      const model = { classify: async () => 'refund' };
+      let right = 0;
+      for (const { text, route } of labelledTickets) {
+        if ((await routeTicket(text, model)) === route) right = right + 1;
+      }
+      console.log(`${right} of ${labelledTickets.length} routed correctly`);
+    prompt: >-
+      An assistant wrote this. Provider A scores 41 of 200. So does provider B, and so does a
+      provider with a wrong API key. Tap the line at fault.
+    lines: [4]
+    reasons:
+      - text: It scores a fake, not the real adapter
+        correct: true
+        feedback: >-
+          Yes. It measures the rules against one fixed label. Pass `providerB(send)` in.
+      - text: '`right` should start at 1'
+        feedback: >-
+          Starting at 0 is right. Every run gets the same score, and the counter isn't the
+          cause.
+      - text: The loop should run the tickets at once
+        feedback: >-
+          That would be faster, and the scores would still match. The model being scored is
+          the problem.
+    fix: |
+      const model = providerB(send);   // the real adapter, making real calls
+
+  - type: code-challenge
+    id: write-model-port
+    concept: arch.model-port
+    difficulty: 4
+    language: ts
+    prompt: >-
+      `routeTicket` builds the prompt and reads provider A's reply itself. Change it to take a
+      `Classifier` and only call `classify`.
+
+
+      Then write the adapters `providerA(send)` and `providerB(send)`. Each sends `'Label as
+      refund, bug or other: '` plus the ticket in its provider's shape, and reads its reply
+      shape. Trim and lowercase the answer. Anything else becomes `'other'`.
+
+
+      So a reply of `' Refund\n'` from provider A gives `'refund'`.
+    hints:
+      - The comments above each adapter show what it sends and what comes back.
+      - One small helper can turn any reply text into a `Label`. Both adapters can call it.
+      - 'Provider A''s adapter starts `return { async classify(ticket) { const reply = await send({ prompt: PROMPT + ticket })`'
+
+  - type: explain-back
+    id: explain-swap-provider
+    concept: arch.model-port
+    difficulty: 4
+    prompt: >-
+      Your team wants to try a cheaper model provider next month. How does a port make that
+      a small job, and what tells you it's safe to switch?
+    rubric:
+      - The rules call a port they own, so only a new adapter with that provider's prompt and reply parsing is needed.
+      - The unit tests keep passing with a fake, which shows the rules didn't change, but says nothing about the new model.
+      - An eval runs both adapters over the same labelled examples, and the scores decide the switch.
+    modelAnswer: >-
+      The rules only know the `Classifier` port. Everything about a provider, its URL, key,
+      prompt and reply shape, lives in its adapter. So trying a new provider means writing
+      one new adapter and passing it in. The unit tests still use a fake, so they prove the
+      rules are untouched, and nothing more. What decides the switch is the eval: run both
+      adapters over the same labelled tickets and compare the scores. If the cheaper one
+      scores as well, switch. If not, the old adapter is still there.
+
+recap:
+  - Treat the model as an outside service, with its own port and one adapter per provider.
+  - Keep prompts, keys and reply parsing in the adapter, and turn odd answers into a safe default.
+  - Test the rules with a fake model, and judge a new model or prompt with an eval.
+
+recall:
+  - id: card-model-port
+    concept: arch.model-port
+    front: What lives in a model adapter, and what stays in the domain?
+    back: >-
+      The adapter holds the provider's URL, key, prompt and reply parsing. The domain keeps
+      the business rules, like where each label is routed.
+  - id: card-odd-answer
+    concept: arch.model-port
+    front: What should an adapter do with a model answer that isn't a known label?
+    back: >-
+      Turn it into a safe default, such as `'other'`, so the rules only ever see values they
+      understand.
+  - id: card-fake-versus-eval
+    concept: arch.evals-at-the-boundary
+    front: What does a test with a fake model prove, and what doesn't it?
+    back: >-
+      It proves the rules work for each label. It says nothing about how well a real model
+      labels. That needs an eval.
+  - id: card-eval-boundary
+    concept: arch.evals-at-the-boundary
+    front: When you swap model providers, what do you run to decide?
+    back: >-
+      An eval: both adapters over the same labelled examples, scored the same way.
+
+references:
+  - kind: essay
+    title: Hexagonal architecture the original 2005 article
+    authors: Alistair Cockburn
+    year: 2005
+    venue: alistair.cockburn.us
+    url: https://alistair.cockburn.us/hexagonal-architecture/
+    note: Ports and adapters, the pattern this lesson applies to a model provider.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Define your success criteria and build evaluations
+    authors: Anthropic
+    venue: Claude documentation
+    url: https://platform.claude.com/docs/en/test-and-evaluate/develop-tests
+    note: Building a set of labelled examples and grading a model's answers against them.
+    verified: true
+
+deepDive: >-
+  The provider reply shapes here are simplified. Real APIs nest their answers in different
+  ways and change them between versions, which is the reason the parsing belongs in one
+  adapter. Read the provider's documentation, and keep one saved real reply per provider as
+  a test fixture.
+
+
+  Many teams use an SDK or a library that already speaks to several providers. That's an
+  adapter someone else wrote, and it helps. It doesn't remove the need for your own port.
+  The library's types still leak provider ideas, like message roles and token settings. Your
+  rules should see `classify(ticket)`, not a chat request.
+
+
+  The adapter is also where the model's failures stop. A timeout, a rate limit or a reply
+  that isn't JSON should become a value the domain understands: `'other'`, or a clear error
+  the handler can turn into a status. The retries and backoff from the scale chapter go
+  here too, once, instead of in every caller.
+
+
+  Evals and unit tests fail for different reasons. A unit test fails when your code
+  changes. An eval's score moves when the model or the prompt changes, even if your code
+  didn't. Keep them apart, run the unit tests on every commit, and run the eval before a
+  prompt or provider change ships. Chapter 20 builds a full eval suite.

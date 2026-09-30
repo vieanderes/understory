@@ -1,0 +1,298 @@
+summary: >-
+  A Server Action is an async function marked `'use server'` that the browser calls through
+  a POST request, while its code stays on the server. You hand it to `<form action>` or
+  `<button formAction>`, or call it from an event handler. Next.js does the plumbing: no
+  route, no `fetch`, no JSON parsing, and the form still works before JavaScript loads.
+
+
+  Underneath, the build swaps the function in client bundles for a reference: an encrypted
+  action id plus a small dispatcher that posts to the current page. When the action changes
+  data and refreshes the cache, one response carries both its return value and the newly
+  rendered page. That single round trip is the reason to prefer actions for your own
+  mutations.
+
+
+  The convenience hides a fact that matters more than any other: an action is a **public
+  endpoint**. Anyone who can send the same POST can call it, with any arguments, whether or
+  not your page ever showed them the button. So every action checks who is asking, checks
+  every field, and finds data by id and owner. Render-time checks and a proxy in front are
+  helpful filters, never the protection.
+remember:
+  - A Server Action is reachable by a direct POST, so it authenticates, authorises and validates inside itself on every call.
+  - A page's sign-in check doesn't extend to the actions defined in it, because each action is a separate entry point.
+  - The caller's identity comes from the session; the client sends only a reference such as an id and the change, and ownership goes into the lookup.
+  - Arguments, bound values and `FormData` are written by the caller, and return values are serialised to the browser, so return only what the UI shows.
+  - With `useActionState`, the action receives the previous state first and `FormData` second, and the hook gives you the state, a form action and a pending flag.
+  - '`updateTag`, `revalidatePath` and `refresh` in an action make the same response carry the re-rendered page; `redirect` throws, so revalidate before it.'
+  - Next.js dispatches a client's actions one at a time, so they're for mutations, not for parallel reads.
+  - Variables an inline action closes over are encrypted with a key made per build, but secrets still don't belong in them.
+sections:
+  - title: What happens when the form is submitted
+    body: |-
+      Follow one submit from the browser to the server and back.
+
+      1. **At build time**, `'use server'` tells the compiler to keep the function body on the
+         server. The client bundle gets a reference: an action id and a dispatcher. Action
+         ids are encrypted and non-deterministic, and actions nothing uses are dropped, so
+         they get no endpoint.
+      2. **On submit**, the dispatcher sends a POST to the page the form is on, with the
+         fields and the action id. Before hydration, the browser posts the plain HTML form
+         itself. In a Client Component, a submit made before JavaScript loads is queued and
+         that form is hydrated first.
+      3. **On the server**, Next.js runs its own checks first. It compares the `Origin`
+         header with `Host` (or `X-Forwarded-Host`) and rejects a mismatch, which blocks
+         cross-site form posts. It caps the body at 1 MB by default. Then your function runs.
+      4. **The response** carries the return value. If the action called `updateTag`,
+         `revalidatePath` or `refresh`, set a cookie, or redirected, it also carries the
+         re-rendered page for the current route. The client applies both, with no follow-up
+         request.
+
+      Only POST can invoke an action. Together with the origin check and SameSite cookies,
+      that stops most CSRF. Behind a reverse proxy or CDN on another domain, list the
+      trusted hosts in `serverActions.allowedOrigins` in `next.config.ts`.
+
+      One client-side detail changes design choices: Next.js dispatches a client's actions
+      **one at a time**. Three quick clicks run in sequence, which keeps the returned page
+      consistent with the action that produced it. So `Promise.all` over actions gains
+      nothing. Do parallel work inside one action, or read data in a Server Component.
+  - title: A complete action, with errors the form can show
+    body: |-
+      The lesson's bike hire shows the checks. Here they are wired to a form that shows
+      field errors and a pending state, booking a restaurant table. The schema lives in its
+      own module, so the rules can be tested without Next.js.
+
+      ```ts
+      // app/bookings/schema.ts
+      import { z } from 'zod';
+
+      export const BookingSchema = z.object({
+        date: z.iso.date({ error: 'Choose a date' }),
+        guests: z.coerce.number().int('Whole numbers only').min(1, 'At least 1 guest').max(8, 'At most 8 guests'),
+        note: z.string().trim().max(200, 'Keep the note under 200 characters').default(''),
+      });
+
+      export type BookingState = {
+        ok: boolean;
+        message: string;
+        errors?: Partial<Record<'date' | 'guests' | 'note', string[]>>;
+      };
+      ```
+
+      ```ts
+      // app/bookings/actions.ts
+      'use server';
+      import { updateTag } from 'next/cache';
+      import { z } from 'zod';
+      import { BookingSchema, type BookingState } from './schema';
+
+      export async function bookTable(_prev: BookingState, formData: FormData): Promise<BookingState> {
+        const session = await getSession();
+        if (!session) return { ok: false, message: 'Sign in to book' };
+
+        const result = BookingSchema.safeParse({
+          date: formData.get('date'),
+          guests: formData.get('guests'),
+          note: formData.get('note') ?? undefined,
+        });
+        if (!result.success) {
+          return { ok: false, message: 'Check the form', errors: z.flattenError(result.error).fieldErrors };
+        }
+
+        await saveBooking({ userId: session.userId, ...result.data });
+        updateTag(`bookings-${session.userId}`);
+        return { ok: true, message: `Booked for ${result.data.guests} on ${result.data.date}` };
+      }
+      ```
+
+      ```tsx
+      // app/bookings/booking-form.tsx
+      'use client';
+      import { useActionState } from 'react';
+      import { bookTable } from './actions';
+      import type { BookingState } from './schema';
+
+      const initial: BookingState = { ok: false, message: '' };
+
+      export function BookingForm() {
+        const [state, formAction, pending] = useActionState(bookTable, initial);
+        return (
+          <form action={formAction}>
+            <label htmlFor="guests">Guests</label>
+            <input id="guests" name="guests" type="number" min={1} max={8} required aria-describedby="guests-error" />
+            <p id="guests-error">{state.errors?.guests?.[0]}</p>
+            {/* the date and note fields follow the same pattern */}
+            <button disabled={pending}>{pending ? 'Booking…' : 'Book a table'}</button>
+            <p aria-live="polite">{state.message}</p>
+          </form>
+        );
+      }
+      ```
+
+      We ran the schema on real `FormData`. `{ date: 'soon', guests: '-5' }` gave
+      `Choose a date` and `At least 1 guest`; `3.5` guests gave `Whole numbers only`. The
+      browser's `min` and `max` are a courtesy for honest users. The schema is the rule.
+
+      Expected problems, like a bad field, come back as returned state the form renders.
+      Throw only for what the user can't fix; a thrown error reaches the nearest error
+      boundary instead of the form.
+  - title: Closures, bound arguments and hidden fields
+    body: |-
+      An action defined inside a Server Component can use variables from the render. That's
+      a **closure**, and it's useful for capturing a snapshot, such as the version of a record
+      the user was looking at.
+
+      ```tsx
+      export default async function BookingPage({ params }: { params: Promise<{ id: string }> }) {
+        const { id } = await params;
+        const session = await getSession();
+        const booking = session ? await getBooking(id, session.userId) : null;
+        if (!booking) return <p>Booking not found</p>;
+        const seenVersion = booking.version;
+
+        async function cancel() {
+          'use server';
+          const session = await getSession(); // the page's check doesn't cover this entry point
+          if (!session) throw new Error('Unauthorized');
+          const done = await cancelBooking(id, session.userId, seenVersion);
+          if (!done) throw new Error('The booking changed since you opened it');
+          updateTag(`bookings-${session.userId}`);
+        }
+
+        return (
+          <form action={cancel}>
+            <button>Cancel booking</button>
+          </form>
+        );
+      }
+      ```
+
+      To make that work, the captured values travel to the browser and back with the call.
+      Next.js **encrypts** them, with a new private key for each action on every build, so
+      an action can only be invoked for the build that rendered it. The docs still advise
+      against relying on encryption alone. Never capture a secret, a token or a whole user
+      record. Capture the smallest value you need, and look the rest up again on the server.
+
+      The other two ways to pass extra data are weaker. `action.bind(null, bookingId)` sends
+      a value along as an argument; it works with progressive enhancement, but the caller
+      can replace it. A hidden input is part of the HTML and isn't encoded at all. Treat
+      both as input, which is why `cancelBooking` above takes the user id from the session
+      and checks ownership itself.
+  - title: Keeping actions thin with a data access layer
+    body: |-
+      Once an app has twenty actions, "check auth in every one" becomes a bet that nobody
+      forgets. The docs recommend a **Data Access Layer**: a `server-only` module that owns
+      the database calls and does the authentication and authorisation inside them. Actions
+      become thin wrappers that validate, delegate and refresh.
+
+      ```ts
+      // data/bookings.ts
+      import 'server-only';
+
+      export async function cancelBookingForCurrentUser(bookingId: string) {
+        const session = await getSession();
+        if (!session) throw new Error('Unauthorized');
+        const booking = await db.booking.findFirst({ where: { id: bookingId, userId: session.userId } });
+        if (!booking) throw new Error('Not found');
+        await db.booking.update({ where: { id: booking.id }, data: { status: 'cancelled' } });
+        return { id: booking.id, status: 'cancelled' as const };
+      }
+      ```
+
+      ```ts
+      // app/bookings/actions.ts
+      'use server';
+      import { updateTag } from 'next/cache';
+      import { cancelBookingForCurrentUser } from '@/data/bookings';
+
+      export async function cancelBookingAction(bookingId: string) {
+        const result = await cancelBookingForCurrentUser(bookingId);
+        updateTag('bookings');
+        return result;
+      }
+      ```
+
+      `import 'server-only'` makes the build fail if a Client Component ever imports the
+      module, so database code can't leak into a bundle by accident. The layer returns a
+      small object, a **DTO**, never the row, because an action's return value is serialised
+      and sent to the browser. The ownership check is in the `where` clause, so another
+      user's booking isn't found rather than found and then refused. That avoids an insecure
+      direct object reference by construction.
+
+      Expensive actions, such as sending email, also want a rate limit, and destructive ones
+      may deserve a fresh sign-in.
+pitfalls:
+  - >-
+    **Checking auth on the page but not in the action.** The redirect controls which UI
+    renders, but a script can post to the action without loading the page. Repeat the
+    session check inside every action, or in the data layer it calls.
+  - >-
+    **Taking the owner from the form.** A hidden `userId` or a bound argument is whatever the
+    caller sends. Read identity from the session, and put the owner in the query.
+  - >-
+    **Trusting `min`, `max` and `required`.** They only guide the browser, and a direct POST
+    never sees them. Validate every field on the server with a schema.
+  - >-
+    **Returning the database record.** The whole row is serialised to the browser, internal
+    fields included. Return a small object with what the UI shows.
+  - >-
+    **Revalidating after `redirect`.** `redirect` throws, so nothing after it runs and the
+    destination shows stale data. Call `updateTag` or `revalidatePath` first.
+  - >-
+    **Capturing secrets in an inline action.** Closed-over values travel to the browser and
+    back, encrypted but present. Capture an id, and look the secret up on the server.
+  - >-
+    **Using an action to fetch data in parallel.** A client's actions run one at a time, so
+    reads through them queue up. Read in Server Components, or use a route handler for
+    client-side reads.
+  - >-
+    **Throwing for validation errors.** The form loses its state and the user sees an error
+    boundary. Return the errors as state and render them next to the fields.
+interview:
+  - question: Are Server Actions secure by default?
+    answer: >-
+      Partly: the framework guards the transport, but authorisation is always my job. Next.js
+      only accepts POST, rejects requests whose `Origin` doesn't match the host, caps bodies
+      at 1 MB, encrypts action ids and closed-over variables, and strips unused actions from
+      the bundle. None of that knows who the user is or what they own. Every action is still
+      a public endpoint a script can call with any arguments, so each one reads the session,
+      validates input with a schema, and finds records by id and owner. I usually put those
+      checks in a `server-only` data access layer, so a new action can't forget them. The
+      trade-off is some repetition, which the layer absorbs.
+  - question: How does the page update after a Server Action changes data?
+    answer: >-
+      In the same round trip. When the action calls `updateTag`, `revalidatePath` or
+      `refresh`, sets a cookie or redirects, Next.js re-renders the current route on the
+      server. The response streams the action's return value and the new RSC payload
+      together, and the client applies both. So there's no second request, and
+      `useActionState` gets the result at the moment the page shows the new data.
+      `revalidateTag` with a stale-while-revalidate profile is the exception: it skips that
+      re-render, so the user may see old data once. For a user's own write I use
+      `updateTag`, which gives read-your-own-writes.
+  - question: When would you choose a route handler over a Server Action?
+    answer: >-
+      When the caller isn't my own UI. Server Actions suit my forms and buttons: no URL to
+      design, progressive enhancement, typed arguments, and the refreshed page in the
+      response. But their ids can change with every build, only POST can call them, and the client
+      runs them one at a time. A mobile app, a webhook or a partner needs a stable URL, any
+      method, a documented contract and maybe a streamed or non-JSON response, and that's a
+      route handler. Both are public, so the security work is the same either way. I often
+      share one data access function between an action and a handler.
+  - question: What happens to variables an inline Server Action closes over?
+    answer: >-
+      They're serialised, encrypted, sent to the browser with the page, and sent back when
+      the action is called. That lets an action capture a snapshot from render time, such as
+      the version of a record the user saw, and compare it on submit for optimistic
+      concurrency. Next.js makes a new key per action on every build, so a page from one
+      build can't call another build's actions, and on several servers they need a shared
+      `NEXT_SERVER_ACTIONS_ENCRYPTION_KEY`. The docs say not to rely on encryption alone, so
+      I capture only small non-secret values like ids, and never tokens or whole records.
+  - question: How do you show validation errors and a pending state for a Server Action form?
+    answer: >-
+      I make the form a Client Component and use `useActionState(action, initialState)`. It
+      returns the current state, a wrapped action for the form's `action` prop, and a
+      pending flag. The action's signature gains a first parameter, the previous state,
+      before `FormData`. It validates with a schema and returns field errors as data rather
+      than throwing, so the form keeps its values and shows messages. I link each message to
+      its input with `aria-describedby`, announce the summary in an `aria-live` region, and
+      disable the button while pending. The form still submits without JavaScript, and the
+      server rules apply either way.

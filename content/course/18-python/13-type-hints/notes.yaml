@@ -1,0 +1,328 @@
+summary: >-
+  Type hints add TypeScript-style types to Python: `def find(user_id: int) -> User | None`.
+  The key difference from TypeScript is that nothing compiles them away, and nothing enforces
+  them either. The interpreter stores the hints and carries on. A separate **type checker**,
+  such as mypy or pyright, reads them and reports mismatches before the code runs.
+
+
+  They solve the same problems as in TypeScript. Editors can complete and navigate code,
+  refactors show every call site they break, and a whole class of bugs (a `None` where a
+  value was expected, a misspelt dict key, the wrong argument order) fails in CI instead of
+  in production. They also document intent: a signature says what a function accepts and
+  returns without anyone reading the body.
+
+
+  Hint every function in shared or long-lived code, and run the checker in CI next to ruff.
+  Throwaway scripts can skip them. Remember the limit: hints describe types, not values. An
+  empty list is still a `list[float]`, and data from outside, such as JSON, only has the type
+  you claim until something validates it.
+remember:
+  - Python never checks hints at run time, and a checker such as mypy or pyright reads them before the code runs.
+  - Python classes are nominal, so a type must inherit from a class to match it, while a `Protocol` matches structurally, like a TypeScript interface.
+  - '`object` is TypeScript''s `unknown` and `Any` is its `any`, and `typing.cast` is `as`: it changes what the checker believes and checks nothing.'
+  - '`X | None` is the modern spelling of `Optional[X]`, and a `None` default doesn''t make a parameter optional in the type unless you write `| None`.'
+  - 'Python 3.12 added generic syntax, `def first[T](items: list[T]) -> T | None`, and `type` statements for aliases.'
+  - '`list` is invariant, so `list[int]` is not a `list[float]`, while read-only `Sequence[float]` accepts it.'
+  - A `TypedDict` is an ordinary dict at run time, so `json.loads` output typed as one is a promise, not a check.
+  - mypy skips the bodies of functions with no hints by default, so run it with `--strict` or hint everything.
+sections:
+  - title: What happens to hints at run time
+    body: |-
+      Python evaluates each hint when the function is defined and stores it in
+      `__annotations__`. After that, nothing reads them unless a library asks. That's how
+      pydantic and FastAPI validate data from hints: they read the stored annotations with
+      `typing.get_type_hints`.
+
+      ```python
+      from typing import get_type_hints
+
+
+      def add_item(cart: list[str], item: str, qty: int = 1) -> list[str]:
+          return cart + [item] * qty
+
+
+      print(add_item.__annotations__["return"])  # list[str]
+      print(get_type_hints(add_item)["qty"])  # <class 'int'>
+
+      try:
+          add_item(["tea"], "jam", qty="2")  # type: ignore[arg-type]
+      except TypeError as err:
+          print(err)  # can't multiply sequence by non-int of type 'str'
+
+      print(isinstance(["tea", 3], list))  # True, only the outer type is checkable
+      ```
+
+      The bad call fails deep inside, at `*`, with a message about sequences. The hint played
+      no part. You also can't check a parameterised type with `isinstance`: `isinstance(x,
+      list[str])` raises `TypeError`, because a list doesn't remember what it was meant to
+      hold. Checking every item would cost time on every call, which is why Python leaves
+      enforcement to tools.
+
+      One run-time trap in Python 3.13: hints are evaluated eagerly, so a method can't name
+      its own class before the class exists.
+
+      ```text
+      class Node:
+          def add(self, child: Node) -> None: ...
+      NameError: name 'Node' is not defined. Did you mean: 'None'?
+      ```
+
+      Quote the name, `child: "Node"`, or put `from __future__ import annotations` at the top
+      of the file. Python 3.14 evaluates annotations lazily and removes the problem, but
+      3.13 code still needs one of these.
+  - title: Coming from TypeScript
+    body: |-
+      Much maps directly, with a few differences a TypeScript developer trips over.
+
+      **Classes are nominal.** In TypeScript, any object with the right shape fits a class
+      type. In Python, a `Pixel` with an `x` attribute is not a `Point`, even if the two are
+      identical. When you want shape-based matching, write a `Protocol`. A protocol marked
+      `@runtime_checkable` also works with `isinstance`, but that check only asks whether the
+      names exist, not whether the signatures match.
+
+      ```python
+      from typing import Protocol, runtime_checkable
+
+
+      @runtime_checkable
+      class Closer(Protocol):
+          def close(self) -> None: ...
+
+
+      class LogFile:
+          def close(self) -> None:
+              print("file closed")
+
+
+      class Door:
+          close = "not a method"
+
+
+      print(isinstance(LogFile(), Closer))  # True
+      print(isinstance(Door(), Closer))  # True, because only the name is checked
+      ```
+
+      **`Any`, `object` and `cast`.** `Any` switches checking off in both directions, like
+      `any`. `object` accepts every value but lets you do almost nothing until you narrow it,
+      like `unknown`. `cast(int, value)` is TypeScript's `as`: at run time it returns its
+      argument untouched.
+
+      **Strictness is opt-in.** TypeScript's `strict` checks everything. mypy by default
+      doesn't check the body of a function with no hints at all, so a new file of
+      unannotated code passes silently. `mypy --strict` demands hints everywhere and turns
+      on the checks you'd expect. pyright checks unannotated code by inferring types.
+
+      **Arrays and lists differ in variance.** TypeScript lets a `number[]` pass where a
+      `(number | string)[]` is expected, which is unsound. Python's checkers don't: `list` is
+      invariant, because a function taking `list[float]` could append a float to your
+      `list[int]`. mypy says `"list" is invariant` and suggests `Sequence`, which is
+      read-only and therefore accepts `list[int]`. Take `Sequence` or `Iterable` in
+      parameters, and return concrete types such as `list`.
+  - title: Generics with the 3.12 syntax
+    body: |-
+      A generic function keeps the link between input and output types. Since Python 3.12,
+      type parameters go in square brackets after the name, like TypeScript's angle
+      brackets. Classes take them the same way, and the `type` statement names an alias.
+
+      ```python
+      from collections.abc import Callable, Iterable
+
+
+      def first[T](items: Iterable[T]) -> T | None:
+          for item in items:
+              return item
+          return None
+
+
+      def group_by[T, K](items: Iterable[T], key: Callable[[T], K]) -> dict[K, list[T]]:
+          groups: dict[K, list[T]] = {}
+          for item in items:
+              groups.setdefault(key(item), []).append(item)
+          return groups
+
+
+      class Stack[T]:
+          def __init__(self) -> None:
+              self._items: list[T] = []
+
+          def push(self, item: T) -> None:
+              self._items.append(item)
+
+          def pop(self) -> T:
+              return self._items.pop()
+
+
+      type Pair[T] = tuple[T, T]
+
+
+      def swap[T](pair: Pair[T]) -> Pair[T]:
+          return (pair[1], pair[0])
+
+
+      print(first(["tea", "jam"]))  # tea
+      print(first([]))  # None
+      print(group_by(["apple", "avocado", "bread"], key=lambda s: s[0]))
+      # {'a': ['apple', 'avocado'], 'b': ['bread']}
+
+      tickets: Stack[int] = Stack()
+      tickets.push(101)
+      print(tickets.pop() + 1)  # 102
+      print(swap((1, 2)))  # (2, 1)
+      ```
+
+      mypy infers `first([1, 2])` as `int | None`. So `first(["tea"]).upper()` is an error,
+      `Item "None" of "str | None" has no attribute "upper"`, and `tickets.push("101")` is
+      rejected because the stack holds `int`. Both pass mypy `--strict` and pyright cleanly
+      as written.
+
+      You'll still see the older spelling, `T = TypeVar("T")` with `Generic[T]`, in code
+      that supports Python before 3.12. It means the same thing.
+  - title: Narrowing and exhaustive checks
+    body: |-
+      A union type becomes useful once you narrow it. Checkers follow `if x is None`,
+      `isinstance`, `==` against a literal and `match`, as TypeScript follows `typeof` and
+      discriminants. Combine a `Literal` union with `assert_never` and the checker tells you
+      every place that forgot a new case.
+
+      ```python
+      from typing import Literal, assert_never
+
+      Status = Literal["open", "pending", "closed"]
+
+
+      def label(status: Status) -> str:
+          match status:
+              case "open":
+                  return "Open"
+              case "pending":
+                  return "Waiting on customer"
+              case "closed":
+                  return "Done"
+              case _:
+                  assert_never(status)
+
+
+      def shout(value: object) -> str:
+          if isinstance(value, str):
+              return value.upper()  # narrowed to str here
+          return str(value)
+
+
+      print(label("pending"))  # Waiting on customer
+      print(shout(42), shout("hi"))  # 42 HI
+      ```
+
+      Delete the `"pending"` case and mypy reports `Argument 1 to "assert_never" has
+      incompatible type "Literal['pending']"; expected "Never"`. That's TypeScript's `never`
+      trick, and it's how you make adding a status to a support ticket safe across a large
+      codebase. If the value somehow arrives at run time anyway, `assert_never` raises
+      `AssertionError`.
+  - title: TypedDict, and where types stop
+    body: |-
+      A `TypedDict` describes a dict's keys. It exists for data that is a dict anyway: parsed
+      JSON, rows from a database driver, keyword arguments. `NotRequired` marks a key that
+      may be missing.
+
+      ```python
+      import json
+      from typing import NotRequired, TypedDict
+
+
+      class Order(TypedDict):
+          id: int
+          total: float
+          note: NotRequired[str]
+
+
+      order: Order = json.loads('{"id": "seven"}')  # accepted: json.loads returns Any
+      print(order["id"], type(order).__name__)  # seven dict
+      print(order.get("note", "none"))  # none
+      ```
+
+      Both checkers accept this, and the object is a plain `dict` with the wrong type in
+      `id` and no `total`. `json.loads` returns `Any`, and `Any` fits every annotation. Types
+      protect the code inside your program. At its edges, where JSON, form data or a model's
+      output arrive, something has to check the values. That's what pydantic does in the
+      next chapter, reading the same kind of hints.
+
+      As a rule of thumb, use a `TypedDict` for dict-shaped data you pass along, a
+      dataclass for objects your own code creates, and a validating model at the boundary.
+pitfalls:
+  - '**Expecting hints to stop bad values.** Python ignores them at run time. Run a checker in CI, and validate outside data with a library such as pydantic.'
+  - '**Running mypy without `--strict` on new code.** Unannotated functions are skipped, so the checker reports nothing and looks happy. Use `--strict`, or at least `check_untyped_defs`.'
+  - '**Writing `def find(name: str = None)`.** The default doesn''t widen the type, and mypy rejects it with `Incompatible default for parameter`. Write `name: str | None = None`.'
+  - '**Taking `list[float]` when you only read.** `list` is invariant, so callers with `list[int]` get an error. Accept `Sequence[float]` or `Iterable[float]` instead.'
+  - '**Silencing errors with `Any` or `cast`.** Both turn checking off without checking anything. Narrow with `isinstance` or validate the data, and keep `cast` for facts the checker can''t know.'
+  - '**Trusting `isinstance` with a runtime-checkable protocol.** It only checks that the attribute names exist. An attribute that isn''t even callable still passes.'
+  - '**Naming the class inside its own methods on 3.13.** `def add(self, child: Node)` raises `NameError` at definition time. Quote it, use `typing.Self` for the current class, or add `from __future__ import annotations`.'
+interview:
+  - question: Does Python enforce type hints? So what are they for?
+    answer: >-
+      No. The interpreter stores hints in `__annotations__` and never checks them, so
+      `double("ab")` with an `int` hint runs and returns `"abab"`. Their value comes from
+      tools. A checker such as mypy or pyright runs in CI and catches wrong argument types,
+      unhandled `None` and misspelt keys before the code ships. Editors use them for
+      completion and safe refactors. Libraries such as pydantic and FastAPI read the stored
+      hints at run time to validate and convert data, which is the one place hints do affect
+      behaviour. The trade-off is that they describe types, not values. An empty list or a
+      negative price is well typed, so tests and validation are still needed, especially for
+      data crossing into the program.
+  - question: How do Python's type hints compare with TypeScript?
+    answer: >-
+      The syntax and intent are close, but Python's classes are nominal and its checkers are
+      opt-in. TypeScript is structural everywhere, so any object with the right shape fits a
+      class type. In Python a class only matches itself and its subclasses, and `Protocol`
+      gives you structural matching when you want it, like an interface. `Any` maps to
+      `any`, `object` to `unknown` and `cast` to `as`. Python's checkers are also stricter
+      about variance: `list` is invariant, whereas TypeScript arrays are covariant. The big
+      practical difference is enforcement. Most TypeScript builds gate on the
+      compiler's checks, while Python runs regardless, and mypy by default skips unannotated
+      functions. So I run mypy with `--strict` or pyright in CI and treat failures as build
+      failures.
+  - question: When would you use a Protocol instead of an abstract base class?
+    answer: >-
+      When I care what an object can do and don't own its class. A `Protocol` matches any
+      type with the right methods, so a third-party client or a test fake fits without
+      inheriting from anything. That keeps the dependency pointing the right way: a function
+      that needs `close()` declares a `Closer` protocol next to itself, and callers bring
+      whatever they have. An abstract base class is nominal: implementers must subclass it,
+      and Python refuses to instantiate a subclass that misses an abstract method, which is a
+      real run-time guarantee. I choose an ABC when I own the hierarchy and want shared
+      behaviour or that guarantee. The caveat with protocols is that `isinstance` on a
+      runtime-checkable one only checks names, not signatures.
+  - question: How do you type data that comes from JSON?
+    answer: >-
+      With a `TypedDict` or a model inside the program, and real validation at the point it
+      enters. `json.loads` returns `Any`, so annotating the result as `Order` is a claim the
+      checker accepts without checking. If the payload has `"id": "seven"`, the typed code
+      still gets a string. For trusted data I control, a `TypedDict` is enough and costs
+      nothing, and mypy catches misspelt keys. For anything external, such as an API
+      request, a webhook or a model's output, I validate with pydantic, which reads the same
+      style of hints, checks the values and gives a clear error. The trade-off is the cost of
+      validation on every payload, which is small next to debugging a bad value three
+      functions away.
+terms:
+  - term: Type hint
+    say: Python checks types now.
+    means: An annotation the interpreter stores and ignores at run time. A separate checker such as mypy
+      or pyright reports mismatches before the code runs.
+  - term: Protocol
+    say: Python's version of an abstract class.
+    means: A type that any class with the right methods matches, structurally, like a TypeScript
+      interface. Ordinary classes and abstract base classes match only through inheritance.
+  - term: "`Optional[X]`"
+    say: An optional parameter.
+    means: It means `X | None`, a value that may be `None`. Whether an argument can be left out depends
+      on a default, which is a separate thing.
+  - term: "`Any` and `object`"
+    say: Both mean any type.
+    means: "`Any` switches checking off, like TypeScript's `any`. `object` accepts every value but
+      allows almost nothing until you narrow it, like `unknown`."
+  - term: Invariant `list`
+    say: A `list[int]` is a `list[float]`.
+    means: A list can be written to, so the checker rejects `list[int]` where `list[float]` is expected.
+      A read-only `Sequence[float]` accepts it.
+  - term: "`TypedDict`"
+    say: A dict that validates its data.
+    means: An ordinary dict at run time. Typing `json.loads` output as one is a promise to the checker,
+      not a check.

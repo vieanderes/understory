@@ -1,0 +1,267 @@
+summary: >-
+  Personal data flows through an AI system faster and further than through most software.
+  One support chat becomes a prompt sent to a provider, a log line, a trace span, a cached
+  response, perhaps a chunk in a vector store and later an item in an eval set. Each copy is
+  a place it can leak from and a place a deletion request has to reach.
+
+
+  The engineering answer has three parts. Know what counts as **PII**, including data that
+  only identifies someone in combination. Detect and redact it before text crosses a
+  boundary you don't control, with patterns for structured values and entity recognition
+  for names and places. And keep a map of where personal data goes, so that you can honour
+  the duties data protection law sets, above all keeping only what you need and erasing it
+  on request.
+
+
+  Redaction is not free. A model can't reason about what it can't see, and detectors miss
+  things and flag harmless text. So you redact what the task doesn't need, keep reversible
+  placeholders where the reply must contain the real value, and treat redacted free text as
+  still personal unless you have good reason to think otherwise.
+remember:
+  - PII is any data that identifies a person alone or in combination, such as a name, email, phone number, address, IBAN, ID number or IP address.
+  - Redact before text leaves your system, which means before the prompt, the log line and the trace are written.
+  - Patterns catch structured PII like emails and IBANs, and entity recognition catches names and places that have no pattern.
+  - Reversible redaction swaps values for numbered placeholders and keeps the map on your side, so the provider never sees the real value.
+  - Under GDPR, pseudonymised data is still personal data; only data nobody can reasonably link back to a person falls outside it.
+  - The right to erasure reaches every copy you hold, including logs, traces, caches, vector stores and eval sets.
+  - Keep a record of which personal data goes to which provider, for what purpose and for how long.
+  - Minimise first, because data you never collected can't leak and never needs deleting.
+sections:
+  - title: Where personal data leaks in an AI pipeline
+    body: |-
+      Teams usually redact the prompt and forget the rest. Walk a single request through the
+      system and list every place its text lands:
+
+      - The prompt sent to the model provider, and whatever the provider keeps under its own
+        retention terms.
+      - Application logs, including exception messages. `ValueError("no account for
+        ana@example.com")` puts an email in the log even if the prompt was clean.
+      - Traces, which by design record the full prompt, the retrieved context and tool
+        arguments.
+      - Response caches keyed on the prompt, and conversation history stored for follow-ups.
+      - The vector store, when user documents or chats are chunked and embedded. An
+        embedding is derived from the text and should be treated as personal data too.
+      - Eval sets and fine-tuning data built from real traffic.
+      - Analytics events and error trackers, which often capture request bodies by default.
+
+      A useful safety net is a logging filter on every handler, so a careless log line
+      can't write an address to disk.
+
+      ```python
+      import logging
+      import re
+      import sys
+
+      EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+")
+
+
+      class RedactFilter(logging.Filter):
+          def filter(self, record):
+              # Format first, so values passed as arguments are redacted too.
+              record.msg = EMAIL.sub("[EMAIL]", record.getMessage())
+              record.args = None
+              return True
+
+
+      handler = logging.StreamHandler(sys.stdout)
+      handler.addFilter(RedactFilter())
+      log = logging.getLogger("support")
+      log.addHandler(handler)
+      log.setLevel(logging.INFO)
+
+      log.info("prompt sent for %s", "ana@example.com")
+      try:
+          raise ValueError("no account for ana@example.com")
+      except ValueError as exc:
+          log.warning("lookup failed: %s", exc)
+      # prompt sent for [EMAIL]
+      # lookup failed: no account for [EMAIL]
+      ```
+
+      Attach it to the handler, not a logger: a handler's filter sees every record that
+      reaches it, while a logger's filter only sees records logged on that exact logger. It
+      doesn't touch tracebacks from `exc_info`, so keep those out of shared logs or scrub
+      them in the formatter. The filter is a net, not the plan: the plan is to redact at the
+      edge.
+  - title: Fewer false positives with checksums
+    body: |-
+      A pattern that's wide enough to catch every IBAN also catches order references and
+      product codes that happen to look alike. Many identifiers carry a check digit, so you
+      can confirm a candidate before redacting it. IBANs use a check modulo 97, and payment
+      card numbers use the Luhn algorithm.
+
+      ```python
+      import re
+
+      IBAN = re.compile(r"\b[A-Z]{2}\d{2}(?: ?[A-Z0-9]){11,30}\b")
+
+
+      def iban_is_valid(candidate):
+          s = candidate.replace(" ", "")
+          moved = s[4:] + s[:4]
+          digits = "".join(str(int(ch, 36)) for ch in moved)  # A is 10 ... Z is 35
+          return int(digits) % 97 == 1
+
+
+      def luhn_is_valid(number):
+          digits = [int(d) for d in re.sub(r"\D", "", number)][::-1]
+          total = 0
+          for i, d in enumerate(digits):
+              if i % 2 == 1:
+                  d = d * 2
+                  if d > 9:
+                      d -= 9
+              total += d
+          return total % 10 == 0
+
+
+      def redact_ibans(text):
+          return IBAN.sub(lambda m: "[IBAN]" if iban_is_valid(m.group(0)) else m.group(0), text)
+
+
+      print(iban_is_valid("DE89 3704 0044 0532 0130 00"))  # True
+      print(iban_is_valid("DE88 3704 0044 0532 0130 00"))  # False
+      print(redact_ibans("Pay DE89370400440532013000, ref AB12CDEFGHIJKLMNO"))
+      # Pay [IBAN], ref AB12CDEFGHIJKLMNO
+      print(luhn_is_valid("4111 1111 1111 1111"), luhn_is_valid("4111 1111 1111 1112"))
+      # True False
+      ```
+
+      There's a trade-off. A customer who mistypes their IBAN still typed personal data, and
+      the checksum lets it through. For the prompt, where a leak is the costly error, many
+      teams prefer the wide pattern and accept a few redacted product codes. For analytics or
+      search, where a false positive destroys useful data, the checksum is worth it. Pick per
+      destination.
+  - title: Reversible redaction that holds up
+    body: |-
+      The lesson's placeholder map works for one email. Real messages mention the same
+      address twice, several addresses, or none, and the model may write a placeholder that
+      was never issued. Two refinements handle that: give the same value the same
+      placeholder every time, so the model can tell that two mentions are one person, and
+      restore in one pass with a pattern, so an invented placeholder is caught.
+
+      ```python
+      import re
+
+      EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+")
+      PLACEHOLDER = re.compile(r"\[EMAIL_\d+\]")
+
+
+      def pseudonymise(text):
+          by_value, mapping = {}, {}
+
+          def swap(match):
+              value = match.group(0)
+              if value not in by_value:
+                  key = f"[EMAIL_{len(by_value) + 1}]"
+                  by_value[value] = key
+                  mapping[key] = value
+              return by_value[value]
+
+          return EMAIL.sub(swap, text), mapping
+
+
+      def restore(reply, mapping):
+          # One pass: invented placeholders are caught, and restored text is never rescanned.
+          return PLACEHOLDER.sub(lambda m: mapping.get(m.group(0), "[unknown address]"), reply)
+
+
+      safe, mapping = pseudonymise("Move ana@example.com to bo@example.org. ana@example.com agreed.")
+      print(safe)
+      # Move [EMAIL_1] to [EMAIL_2]. [EMAIL_1] agreed.
+      print(restore("Done: [EMAIL_1] replaced by [EMAIL_2]. Copied [EMAIL_3].", mapping))
+      # Done: ana@example.com replaced by bo@example.org. Copied [unknown address].
+      ```
+
+      The map is itself personal data. Keep it in memory for the request, or in storage with
+      the same protection and retention as the original message. Never write it to the trace
+      next to the redacted prompt, or the redaction has achieved nothing.
+
+      Typed placeholders help the model. `[EMAIL_1]` tells it an address sat there, which
+      keeps the reply grammatical. Where the task needs a property of the value, such as the
+      country of an address, keep that property and drop the rest.
+  - title: GDPR duties an engineer actually touches
+    body: |-
+      GDPR is the EU regulation on personal data, and it applies to organisations that
+      process data about people in the EU. A lawyer decides the legal questions, but several
+      duties land directly in code and architecture.
+
+      **A lawful basis and a purpose.** Each processing activity needs one of the bases in
+      Article 6, such as a contract with the user or a legitimate interest. Data collected
+      for support can't quietly become training data for something else.
+
+      **Minimisation and storage limits.** Article 5 asks you to keep only what the purpose
+      needs, for only as long as it needs. In code: redact what the model doesn't need, set
+      a retention period on logs and traces, and expire them automatically.
+
+      **Processors.** A model provider that handles personal data on your behalf is a
+      processor, and Article 28 requires a contract with it. Its retention terms become part
+      of your answer to "where does this data live?". Sending data outside the EU brings in
+      the transfer rules of Chapter V.
+
+      **Records.** Article 30 requires a record of processing activities: what data, what
+      purpose, which recipients, how long. For an AI feature this is the list from the first
+      section, written down.
+
+      **Rights.** People can ask for access to their data and for erasure, and you normally
+      have one month to respond. Erasure only works if every copy is findable, so tag logs,
+      traces, vector chunks and eval items with a user or tenant id when you write them. A
+      deletion job can then query by that id in each store.
+
+      **Breaches.** A breach likely to put people at risk must be reported to the supervisory
+      authority within 72 hours of becoming aware of it. A prompt log full of raw IBANs
+      turns a minor incident into a reportable one.
+
+      For a new high-risk use, such as large-scale processing of sensitive data, Article 35
+      asks for a data protection impact assessment before you start.
+pitfalls:
+  - '**Redacting the prompt but not the logs.** Exception messages, traces and error trackers capture raw text too. Redact at the edge, and add a filter on every log handler as a safety net.'
+  - '**Trusting regular expressions alone.** Names and places have no pattern. Add entity recognition, and test the detector on real, messy samples such as IBANs in groups of four.'
+  - '**Assuming redacted text is anonymous.** Pseudonymised data is still personal data under GDPR, and free text can identify through context. Apply the same retention and access rules.'
+  - '**Storing the placeholder map beside the redacted prompt.** Anyone who can read the trace can reverse the redaction. Keep the map with the protection of the original, or only in memory.'
+  - '**Building eval sets from raw traffic.** Real chats in a test fixture are personal data that nobody tracks. Redact before adding, tag each item with its source, and include eval sets in erasure.'
+  - '**Untagged copies.** If a vector chunk or trace has no user id, an erasure request can''t find it. Tag every derived copy with the owner when you write it.'
+  - '**Over-redacting.** Stripping every number breaks order lookups and makes answers useless. Redact what the task doesn''t need, and keep properties such as the country when the task depends on them.'
+interview:
+  - question: How would you keep customer PII out of prompts sent to a third-party model?
+    answer: >-
+      I'd redact at the boundary, in code, before the request leaves our system. A
+      detection step combines patterns for structured values, emails, phone numbers, IBANs,
+      card numbers with checksums, and an entity recognition model for names and places. Each
+      find becomes a typed, numbered placeholder. Where the reply must contain the real
+      value, I keep the map on our side and restore values afterwards. The same redacted text
+      is what goes to logs and traces, so nothing downstream sees the raw message. On top,
+      there's a contract with the provider as a processor and a check of its retention terms.
+      The trade-off is quality: the model can't reason about what it can't see, so I keep
+      properties the task needs, like the country.
+  - question: A user asks to be deleted. Walk me through what happens in an AI product.
+    answer: >-
+      Erasure has to reach every copy, so the real work happens before the request arrives:
+      every copy is tagged with the user id when it's written. The deletion job then removes
+      or anonymises the account row, conversation history, logs and traces within their
+      retention window, cached responses, vector chunks built from the user's documents, and
+      eval or fine-tuning items taken from their chats. The provider's copies are covered by
+      its retention terms and our processor contract. The job records what it deleted, and we
+      respond within the legal deadline, normally one month. Backups are the awkward case:
+      the usual approach is to let them expire on schedule and make sure a restore re-applies
+      deletions.
+  - question: Is it enough to hash email addresses before storing them in traces?
+    answer: >-
+      No: a hashed email is pseudonymised, not anonymous, so it's still personal data. Email
+      addresses are guessable, so anyone with a list of addresses can hash them and match. An
+      unsalted hash also links the same person across every trace, which is itself
+      identifying. Hashing is still useful, for example a keyed hash to count distinct users
+      without storing the address, but it doesn't take the data out of GDPR. So traces with
+      hashed ids still need retention limits, access control and inclusion in erasure. If the
+      trace doesn't need the identity at all, the better answer is not to record it.
+  - question: What are the trade-offs of redacting data before it reaches the model?
+    answer: >-
+      Redaction lowers privacy risk but can lower answer quality, and detectors make errors
+      in both directions. The model can't check whether two placeholders are the same
+      person, whether an address is abroad, or whether a name matches the account, unless I
+      pass that as a separate fact. Consistent placeholders per value and keeping needed
+      properties, like a country, recover most of that. Detection misses some PII, names in
+      unusual formats especially, and flags harmless codes, so I measure recall and
+      precision on a labelled sample and treat redacted text as still personal. When a task
+      truly needs the raw value, the alternative is a provider arrangement with no retention,
+      or a model we host ourselves.

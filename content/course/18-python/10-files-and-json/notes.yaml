@@ -1,0 +1,343 @@
+summary: >-
+  Most data a program keeps between runs sits in files, and most of that is JSON: settings,
+  datasets, eval results, API responses saved for later. This lesson covers the three
+  pieces you need: `pathlib.Path` to name and read files, a `with` block to open them and
+  close them reliably, and the `json` module to turn text into dicts and lists and back.
+
+
+  Underneath sit three ideas worth knowing properly. A file holds bytes, and text only
+  appears once you pick an encoding. A `with` block is a protocol, `__enter__` and
+  `__exit__`, that any object can implement, not a special case for files. And JSON is a
+  smaller type system than Python's, so a round trip can quietly change your data: tuples
+  come back as lists, integer keys come back as strings.
+
+
+  Reach for `read_text` and `write_text` for small whole files, a `with` block for streaming
+  or appending, and `json` for anything structured you share with another program. Reach for
+  something else when the data outgrows a file you rewrite each time: a database for
+  concurrent writers, JSON Lines or a columnar format for large logs and datasets.
+remember:
+  - A `with` block calls `__enter__` on the way in and `__exit__` on the way out, however the block ends.
+  - Pass `encoding="utf-8"` whenever you read or write text, because the default depends on the machine.
+  - '`json.loads` and `json.dumps` work on strings, `json.load` and `json.dump` work on open files.'
+  - 'JSON keys are always strings: `{1: "a"}` comes back as `{"1": "a"}`, and tuples come back as lists.'
+  - '`json.dumps` raises `TypeError` for types it does not know, such as `datetime` and `set`, unless you pass `default=`.'
+  - Broken JSON raises `json.JSONDecodeError`, a `ValueError` with `msg`, `lineno` and `colno` attributes.
+  - Open a missing file and catch `FileNotFoundError`, rather than checking `exists()` first, to avoid a race.
+  - For a file that must never be half written, write a temporary file and swap it in with `os.replace`.
+sections:
+  - title: Text, bytes and encodings
+    body: |-
+      A file on disk is a sequence of bytes. Text mode, the default for `open` and what
+      `read_text` uses, decodes those bytes into a `str` with an **encoding**. Binary mode
+      (`"rb"`, `"wb"`, `read_bytes`) hands you the raw `bytes`.
+
+      ```python
+      import tempfile
+      from pathlib import Path
+
+      path = Path(tempfile.mkdtemp()) / "menu.txt"
+      path.write_text("Café crème\r\nThé\r\n", encoding="utf-8", newline="")
+
+      print(path.read_bytes())
+      # b'Caf\xc3\xa9 cr\xc3\xa8me\r\nTh\xc3\xa9\r\n'
+      print(repr(path.read_text(encoding="utf-8")))
+      # 'Café crème\nThé\n'
+
+      try:
+          path.read_text(encoding="ascii")
+      except UnicodeDecodeError as error:
+          print(error.reason, "at byte", error.start)  # ordinal not in range(128) at byte 3
+      ```
+
+      Two things happened there. The é took two bytes in UTF-8, and reading with the wrong
+      encoding failed at the first of them. And text mode turned `\r\n` into `\n` when
+      reading. That's **universal newlines**: Windows line endings arrive as `\n`, so
+      `line.strip()` and `split("\n")` behave the same everywhere. `newline=""` switches the
+      translation off, which the `csv` module needs.
+
+      Without `encoding=`, Python uses the locale's preferred encoding. On most Linux and macOS
+      machines that's UTF-8. On Windows it's often a legacy code page such as cp1252, so a
+      script that worked on your laptop writes mojibake on a colleague's. Always pass
+      `encoding="utf-8"` for text. `python -X utf8` or `PYTHONUTF8=1` turns on UTF-8 mode
+      for a whole process, and PEP 686 makes that mode the default in a future version.
+
+      Node handles this differently: `fs.readFileSync(path)` returns a `Buffer` of bytes, and
+      you only get a string if you pass `"utf8"`. Python's text mode is the reverse, text by
+      default, bytes on request. `errors="replace"` or `errors="ignore"` let a decode carry on
+      past bad bytes, at the cost of silently changing data.
+  - title: How with works, and writing your own context manager
+    body: |-
+      `with EXPR as name:` is a protocol. Python evaluates `EXPR`, calls its `__enter__`, and
+      binds the return value to `name`. When the block ends for any reason, it calls
+      `__exit__(exc_type, exc, traceback)`. Those three are `None` on a clean exit. If
+      `__exit__` returns a true value, the exception is swallowed. Otherwise it carries on.
+
+      ```python
+      from contextlib import contextmanager
+
+
+      class Audit:
+          def __init__(self, label):
+              self.label = label
+
+          def __enter__(self):
+              print("begin", self.label)
+              return self  # this is what "as" binds
+
+          def __exit__(self, exc_type, exc, tb):
+              outcome = exc_type.__name__ if exc_type else "ok"
+              print("end", self.label, outcome)
+              return False  # False or None lets the exception carry on
+
+
+      with Audit("load") as audit:
+          print("working on", audit.label)
+
+      try:
+          with Audit("parse"):
+              int("x")
+      except ValueError:
+          print("the error still reached us")
+
+
+      @contextmanager
+      def audit_step(label):
+          print("begin", label)
+          try:
+              yield label
+          finally:
+              print("end", label)
+
+
+      with audit_step("export") as label:
+          print("working on", label)
+      ```
+
+      That prints:
+
+      ```text
+      begin load
+      working on load
+      end load ok
+      begin parse
+      end parse ValueError
+      the error still reached us
+      begin export
+      working on export
+      end export
+      ```
+
+      A file's `__enter__` returns the file itself and its `__exit__` closes it. The generator
+      version is usually shorter: code before `yield` is the set-up, the yielded value is what
+      `as` binds, and the `finally` is the tidy-up. Without that `try`/`finally`, an exception
+      in the block would skip the tidy-up.
+
+      The same shape covers locks (`with lock:`), database transactions that commit or roll
+      back, temporary directories and HTTP clients. `contextlib.suppress(FileNotFoundError)`
+      ignores one named error, and `contextlib.ExitStack` manages a number of resources
+      decided at run time. JavaScript now has the same idea: a `using` declaration calls
+      `[Symbol.dispose]()` when the block ends, and Node 24 supports it. Before that, JS code
+      wrote `try`/`finally` by hand.
+  - title: What JSON can hold, and what a round trip changes
+    body: |-
+      JSON has six kinds of value: object, array, string, number, `true`/`false` and `null`.
+      Python maps them to `dict`, `list`, `str`, `int` or `float`, `True`/`False` and `None`.
+      Going the other way, `dumps` also accepts tuples, writing them as arrays. Anything that
+      doesn't fit is changed or refused:
+
+      ```python
+      import json
+
+      cart = {101: 2, None: 0, "items": ("tea", "cake")}
+      text = json.dumps(cart)
+      print(text)              # {"101": 2, "null": 0, "items": ["tea", "cake"]}
+      back = json.loads(text)
+      print(back == cart)      # False
+      print(back)              # {'101': 2, 'null': 0, 'items': ['tea', 'cake']}
+
+      print(json.dumps({1: "a", "1": "b"}))  # {"1": "a", "1": "b"}
+      print(json.dumps({True: "yes"}))       # {"true": "yes"}
+      print(json.loads('{"a": 1, "a": 2}'))  # {'a': 2}
+      print(json.loads("12345678901234567890123"))  # 12345678901234567890123
+      ```
+
+      Keys become strings, so an `int` key and a `str` key can even collide into duplicate
+      JSON keys. When reading duplicates, the last one wins. Python ints are exact at any size,
+      which JavaScript's `JSON.parse` is not: past `2 ** 53` it rounds, so IDs that big should
+      travel as strings.
+
+      Three more cases trip people up:
+
+      ```python
+      import json
+      from datetime import datetime, timezone
+
+      print(json.dumps(float("nan")))  # NaN
+      try:
+          json.dumps(float("nan"), allow_nan=False)
+      except ValueError as error:
+          print("ValueError:", error)
+
+      placed = datetime(2026, 9, 25, 14, 30, tzinfo=timezone.utc)
+      try:
+          json.dumps({"placed": placed})
+      except TypeError as error:
+          print("TypeError:", error)
+
+
+      def to_json(value):
+          if isinstance(value, datetime):
+              return value.isoformat()
+          if isinstance(value, set):
+              return sorted(value)
+          raise TypeError(f"cannot serialise {type(value).__name__}")
+
+
+      print(json.dumps({"placed": placed, "tags": {"gift", "fragile"}}, default=to_json))
+      print(json.dumps({"city": "Zürich"}))
+      print(json.dumps({"city": "Zürich"}, ensure_ascii=False))
+      ```
+
+      That prints:
+
+      ```text
+      NaN
+      ValueError: Out of range float values are not JSON compliant: nan
+      TypeError: Object of type datetime is not JSON serializable
+      {"placed": "2026-09-25T14:30:00+00:00", "tags": ["fragile", "gift"]}
+      {"city": "Zürich"}
+      {"city": "Zürich"}
+      ```
+
+      By default Python writes `NaN` and `Infinity`, which strict parsers, `JSON.parse`
+      included, reject. Pass `allow_nan=False` for data you send elsewhere. `default=` is
+      called for any object `dumps` can't handle, and must return something it can. Compare
+      `JSON.stringify`, which quietly writes `NaN` as `null`, drops `undefined`, turns a `Date`
+      into an ISO string through `toJSON`, and writes a `Map` as `{}`. Python fails loudly
+      instead, which is kinder in the long run.
+  - title: Loading and saving JSON files safely
+    body: |-
+      Real files go missing, get corrupted, and get written by a process that crashes halfway.
+      This pair handles all three:
+
+      ```python
+      import json
+      import os
+      import tempfile
+      from pathlib import Path
+
+
+      def load_settings(path):
+          try:
+              text = Path(path).read_text(encoding="utf-8")
+          except FileNotFoundError:
+              return {}
+          try:
+              return json.loads(text)
+          except json.JSONDecodeError as error:
+              raise ValueError(f"{path} is not valid JSON: {error}") from error
+
+
+      def save_settings(path, settings):
+          target = Path(path)
+          # Write a sibling temp file, then swap it in with one rename.
+          fd, tmp = tempfile.mkstemp(dir=target.parent, suffix=".tmp")
+          try:
+              with os.fdopen(fd, "w", encoding="utf-8") as f:
+                  json.dump(settings, f, indent=2)
+                  f.flush()
+                  os.fsync(f.fileno())
+              os.replace(tmp, target)
+          except BaseException:
+              os.unlink(tmp)
+              raise
+
+
+      workdir = Path(tempfile.mkdtemp())
+      settings_path = workdir / "settings.json"
+      print(load_settings(settings_path))            # {}
+      save_settings(settings_path, {"theme": "dark"})
+      print(load_settings(settings_path))            # {'theme': 'dark'}
+
+      settings_path.write_text("{'theme': 'dark'}", encoding="utf-8")
+      try:
+          load_settings(settings_path)
+      except ValueError as error:
+          cause = error.__cause__
+          print(cause.msg, cause.lineno, cause.colno)
+      ```
+
+      The last line prints `Expecting property name enclosed in double quotes 1 2`.
+
+      Catching `FileNotFoundError` instead of calling `exists()` first avoids the gap where
+      the file vanishes between check and read. A missing file becomes the default, but a
+      corrupt one is an error with its position attached: silently returning `{}` there would
+      throw away someone's settings on the next save.
+
+      `write_text` truncates the file first, so a crash mid-write leaves it half written.
+      Writing to a temporary file in the same folder and calling `os.replace` fixes that. On
+      POSIX file systems the rename is atomic, so readers see the old file or the new one,
+      never a mix. `fsync` makes sure the bytes reach the disk before the swap. The
+      `except BaseException` cleans up the temp file even on Ctrl+C, then re-raises.
+
+      For logs and datasets that only grow, use **JSON Lines**: one JSON object per line,
+      opened with `"a"`. Appending never rewrites earlier records, and a reader can stream it
+      with `for line in f: json.loads(line)` without loading the whole file.
+pitfalls:
+  - >-
+    **Leaving out `encoding=`.** The code works on your machine and garbles accented text on
+    a machine with a different locale. Pass `encoding="utf-8"` to `open`, `read_text` and
+    `write_text` every time.
+  - >-
+    **Expecting a round trip to give back the same data.** Tuples become lists, integer keys
+    become strings and sets can't be written at all. Convert on the way back in, or validate
+    the loaded data into proper types, which the pydantic chapter covers.
+  - >-
+    **Returning a default when the JSON is broken.** Treating a corrupt file like a missing
+    one hides the corruption and often overwrites the original on the next save. Default only
+    on `FileNotFoundError`, and raise with the file name on `JSONDecodeError`.
+  - >-
+    **Checking `exists()` and then opening.** Another process can delete or create the file
+    in between. Open it and handle `FileNotFoundError` or `FileExistsError`, or use mode
+    `"x"` to create a file only if it's new.
+  - >-
+    **Calling `json.load` on a path.** `json.load` expects an open file, and a string path
+    raises `AttributeError: 'str' object has no attribute 'read'`. Use
+    `json.loads(Path(p).read_text(encoding="utf-8"))` or open the file in a `with` block.
+  - >-
+    **Reading a huge file with `read_text`.** It loads the whole file into memory at once.
+    Iterate over an open file line by line, and store large records as JSON Lines rather
+    than one giant array.
+interview:
+  - question: How does a `with` statement work, and how would you write your own context manager?
+    answer: >-
+      `with` calls the object's `__enter__` on entry, binds its return value to the `as`
+      name, and calls `__exit__` with the exception type, value and traceback when the block
+      ends, or three `None`s on a clean exit. If `__exit__` returns true, the exception is
+      suppressed. That guarantees clean-up the way `try`/`finally` does, but the clean-up
+      lives with the resource instead of in every caller. To write one I usually use
+      `contextlib.contextmanager`: set-up before `yield`, tidy-up in a `finally` after it. I
+      write a class with `__enter__` and `__exit__` when the object has other methods or
+      state, such as a transaction that commits on success and rolls back on an exception.
+      The trap is swallowing exceptions by returning true without meaning to.
+  - question: What can go wrong when you serialise Python data to JSON?
+    answer: >-
+      Anything outside JSON's six types is changed or refused. Non-string keys are converted
+      to strings, so `{1: "a"}` loads back as `{"1": "a"}`, and tuples come back as lists.
+      `datetime`, `Decimal`, `set` and custom objects raise `TypeError` unless I pass
+      `default=` or convert them first, typically to ISO 8601 strings for dates. Python
+      writes `NaN` and `Infinity` by default, which other parsers reject, so I set
+      `allow_nan=False` for data leaving the service. Large integers are exact in Python but
+      lose precision in JavaScript past 2 to the 53, so IDs go out as strings. In practice I
+      define the shape with a pydantic model or a dataclass and let it handle both directions.
+  - question: How do you write a file so that a crash can't leave it corrupted?
+    answer: >-
+      Write the full contents to a temporary file in the same directory, flush and `fsync`
+      it, then `os.replace` it over the target. A rename within one file system is atomic on
+      POSIX, so any reader sees either the complete old file or the complete new one. Writing
+      in place with `write_text` truncates first, so a crash or full disk mid-write leaves a
+      partial file. The temp file must be on the same file system, or the rename becomes a
+      copy and loses atomicity, and I delete it if anything fails. It doesn't solve two
+      writers racing each other: the last replace wins. For concurrent updates I'd use a
+      database or a lock instead.

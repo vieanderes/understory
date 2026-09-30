@@ -1,0 +1,287 @@
+summary: >-
+  React performance work starts with one fact: when a component's state changes, React
+  renders that component and every component inside it, whether their props changed or not.
+  Usually that's fine, because rendering is calling functions and comparing their output, and
+  React touches the real page only where something differs. It becomes a problem when one of
+  those components is slow, or when there are thousands of them.
+
+
+  So the method is measure, then fix the cause. The Profiler shows which components rendered
+  and how long they took. The fixes come in a rough order of preference: move state down so
+  fewer components are affected, keep a slow calculation with `useMemo`, skip a child's
+  render with `memo` plus stable props, and mark updates that can wait with a transition or
+  `useDeferredValue`, so typing and clicking stay responsive while heavy work catches up.
+
+
+  The React Compiler changes the manual part. It's a build step that adds memoisation for
+  you, for code that follows the rules of React. With it on, `useMemo` and `useCallback`
+  become tools for control, such as keeping an effect dependency stable, rather than
+  something you sprinkle for speed. Knowing what they do still matters, because you debug
+  what the compiler produces and you work in code bases without it.
+remember:
+  - A state change renders the component and all its descendants by default; `memo` is what lets a child skip it.
+  - Measure with the React DevTools Profiler before optimising, because most renders are cheap and guesses are often wrong.
+  - Dependencies and `memo` props are compared with `Object.is`, so a new object, array or function counts as a change even with the same contents.
+  - "`useCallback(fn, deps)` is the same as `useMemo(() => fn, deps)`: it keeps a function's identity so memoised children and effects see no change."
+  - Moving state down, or passing slow parts as `children`, often removes needless renders without any memoisation.
+  - A transition marks an update as not urgent, so React keeps the current screen responsive and shows it pending instead of a Suspense fallback.
+  - "`useDeferredValue` gives a lagging copy of a value, so an input updates at once while a slow memoised list catches up."
+  - The React Compiler memoises components and values at build time, and skips code it can't prove follows the rules of React.
+sections:
+  - title: Fewer renders without memo
+    body: |-
+      Before reaching for `memo`, ask which components really depend on the state that
+      changed. Often the answer is "only one small part", and the fix is structural. Here a
+      Dark mode toggle lives in the page, so every toggle renders a slow chart that doesn't
+      care about the theme.
+
+      ```tsx
+      import { useState, type ReactNode } from 'react';
+
+      // Before: the theme state lives in the page, so every toggle renders the chart too.
+      function PageBefore() {
+        const [dark, setDark] = useState(false);
+        return (
+          <main className={dark ? 'dark' : 'light'}>
+            <button onClick={() => setDark(!dark)}>Dark mode</button>
+            <SalesChart />
+          </main>
+        );
+      }
+
+      // After: the state moves into a shell, and the chart arrives as children from above.
+      function ThemeShell({ children }: { children: ReactNode }) {
+        const [dark, setDark] = useState(false);
+        return (
+          <main className={dark ? 'dark' : 'light'}>
+            <button onClick={() => setDark(!dark)}>Dark mode</button>
+            {children}
+          </main>
+        );
+      }
+
+      function PageAfter() {
+        return (
+          <ThemeShell>
+            <SalesChart />
+          </ThemeShell>
+        );
+      }
+      ```
+
+      We counted renders: two toggles rendered the chart three times in the first version
+      and once in the second. Why does it work? The `<SalesChart />` element is created by
+      `PageAfter`, which doesn't render when the theme changes. `ThemeShell` receives the
+      same `children` element as before, and React skips an element it has already
+      rendered when it gets the identical object back.
+
+      The two moves are **state down** (keep state in the smallest component that needs it)
+      and **content up** (let the stateful component take the slow parts as `children` or
+      another prop). They make the code clearer as well as faster, which memoisation never
+      does.
+  - title: How memo, useMemo and useCallback decide
+    body: |-
+      All three compare with `Object.is`, one value at a time. Numbers, strings and booleans
+      compare by value. Objects, arrays and functions compare by identity: a new one is a
+      change, even with the same contents. That single rule explains most memoisation bugs.
+
+      - `memo(Component)` skips rendering when every prop is `Object.is`-equal to last time.
+        One inline object, array or arrow in the props defeats it. A second argument,
+        `memo(Component, arePropsEqual)`, lets you compare yourself, but a wrong comparison
+        shows stale output, so use it rarely.
+      - `useMemo(calculate, deps)` reruns `calculate` only when a dependency changed. The
+        fix in the lesson's challenge was to build the filters object inside the
+        calculation and depend on its parts, because an object built during render is new
+        each time.
+      - `useCallback(fn, deps)` is `useMemo(() => fn, deps)`. It exists to keep a function's
+        identity for a memoised child or an effect's dependency list. On its own, with no
+        memoised consumer, it does nothing useful.
+
+      Two things bypass `memo` entirely. A component re-renders when its own state changes,
+      and when a context it reads changes, whatever its props. So a memoised row that reads a
+      theme context still renders when the theme changes.
+
+      And every memo costs something: it stores the previous result and compares the
+      dependencies on every render. Wrapping a cheap calculation adds that cost and makes the
+      code harder to read. Memoise what the Profiler shows is slow, or values whose identity
+      matters to a memoised child or an effect.
+  - title: Keeping input responsive with useDeferredValue
+    body: |-
+      Typing into a search box that filters a long list feels sluggish when each keystroke
+      renders the whole list. The input must update at once, so its state can't be a
+      transition: React's docs say a transition can't control a text input. Instead, give the
+      list a lagging copy of the query with `useDeferredValue`.
+
+      ```tsx
+      import { memo, useDeferredValue, useState } from 'react';
+
+      type Film = { id: string; title: string };
+
+      const FilmList = memo(function FilmList({ films, query }: { films: Film[]; query: string }) {
+        const matches = films.filter((film) => film.title.toLowerCase().includes(query.toLowerCase()));
+        return (
+          <ul>
+            {matches.map((film) => (
+              <li key={film.id}>{film.title}</li>
+            ))}
+          </ul>
+        );
+      });
+
+      export function FilmSearch({ films }: { films: Film[] }) {
+        const [query, setQuery] = useState('');
+        // The input updates at once; the list catches up with a lagging copy of the query.
+        const deferredQuery = useDeferredValue(query);
+        const stale = query !== deferredQuery;
+        return (
+          <div>
+            <label>
+              Search
+              <input value={query} onChange={(event) => setQuery(event.target.value)} />
+            </label>
+            <div aria-busy={stale} className={stale ? 'is-stale' : undefined}>
+              <FilmList films={films} query={deferredQuery} />
+            </div>
+          </div>
+        );
+      }
+      ```
+
+      On each keystroke React first renders with the old deferred value, which is quick
+      because `FilmList` is memoised and its props haven't changed. Then it renders again in
+      the background with the new value. If another key arrives first, React abandons that
+      background render and starts over. The `memo` is essential: without it, the urgent
+      render would redo the slow list anyway. Comparing `query` with `deferredQuery` tells
+      you the list is behind, so you can dim it.
+
+      Choose `useTransition` when you own the state update, such as switching tabs, and
+      `useDeferredValue` when you receive a value and can't wrap its setter.
+  - title: The React Compiler in practice
+    body: |-
+      The compiler is a build-time tool, run as a Babel plugin,
+      `babel-plugin-react-compiler`. It reads your components and hooks and inserts
+      memoisation for values, callbacks and JSX, so a component re-renders only the parts
+      whose inputs changed. In Next.js 16 you install the plugin and set one option; Next.js
+      applies it only to files that contain JSX or hooks.
+
+      ```ts
+      import type { NextConfig } from 'next';
+
+      const nextConfig: NextConfig = {
+        reactCompiler: true,
+      };
+
+      export default nextConfig;
+      ```
+
+      What it relies on: the rules of React. Components must be pure during render, props
+      and state are never mutated, and hooks follow the rules of hooks. When the compiler
+      can't be sure a component follows them, it leaves that component as it was rather than
+      risk changing its behaviour. That's why it can't fix a broken component, only speed up
+      a correct one.
+
+      For gradual adoption there's an opt-in mode, `compilationMode: 'annotation'`, where only
+      components marked with a `"use memo"` directive are compiled, and a `"use no memo"`
+      directive to exclude one component while you investigate a problem.
+
+      What changes for you: stop adding `useMemo`, `useCallback` and `memo` for speed in
+      compiled code. Keep them where identity is part of the logic, for example a value that
+      an effect lists as a dependency and must not change on every render. And keep
+      measuring: the compiler removes needless renders, not slow renders.
+  - title: Measuring properly
+    body: |-
+      The **React DevTools Profiler** records an interaction and shows, per commit, which
+      components rendered, how long each took, and why it rendered. Look for components that
+      rendered when nothing they show changed, and for single renders that take a long time.
+
+      Two habits keep measurements honest. Measure a production build, because development
+      builds run extra checks and are much slower. And slow the CPU down in the browser's
+      developer tools, because your laptop is faster than your users' phones.
+
+      React also has a `<Profiler>` component for measuring in code, for example to log slow
+      renders from real users:
+
+      ```tsx
+      import { Profiler, type ProfilerOnRenderCallback } from 'react';
+
+      const onRender: ProfilerOnRenderCallback = (id, phase, actualDuration, baseDuration) => {
+        // phase is 'mount', 'update' or 'nested-update'; durations are in milliseconds.
+        if (actualDuration > 16) console.warn(`${id} ${phase} took ${actualDuration.toFixed(1)} ms`, { baseDuration });
+      };
+
+      export function CartPage({ children }: { children: React.ReactNode }) {
+        return (
+          <Profiler id="cart" onRender={onRender}>
+            {children}
+          </Profiler>
+        );
+      }
+      ```
+
+      `actualDuration` is the time spent rendering this commit; `baseDuration` estimates the
+      time to render the whole subtree with no memoisation, so a large gap between them shows
+      memoisation is paying off. Profiling adds overhead and is off in production builds by
+      default, so use this sparingly.
+pitfalls:
+  - >-
+    **Optimising without measuring.** Wrapping everything in `memo` and `useMemo` adds
+    comparisons and noise, and often the slow part was elsewhere. Record with the Profiler
+    first, and fix what it shows.
+  - >-
+    **A new object or arrow in a dependency list or a memoised child's props.** It's a new
+    identity every render, so the cache never hits. Build the object inside the calculation,
+    depend on primitives, or keep the function with `useCallback`.
+  - >-
+    **Leaving a dependency out to stop reruns.** The memoised value or callback then reads
+    stale props and state. List every value it reads, and make those values stable instead.
+  - >-
+    **Using `useDeferredValue` without `memo` on the slow child.** The urgent render still
+    renders the slow list, so nothing improves. Memoise the component that receives the
+    deferred value.
+  - >-
+    **Wrapping a text input's state in a transition.** The input lags or drops characters.
+    Keep the input urgent and defer the expensive consumer.
+  - >-
+    **Profiling a development build.** Development React is much slower and exaggerates
+    costs. Measure a production build, with CPU throttling on.
+interview:
+  - question: When does a React component re-render?
+    answer: >-
+      When its own state changes, when a context it reads changes, or when its parent renders.
+      The last one surprises people: by default a child renders whenever its parent does, even
+      with identical props. Rendering only means calling the function and comparing the
+      result; React changes the real DOM only where output differs, so most renders are cheap.
+      When one is expensive, I first try structure: move state down into the component that
+      needs it, or pass the slow part in as `children` so it isn't re-created. If that isn't
+      enough, `memo` lets a child skip rendering when its props are equal by `Object.is`, which
+      then means keeping those props stable.
+  - question: What's the difference between useMemo, useCallback and memo?
+    answer: >-
+      `memo` wraps a component so it skips rendering when its props haven't changed.
+      `useMemo` keeps a computed value between renders until a dependency changes. `useCallback`
+      keeps a function between renders, and is literally `useMemo` returning the function.
+      They work together: `memo` on a row is useless if the parent passes a new arrow each
+      render, so the parent wraps that handler in `useCallback`. All three compare with
+      `Object.is`, so objects built during render break them. I use them where the Profiler
+      shows a real cost, or where identity matters to an effect. With the React Compiler on, I
+      mostly stop writing them by hand.
+  - question: How would you keep a search box responsive while filtering 20,000 rows?
+    answer: >-
+      Keep the input's state urgent and let the list lag, using `useDeferredValue` with a
+      memoised list component. Each keystroke renders the input straight away with the new
+      text and the list with the old deferred query, which is cheap because `memo` sees
+      unchanged props. React then renders the list with the new query in the background and
+      abandons that work if another key arrives. Comparing the query with the deferred one
+      lets me dim the stale list. If each render of 20,000 rows is itself too slow, I'd
+      virtualise so only visible rows render, or move filtering to the server. A transition
+      doesn't fit here because it can't drive a text input.
+  - question: What does the React Compiler do, and does it mean you never write useMemo again?
+    answer: >-
+      It's a build-time plugin that analyses components and hooks and inserts memoisation for
+      values, callbacks and JSX, so only the parts whose inputs changed re-render. It relies on
+      the rules of React; when it can't be sure a component follows them, it leaves that
+      component unchanged, so it speeds up correct code but can't fix broken code. I'd still
+      write `useMemo` or `useCallback` where identity is part of the logic, like a value an
+      effect depends on that must stay the same object. I'd also keep profiling, because the
+      compiler removes needless renders but a render that's slow on its own stays slow. In
+      Next.js 16 it's the `reactCompiler` option plus the Babel plugin.

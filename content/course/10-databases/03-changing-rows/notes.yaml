@@ -1,0 +1,193 @@
+summary: >-
+  `INSERT`, `UPDATE` and `DELETE` are how an app writes: a sign-up adds a row, a settings
+  page changes one, "close my account" removes one. The statements are short. The skill is
+  making them touch exactly the rows you mean, and stay correct when two requests run them
+  at the same moment.
+
+
+  That second part is what separates a demo from production code. Reading a value into
+  your app, changing it and writing it back loses updates under concurrency. Checking
+  whether a row exists and then inserting it creates duplicates. Postgres has single
+  statements for both jobs: an update that computes the new value itself, and an insert
+  that resolves a clash with `ON CONFLICT`.
+
+
+  Reach for these statements whenever state changes. Reach for a transaction around them
+  when several changes must succeed or fail together, and for a soft delete when you need
+  history or an undo button more than you need the row gone.
+remember:
+  - An `UPDATE` or `DELETE` without a `WHERE` touches every row, and Postgres doesn't ask for confirmation.
+  - Let the database generate ids with `GENERATED ALWAYS AS IDENTITY` and read them back with `RETURNING id`.
+  - Do read-modify-write in one statement, `SET stock = stock - 1 WHERE id = $1 AND stock > 0`, and check the row count.
+  - "`INSERT ... ON CONFLICT` makes create-or-update atomic, and it needs a unique constraint or index on the conflict columns."
+  - The row count a write reports is part of its result, and code should check it, for example a count of zero means not found.
+  - A `DELETE` marks rows dead rather than freeing space at once, and `VACUUM` reclaims it later.
+  - Delete millions of rows in batches, so no single statement holds locks and builds up work for minutes.
+sections:
+  - title: Ids the database hands out
+    body: |-
+      Ask the database for ids rather than inventing them in code. An **identity column**
+      takes the next value from a sequence on every insert, and `RETURNING` hands it back in
+      the same round trip:
+
+      ```sql
+      CREATE TABLE subscribers (
+        id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        email text NOT NULL UNIQUE,
+        confirmed boolean NOT NULL DEFAULT false
+      );
+      INSERT INTO subscribers (email) VALUES ('ana@example.com'), ('ben@example.com')
+      RETURNING id, email;
+      BEGIN;
+      INSERT INTO subscribers (email) VALUES ('cara@example.com');
+      ROLLBACK;
+      INSERT INTO subscribers (email) VALUES ('dev@example.com') RETURNING id;
+      ```
+
+      The first insert returns ids 1 and 2. The rolled-back insert used id 3, and sequences
+      never give a value back, so Dev gets 4. **Ids have gaps**, by design: handing out
+      numbers without waiting for other transactions is what keeps inserts fast. Never use
+      an id as a count or promise gap-free invoice numbers from one.
+
+      `GENERATED ALWAYS` refuses an explicit id unless you write `OVERRIDING SYSTEM VALUE`,
+      which catches code that invents its own. The older `serial` type does the same job
+      with a looser link between table and sequence; new tables use identity columns.
+  - title: Create or update in one statement
+    body: |-
+      A newsletter form should add an address or, if it's already there, refresh the name.
+      The obvious code checks first:
+
+      ```text
+      SELECT ... WHERE email = $1   -- nothing found
+      INSERT ...                    -- another request did the same in between
+      ```
+
+      Two requests can both find nothing and both insert. With a unique constraint the
+      second fails; without one you get a duplicate. An **upsert** does it atomically:
+
+      ```sql
+      CREATE TABLE contacts (email text PRIMARY KEY, name text NOT NULL, updated int NOT NULL DEFAULT 0);
+      INSERT INTO contacts VALUES ('ana@example.com', 'Ana', 0);
+      INSERT INTO contacts (email, name) VALUES ('ana@example.com', 'Ana Silva')
+      ON CONFLICT (email) DO UPDATE
+        SET name = EXCLUDED.name, updated = contacts.updated + 1
+      RETURNING *;
+      INSERT INTO contacts (email, name) VALUES ('ana@example.com', 'Someone else')
+      ON CONFLICT (email) DO NOTHING
+      RETURNING *;
+      ```
+
+      `EXCLUDED` is the row you tried to insert. The first upsert returns Ana's row with the
+      new name and `updated` at 1. The `DO NOTHING` version returns no row, which is how
+      your code learns the address was already taken.
+
+      The conflict target must match a unique constraint or unique index. `ON CONFLICT
+      (email)` on a column without one is an error, not a slow query.
+  - title: Updates that can't lose a change
+    body: |-
+      Two customers buy the last mug at once. If each request reads `stock = 1`, subtracts
+      in JavaScript and writes back `0`, both succeed and you've sold two mugs you don't
+      have. This is a **lost update**.
+
+      Let the database do the arithmetic, and put the rule in the `WHERE`:
+
+      ```sql
+      CREATE TABLE products (id integer PRIMARY KEY, name text NOT NULL, stock integer NOT NULL);
+      INSERT INTO products VALUES (1, 'Mug', 1);
+      UPDATE products SET stock = stock - 1 WHERE id = 1 AND stock > 0 RETURNING stock;
+      UPDATE products SET stock = stock - 1 WHERE id = 1 AND stock > 0 RETURNING stock;
+      ```
+
+      The first update returns `stock` 0. The second matches no row and returns nothing.
+      Concurrent updates to one row queue behind each other's row lock, and the second
+      re-checks `stock > 0` against the new value, so only one sale goes through. Your code
+      reads the count: one row means sold, zero means sold out.
+
+      Writes can also draw on other tables. `UPDATE ... FROM` joins for the new values, and
+      `DELETE ... USING` joins to choose rows:
+
+      ```sql
+      CREATE TABLE prices (product_id integer PRIMARY KEY, pence integer NOT NULL);
+      CREATE TABLE price_changes (product_id integer PRIMARY KEY, new_pence integer NOT NULL);
+      INSERT INTO prices VALUES (1, 500), (2, 800);
+      INSERT INTO price_changes VALUES (2, 750);
+      UPDATE prices SET pence = c.new_pence
+      FROM price_changes c WHERE c.product_id = prices.product_id
+      RETURNING prices.*;
+      ```
+
+      Only product 2 changes, to 750.
+  - title: Deleting a lot of rows from a live table
+    body: |-
+      Postgres keeps old row versions so readers never wait for writers. That design, called
+      **MVCC**, means a `DELETE` only marks rows as dead. `VACUUM`, usually run by the
+      autovacuum background worker, later makes their space reusable.
+
+      So one `DELETE` of fifty million rows is slow to run, holds row locks on every row it
+      touches until it commits, produces a flood of write-ahead log, and leaves fifty million
+      dead rows for vacuum. The usual fix is batches, each in its own short transaction:
+
+      ```sql
+      CREATE TABLE audit_log (id bigint PRIMARY KEY, created_at timestamptz NOT NULL);
+      INSERT INTO audit_log
+      SELECT g, now() - g * interval '1 hour' FROM generate_series(1, 5000) AS g;
+      DELETE FROM audit_log
+      WHERE id IN (
+        SELECT id FROM audit_log
+        WHERE created_at < now() - interval '90 days'
+        LIMIT 1000
+      );
+      ```
+
+      Run it in a loop from a script until it deletes nothing, pausing between batches so
+      replicas and vacuum keep up. Each run here removes 1,000 rows.
+
+      Two alternatives fit special cases. `TRUNCATE` empties a whole table almost instantly,
+      but takes a lock that blocks every reader and has no `WHERE`. And a table partitioned
+      by month lets you drop an old month's partition, which is the cheapest delete there is.
+pitfalls:
+  - '**Read, change in code, write back.** Two requests interleave and one change is lost. Compute the new value in the `UPDATE` itself and guard it in the `WHERE`.'
+  - '**Check-then-insert.** Two requests both see "not there" and both insert. Add a unique constraint and use `ON CONFLICT`.'
+  - '**Ignoring the affected row count.** An `UPDATE ... WHERE id = $1` that matched nothing still "succeeds". Treat zero rows as not found, or sold out, in code.'
+  - '**Matching on a non-unique column.** Names and emails without a unique constraint repeat. Match on the primary key.'
+  - '**Positional `INSERT` without column names.** Adding a column later shifts values into the wrong places or breaks the insert. Name the columns.'
+  - '**Treating ids as counts or invoice numbers.** Rolled-back inserts leave gaps. Count with `count(*)` and generate gap-free numbers separately if the law requires them.'
+  - '**One giant `DELETE` in production.** It locks rows, bloats the table and floods replication. Delete in batches.'
+interview:
+  - question: Two users buy the last item at the same time. How do you stop overselling?
+    answer: >-
+      Make the check and the change one atomic statement: `UPDATE products SET stock = stock
+      - 1 WHERE id = $1 AND stock > 0`, then read the affected row count. Postgres locks the
+      row for the first update; the second waits, then re-evaluates `stock > 0` against the
+      committed value and matches nothing, so the code tells that user it's sold out. Reading
+      stock into the app and writing it back is a lost-update race. A `CHECK (stock >= 0)`
+      constraint is a good backstop. If the purchase spans several tables, I'd wrap it in a
+      transaction and take the row lock first with `SELECT ... FOR UPDATE`, accepting some
+      waiting under contention.
+  - question: How would you implement "create this record, or update it if it exists"?
+    answer: >-
+      With `INSERT ... ON CONFLICT (key) DO UPDATE SET ... = EXCLUDED....`, which is atomic
+      and needs a unique constraint on the key. The naive version, select then insert or
+      update, races: two requests both see nothing and both insert, giving a duplicate or a
+      constraint error. `DO NOTHING` suits "insert if new", with `RETURNING` telling you
+      whether a row was written. One caution: `DO UPDATE` always writes the row even when
+      nothing changed, which creates a new row version. Adding a `WHERE` to the `DO UPDATE`
+      skips no-op updates on hot rows.
+  - question: You need to delete 50 million old rows from a busy table. How?
+    answer: >-
+      In batches of a few thousand, each its own short transaction, looping until nothing is
+      left, with a pause between batches. One huge `DELETE` holds locks on every row until
+      it commits, generates a burst of WAL that replicas must replay, and leaves millions of
+      dead rows, because MVCC only marks them. Batching keeps each lock short and lets
+      autovacuum keep up. An index on the filter column keeps each batch fast. If this is a
+      recurring retention job, I'd partition the table by time and drop old partitions
+      instead, which is nearly free.
+  - question: Soft delete or hard delete?
+    answer: >-
+      Soft delete, a `deleted_at` timestamp, when you need undo, audit history or to keep
+      references intact; hard delete when the data must truly go. Soft delete costs a
+      `deleted_at IS NULL` filter on every query, and a forgotten filter leaks deleted rows.
+      Unique constraints need care too: a partial unique index `WHERE deleted_at IS NULL`
+      lets a deleted email be reused. Personal data under GDPR erasure requests usually has
+      to be hard deleted or anonymised, so many systems soft delete first and purge after a
+      grace period.

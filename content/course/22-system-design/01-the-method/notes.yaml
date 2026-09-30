@@ -1,0 +1,215 @@
+summary: >-
+  System design is the skill of turning a vague brief into a set of boxes, data and
+  trade-offs you can defend. The lesson gives you the loop: functional requirements, scale in
+  numbers, the standard sketch, a deep dive, then failure modes. These notes add what an
+  interviewer or a design review listens for underneath that loop.
+
+
+  The loop exists because design problems have no single right answer. What they have is a
+  chain of reasons: this requirement, so this number, so this component, at this cost. A
+  reviewer can follow and challenge a chain. They can't follow a list of technologies.
+
+
+  Reach for the full method whenever a decision is expensive to reverse: a new service, a
+  new data store, a change that alters what users see when something breaks. For a small
+  feature inside an existing system, the same questions still apply, in five minutes rather
+  than forty-five.
+remember:
+  - Every box in a design must trace back to a requirement or a number; a box you can't justify is a box you should remove.
+  - Requirements come in two kinds, what the system does and how much, and the second kind is only useful as numbers such as 50 requests a second or 200 ms at p95.
+  - The standard shape is client, load balancer, stateless services, cache, database, and a queue with workers for anything a user needn't wait for.
+  - For each box ask three questions, what happens when it's slow, down or wrong, and answer them before you are asked.
+  - A dependency that can fail the request is a hard dependency, and every hard dependency spends your availability budget.
+  - Retries multiply load, so three layers that each try three times can send 27 calls to the bottom layer during an outage.
+  - Spend a 45-minute interview roughly as 5 minutes of requirements, 5 of numbers, 10 of sketch, 15 of deep dive and 10 of failures and measurement.
+sections:
+  - title: Non-functional requirements beyond scale
+    body: |-
+      Scale numbers are the non-functional requirements people remember. Four more change
+      designs just as often, and naming them early shows judgement.
+
+      - **Consistency.** Must a reader always see the latest write? A bank balance must. A
+        like count needn't. This decides whether you can read from replicas and caches.
+      - **Durability.** Can the system lose a confirmed write? A booking never. A typing
+        indicator, always. This decides synchronous replication and write-behind.
+      - **Privacy and access.** Who may see what, and where may data live? This decides
+        where permission checks sit and which regions hold data.
+      - **Cost.** A design that works but costs ten times the budget is wrong. For AI
+        systems, cost per request is often the first constraint.
+
+      State each as a sentence with a number where possible. "A confirmed booking survives
+      the loss of any one machine" is testable. "Bookings are durable" isn't.
+
+      The lesson's fix for the table-booking requirements added "a booking must never be
+      given to two guests". That line is worth more than any store choice. It tells you the
+      booking write needs a transaction or a unique constraint on the slot, and that you
+      can't accept bookings on two replicas at once.
+  - title: Why the standard shape looks the way it does
+    body: |-
+      Each box in the standard shape solves one problem, and knowing the problem lets you
+      leave the box out when it isn't there.
+
+      - **Load balancer.** One server has a ceiling and fails. The balancer spreads requests
+        and stops sending to servers that fail health checks.
+      - **Stateless services.** State kept in a server's memory ties a user to that server.
+        Move it out: sessions to a store or a signed token, uploads to object storage. Then
+        any server can die or be added.
+      - **Cache.** Reads repeat. Serving a repeat from memory costs microseconds instead of a
+        database query, and it takes load off the one component that is hard to scale.
+      - **Database.** The source of truth. Everything else can be rebuilt from it.
+      - **Queue and workers.** Work the user needn't wait for leaves the request. The queue
+        also absorbs bursts: workers drain it at their own pace.
+
+      A small internal tool might need only one server and one database. Say so. "At 5
+      requests a second I'd skip the cache and add it when the numbers call for it" is a
+      stronger answer than drawing every box by reflex.
+  - title: How one slow box takes down the rest
+    body: |-
+      Failure modes matter because failures spread. The usual chain is a **cascading
+      failure**, and it starts with something slow rather than something down.
+
+      A dependency slows from 20 ms to 2 seconds. Each request now holds a connection and a
+      worker 100 times longer. Pools fill, new requests queue, callers time out and retry.
+      The retries add load to the part that was already struggling. Soon every service that
+      touches it is out of workers too.
+
+      The defences, in the order you'd mention them:
+
+      - **Timeouts** on every network call, shorter than the caller's own timeout.
+      - **Bounded retries** with exponential backoff and jitter, at one layer only. Three
+        layers each making three attempts can send 3 × 3 × 3 = 27 calls to the bottom.
+      - **Circuit breakers** that stop calling a failing dependency for a while and fail
+        fast instead.
+      - **Load shedding**: reject some requests early with a 503 so the rest succeed.
+      - **Optional dependencies stay optional.** A cache that errors or hangs is treated as
+        a miss.
+
+      The last point is the one the lesson's Redis bug missed. Here is the pattern with a
+      timeout as well as the error handling.
+
+      ```ts
+      type Cache = {
+        get(key: string): Promise<string | null>;
+        set(key: string, value: string): Promise<void>;
+      };
+      type Db = { findMenu(id: string): Promise<object> };
+
+      async function withTimeout<T>(work: Promise<T>, ms: number): Promise<T> {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const late = new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error(`timed out after ${ms} ms`)), ms);
+        });
+        try {
+          return await Promise.race([work, late]);
+        } finally {
+          clearTimeout(timer);
+        }
+      }
+
+      async function getMenu(id: string, cache: Cache, db: Db) {
+        const key = `menu:${id}`;
+        const cached = await withTimeout(cache.get(key), 50).catch(() => null);
+        if (cached) return JSON.parse(cached);
+        const menu = await db.findMenu(id);
+        cache.set(key, JSON.stringify(menu)).catch(() => {}); // best effort
+        return menu;
+      }
+      ```
+
+      A cache that hangs now costs 50 ms, not the whole request. The database must still be
+      sized for the day every read misses, or it becomes the next box to fall.
+  - title: Talking it through in the room
+    body: |-
+      Interviewers score the reasoning they can hear. A few habits make it audible.
+
+      Write the requirements and numbers where both of you can see them, and point back to
+      them. "Because reads are 100 times writes, the cache goes here" links a box to a line
+      on the board.
+
+      Check in at the end of each phase. "That's the high-level shape. Would you like me to
+      go deep on the booking write or the search path?" It hands the interviewer the wheel
+      at the moment they want it, and it stops you spending 15 minutes on a part they don't
+      care about.
+
+      Say every trade-off as a pair: what you gain, what you pay. "The queue makes uploads
+      return in 100 ms, and in exchange thumbnails appear a few seconds later." A choice
+      with no cost named sounds like you haven't seen the cost.
+
+      Close with measurement. Name two or three numbers you'd watch in production, such as
+      p95 search latency, queue age and booking error rate. That shows you expect to operate
+      what you drew.
+pitfalls:
+  - "**Naming technologies before requirements.** \"We'll use Kafka and Cassandra\" in minute two sounds confident and signals the opposite. Gather needs and numbers first, then let each choice follow from one of them."
+  - "**Drawing every box by reflex.** A cache, a queue and three databases for 10 requests a second is over-engineering. Justify each box with a number, and say which boxes you'd add later and at what load."
+  - "**Designing only the happy path.** A sketch that works when everything is up is half a design. Walk each box with slow, down and wrong, and say how users experience each."
+  - "**Retrying at every layer.** Each layer adding its own retries multiplies load during an outage. Retry in one place, with backoff, jitter and a cap."
+  - "**Going deep on the part you know best.** The deep dive should follow the requirements, such as the write path for bookings. Ask which part the interviewer wants if it isn't clear."
+  - "**Treating a cache as a hard dependency.** If a Redis error fails the request, the cache has become part of your availability. Catch errors, time out quickly and fall back to the source."
+interview:
+  - question: How do you approach a system design question you've never seen before?
+    answer: >-
+      I run the same loop every time, so an unfamiliar brief still has a structure. First
+      functional requirements, then scale as numbers: users, peak requests per second, data
+      size, latency and availability targets. Those numbers tell me which band I'm in, a
+      single server or a sharded store. Then I draw the standard shape and remove what the
+      numbers don't justify. I check with the interviewer which part to go deep on, usually
+      the path with the hardest requirement, and I finish by walking each box for slow,
+      down and wrong. The trade-off is time: in 45 minutes I can go deep on one or two
+      parts, so I say what I'd examine next rather than skim everything.
+  - question: Your service calls five other services. How do you stop one of them taking yours down?
+    answer: >-
+      Treat every call as something that will be slow one day, and bound what it can cost
+      me. Each call gets a timeout shorter than my own deadline, so a stuck dependency can't
+      hold my workers. Retries are bounded, with backoff and jitter, and happen at one layer
+      only, because three layers of three attempts is 27 calls during an outage. A circuit
+      breaker stops calling a dependency that keeps failing and fails fast. Then I sort the
+      five into hard and optional: optional ones degrade to a default, hard ones need a
+      fallback or their availability caps mine. The cost is complexity and some wrong
+      answers during partial outages, which is why I only add fallbacks where the product
+      can accept them.
+  - question: Why do the servers behind a load balancer need to be stateless, and where does the state go?
+    answer: >-
+      So any server can take any request, which is what lets you add servers under load and
+      lose one without losing users. If a session lives in one server's memory, that user is
+      pinned to it, and a deploy or crash logs them out. So state moves out: sessions to
+      Redis or a signed token, files to object storage, anything durable to the database.
+      The servers then hold only caches they can afford to lose. The trade-off is an extra
+      network hop for session data, a fraction of a millisecond in the same datacentre,
+      which is almost always worth it. Sticky sessions are the shortcut, and they make
+      scaling and deploys harder.
+  - question: What does "a good design" mean to you in a design review?
+    answer: >-
+      A design where every component traces to a requirement and every risk has an owner.
+      Concretely, I look for requirements written as numbers, an estimate that puts the
+      system in the right band, and a sketch with nothing unexplained on it. Then I look at
+      the failure section: what happens when each part is slow or down, and how we'd know
+      from our metrics. Finally the trade-offs: the option not chosen and why. A design can
+      be simple and still excellent, and one with many boxes can be weak if nobody can say
+      why each is there.
+terms:
+  - term: Non-functional requirements
+    say: Nice-to-haves after the features.
+    means: "How much and how well the system must work: load, latency, availability, durability
+      and cost. They are only useful as numbers, such as 50 requests a second or 200 ms at
+      p95."
+  - term: p95 latency
+    say: The average response time.
+    means: The time within which 95% of requests finish. Averages hide the slow tail that users
+      actually feel, so targets are set on percentiles.
+  - term: Stateless service
+    say: A service with no database.
+    means: A server that keeps no per-user data in its own memory between requests, so any
+      instance can serve any request. The state lives in a database, a cache or a token.
+  - term: Hard dependency
+    say: Any service you call.
+    means: A dependency whose failure fails your request. Availabilities multiply, so three hard
+      dependencies at 99.9% each leave you at about 99.7% before your own faults.
+  - term: Retry amplification
+    say: Retries make a system more reliable.
+    means: Each layer that retries multiplies the calls below it, so three layers trying three
+      times send up to 27 calls to the bottom during an outage. Retry in one layer, with
+      backoff.
+  - term: Back-of-the-envelope estimate
+    say: Precise capacity planning.
+    means: Rough numbers from stated assumptions, right to within a factor of ten, used to
+      decide which components the design needs at all.

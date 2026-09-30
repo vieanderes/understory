@@ -1,0 +1,314 @@
+id: perf.backend-performance
+title: Finding a slow request
+objective: Find where a request's time goes, replace an N+1 loop with one query and check its plan, and see why many calls meet the slow tail.
+level: advanced
+minutes: 10
+concepts: [perf.profiling, perf.n-plus-one, perf.tail-latency]
+prerequisites: [perf.server-caching, db.reading-explain, db.from-code]
+opening:
+  text: >-
+    You'll find the part of a slow request that really costs the time, and prove it before
+    you touch anything. Then you'll take a page from 201 queries down to one fast one.
+
+steps:
+  - type: prose
+    id: where-the-time-goes
+    body: |-
+      A slow request is a sum of parts: queries, calls to other APIs, your own code. Time each part and send the timings in a `Server-Timing` header. DevTools shows them under the request's Timing tab:
+
+      ```http
+      Server-Timing: auth;dur=3, db;dur=412, render;dur=18
+      ```
+
+      Measuring where the time goes before changing anything is **profiling**. Fix the biggest part, then measure again.
+
+  - type: multiple-choice
+    id: pick-the-slow-part
+    concept: perf.profiling
+    difficulty: 1
+    question: A teammate wants to rewrite the page's rendering. Where would you look first, going by that header?
+    choices:
+      - text: The database, 412 ms
+        correct: true
+        feedback: >-
+          Right. Rendering is 18 ms. Even a perfect rewrite saves almost nothing.
+      - text: The rendering, as they suggest
+        feedback: >-
+          18 ms of 433. The header already says where the time is.
+      - text: The sign-in check
+        feedback: >-
+          3 ms. Look for the biggest number first.
+
+  - type: prose
+    id: count-the-queries
+    body: |-
+      Counting queries matters as much as timing them. Turn on the query log for one page load:
+
+      ```text
+      SELECT id, title, author_id FROM books LIMIT 200
+      SELECT name FROM authors WHERE id = $1    (200 times)
+      ```
+
+      One query for the list, then one per book: the **N+1** you met in Querying from code. We ran both in Postgres with no network at all: 201 queries took 53 ms, one join 2 ms.
+
+  - type: ai-review
+    id: review-promise-all-n-plus-one
+    concept: perf.n-plus-one
+    difficulty: 3
+    language: js
+    request: The book list awaits each author one by one. Make it faster.
+    flawClass: performance
+    code: |
+      async function getAuthor(id) {
+        const rows = await db.query("SELECT name FROM authors WHERE id = $1", [id]);
+        return rows[0];
+      }
+      async function listBooks() {
+        const books = await db.query("SELECT id, title, author_id FROM books LIMIT 200");
+        const authors = await Promise.all(
+          books.map((book) => getAuthor(book.author_id)),
+        );
+        return books.map((book, i) => ({ ...book, author: authors[i].name }));
+      }
+    prompt: >-
+      An assistant wrote this. The test database has three books, so the test is quick and
+      green. With 200 books it still sends 201 queries. Tap the line at fault.
+    lines: [7, 8]
+    reasons:
+      - text: '`Promise.all` overlaps the 200 queries but still sends them'
+        correct: true
+        feedback: >-
+          Yes. It's still N+1, now all at once. One join fixes it.
+      - text: '`LIMIT 200` asks for too many books'
+        feedback: >-
+          200 rows is a small result. The trouble is the 200 queries after it.
+      - text: '`getAuthor` should return `rows`, not `rows[0]`'
+        feedback: >-
+          One author per id is right. The flaw is how many times it's called.
+    fix: |
+      async function listBooks() {
+        return db.query(
+          `SELECT books.id, books.title, authors.name AS author
+           FROM books JOIN authors ON authors.id = books.author_id
+           LIMIT 200`,
+        );
+      }
+
+  - type: sql
+    id: write-one-join
+    concept: perf.n-plus-one
+    difficulty: 2
+    prompt: >-
+      The poetry page asks for each book's author in a loop. Write one query: the 20 newest
+      `poetry` books, newest first, each `title` with its author's `name` as `author`.
+    setup: &library |
+      CREATE TABLE authors (id integer PRIMARY KEY, name text NOT NULL);
+      CREATE TABLE books (
+        id integer PRIMARY KEY,
+        title text NOT NULL,
+        author_id integer NOT NULL REFERENCES authors(id),
+        genre text NOT NULL,
+        published timestamp NOT NULL
+      );
+      INSERT INTO authors SELECT n, 'Author ' || n FROM generate_series(1, 2000) AS n;
+      INSERT INTO books
+      SELECT n, 'Book ' || n, 1 + n % 2000,
+        (ARRAY['poetry', 'crime', 'history', 'travel', 'cooking'])[1 + n % 5],
+        timestamp '2024-01-01' + n * interval '1 hour'
+      FROM generate_series(1, 20000) AS n;
+      ANALYZE authors;
+      ANALYZE books;
+      -- Reports whether the plan for a query reads books through an index.
+      CREATE FUNCTION books_use_index(query text) RETURNS boolean LANGUAGE plpgsql AS $f$
+      DECLARE line text;
+      BEGIN
+        FOR line IN EXECUTE 'EXPLAIN (COSTS OFF) ' || query LOOP
+          IF line LIKE '%Index%Scan%books%' THEN RETURN true; END IF;
+        END LOOP;
+        RETURN false;
+      END $f$;
+    starter: |
+      SELECT id, title, author_id
+      FROM books
+      WHERE genre = 'poetry'
+      ORDER BY published DESC
+      LIMIT 20;
+    solution: |
+      SELECT books.title, authors.name AS author
+      FROM books JOIN authors ON authors.id = books.author_id
+      WHERE books.genre = 'poetry'
+      ORDER BY books.published DESC
+      LIMIT 20;
+    checks:
+      ordered: true
+    showSchema: true
+    hints:
+      - '`JOIN authors ON authors.id = books.author_id` pairs every book with its author in the same query.'
+      - Select `books.title` and `authors.name AS author`, and keep the `WHERE`, `ORDER BY` and `LIMIT`.
+
+  - type: sql
+    id: index-the-join
+    concept: perf.profiling
+    difficulty: 3
+    prompt: >-
+      Your join is one query now, but its plan reads every book to keep the poetry. Run the
+      `EXPLAIN ANALYZE`, then add the index that lets Postgres jump straight to the newest
+      poetry.
+    setup: *library
+    starter: |
+      EXPLAIN ANALYZE
+      SELECT books.title, authors.name AS author
+      FROM books JOIN authors ON authors.id = books.author_id
+      WHERE books.genre = 'poetry'
+      ORDER BY books.published DESC
+      LIMIT 20;
+    solution: |
+      CREATE INDEX ON books (genre, published);
+      EXPLAIN ANALYZE
+      SELECT books.title, authors.name AS author
+      FROM books JOIN authors ON authors.id = books.author_id
+      WHERE books.genre = 'poetry'
+      ORDER BY books.published DESC
+      LIMIT 20;
+    checks:
+      query: >-
+        SELECT books_use_index($$SELECT * FROM books WHERE genre = 'poetry'
+        ORDER BY published DESC LIMIT 20$$) AS books_read_through_an_index
+    showSchema: true
+    hints:
+      - 'Find `Seq Scan on books` and the `Rows Removed by Filter` under it: 16,000 books read for nothing.'
+      - 'An index on `(genre, published)` keeps each genre''s books in date order. Put `CREATE INDEX ON books (...)` before the `EXPLAIN`.'
+
+  - type: prose
+    id: the-tail
+    body: >-
+      Many pages wait on several calls at once: services, APIs, model calls. The page is as
+      slow as its slowest call.
+
+
+      Say one call in 100 takes a second. For one call, that's rare. A page that waits on
+      100 such calls meets at least one slow call on about 63% of loads. The rare **tail**
+      has become the normal page.
+
+  - type: multiple-choice
+    id: pick-tail-fix
+    concept: perf.tail-latency
+    difficulty: 2
+    question: A dashboard waits on 100 calls, and most loads take a second. Which change helps most?
+    choices:
+      - text: Wait on fewer calls, such as one batched call
+        correct: true
+        feedback: >-
+          Right. Fewer calls, fewer chances to draw a slow one.
+      - text: Make the typical call faster
+        feedback: >-
+          The typical call is already fast. The page waits for the slowest.
+      - text: Run the dashboard on a bigger server
+        feedback: >-
+          The page's server is waiting, not working. The slow calls are elsewhere.
+
+  - type: code-challenge
+    id: write-attach-authors
+    concept: perf.n-plus-one
+    difficulty: 3
+    language: ts
+    editable: '12-17'
+    prompt: >-
+      The authors live behind another service, so there's no join. `attachAuthors` calls
+      `loadAuthors` once per book.
+
+
+      Call it once, with each author id only once. Return the books in their order, each
+      with an `author` name, or `'Unknown'` if the service didn't return one.
+    hints:
+      - Gather the ids first. A `Set` drops the repeats.
+      - '`[...new Set(books.map((book) => book.authorId))]` is the list to send.'
+      - 'After one `await loadAuthors(ids)`, map the books to `{ ...book, author: names.get(book.authorId) ?? "Unknown" }`.'
+
+  - type: explain-back
+    id: explain-slow-page
+    concept: perf.profiling
+    difficulty: 3
+    prompt: >-
+      A book list page takes two seconds on the server. Walk through how you'd find the
+      cause before changing any code.
+    rubric:
+      - Time each part of the request, for example with Server-Timing, and start with the biggest.
+      - Count the queries, since a loop of queries is an N+1 that one join or batch replaces.
+      - Read the slow query's plan with EXPLAIN, fix it, and measure again.
+    modelAnswer: >-
+      I'd time each part of the request and send it in `Server-Timing`, then start with the
+      biggest part. If it's the database, I'd count queries: 201 for 200 books means an N+1,
+      so one join replaces the loop. Then I'd run `EXPLAIN ANALYZE` on that query, add the
+      index it needs, and measure again.
+
+recap:
+  - Time each part of a request before changing code, and start with the biggest.
+  - Replace an N+1 loop with one join or one batched call, then read its plan.
+  - Wait on fewer calls, because many calls meet the slow tail often.
+
+recall:
+  - id: card-server-timing
+    concept: perf.profiling
+    front: How can a server show where a request's time went?
+    back: >-
+      Time each part and send it in a `Server-Timing` header. DevTools shows it on the
+      request.
+  - id: card-n-plus-one
+    concept: perf.n-plus-one
+    front: What is an N+1 query, and what replaces it?
+    back: >-
+      One query for a list, then one per item. One join, or one batched query, replaces it.
+  - id: card-promise-all
+    concept: perf.n-plus-one
+    front: Does `Promise.all` over 200 queries fix an N+1?
+    back: >-
+      No. It sends the same 200 queries at once. The fix is fewer queries.
+  - id: card-fan-out
+    concept: perf.tail-latency
+    front: Why is a page that waits on 100 calls often slow, when each call is rarely slow?
+    back: >-
+      It waits for the slowest. With 100 chances, one slow call is likely on most loads.
+
+references:
+  - kind: spec
+    title: Server Timing
+    authors: W3C Web Performance Working Group
+    venue: W3C
+    url: https://www.w3.org/TR/server-timing/
+    note: The header that carries a server's timings to the browser's DevTools.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Using EXPLAIN
+    authors: PostgreSQL Global Development Group
+    venue: PostgreSQL documentation
+    url: https://www.postgresql.org/docs/current/using-explain.html
+    note: Reading plan nodes, and what `EXPLAIN ANALYZE` adds.
+    verified: true
+  - kind: paper
+    title: The Tail at Scale
+    authors: Jeffrey Dean and Luiz André Barroso
+    year: 2013
+    venue: Communications of the ACM 56(2)
+    url: https://research.google/pubs/the-tail-at-scale/
+    note: Why fanning out to many servers makes rare slow responses common.
+    verified: true
+
+deepDive: >-
+  The 53 ms and 2 ms came from PGlite, Postgres running in the same process. Across a
+  network each query also pays a round trip, often a millisecond or more, so the gap grows.
+
+
+  The 63% is the chance that at least one of 100 calls is slow when each is slow one time
+  in a hundred. A simulation of 200,000 page loads agreed.
+
+
+  For CPU-heavy code, a profile shows time per function. `node --cpu-prof app.js` writes
+  one, and DevTools opens it. Sort by self time, fix the top line, and measure again.
+
+
+  Batching loaders such as DataLoader collect every id asked for in one tick and send a
+  single query. GraphQL servers use them to avoid N+1 queries across resolvers. The same
+  fan-out rule applies to AI agents: a step that waits on five tool calls at once is as
+  slow as the slowest tool.

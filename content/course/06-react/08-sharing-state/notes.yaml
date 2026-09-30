@@ -1,0 +1,249 @@
+summary: >-
+  Every piece of state in React is owned by one component. That is what makes it predictable:
+  one place changes it, and data flows down from there as props. The question this lesson
+  answers is where that one place should be. When two components must agree, such as a search box and its results, the state moves up to
+  their closest common parent. The parent passes the value down, with a function to change it. That is **lifting state up**.
+
+
+  Lifting works until the value is needed far below, through layers that don't care about it.
+  Threading it through every level is prop drilling. **Context** lets a component provide a
+  value to its whole subtree, and any component inside can read it directly. The nearest provider
+  above wins, and with none you get the default from `createContext`.
+
+
+  Both tools serve one principle: a single source of truth for each fact. Two copies of the same
+  value, kept in sync by hand, eventually disagree. Context is a way to deliver a value, not a
+  place to store it. The state still lives in a component, usually the one that renders the
+  provider.
+remember:
+  - Each fact lives in exactly one component's state; everything else receives it as props or derives it during render.
+  - State shared by siblings moves to their closest common parent, which passes the value down and a callback to change it.
+  - '`useState(props.x)` reads the prop only on the first render, so either use the prop directly or name it `initialX` and reset with a key.'
+  - A context reader gets the value from the nearest provider above it, or the default from `createContext` when there is none.
+  - When a provider's value changes by `Object.is`, every component that reads that context renders again, even inside `memo`.
+  - A new object literal as a provider value changes on every render, so memoise it with `useMemo` or split the context.
+  - Try passing components as `children` before reaching for context, because composition removes drilling without hidden dependencies.
+  - Context suits values many distant components read and that change rarely, such as theme, locale and the signed-in user.
+sections:
+  - title: Deciding where state lives
+    body: |-
+      For each value, find every component that reads it and every component that changes it.
+      The state belongs in the lowest component that sits above all of them. Lower than that,
+      and a sibling can't see it. Higher, and more of the tree renders on every change and more
+      components are coupled to it than need to be.
+
+      Lifting turns a component from one that owns its value into one that receives it. After
+      the lesson's accordion lift, `Panel` has no state: it shows `isOpen` and reports clicks.
+      That makes it reusable in ways the stateful version wasn't. The parent can decide that one
+      panel opens at a time, or several, without changing `Panel` at all:
+
+      ```tsx
+      function FloorGuide({ floors }: { floors: { id: string; title: string; text: string }[] }) {
+        const [openIds, setOpenIds] = useState<ReadonlySet<string>>(new Set());
+
+        function toggle(id: string) {
+          setOpenIds((prev) => {
+            const next = new Set(prev);
+            if (next.has(id)) next.delete(id);
+            else next.add(id);
+            return next;
+          });
+        }
+
+        return floors.map((floor) => (
+          <Panel key={floor.id} title={floor.title} isOpen={openIds.has(floor.id)} onShow={() => toggle(floor.id)}>
+            {floor.text}
+          </Panel>
+        ));
+      }
+      ```
+
+      A `Set` is copied before it changes, for the same reason arrays are: React compares
+      references.
+
+      The opposite mistake is also common: keeping a second copy of a value and syncing it with
+      an effect. If `Results` stores its own `query` and an effect copies the parent's into it,
+      there is a render where the two differ, and a bug waiting wherever someone updates only
+      one. Delete the copy and read the prop.
+  - title: How context delivers a value, and what it costs
+    body: |-
+      A provider makes a value available to everything rendered inside it. In React 19 you
+      render the context itself as the provider, `<ThemeContext value={theme}>`. A reader calls
+      `useContext(ThemeContext)`, and React walks up the tree to the nearest provider for that
+      context.
+
+      Providers nest, and the nearest one wins. That makes context good for values that depend
+      on where you are in the tree, not only global ones:
+
+      ```tsx
+      const LevelContext = createContext(1);
+
+      function Section({ children }: { children: ReactNode }) {
+        const level = useContext(LevelContext);
+        return (
+          <section>
+            <LevelContext value={level + 1}>{children}</LevelContext>
+          </section>
+        );
+      }
+
+      function Heading({ children }: { children: ReactNode }) {
+        const level = Math.min(useContext(LevelContext), 6);
+        const Tag = `h${level}` as 'h1';
+        return <Tag>{children}</Tag>;
+      }
+      ```
+
+      A `Heading` directly on the page is an `h1`, inside one `Section` an `h2`, inside two an
+      `h3`. No heading is told its level; it reads it from its position.
+
+      The cost is renders. When a provider's value changes, compared with `Object.is`, React
+      renders every component that reads that context. `memo` doesn't stop it: in our test a
+      memoised component that read the theme rendered on a toggle, and a memoised sibling that
+      didn't read it stayed put. So a value that changes many times a second, or one object that
+      bundles unrelated fields, makes every reader pay for every change.
+
+      React 19 also lets you read context with `use(ThemeContext)`. Unlike `useContext`, `use`
+      may be called inside a condition or a loop. Both return the same value.
+  - title: A provider component and a hook that guards it
+    body: |-
+      Real code wraps a context in two pieces: a provider component that owns the state, and a
+      hook that reads it. The default of `null` plus a check turns a forgotten provider into a
+      clear error instead of a silent fallback.
+
+      ```tsx
+      type Theme = 'light' | 'dark';
+      type ThemeValue = { theme: Theme; toggle: () => void };
+
+      const ThemeContext = createContext<ThemeValue | null>(null);
+
+      export function ThemeProvider({ children }: { children: ReactNode }) {
+        const [theme, setTheme] = useState<Theme>('light');
+        // A new object every render would re-render every reader, so keep the same one until theme changes.
+        const value = useMemo(
+          () => ({ theme, toggle: () => setTheme((t) => (t === 'light' ? 'dark' : 'light')) }),
+          [theme],
+        );
+        return <ThemeContext value={value}>{children}</ThemeContext>;
+      }
+
+      export function useTheme(): ThemeValue {
+        const value = useContext(ThemeContext);
+        if (value === null) throw new Error('useTheme must be used inside <ThemeProvider>');
+        return value;
+      }
+
+      function ThemeSwitch() {
+        const { theme, toggle } = useTheme();
+        return <button onClick={toggle}>Theme: {theme}</button>;
+      }
+      ```
+
+      We rendered this in a test: the button toggled between light and dark, and rendering
+      `ThemeSwitch` without the provider threw the error message. The module exports the
+      provider and the hook, not the context, so every reader goes through the check.
+
+      When one context would carry both busy and quiet values, split it. A common split puts
+      the state in one context and the functions that change it in another. Components that only
+      change the value, like a button, read the second context and never render when the value
+      changes.
+  - title: Composition before context
+    body: |-
+      Drilling often means a layout component is passing along data meant for something it
+      renders deep inside. If the layout accepts `children` or other element props, the top
+      component can build the deep part itself and hand it over, already filled in:
+
+      ```tsx
+      function Page({ user }: { user: User }) {
+        return (
+          <Layout
+            header={<Header avatar={<Avatar user={user} />} />}
+            sidebar={<Sidebar />}
+          >
+            <Feed userId={user.id} />
+          </Layout>
+        );
+      }
+
+      function Layout({ header, sidebar, children }: { header: ReactNode; sidebar: ReactNode; children: ReactNode }) {
+        return (
+          <div className="layout">
+            {header}
+            <aside>{sidebar}</aside>
+            <main>{children}</main>
+          </div>
+        );
+      }
+      ```
+
+      `Layout` and `Header` never mention `user`. The data flow is still explicit: you can read
+      `Page` and see who gets what. Context, by contrast, is an invisible dependency. A
+      component that calls `useTheme()` only works inside a `ThemeProvider`, and nothing in its
+      props says so, which makes it harder to reuse and to test.
+
+      A rough order to try. Pass props for one or two levels. Restructure with `children` when a
+      middle layer only forwards data. Use context when many components at many depths read the
+      same slow-changing value. For app state that changes often and is read in many places,
+      teams usually pair context with a reducer, or use a store library built for fine-grained
+      subscriptions.
+pitfalls:
+  - >-
+    **Copying a prop into state.** `useState(props.quantity)` ignores every later value of the
+    prop. Read the prop directly and report changes up, or call it `initialQuantity` and reset
+    the component with a key.
+  - >-
+    **Syncing two copies with an effect.** An effect that copies a parent's value into a child's
+    state shows the stale copy for a render and doubles the work. Keep one owner and pass the
+    value down.
+  - >-
+    **Lifting too high.** State at the root re-renders the whole app on every keystroke. Put it
+    in the lowest common parent of the components that use it.
+  - >-
+    **A reader outside the provider.** It silently gets the default, as the lesson's header did.
+    Use a `null` default and a hook that throws, so the mistake fails loudly.
+  - >-
+    **A new object as the provider value.** `value={{ user, signOut }}` is new every render, so
+    every reader renders whenever the provider's parent does. Wrap it in `useMemo`, or split the
+    context.
+  - >-
+    **Context for fast-changing values.** A mouse position or a text field in context renders
+    every reader on every change. Keep it in local state, or in a store with selective
+    subscriptions.
+interview:
+  - question: How do you decide where a piece of state should live?
+    answer: >-
+      In the lowest component that sits above everything that reads or changes it. I list the
+      readers and writers, find their closest common parent, and put the state there, passing
+      the value down and a callback up. Lower, and a sibling can't reach it; higher, and more of
+      the tree re-renders and more components depend on it. Before adding state at all I check
+      whether it can be derived from existing state or props, because derived values need no
+      storage and can't drift. If the value must survive a reload or be shareable, it goes in
+      the URL instead. The trade-off of lifting is that the parent grows, which is where a
+      reducer or a custom hook helps.
+  - question: What is prop drilling, and how do you deal with it?
+    answer: >-
+      Prop drilling is passing a value through components that don't use it, only to reach one
+      that does. A little is fine and even good, because the data flow is explicit. When it grows, I first try composition. The middle components take `children` or element
+      props, so the top component renders the deep part directly and the middle never sees the
+      data. If many components at different depths need the same value, like the theme or the
+      signed-in user, I use context. Context hides the dependency, so a component only works
+      inside its provider, which is why I don't reach for it first.
+  - question: Why can context cause performance problems, and how do you fix them?
+    answer: >-
+      Every component that reads a context renders again when the provider's value changes,
+      compared with `Object.is`, and `memo` doesn't prevent it. Two patterns make that expensive.
+      One is passing a fresh object, `value={{ user, signOut }}`, which changes on every render
+      of the provider's parent. I memoise it with `useMemo`. The other is one context holding
+      unrelated values, so a change to one field renders readers of all of them. I split it,
+      often into a state context and a separate context for the update functions, which never
+      change. For values that change many times a second, context is the wrong tool; local
+      state or a store with selectors fits better.
+  - question: A child component starts from `useState(props.value)`. What goes wrong?
+    answer: >-
+      `useState` uses its argument only on the first render, so the child copies the prop once
+      and ignores it afterwards. When the parent changes the value, for example emptying a cart,
+      the child still shows the old one. There are two correct designs. If the parent should
+      own the value, make the child controlled: render `props.value` directly and call
+      `onChange` to ask for changes. If the prop is only a starting point, name it `initialValue` so the name says it's read once.
+      Then give the child a key tied to the record, so it restarts when the record changes. Syncing the copy with an effect is the
+      version to avoid.

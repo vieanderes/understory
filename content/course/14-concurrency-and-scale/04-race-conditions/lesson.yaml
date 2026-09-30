@@ -1,0 +1,320 @@
+id: scale.race-conditions
+title: Race conditions
+objective: Find the gap between a check and its write, and close it in one process and across servers.
+level: essential
+minutes: 10
+concepts: [scale.race-condition, scale.check-then-act, scale.lost-update]
+prerequisites: [scale.concurrency-vs-parallelism, db.isolation-levels]
+opening:
+  text: >-
+    You'll spot the bug that only shows up when two people act at once, by reading the code.
+    Tests rarely catch it, so your eyes have to.
+
+steps:
+  - type: prose
+    id: two-calls-one-value
+    body: |-
+      Two requests can run the same function at the same time. Each `await` hands the thread
+      to the other one. So if both use one shared value, the other request can change it
+      while you wait.
+
+      ```js
+      let seatsLeft = 1;
+
+      async function book() {
+        if (seatsLeft > 0) {          // check
+          await chargeCard();         // the other request runs here
+          seatsLeft = seatsLeft - 1;  // act
+        }
+      }
+      ```
+
+  - type: predict-output
+    id: predict-coupon-twice
+    concept: scale.check-then-act
+    difficulty: 1
+    language: js
+    code: |
+      const coupon = { usesLeft: 1 };
+
+      async function redeem() {
+        if (coupon.usesLeft > 0) {
+          await chargeCard();               // takes 20 ms
+          coupon.usesLeft = coupon.usesLeft - 1;
+          return 'redeemed';
+        }
+        return 'refused';
+      }
+      console.log(await Promise.all([redeem(), redeem()]));
+    question: The coupon has one use left. Two shoppers redeem it at once. What logs?
+    choices:
+      - text: "`['redeemed', 'refused']`"
+        feedback: >-
+          That's what the code means to do. But the second check ran while the first shopper
+          was still paying.
+      - text: "`['redeemed', 'redeemed']`"
+        correct: true
+        feedback: >-
+          Right. Both passed the check before either wrote. `usesLeft` ended at `-1`.
+      - text: "`['refused', 'refused']`"
+        feedback: >-
+          The coupon starts with one use, so the first check passes. The trouble is that the
+          second one does too.
+
+  - type: prose
+    id: name-the-race
+    body: >-
+      That's a **race condition**: the result depends on the order things happen in, and
+      some orders are wrong. Alone, `redeem` is correct. Two at once break it.
+
+
+      This shape is **check-then-act**: check a value, wait, then act on what you saw. The
+      `await` is the gap. In one process, the cure is to leave no `await` between the check
+      and the write.
+
+  - type: bug-hunt
+    id: hunt-the-gap
+    concept: scale.race-condition
+    difficulty: 2
+    language: js
+    code: |
+      async function bookDesk(deskId, userId) {
+        const desk = desks.get(deskId);
+        if (desk.bookedBy !== null) {
+          return 'taken';
+        }
+        await sendConfirmationEmail(userId);
+        desk.bookedBy = userId;
+        return 'booked';
+      }
+    prompt: >-
+      Two colleagues book the last desk at once, and both get "booked". Tap the line where
+      the second request slips in.
+    lines: [6]
+    reasons:
+      - text: The `await` sits between the check and the write
+        correct: true
+        feedback: >-
+          Yes. While the email sends, the desk still looks free to everyone else.
+      - text: '`desks.get` can return an old desk'
+        feedback: >-
+          It returns the live object. Reading it isn't the fault. Waiting before the write is.
+      - text: '`!==` should be `===`'
+        feedback: >-
+          The comparison is right: a desk that's booked returns "taken". Look between the
+          check and the write.
+    fix: |
+      if (desk.bookedBy !== null) {
+        return 'taken';
+      }
+      desk.bookedBy = userId;                 // act first, with no gap
+      await sendConfirmationEmail(userId);
+      return 'booked';
+
+  - type: prose
+    id: share-the-promise
+    body: |-
+      Loading something once has the same gap. A cache checks "do I have it?", then awaits
+      the fetch. Every caller that arrives meanwhile sees nothing, and starts its own.
+
+      The fix is to store the **promise** at once, before any `await`. Later callers share
+      it:
+
+      ```js
+      if (loading === null) loading = fetchRates(); // no await in the gap
+      return loading;
+      ```
+
+  - type: ai-review
+    id: review-token-stampede
+    concept: scale.check-then-act
+    difficulty: 3
+    language: js
+    request: Fetch an access token for the model API once, and reuse it.
+    flawClass: race
+    code: |
+      let token = null;
+
+      async function getToken() {
+        if (token === null) {
+          token = await fetchNewToken();   // about 300 ms
+        }
+        return token;
+      }
+    prompt: >-
+      Your server restarts, and 100 requests arrive together. The model provider logs 100
+      token requests, then starts refusing them. The assistant's test called it twice in a
+      row. Tap the line at fault.
+    lines: [5]
+    reasons:
+      - text: '`token` stays `null` for the whole fetch'
+        correct: true
+        feedback: >-
+          Yes. Every caller passes the check meanwhile. Store the promise, with no `await`
+          first.
+      - text: '`token` should be a `const`'
+        feedback: >-
+          It has to change once, so `let` is needed. The fault is when it changes.
+      - text: '`=== null` misses an `undefined` token'
+        feedback: >-
+          `token` starts as `null`, so the check is right. What happens before the write isn't.
+    fix: |
+      let tokenPromise = null;
+
+      function getToken() {
+        if (tokenPromise === null) {
+          tokenPromise = fetchNewToken();   // set at once, no gap
+        }
+        return tokenPromise;
+      }
+
+  - type: code-challenge
+    id: write-single-flight
+    concept: scale.race-condition
+    difficulty: 3
+    language: ts
+    prompt: >-
+      Write `singleFlight(fetchToken)`. It returns a function. Callers who arrive while a
+      fetch is running get that same promise, so 100 callers at once make one fetch.
+
+
+      Once the fetch settles, the next call starts a fresh one. A failed fetch isn't kept:
+      the call after it tries again.
+    hints:
+      - Keep the running promise in a variable outside the returned function, starting at `null`.
+      - Set it before any `await`. That leaves no gap for a second caller to slip through.
+      - "`promise.finally(() => { ... })` runs when it settles either way. Clear the variable there."
+
+  - type: prose
+    id: across-copies
+    body: >-
+      "No `await` in the gap" works because one thread runs your code. With four copies of
+      the server, each has its own memory, and the shared value lives in the database.
+
+
+      Then a copy reads a value, computes, and saves it back. Two copies doing that at once
+      is a **lost update**: the second write erases the first. You met it in the lesson "Two
+      writers at once".
+
+  - type: multiple-choice
+    id: pick-fix-across-copies
+    concept: scale.lost-update
+    difficulty: 3
+    language: js
+    code: |
+      async function addPoints(userId, amount) {
+        const { rows } = await db.query('SELECT points FROM users WHERE id = $1', [userId]);
+        await db.query('UPDATE users SET points = $1 WHERE id = $2', [
+          rows[0].points + amount, userId,
+        ]);
+      }
+    question: Four server copies run this. Points go missing at busy times. Which fix holds?
+    choices:
+      - text: '`SET points = points + $1` in one `UPDATE`'
+        correct: true
+        feedback: >-
+          Right. The database does the sum on the current row, so no update is lost.
+      - text: A `let saving = true` flag around the two queries
+        feedback: >-
+          A flag lives in one copy's memory. The other three copies never see it.
+      - text: Run the two queries with `Promise.all`
+        feedback: >-
+          That still reads first and writes a number worked out in the app. The gap stays.
+
+  - type: explain-back
+    id: explain-tests-miss-races
+    concept: scale.race-condition
+    difficulty: 4
+    prompt: >-
+      A booking function passes 1,000 test runs. In production it double-books about once a
+      week. Why do the tests keep passing?
+    rubric:
+      - The bug needs two calls to overlap inside the gap between the check and the write.
+      - Tests usually call the function one at a time, so that order never happens.
+      - Production has many users at once, so the rare order comes up eventually.
+    modelAnswer: >-
+      The function is correct for one caller at a time, and that's all the tests do. The bug
+      only appears when a second call runs its check while the first is waiting, before it
+      writes. That window is a few milliseconds wide. A test that calls once, or one call
+      after another, never lands in it. Production has real people clicking at once, so now
+      and then two do. I'd find it by reading: look for an `await` between a check and the
+      write that depends on it.
+
+recap:
+  - 'Read for the gap: an `await` between a check or a read, and the write that depends on it.'
+  - Close the gap in one process by acting before you await, or by sharing one promise.
+  - Across server copies, let the database do the change in one statement.
+
+recall:
+  - id: card-race-condition
+    concept: scale.race-condition
+    front: What makes a bug a race condition?
+    back: >-
+      The result depends on the order of concurrent operations, and some orders give a wrong
+      result. One caller alone never shows it.
+  - id: card-check-then-act
+    concept: scale.check-then-act
+    front: What does check-then-act look like in async JavaScript?
+    back: >-
+      An `if` on some value, then an `await`, then a write that trusts the `if`. Another call
+      can pass the same check during the wait.
+  - id: card-single-flight
+    concept: scale.check-then-act
+    front: How do you stop 100 callers at once from all fetching the same thing?
+    back: >-
+      Store the promise before any `await`, and hand the same promise to every caller until
+      it settles.
+  - id: card-lost-update
+    concept: scale.lost-update
+    front: Why doesn't "no `await` in the gap" protect a value stored in the database?
+    back: >-
+      Several server copies run at once, each with its own thread. Two can read the same row
+      and write back, and one write is lost.
+
+references:
+  - kind: paper
+    title: What are race conditions?
+    authors: Robert H. B. Netzer and Barton P. Miller
+    year: 1992
+    venue: ACM Letters on Programming Languages and Systems, 1(1)
+    url: https://doi.org/10.1145/130616.130623
+    note: A careful definition of a race, and why finding them all by testing is so hard.
+    primary: true
+    verified: true
+  - kind: docs
+    title: 'CWE-367: Time-of-check Time-of-use (TOCTOU) Race Condition'
+    authors: MITRE
+    venue: Common Weakness Enumeration
+    url: https://cwe.mitre.org/data/definitions/367.html
+    note: Check-then-act under its security name, with its consequences.
+    verified: true
+  - kind: docs
+    title: 13.2. Transaction Isolation
+    authors: The PostgreSQL Global Development Group
+    venue: PostgreSQL 17 documentation
+    url: https://www.postgresql.org/docs/17/transaction-iso.html
+    note: The same lost update seen from the database, and the isolation levels that stop it.
+    primary: true
+    verified: true
+
+deepDive: >-
+  The coupon output is from Node 24. Both calls passed the check, then both wrote, and
+  `usesLeft` ended at -1. The shared-promise version of `getToken` made 1 fetch for 100
+  callers. The original made 100.
+
+
+  "Act before you await" works inside one process because one thread runs a stretch of
+  synchronous code without interruption. That's called run-to-completion. With worker
+  threads and shared memory, even `count + 1` can be split. With several server copies, the
+  shared state is the database, and the fix belongs there: an atomic `UPDATE`, a `UNIQUE`
+  constraint, or the version check in the next lesson.
+
+
+  A real token expires. A fuller `getToken` keeps the token with its expiry time, and
+  starts one shared refresh a little before it runs out. The same single-flight idea stops
+  a cache stampede, where a popular cache entry expires and every request rebuilds it at
+  once.
+
+
+  Acting first has a cost: if the charge fails, you must undo the write. The lesson "Holds
+  that expire" turns that into a design.

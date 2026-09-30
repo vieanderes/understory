@@ -1,0 +1,303 @@
+id: interview.streaming-build
+title: "AI build: streaming chat"
+objective: "Turn a stream of text and tool-call deltas into chat state, and handle cancel and a failure halfway through."
+level: advanced
+minutes: 10
+concepts: [interview.delta-accumulation, interview.stream-failure]
+prerequisites: [backend.realtime]
+opening:
+  text: >-
+    You'll turn a model's stream into chat state that survives a cancel and a dropped
+    connection. It's the part of a chat build that reviewers poke at first.
+
+steps:
+  - type: prose
+    id: what-you-need
+    body: >-
+      What you need: a streamed reply arrives in pieces as the model writes it, so the chat
+      can show words at once. In JavaScript you read such a stream with `for await (const
+      event of stream)`, which waits for each piece in turn.
+
+
+      A **reducer** is a function `(state, event) => newState`. The chat state is whatever
+      the reducer has built so far.
+
+  - type: prose
+    id: name-deltas
+    body: >-
+      A streamed reply arrives as small events called **deltas**. Each adds a little to the
+      message: a few words, or a fragment of a tool call's arguments.
+
+
+      The reducer folds each delta into the chat state, and the UI renders that state. It's
+      one pure function, so a plain list of events tests it.
+
+  - type: fill-blank
+    id: fill-tool-delta
+    concept: interview.delta-accumulation
+    difficulty: 3
+    prompt: Append a fragment to the right tool call, without changing the old state.
+    language: ts
+    template: |
+      case 'tool-call-delta':
+        return {
+          ...state,
+          toolCalls: state.toolCalls.map((call) =>
+            call.id === {{1}} ? { ...call, argsText: {{2}} } : call,
+          ),
+        };
+    blanks:
+      - key: '1'
+        answer: event.id
+      - key: '2'
+        answer: call.argsText + event.argsDelta
+    bank:
+      - event.id
+      - call.name
+      - call.argsText + event.argsDelta
+      - event.argsDelta
+      - JSON.parse(event.argsDelta)
+
+  - type: prose
+    id: name-failing-midway
+    body: >-
+      A stream can stop early in three ways. The server sends an error event. The connection
+      drops, so the read throws. Or the user presses stop.
+
+
+      In each case keep the text that arrived. Mark the message so nobody mistakes it for a
+      whole answer, and offer a retry. Once a message is finished, ignore any events that
+      still trickle in.
+
+  - type: prose
+    id: sse-or-fetch
+    body: >-
+      The browser has two ways to read a stream. `EventSource` reads **server-sent
+      events**, a plain-text stream format, and reconnects by itself. But it only sends a
+      GET, with no body.
+
+
+      `fetch` can POST the whole conversation and read `response.body` piece by piece. It
+      never reconnects: a dropped connection makes the read throw, and your code decides.
+
+  - type: code-challenge
+    id: write-sse-parser
+    concept: interview.delta-accumulation
+    difficulty: 4
+    language: ts
+    starter: sse.starter.ts
+    solution: sse.solution.ts
+    tests: sse.tests.ts
+    twin:
+      language: python
+      starter: sse.starter.py
+      solution: sse.solution.py
+      tests: sse.tests.py
+    prompt: >-
+      `fetch` hands you bytes in chunks that split anywhere: mid-event, mid-line, even
+      mid-character. Write `createSseParser(decoder)`, which turns them back into events.
+
+
+      Decode each chunk with `{ stream: true }`, so a split character waits for its last
+      byte. Add the text to a buffer, and cut events at each blank line, `\n\n`. The piece
+      after the last cut stays in the buffer.
+
+
+      For each event, join its `data:` lines with `\n`, dropping `data:` and one space.
+      Skip other lines. Many model APIs end with `data: [DONE]`: don't return it, and ignore
+      everything after it.
+    hints:
+      - Keep `buffer` in a variable outside `push`, so it lives between calls.
+      - "`buffer.split('\\n\\n')` gives the finished events, plus one unfinished piece at the end. `pop()` takes that piece off."
+      - Inside the event, `split('\n')`, keep the lines that start with `data:`, then `slice(5)`.
+
+  - type: ai-review
+    id: review-two-streams
+    concept: interview.stream-failure
+    difficulty: 4
+    language: ts
+    request: Stream the reply into the chat, and let the user press retry.
+    flawClass: race
+    code: |
+      let state = initialState;
+
+      async function send(prompt: string) {
+        state = initialState;
+        render(state);
+        for await (const event of streamChat(prompt)) {
+          state = reduceStream(state, event);
+          render(state);
+        }
+      }
+    prompt: >-
+      An assistant wrote this. In tests, each reply finished before the next send. A user
+      pressed retry mid-stream, and two answers mixed. Tap the line at fault.
+    lines: [7]
+    reasons:
+      - text: An older stream still writes into the same state
+        correct: true
+        feedback: >-
+          Yes. Nothing stops the first loop, so both streams fold into one message.
+      - text: '`render` should run once, after the loop'
+        feedback: >-
+          Then nothing shows until the end, which defeats streaming. Rendering each event is
+          right.
+      - text: '`for await` reads events out of order'
+        feedback: >-
+          Within one stream, events arrive in order. The mix comes from two streams at once.
+    fix: |
+      let current: AbortController | null = null;
+
+      async function send(prompt: string) {
+        current?.abort(); // stop the old stream first
+        const controller = new AbortController();
+        current = controller;
+        let state = initialState;
+        for await (const event of streamChat(prompt, controller.signal)) {
+          if (controller.signal.aborted) return;
+          state = reduceStream(state, event);
+          render(state);
+        }
+      }
+
+  - type: code-challenge
+    id: write-reduce-stream
+    concept: interview.delta-accumulation
+    difficulty: 5
+    language: ts
+    twin:
+      language: python
+      starter: reduce.starter.py
+      solution: reduce.solution.py
+      tests: reduce.tests.py
+    prompt: >-
+      Write `reduceStream(state, event)` and `collect(events, signal)`. The tests feed
+      scripted async streams, so no network is involved.
+
+
+      `reduceStream` returns a new state and never changes the old one. Text deltas append.
+      Tool-call deltas append to that call's `argsText`. Parse the arguments only at
+      `tool-call-end`, and treat bad JSON as an error. `done` finishes. An `error` event keeps
+      the text and sets `error` and `canRetry`. Once finished, ignore further events.
+
+
+      `collect` folds a stream from `initialState`. If `signal.aborted` is set, return what
+      you have as `cancelled`, with `canRetry`. A thrown read, or a stream with no `done`, is
+      an error with a retry.
+    hints:
+      - Start the reducer with a `switch` on `event.type`, and spread `state` in every branch.
+      - For tool calls, `map` over the list and change only the call whose id matches.
+      - In `collect`, check `signal.aborted` before each event, and again inside `catch`.
+
+  - type: explain-back
+    id: explain-keep-partial
+    concept: interview.stream-failure
+    difficulty: 4
+    prompt: >-
+      The connection drops halfway through a long answer. Why keep the partial text and mark
+      it, rather than clear the message?
+    rubric:
+      - The text that arrived is real and often already useful.
+      - Marking it incomplete stops anyone mistaking it for the whole answer.
+      - A retry lets them get the rest without retyping the question.
+    modelAnswer: >-
+      What arrived is real output, and the first half of an answer is often enough to act on.
+      Clearing it throws that away and looks like nothing happened. Marking it incomplete
+      keeps it honest, so nobody reads it as the full answer. And a retry button gets the
+      rest without making the user type the question again.
+
+  - type: code-challenge
+    id: write-use-streaming-chat
+    concept: interview.stream-failure
+    difficulty: 4
+    language: tsx
+    starter: hook.starter.tsx
+    solution: hook.solution.tsx
+    tests: hook.tests.tsx
+    prompt: >-
+      Write the hook a chat screen uses: `useStreamingChat(stream)` returns `answer`,
+      `status`, `error`, `send` and `stop`. `stream(message, signal)` yields token, done and
+      error events.
+
+
+      `send` starts at `waiting`, moves to `streaming` on the first token, and ends at
+      `done` or `error`, keeping the text. `stop` aborts the signal and sets `stopped`. A
+      thrown read is an error, unless it was stopped.
+    hints:
+      - Keep the `AbortController` in a `useRef`, and create a new one in each `send`.
+      - Read with `for await (const event of stream(message, controller.signal))`.
+      - "Append with `setAnswer((previous) => previous + event.text)`, and in `catch` return early if the signal is aborted."
+
+recap:
+  - Fold text and tool-call deltas into chat state with a pure reducer.
+  - Parse tool arguments once, when the call ends.
+  - Keep partial text on a cancel or failure, mark it, and offer a retry.
+recall:
+  - id: card-parse-at-end
+    concept: interview.delta-accumulation
+    front: Why are a streamed tool call's arguments parsed only when the call ends?
+    back: >-
+      Each fragment is a piece of a JSON string. It isn't valid JSON until the last piece
+      arrives.
+  - id: card-after-finish
+    concept: interview.stream-failure
+    front: What should the reducer do with events that arrive after a message is finished?
+    back: >-
+      Ignore them. A cancelled or failed stream can still deliver stragglers, and they mustn't
+      change the message.
+  - id: card-three-endings
+    concept: interview.stream-failure
+    front: Name three ways a stream ends without a done event.
+    back: >-
+      The server sends an error event, the connection drops so the read throws, or the user
+      cancels.
+  - id: card-fetch-vs-eventsource
+    concept: interview.stream-failure
+    front: Why does a chat usually stream with `fetch` rather than `EventSource`?
+    back: >-
+      `EventSource` can only send a GET with no body. `fetch` can POST the conversation, but
+      it never reconnects on its own.
+
+references:
+  - kind: spec
+    title: 'HTML Living Standard: Server-sent events'
+    authors: WHATWG
+    url: https://html.spec.whatwg.org/multipage/server-sent-events.html
+    note: The event stream format, `EventSource`, and its automatic reconnection.
+    primary: true
+    verified: true
+  - kind: spec
+    title: Streams Standard
+    authors: WHATWG
+    url: https://streams.spec.whatwg.org/
+    note: '`ReadableStream`, which `response.body` is, and how cancelling a stream works.'
+    primary: true
+    verified: true
+  - kind: docs
+    title: Using readable streams
+    authors: MDN contributors
+    venue: MDN Web Docs
+    url: https://developer.mozilla.org/en-US/docs/Web/API/Streams_API/Using_readable_streams
+    note: Reading a fetch body chunk by chunk with a reader.
+    verified: true
+
+deepDive: >-
+  Chatbots appear in over 20% of AI engineering take-homes, and the stream is where they get
+  tested. A classic design question: stream a 30-second agent run to the browser and fail
+  halfway through. What does the user see?
+
+
+  SSE or fetch. Server-sent events are plain text over HTTP, and `EventSource` reconnects
+  with the `Last-Event-ID` header. But it only sends a GET with no body and no custom
+  headers. A chat needs to POST the conversation, so most clients use `fetch`, read
+  `response.body` with a reader, and decode with `TextDecoder`. The server can still format
+  the stream as SSE. You then parse the `data:` lines yourself, as in the realtime lesson.
+
+
+  Cancelling. Pass an `AbortController`'s signal to `fetch`. Aborting rejects the pending
+  read with an `AbortError`, which is why `collect` checks the signal inside `catch`. Tell
+  the server too: an abandoned generation still costs tokens.
+
+
+  Resuming. A retry usually regenerates the whole answer. Resuming mid-answer needs the
+  server to keep the run and replay from an event id, which is worth naming as a next step.

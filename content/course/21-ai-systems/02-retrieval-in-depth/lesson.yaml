@@ -1,0 +1,299 @@
+id: aisys.retrieval-in-depth
+title: Retrieval in depth
+objective: Choose a chunking strategy, filter by metadata, rewrite queries, and rerank candidates before they reach the prompt.
+level: advanced
+minutes: 10
+concepts: [aisys.chunking-strategies, aisys.reranking, aisys.query-rewriting, aisys.metadata-filtering]
+prerequisites: [aisys.demo-to-system, ai.rag]
+opening:
+  text: >-
+    You'll fix the four places where a RAG system usually loses the right passage. Most bad
+    answers start here, long before the model writes a word.
+
+steps:
+  - type: prose
+    id: recall-rag
+    body: >-
+      Quick reminder from chapter 20. **RAG** answers from your own documents: split them
+      into chunks, embed each one, find the chunks nearest the question, and put them in
+      the prompt.
+
+
+      The model only sees what search returns. So this lesson fixes the four places the
+      right passage gets lost: how you chunk, what you search for, which rows you search,
+      and how you rank.
+    figure:
+      id: rag-pipeline
+      caption: A passage that never reaches the top k is invisible to the model, however good it is.
+
+  - type: multiple-choice
+    id: pick-lost-chunk
+    concept: aisys.chunking-strategies
+    difficulty: 1
+    language: json
+    code: |
+      [
+        { "chunk": 1, "text": "Refunds. You can return any item within 30 days." },
+        { "chunk": 2, "text": "It takes 5 working days to reach your account." },
+        { "chunk": 3, "text": "Exchanges. Swap an item for another size in store." }
+      ]
+    question: 'Which chunk is hardest to find for the query "how long do refunds take"?'
+    choices:
+      - text: Chunk 2
+        correct: true
+        feedback: >-
+          Yes. It holds the answer but never says what "it" is.
+      - text: Chunk 1
+        feedback: >-
+          Chunk 1 says "refunds", so both keyword and vector search find it.
+      - text: Chunk 3
+        feedback: >-
+          Chunk 3 is off topic, so it won't be found. But it isn't needed either.
+
+  - type: prose
+    id: name-chunking-strategies
+    body: |-
+      That's the classic chunking failure: the split cut the answer off from its topic.
+      There are three **chunking strategies**. Fixed size is simple and blind. Structure-aware
+      splits on headings, paragraphs or FAQ entries. Semantic splits where the meaning shifts.
+
+      Whichever you pick, give each chunk its context back. Prepend the document title and
+      heading before embedding: "Returns policy > Refunds: It takes 5 working days".
+
+  - type: code-challenge
+    id: write-heading-chunks
+    concept: aisys.chunking-strategies
+    difficulty: 3
+    language: python
+    starter: chunks.starter.py
+    solution: chunks.solution.py
+    tests: chunks.tests.py
+    prompt: >-
+      Write `chunk_by_heading(title, markdown)`. A line starting with `## ` is a heading.
+      Blank lines separate paragraphs. Return one chunk per paragraph, its lines joined with
+      a space.
+
+
+      Start each chunk with `"{title} > {heading}: "`, or `"{title}: "` before the first
+      heading. So a paragraph under `## Refunds` in "Returns policy" becomes
+      `"Returns policy > Refunds: It takes 5 working days..."`.
+    hints:
+      - Walk the lines once, remembering the current heading and the lines of the current paragraph.
+      - A heading or a blank line ends the paragraph so far. So does the end of the text.
+      - A small inner `flush()` that turns the collected lines into a chunk, then clears them, saves repeating yourself.
+
+  - type: prose
+    id: name-reranking
+    body: |-
+      Now ranking. Vector search embeds the query and each passage apart, then compares the
+      vectors. A **reranker** reads the query and one passage together, as a pair, and
+      scores how well the passage answers it. That's far more accurate.
+
+      It's also far slower per passage. So retrieve 50 to 100 candidates cheaply, rerank
+      those, and keep the best five. The reranker can only reorder what you give it.
+
+  - type: ai-review
+    id: review-rerank-everything
+    concept: aisys.reranking
+    difficulty: 3
+    language: python
+    request: Add a reranker to our passage search.
+    flawClass: performance
+    code: |
+      def search(query, k=5):
+          candidates = vector_search(query, limit=50)   # cheap first stage
+          passages = db.all_passages()
+          scores = reranker.score(query, [p.text for p in passages])
+          ranked = sorted(zip(passages, scores), key=lambda pair: pair[1], reverse=True)
+          return [passage for passage, _ in ranked[:k]]
+    prompt: >-
+      An assistant wrote this. On the 40-passage test corpus it felt instant, and answers
+      improved. The real corpus has 200,000 passages. Tap the lines at fault.
+    lines: [3, 4]
+    reasons:
+      - text: It reranks every passage, not the 50 candidates
+        correct: true
+        feedback: >-
+          Yes. Each query now scores 200,000 pairs with the slowest model in the chain.
+      - text: The first stage should fetch 5, not 50
+        feedback: >-
+          Fetching more candidates is right. The reranker needs room to find the best few.
+      - text: '`reverse=True` puts the worst first'
+        feedback: >-
+          Higher scores mean more relevant, so highest first is correct here.
+    fix: |
+      def search(query, k=5):
+          candidates = vector_search(query, limit=50)   # cheap first stage
+          scores = reranker.score(query, [p.text for p in candidates])
+          ranked = sorted(zip(candidates, scores), key=lambda pair: pair[1], reverse=True)
+          return [passage for passage, _ in ranked[:k]]
+
+  - type: prose
+    id: name-shaping-the-search
+    body: |-
+      Two fixes happen before the search runs. **Query rewriting** turns what the user typed
+      into what the index needs. After Paris, "And Berlin?" becomes "store opening hours in
+      Berlin". A small, fast model does it well.
+
+      **Metadata filtering** narrows the rows first. A **tenant** is one customer whose data
+      stays apart from everyone else's. Filter by tenant or date inside the query, before
+      `LIMIT`. Afterwards can leave nothing.
+
+  - type: multiple-choice
+    id: pick-rewritten-query
+    concept: aisys.query-rewriting
+    difficulty: 2
+    question: 'A user asks about opening hours in Paris, then types "And Berlin". What should the search receive?'
+    choices:
+      - text: Store opening hours in Berlin
+        correct: true
+        feedback: >-
+          Right. It carries the topic from the earlier turn into a query that stands alone.
+      - text: And Berlin
+        feedback: >-
+          That's what was typed, but "Berlin" alone matches everything about Berlin.
+      - text: The whole conversation, word for word
+        feedback: >-
+          Tempting, but every old topic then pulls in its own passages. Distil it.
+
+  - type: fill-blank
+    id: fill-tenant-filter
+    concept: aisys.metadata-filtering
+    difficulty: 3
+    language: sql
+    prompt: >-
+      Search only this customer's passages from the last year, nearest first by cosine
+      distance. `$1` is the query vector and `$2` the tenant id.
+    template: |
+      SELECT id, body FROM passages
+      WHERE {{1}} = $2
+        AND published_at > now() - interval '1 year'
+      ORDER BY embedding {{2}} $1
+      LIMIT 50;
+    blanks:
+      - key: '1'
+        answer: tenant_id
+      - key: '2'
+        answer: <=>
+    bank: [tenant_id, title, <=>, LIKE, '=']
+
+  - type: explain-back
+    id: explain-rerank-ceiling
+    concept: aisys.reranking
+    difficulty: 4
+    prompt: >-
+      A team reranks the five passages vector search returns. Answers barely improve. Why,
+      and what would you change?
+    rubric:
+      - A reranker only reorders the candidates it is given.
+      - If the right passage isn't in the five, reranking can't bring it back.
+      - Fetch 50 to 100 candidates cheaply, rerank them, then keep the best five.
+    modelAnswer: >-
+      The reranker can only reorder what it gets. When vector search misses the right
+      passage, it isn't among the five, so no reranker can surface it. I'd widen the first
+      stage to 50 or 100 candidates, which is cheap with an index. Then the slow, accurate
+      reranker picks the best five from a pool that actually holds them.
+
+recap:
+  - Chunk by structure, and give each chunk its title and heading back.
+  - Rewrite the query, and filter by metadata inside the search.
+  - Fetch a wide pool cheaply, then rerank it down to a few.
+
+recall:
+  - id: card-chunk-context
+    concept: aisys.chunking-strategies
+    front: Why prepend a document's title and heading to each chunk before embedding?
+    back: >-
+      A chunk often loses its topic when split. The added context lets search match it to
+      questions about that topic.
+  - id: card-cross-encoder
+    concept: aisys.reranking
+    front: How does a reranker judge relevance differently from vector search?
+    back: >-
+      It reads the query and one passage together, rather than comparing two separate
+      embeddings. More accurate, and much slower per passage. It's also called a
+      cross-encoder.
+  - id: card-query-rewrite
+    concept: aisys.query-rewriting
+    front: What does query rewriting do with "And Berlin?" in a chat about opening hours?
+    back: >-
+      It turns it into a query that stands alone, like "store opening hours in Berlin",
+      before the search runs.
+  - id: card-filter-before-limit
+    concept: aisys.metadata-filtering
+    front: Why put a tenant filter inside the search rather than after it?
+    back: >-
+      Filtering after the top k can leave few or no rows for that tenant. Inside the query,
+      the ranking only sees rows that qualify.
+
+references:
+  - kind: essay
+    title: Introducing Contextual Retrieval
+    authors: Anthropic
+    year: 2024
+    venue: Anthropic News
+    url: https://www.anthropic.com/news/contextual-retrieval
+    note: Adding context to each chunk before embedding, and a measured gain from reranking on top.
+    primary: true
+    verified: true
+  - kind: paper
+    title: Passage Re-ranking with BERT
+    authors: Rodrigo Nogueira and Kyunghyun Cho
+    year: 2019
+    venue: arXiv
+    url: https://arxiv.org/abs/1901.04085
+    note: The cross-encoder reranker that reads query and passage together.
+    verified: true
+  - kind: paper
+    title: Query Rewriting for Retrieval-Augmented Large Language Models
+    authors: Xinbei Ma and others
+    year: 2023
+    venue: Conference on Empirical Methods in Natural Language Processing
+    url: https://arxiv.org/abs/2305.14283
+    note: Rewriting the input before retrieval, with a small trainable rewriter.
+    verified: true
+  - kind: source
+    title: pgvector README
+    authors: Andrew Kane and contributors
+    venue: GitHub
+    url: https://github.com/pgvector/pgvector
+    note: Filtering with approximate indexes, and iterative index scans since 0.8.0.
+    primary: true
+    verified: true
+
+  - kind: paper
+    title: Precise Zero-Shot Dense Retrieval without Relevance Labels
+    authors: Luyu Gao and others
+    year: 2023
+    venue: Annual Meeting of the Association for Computational Linguistics
+    url: https://arxiv.org/abs/2212.10496
+    note: HyDE, embedding a hypothetical answer instead of the question.
+    verified: true
+
+deepDive: >-
+  No model was called. The chunker ran in Python 3.12, and the filter ran on
+  PostgreSQL 17.11 with pgvector 0.8.6 and toy three-dimensional vectors. There, taking the
+  top two rows first and filtering for the second customer afterwards returned 0 rows,
+  though that customer had a matching passage.
+
+
+  Filtering with an index has a subtlety. pgvector's HNSW index applies a `WHERE` clause after
+  it scans, and by default it considers 40 candidates (`hnsw.ef_search`). A filter matching
+  10% of rows then yields about 4 on average. Since 0.8.0, `SET hnsw.iterative_scan =
+  strict_order` makes it keep scanning until enough rows pass. A partial index or a partition
+  per tenant also works when the filter has few values.
+
+
+  One published test found that adding context to chunks, for both vector and keyword search,
+  cut retrieval failures in the top 20 by 49%. Adding a reranker as well made it 67%. Treat such numbers as a direction, and
+  measure on your own labelled queries: for each, is the right passage in the top five?
+
+
+  A cheaper cousin of rewriting is HyDE: the model writes a hypothetical answer, and you
+  embed that instead of the question, since answers look more like passages than questions
+  do.
+
+
+  Rerank scores also make a good cut-off. Keep a minimum score, and when no candidate
+  clears it, say the documents don't cover the question rather than hand the model weak
+  passages. Choose that minimum from labelled queries, the way lesson 4 chooses thresholds.

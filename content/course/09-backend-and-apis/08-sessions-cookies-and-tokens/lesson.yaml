@@ -1,0 +1,286 @@
+id: backend.sessions-and-tokens
+title: Sessions, cookies and tokens
+objective: Remember a signed-in user with a session cookie, set its safety flags, and weigh a session against a JWT.
+level: essential
+minutes: 10
+concepts: [backend.authentication, backend.cookies, backend.server-sessions, backend.jwt]
+prerequisites: [backend.validation]
+opening:
+  text: >-
+    You'll make a server remember who signed in, with the cookie flags that keep that memory
+    from an attacker. Then you'll know when a token is the better choice, and when it isn't.
+
+steps:
+  - type: prose
+    id: http-forgets-you
+    body: >-
+      Sam signs in, then opens her orders. To the server those are two unrelated requests.
+      HTTP forgets you the moment it answers.
+
+
+      So every request has to prove who sent it. That proof is **authentication**. Asking for
+      a password on every click would be absurd, so the server hands out something to show
+      instead.
+
+  - type: prose
+    id: what-a-cookie-is
+    body: |-
+      That something is a **cookie**: a small `name=value` the server asks the browser to
+      keep. It arrives in a `Set-Cookie` response header:
+
+      ```bash
+      $ curl -i -d '{"user":"sam","password":"..."}' localhost:3000/login
+      HTTP/1.1 204 No Content
+      Set-Cookie: sid=q9LLVKsrtaIsWO3q3OmgNvU-0RRBiOAsoG2CwzGIyBg; Path=/; HttpOnly; Secure; SameSite=Lax
+      ```
+
+      From then on, the browser sends `Cookie: sid=...` with every request to that site.
+
+  - type: prose
+    id: what-a-session-is
+    body: >-
+      That `sid` is a **session id**: a long random string the server made at login. The
+      server keeps a **session**, a note of whose id it is, in a `Map`.
+
+
+      A later request brings the id, and the server looks it up. No match means a **401
+      Unauthorized**: "I don't know who you are". `curl -b "sid=..."` sends a cookie by hand.
+
+  - type: predict-output
+    id: predict-forged-sid
+    concept: backend.authentication
+    difficulty: 1
+    language: bash
+    code: |
+      $ curl -b "sid=q9LLVKsrtaIsWO3q3OmgNvU-0RRBiOAsoG2CwzGIyBg" localhost:3000/me
+      {"user":"sam"}
+
+      $ curl -i -b "sid=abc123" localhost:3000/me
+    question: The second call makes up its own session id. What status comes back?
+    choices:
+      - text: '`401 Unauthorized`'
+        correct: true
+        feedback: >-
+          Right. The server only knows ids it made. `abc123` isn't one of them.
+      - text: '`200`, with Sam''s details'
+        feedback: >-
+          A cookie proves nothing by itself. The server looks the id up in its own sessions.
+      - text: '`404 Not Found`'
+        feedback: >-
+          `/me` exists. What's missing is a session for that id, which is a 401.
+
+  - type: prose
+    id: cookie-flags
+    body: >-
+      A session cookie is as good as a password, so it gets three flags. **`HttpOnly`**: page
+      scripts can't read it, so an injected script can't steal it. **`Secure`**: only sent
+      over HTTPS.
+
+
+      **`SameSite=Lax`**: not sent on a form another site submits to yours. That blocks
+      cross-site request forgery, **CSRF**, which the security chapter covers in depth.
+
+  - type: fill-blank
+    id: fill-login-cookie
+    concept: backend.cookies
+    difficulty: 2
+    language: js
+    prompt: >-
+      Finish the login. Remember whose session this is, and send the id in a cookie scripts
+      can't read. Fill the gaps.
+    template: |
+      const id = newSessionId();
+      sessions.{{1}}(id, user.name);
+      return Response.json({ signedIn: true }, {
+        headers: { "{{2}}": `sid=${id}; Path=/; {{3}}; Secure; SameSite=Lax` },
+      });
+    blanks:
+      - key: '1'
+        answer: set
+      - key: '2'
+        answer: Set-Cookie
+      - key: '3'
+        answer: HttpOnly
+    bank: [set, get, Set-Cookie, Cookie, HttpOnly, Public]
+
+  - type: prose
+    id: what-a-jwt-is
+    body: |-
+      A **JWT**, JSON Web Token, turns this round. The cookie carries the facts themselves,
+      plus a signature made with the server's secret. Its middle part decodes to plain JSON:
+
+      ```json
+      {"sub":"7","role":"user","iat":1790337934,"exp":1790338834}
+      ```
+
+      Anyone can read that. `jwt.verify(token, secret)`, from the `jsonwebtoken` package,
+      checks the signature, so no one can change it. It stays valid until `exp`, even after
+      logout.
+
+  - type: ai-review
+    id: review-decode-not-verify
+    concept: backend.jwt
+    difficulty: 3
+    language: js
+    request: Only admins may open the reports page. Read the role from the user's JWT.
+    flawClass: security
+    code: |
+      import jwt from "jsonwebtoken";
+
+      function isAdmin(request) {
+        const token = readCookie(request, "token");
+        const claims = jwt.decode(token);
+        return claims?.role === "admin";
+      }
+    prompt: >-
+      An assistant wrote this. Admins get in, users don't, and the tests pass. Then someone
+      edits their token to say `"role":"admin"` and gets in. Tap the line at fault.
+    lines: [5]
+    reasons:
+      - text: '`decode` reads the claims without checking the signature'
+        correct: true
+        feedback: >-
+          Yes. Use `jwt.verify(token, secret)`, which throws when the token was changed.
+      - text: The token should come from the request body
+        feedback: >-
+          Where it's read from isn't the gap. Any token is trusted without its signature checked.
+      - text: The role should be compared case-insensitively
+        feedback: >-
+          The attacker can write any spelling they like. The claims were never checked at all.
+    fix: |
+      import jwt from "jsonwebtoken";
+
+      function isAdmin(request) {
+        const token = readCookie(request, "token");
+        const claims = jwt.verify(token, process.env.JWT_SECRET);
+        return claims.role === "admin";
+      }
+
+  - type: code-challenge
+    id: write-login-and-me
+    concept: backend.server-sessions
+    difficulty: 3
+    language: ts
+    editable: '30-37'
+    prompt: >-
+      This login trusts a `user=` cookie, so anyone can write `user=sam`. Use sessions.
+
+
+      `login`: on a good password, make an id with `newId()`, store it in `sessions`, and
+      answer 204 with `Set-Cookie: sid=<id>; Path=/; HttpOnly; Secure; SameSite=Lax`.
+
+
+      `me`: find `sid=` in the `Cookie` header, which may hold several cookies joined by `; `.
+      Answer 200 with `{ user }` for a known id, or 401 with `{ error: 'Not signed in' }`.
+    hints:
+      - The session lives in `sessions`, not in the cookie. The cookie only carries the id.
+      - 'Split the `Cookie` header on `"; "` and look for the part that starts with `sid=`.'
+      - 'In `login`, start with `const id = newId();` then `sessions.set(id, user);`.'
+
+  - type: explain-back
+    id: explain-logout-with-jwt
+    concept: backend.server-sessions
+    difficulty: 3
+    prompt: >-
+      A user's laptop is stolen. With sessions you end their access at once. Why can't you do
+      that with a plain JWT?
+    rubric:
+      - A session id is a key into the server's store, so deleting the entry ends access on the next request.
+      - A JWT is checked by its signature and expiry alone, so it stays valid until `exp`.
+      - Ending it early needs a list of revoked tokens checked on every request, the lookup a JWT was meant to avoid.
+    modelAnswer: >-
+      A session lives on the server. Delete the stolen laptop's entry, and its next request
+      finds nothing and gets a 401. A JWT lives in the token. The server only checks the
+      signature and the expiry. Both are still fine, so the thief stays in until `exp`.
+      Stopping it early means a list of revoked tokens checked on every request. That's the
+      lookup the JWT was chosen to avoid.
+
+recap:
+  - Remember a signed-in user with a random session id the server stores.
+  - "Set `HttpOnly`, `Secure` and `SameSite=Lax` on every cookie that proves who you are."
+  - Verify a JWT's signature before reading it, and pick sessions when you need instant logout.
+
+recall:
+  - id: card-forged-session
+    concept: backend.authentication
+    front: Why does a made-up session id get a 401 rather than someone's account?
+    back: >-
+      The id is a key into the server's sessions, not a claim. An unknown key finds nothing.
+  - id: card-three-flags
+    concept: backend.cookies
+    front: What do `HttpOnly`, `Secure` and `SameSite=Lax` each stop?
+    back: >-
+      Scripts reading the cookie; sending it over plain HTTP; sending it on a form another site
+      submits.
+  - id: card-session-revoke
+    concept: backend.server-sessions
+    front: How does logout work with a server session?
+    back: >-
+      Delete the session entry. The cookie's id now matches nothing, so the next request is
+      signed out.
+  - id: card-jwt-readable
+    concept: backend.jwt
+    front: Who can read the claims inside a JWT?
+    back: >-
+      Anyone who holds it. The payload is only encoded. The signature stops changes, not
+      reading.
+  - id: card-decode-verify
+    concept: backend.jwt
+    front: What's the difference between `jwt.decode` and `jwt.verify`?
+    back: >-
+      `decode` reads the claims without checking anything. `verify` checks the signature and
+      expiry first, and throws if either fails.
+
+references:
+  - kind: rfc
+    title: 'RFC 6265: HTTP State Management Mechanism'
+    authors: A. Barth
+    year: 2011
+    venue: IETF
+    url: https://www.rfc-editor.org/rfc/rfc6265
+    note: How cookies are set and sent, and the `HttpOnly`, `Secure` and `Path` attributes.
+    primary: true
+    verified: true
+  - kind: rfc
+    title: 'RFC 7519: JSON Web Token (JWT)'
+    authors: M. Jones, J. Bradley and N. Sakimura
+    year: 2015
+    venue: IETF
+    url: https://www.rfc-editor.org/rfc/rfc7519
+    note: The three-part token, and registered claims such as `sub` and `exp`.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Set-Cookie header
+    authors: MDN contributors
+    venue: MDN Web Docs
+    url: https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Set-Cookie
+    note: Every attribute, including `SameSite` and the rule that `None` requires `Secure`.
+    verified: true
+  - kind: docs
+    title: Session Management Cheat Sheet
+    authors: OWASP
+    venue: OWASP Cheat Sheet Series
+    url: https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html
+    note: Session id length and randomness, cookie attributes, and renewing the id at login.
+    verified: true
+
+deepDive: >-
+  A real server makes the id with `crypto.randomBytes(32).toString("base64url")` from
+  `node:crypto`: 32 random bytes, too many to guess. Never build one from a user id or the
+  time.
+
+
+  `SameSite` compares sites, not origins. `localhost:3000` and `localhost:4000` are one site,
+  so a Lax cookie crosses between them. Modern browsers treat a cookie with no `SameSite` as
+  Lax, and refuse `SameSite=None` without `Secure`.
+
+
+  A JWT's three parts are a header, the claims and the signature, each base64url-encoded and
+  joined by dots. `exp` is a Unix time in seconds. Keep tokens short-lived, minutes rather
+  than days, and pair them with a refresh token the server does store and can revoke. The
+  security chapter's JWT lesson covers the attacks on verification itself.
+
+
+  Browsers treat `localhost` as secure, so a `Secure` cookie still works while you develop
+  over plain `http`.

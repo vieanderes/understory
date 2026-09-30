@@ -1,0 +1,249 @@
+summary: >-
+  HTTP caching lets a response be reused instead of fetched again. The server decides, in
+  the `Cache-Control` header, how long a copy stays fresh, who may store it and what to do
+  once it's stale. Two kinds of cache obey it: the **private** cache in each browser and
+  **shared** caches such as a CDN, which serve one stored copy to many people.
+
+
+  A good policy rests on three ideas. A copy is fresh for a set time and reused without
+  asking. A stale copy is revalidated with an `ETag` or `Last-Modified`, which costs a
+  round trip but no body when nothing changed. And a URL whose content can change needs a
+  short or no freshness, while a URL whose name changes with its content, such as a hashed
+  asset, can be cached for a year.
+
+
+  These notes add how a cache works out freshness, every directive worth knowing, how
+  shared caches differ from the browser, and how to change content that's already cached:
+  purging, cache tags, `stale-while-revalidate` and safe deploys. Personal data is the line
+  you never cross: anything that differs per user is `private` or `no-store`.
+remember:
+  - '`Cache-Control: max-age=N` makes a copy fresh for N seconds, and a fresh copy is reused without contacting the server.'
+  - '`no-cache` means store it but revalidate before every use, while `no-store` means never store it at all.'
+  - A stale copy is revalidated with `If-None-Match` or `If-Modified-Since`, and a `304 Not Modified` answer carries headers but no body.
+  - Hashed asset URLs get `public, max-age=31536000, immutable`, and the HTML that names them gets `no-cache`.
+  - '`private` keeps a response out of shared caches, and anything that differs per signed-in user must be `private` or `no-store`.'
+  - '`s-maxage` sets freshness for shared caches only, so a CDN can hold a page longer than browsers do and you purge it on change.'
+  - '`Vary` adds request headers to the cache key, so `Vary: Accept-Encoding` is normal and `Vary: Cookie` usually destroys the hit rate.'
+  - '`stale-while-revalidate` lets a cache serve a stale copy while it refetches in the background, trading a little staleness for no waiting.'
+sections:
+  - title: How a cache decides what to do
+    body: |-
+      For every request, a cache that holds a copy asks two questions: is the copy fresh,
+      and if not, is it still right?
+
+      **Freshness.** The freshness lifetime comes from, in order: `s-maxage` (shared caches
+      only), `max-age`, then the older `Expires` date. The copy's age is how long ago it
+      left the origin; a shared cache passes that on in the `Age` header. If the age is
+      below the lifetime, the copy is served with no network at all. With no explicit
+      lifetime, caches may guess one, typically 10% of the time since `Last-Modified`. That
+      **heuristic freshness** surprises people who sent no `Cache-Control` and still see old
+      responses, so always send one.
+
+      **Validation.** A stale copy is checked with a conditional request. With an `ETag`
+      the cache sends `If-None-Match`; with only `Last-Modified` it sends
+      `If-Modified-Since`, which has one-second resolution. If both are sent, the server
+      uses `If-None-Match`. A match returns `304` with the current headers and no body, and
+      the copy becomes fresh again. A mismatch returns a normal `200`.
+
+      Here's a server that makes the ETag a hash of the body, and a client that
+      revalidates. Node's `fetch` has no HTTP cache, so the client sends `If-None-Match`
+      by hand, the way a browser would:
+
+      ```js
+      import { createServer } from "node:http";
+      import { createHash } from "node:crypto";
+
+      let catalogue = JSON.stringify([{ isbn: "978-0", title: "Night trains" }]);
+      const etagOf = (body) => `"${createHash("sha256").update(body).digest("base64url").slice(0, 16)}"`;
+
+      const server = createServer((req, res) => {
+        const etag = etagOf(catalogue);
+        res.setHeader("Cache-Control", "no-cache");
+        res.setHeader("ETag", etag);
+        if (req.headers["if-none-match"] === etag) {
+          res.statusCode = 304; // no body: the client's copy is still right
+          return res.end();
+        }
+        res.setHeader("Content-Type", "application/json");
+        res.end(catalogue);
+      });
+
+      server.listen(0, async () => {
+        const url = `http://localhost:${server.address().port}/books`;
+        const first = await fetch(url);
+        const tag = first.headers.get("etag");
+        console.log(first.status, (await first.text()).length); // 200 41
+
+        const again = await fetch(url, { headers: { "If-None-Match": tag } });
+        console.log(again.status, (await again.text()).length); // 304 0
+
+        catalogue = JSON.stringify([{ isbn: "978-1", title: "Late light" }]);
+        const changed = await fetch(url, { headers: { "If-None-Match": tag } });
+        console.log(changed.status, changed.headers.get("etag") !== tag); // 200 true
+        server.close();
+      });
+      ```
+
+      A production server also handles `If-None-Match` lists and weak tags (`W/"..."`),
+      which frameworks do for you. A weak ETag means "equivalent", not byte-identical, and
+      is what servers often send for compressed responses. Note that the server still built
+      the whole body to hash it: a `304` saves bandwidth and download time, not server work.
+      To save the work too, derive the ETag from something cheap, such as a row's version
+      column.
+  - title: The directives, and a policy per kind of response
+    body: |-
+      These are the `Cache-Control` response directives you'll use:
+
+      - `max-age=N`: fresh for N seconds in any cache.
+      - `s-maxage=N`: fresh for N seconds in shared caches, overriding `max-age` there.
+      - `no-cache`: may be stored, must be revalidated before each use.
+      - `no-store`: must not be stored anywhere.
+      - `private`: only the user's own browser may store it.
+      - `public`: shared caches may store it, even where they otherwise wouldn't, such as a
+        response to a request with an `Authorization` header.
+      - `must-revalidate`: once stale, never serve it without a successful revalidation. If
+        the origin is down, the cache returns an error instead.
+      - `immutable`: the content will never change while fresh, so don't revalidate even
+        when the user reloads.
+      - `stale-while-revalidate=N`: after going stale, may be served for N more seconds while
+        the cache refetches in the background.
+      - `stale-if-error=N`: may be served stale for N seconds if the origin returns a server
+        error or can't be reached.
+
+      A sensible policy for a typical web app, as headers:
+
+      ```text
+      # hashed JS, CSS, fonts and images: the name changes when the content does
+      Cache-Control: public, max-age=31536000, immutable
+
+      # HTML documents and unhashed URLs: always check, cheap with an ETag
+      Cache-Control: no-cache
+
+      # public API data that can be a minute old, held longer at the CDN
+      Cache-Control: public, max-age=60, s-maxage=300, stale-while-revalidate=60
+
+      # signed-in pages and per-user API responses
+      Cache-Control: private, no-cache
+
+      # secrets: bank statements, one-time tokens, anything that must not touch disk
+      Cache-Control: no-store
+      ```
+
+      `private, no-cache` still lets the browser keep the page for the back button and a
+      cheap `304`. Choose `no-store` when even the user's own disk shouldn't hold a copy.
+  - title: What changes in a shared cache
+    body: |-
+      A CDN sits between every user and your origin, so its mistakes are everybody's
+      mistakes. Four rules keep it safe.
+
+      **The cache key.** By default a shared cache keys on the method and URL, and nothing
+      about who asked. That's why a per-user response with `public` leaks. Most CDNs let you
+      configure the key, for example to ignore tracking query parameters such as
+      `utm_source` so they don't split one page into thousands of copies.
+
+      **`Vary`.** A response can name request headers that change it, and the cache then
+      stores one copy per combination of their values. `Vary: Accept-Encoding` keeps gzip
+      and Brotli copies apart and is normal. `Vary: Accept-Language` gives one copy per
+      language header, and browsers send many slightly different ones. `Vary: Cookie` gives
+      nearly one copy per visitor, so the hit rate collapses. Personalise with a separate
+      request, or cache only the logged-out version.
+
+      **Cookies and credentials.** A shared cache won't store a response to a request with
+      `Authorization` unless the response says `public`, `s-maxage` or `must-revalidate`.
+      `Set-Cookie`, however, does not stop caching by itself: a cacheable response that sets
+      a cookie can hand the same cookie to other visitors. Never set a session cookie on a
+      response marked for shared caching.
+
+      **Separate lifetimes.** `s-maxage` gives the CDN its own lifetime. There's also a
+      standard `CDN-Cache-Control` header, which CDNs that support it obey instead of
+      `Cache-Control`, while browsers ignore it. Either way, the pattern is the same: let
+      the CDN hold a page for minutes or hours, keep browsers on a short leash, and purge the
+      CDN when the content changes. You can purge a CDN, but you can't purge a browser.
+
+      To see what a CDN did, read the response headers. `Age` shows how long the copy has
+      sat in the cache, and most CDNs add a header that says hit or miss, such as
+      `x-cache` or `cf-cache-status`, depending on the vendor.
+  - title: Changing content that is already cached
+    body: |-
+      Every cached copy is a promise you made in the past. There are four ways to change
+      one.
+
+      **Change the URL.** Hashed filenames make every deploy a new set of URLs, so nothing
+      old is ever served by mistake. It's the only method that also reaches browsers.
+
+      **Purge.** CDNs offer an API to remove a URL, a prefix or everything. Purging a list
+      of URLs after each change works, but one is often missed: the product page, the
+      category page, the search results and the sitemap may all show the same price. **Cache
+      tags**, also called surrogate keys, fix that. The origin labels each response with the
+      things it contains, and one purge by tag clears every page that shows them:
+
+      ```http
+      HTTP/1.1 200 OK
+      Cache-Control: public, max-age=0, s-maxage=3600
+      Surrogate-Key: product-812 category-mugs
+      ```
+
+      The header name depends on the CDN: `Surrogate-Key` on Fastly, `Cache-Tag` on
+      Cloudflare, for example. When product 812 changes, you purge the tag `product-812`.
+
+      **Serve stale on purpose.** `stale-while-revalidate` removes the wait when a copy
+      expires: the first visitor after expiry gets the old copy at once, and the cache
+      refetches in the background. `stale-if-error` keeps pages up when the origin fails.
+      Browser support for both varies, while many CDNs honour them, so check your CDN's
+      documentation.
+
+      **Deploy in the right order.** Upload the new hashed assets first, then switch the
+      HTML. And keep the previous deploy's assets online for a while. A visitor with the
+      old HTML still open will lazy-load the old chunk names, and if you've deleted them,
+      that click fails with a `404`.
+pitfalls:
+  - '**Marking a signed-in page `public`.** A shared cache keys on the URL, so everyone gets the first visitor''s page. Use `private, no-cache` or `no-store` for anything personal.'
+  - '**Confusing `no-cache` with `no-store`.** `no-cache` stores and revalidates, `no-store` never stores. Use `no-cache` for HTML you want fresh, and `no-store` only for data that mustn''t be kept.'
+  - '**Long `max-age` on a URL that changes.** A browser keeps a year-long `/app.js` for a year, and you can''t purge it. Long lifetimes belong only on hashed filenames.'
+  - '**Sending no `Cache-Control` at all.** Caches may then use heuristic freshness and reuse responses you expected to be fetched again. Send an explicit policy on every response.'
+  - '**Setting a cookie on a publicly cached response.** `Set-Cookie` doesn''t prevent caching, so one visitor''s cookie can be served to others. Keep cookies off cacheable responses.'
+  - '**`Vary: Cookie` or `Vary: User-Agent` on a CDN.** The cache stores nearly one copy per visitor or browser version, so it almost never hits. Personalise separately and vary only on headers with few values.'
+  - '**Deleting old assets on deploy.** Open tabs still reference the previous hashed chunks and break when they load one. Keep at least the previous deploy''s files.'
+interview:
+  - question: Design the caching headers for a single-page app and its API.
+    answer: >-
+      Hashed assets get `public, max-age=31536000, immutable`, and `index.html` gets
+      `no-cache`. The build puts a content hash in every JS, CSS and font filename, so a new
+      version always has a new URL and an old copy is never wrong, which makes a year safe.
+      The HTML keeps its URL and points at the current hashes, so it's revalidated on every
+      load, which costs a `304` when nothing changed. For the API, public read-mostly data
+      such as a product catalogue gets a short `max-age`, a longer `s-maxage` with
+      `stale-while-revalidate` at the CDN, and a purge on change. Anything per user gets
+      `private, no-cache`. The trade-off is freshness against load: longer shared lifetimes
+      cut origin traffic but make purging part of every write.
+  - question: What's the difference between `no-cache`, `no-store` and `max-age=0`?
+    answer: >-
+      `no-store` forbids storing the response at all. `no-cache` allows storing it but
+      requires revalidation with the origin before every reuse. `max-age=0` makes the copy
+      stale immediately, and a stale copy is normally revalidated, but caches are allowed to
+      serve stale copies in some situations, such as when disconnected, unless
+      `must-revalidate` forbids it. So `no-cache` is the clear way to say "always check".
+      For HTML I use `no-cache` with an ETag: the check is cheap and the browser still has
+      a copy for the back button. I reserve `no-store` for sensitive data, because it gives
+      up the cheap `304` and every visit downloads the full body.
+  - question: How do you get a CDN to cache pages that change, without serving old content after an update?
+    answer: >-
+      Give the CDN a long shared lifetime with `s-maxage`, keep browsers short, and purge the
+      CDN on every change. Browsers get `max-age=0` or a few seconds, because I can't purge
+      them. The CDN gets an hour or a day, so almost every request is a hit. When content
+      changes, the write path calls the CDN's purge API. Purging by URL misses pages that
+      embed the same data, so I tag responses with cache tags such as `product-812` and
+      purge by tag. `stale-while-revalidate` removes the wait at expiry, and
+      `stale-if-error` keeps pages up if the origin fails. The trade-off is operational: a
+      failed purge means stale pages until expiry, so purges need retries and monitoring.
+  - question: Compare `ETag` and `Last-Modified` for validation.
+    answer: >-
+      Both let a cache revalidate a stale copy and get a bodyless `304`, but `ETag` is more
+      precise. `Last-Modified` is a date with one-second resolution, so two changes in one
+      second look like one, and a file restored from a backup with an older date can look
+      unchanged. An `ETag` is an opaque version label, often a content hash or a row version,
+      and the client sends it back in `If-None-Match`, which takes precedence when both are
+      present. Strong ETags promise byte-identical content, and weak ones, prefixed `W/`,
+      promise equivalence. One caveat: hashing the body means the server still does all the
+      work to build it, so for expensive responses I derive the ETag from a cheap version
+      number instead.

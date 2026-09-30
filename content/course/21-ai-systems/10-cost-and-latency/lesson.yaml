@@ -1,0 +1,299 @@
+id: aisys.cost-and-latency
+title: Cost, latency and fallbacks
+objective: Budget tokens and milliseconds per feature, keep the cached prefix stable, route by measured quality, and fall back safely when a provider fails.
+level: advanced
+minutes: 10
+concepts: [aisys.token-budgets, aisys.latency-budgets, aisys.model-routing, aisys.fallbacks]
+prerequisites: [ai.production, ai.failures, aisys.llmops]
+opening:
+  text: >-
+    You'll give every model feature a budget in tokens and milliseconds, and a plan for when
+    the provider fails. It's how a demo that costs pennies survives a million requests.
+
+steps:
+  - type: prose
+    id: token-budgets
+    body: >-
+      Chapter 20 priced one call. In production, each feature gets a **token budget**: per
+      request, and per user per day. Enforce it with `max_tokens`, trimmed history and a
+      per-user counter.
+
+
+      Count cost per finished task, not per call. A cheap call that needs two retries isn't
+      cheap. And work nobody waits for, like a nightly report, goes through a batch API at
+      half the price.
+
+  - type: multiple-choice
+    id: pick-batches
+    concept: aisys.token-budgets
+    difficulty: 1
+    question: Every night you summarise 40,000 tickets for a morning report. What cuts the cost most?
+    choices:
+      - text: Sending them through the batch API
+        correct: true
+        feedback: >-
+          Yes. Nobody waits overnight, and batches cost half as much.
+      - text: Streaming each summary
+        feedback: >-
+          Streaming helps someone watching. At night nobody is, and it costs the same.
+      - text: Raising `max_tokens`
+        feedback: >-
+          That allows longer summaries, which cost more, not less.
+
+  - type: ai-review
+    id: review-personal-prefix
+    concept: aisys.token-budgets
+    difficulty: 3
+    language: python
+    request: Add prompt caching to the support bot, which sends a long policy manual on every call.
+    flawClass: performance
+    code: |
+      reply = client.messages.create(
+          model="claude-opus-5", max_tokens=1024,
+          system=[
+              {"type": "text", "text": f"Customer: {customer.name}, plan {customer.plan}."},
+              {"type": "text", "text": POLICY_MANUAL, "cache_control": {"type": "ephemeral"}},
+          ],
+          messages=[{"role": "user", "content": question}],
+      )
+    prompt: >-
+      An assistant wrote this. Answers are correct, but a month later the bill hasn't
+      dropped. Remember, the cache matches from the very start of the prompt. Tap the line
+      at fault.
+    lines: [4]
+    reasons:
+      - text: The per-customer line sits before the manual
+        correct: true
+        feedback: >-
+          Yes. Each customer starts a new prefix, so the manual only caches per customer.
+      - text: '`cache_control` belongs on the first block'
+        feedback: >-
+          Marking the first block caches only the customer line. The manual still misses.
+      - text: The manual is too long to cache
+        feedback: >-
+          Long, stable text is exactly what caching is for. The order is the problem.
+    fix: |
+      system=[
+          {"type": "text", "text": POLICY_MANUAL, "cache_control": {"type": "ephemeral"}},
+          {"type": "text", "text": f"Customer: {customer.name}, plan {customer.plan}."},
+      ],
+
+  - type: prose
+    id: latency-budgets
+    body: |-
+      Latency has two numbers: **time to first token**, and total time. With streaming from
+      chapter 20, words appear early, so users feel the first number most.
+
+      So split a first-token budget across every step before generation: retrieval,
+      reranking, classifying, the model starting up. Run independent steps in parallel, and
+      cut the biggest wait first.
+
+  - type: multiple-choice
+    id: pick-latency-step
+    concept: aisys.latency-budgets
+    difficulty: 2
+    language: yaml
+    code: |
+      # budget for the first streamed word: 1,500 ms
+      retrieval:          400 ms
+      rerank:             900 ms
+      classify:            60 ms
+      model first token:  700 ms
+      generation:       3,000 ms   # streamed
+    question: The first word appears after 2,060 ms. Which step would you work on first?
+    choices:
+      - text: The rerank step
+        correct: true
+        feedback: >-
+          Yes. It's the biggest wait before the first word. Rerank fewer candidates.
+      - text: Generation
+        feedback: >-
+          It's the longest step, but it's streamed. Users already see words while it runs.
+      - text: The classifier
+        feedback: >-
+          At 60 ms it's already cheap. Removing it saves almost nothing.
+      - text: Retrieval
+        feedback: >-
+          Worth a look later, but rerank costs more than twice as much.
+
+  - type: prose
+    id: model-routing
+    body: |-
+      **Model routing** sends simple requests to a small, fast model and hard ones to a large
+      one. Rules or a classifier from lesson 3 decide. A model only takes the requests your
+      evals show it passes.
+
+      Try the simpler lever first: the large model at a lower effort setting. It keeps one
+      prompt cache, since caches belong to one model, and needs no classifier.
+
+  - type: prose
+    id: fallbacks
+    body: |-
+      Providers fail: rate limits (`429`), overload (`529`), timeouts. The SDK retries a
+      few times, as in chapter 20. After that, your system needs a **fallback**: another
+      model, a smaller answer, or "we'll email you".
+
+      A **circuit breaker** stops calling a dependency that keeps failing. After a few
+      failures in a row it opens, and calls fail fast. After a cool-down, one trial call
+      goes through.
+
+  - type: bug-hunt
+    id: hunt-fallback-hides-bugs
+    concept: aisys.fallbacks
+    difficulty: 3
+    language: python
+    code: |
+      MODELS = ["claude-opus-5", "claude-sonnet-5"]
+
+      def reply(messages):
+          for model in MODELS:
+              try:
+                  return client.messages.create(model=model, max_tokens=1024, messages=messages)
+              except anthropic.APIStatusError:
+                  continue   # try the next model
+          return SORRY_MESSAGE
+    prompt: >-
+      A deploy broke the message format, and every request got a `400`. For a week users saw
+      the sorry message, and no alert fired. Tap the line to fix.
+    lines: [7]
+    reasons:
+      - text: It falls back on errors no other model can fix
+        correct: true
+        feedback: >-
+          Right. A `400` is our bug. It should raise, and page someone.
+      - text: The smaller model should be tried first
+        feedback: >-
+          Order sets quality and cost. It wouldn't make a broken request work.
+      - text: '`continue` skips the second model'
+        feedback: >-
+          `continue` moves on to the next model, which is what a fallback wants.
+    fix: |
+      def reply(messages):
+          for model in MODELS:
+              try:
+                  return client.messages.create(model=model, max_tokens=1024, messages=messages)
+              except (anthropic.RateLimitError, anthropic.InternalServerError,
+                      anthropic.APITimeoutError):
+                  continue   # busy, down or slow: another model may answer
+          return SORRY_MESSAGE   # a 400 or 401 raises above, so it gets fixed
+
+  - type: code-challenge
+    id: write-circuit-breaker
+    concept: aisys.fallbacks
+    difficulty: 4
+    language: python
+    starter: breaker.starter.py
+    solution: breaker.solution.py
+    tests: breaker.tests.py
+    prompt: >-
+      Write `CircuitBreaker(threshold, cooldown)` with `allow(now)` and `record(ok, now)`.
+      `now` is the time in seconds.
+
+
+      After `threshold` failures in a row, it opens and `allow` returns `False`. Once
+      `cooldown` seconds have passed since it opened, `allow` returns `True` for a trial. A
+      success closes it and resets the count. A failure while open reopens it from `now`.
+    hints:
+      - Two pieces of state are enough, a failure count and the time it opened, or `None`.
+      - When it's open, `allow` only compares `now - opened_at` with the cool-down.
+      - In `record`, a success clears both. A failure counts, then opens it if it's at the threshold or already open.
+
+  - type: explain-back
+    id: explain-routing-trap
+    concept: aisys.model-routing
+    difficulty: 3
+    prompt: >-
+      A team routes simple requests to a small model to save money. Why might the total bill
+      go up, and how would you check?
+    rubric:
+      - If the small model fails more often, retries and escalations add calls, so cost per finished task can rise.
+      - Caches belong to one model, so splitting traffic loses cache reuse.
+      - Compare cost per completed task and eval scores per slice, before and after, on real traffic.
+    modelAnswer: >-
+      A small model is cheaper per call, not per finished task. If it fails more, users
+      retry and some requests escalate to the big model anyway. Caches are per model too,
+      so splitting traffic means fewer cache hits. I'd measure cost per completed task and
+      eval scores per slice, with and without routing.
+
+recap:
+  - Budget tokens per feature, count cost per finished task, and batch what can wait.
+  - Keep the cached prefix stable, and split a first-token budget across steps.
+  - Route by measured quality, and fall back only on errors another model can fix.
+recall:
+  - id: card-cost-per-task
+    concept: aisys.token-budgets
+    front: Why count model cost per finished task rather than per call?
+    back: >-
+      Retries and escalations add calls. A cheap call that fails twice costs more than one
+      good call.
+  - id: card-cache-order
+    concept: aisys.token-budgets
+    front: In what order should a cached prompt put stable and changing content?
+    back: >-
+      Stable first, changing last. Tools, then system, then messages, with per-request text
+      after the cache breakpoint.
+  - id: card-first-token
+    concept: aisys.latency-budgets
+    front: Which steps count against the time to the first token?
+    back: >-
+      Everything before generation starts: retrieval, reranking, classifying and the model's
+      first token.
+  - id: card-routing-fit
+    concept: aisys.model-routing
+    front: How does a model router choose between models?
+    back: >-
+      Keep the models that pass evals at that difficulty and meet the latency budget. Then
+      pick the cheapest.
+  - id: card-circuit-breaker
+    concept: aisys.fallbacks
+    front: What does a circuit breaker do when a dependency keeps failing?
+    back: >-
+      It opens after a few failures in a row, so calls fail fast. After a cool-down it lets
+      one trial through, and a success closes it.
+
+references:
+  - kind: docs
+    title: Prompt caching
+    authors: Anthropic
+    venue: Claude Platform Docs
+    url: https://platform.claude.com/docs/en/build-with-claude/prompt-caching
+    note: Prefix order, cache lifetimes, minimum lengths and the usage fields.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Batch processing
+    authors: Anthropic
+    venue: Claude Platform Docs
+    url: https://platform.claude.com/docs/en/build-with-claude/batch-processing
+    note: Asynchronous requests at half price, finished within 24 hours.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Streaming messages
+    authors: Anthropic
+    venue: Claude Platform Docs
+    url: https://platform.claude.com/docs/en/build-with-claude/streaming
+    note: The server-sent events that deliver text as it is generated.
+    verified: true
+
+deepDive: >-
+  No model was called. The breaker and the fallback ran in Python 3.12 against fake
+  clients. Prices and cache rules were checked against Anthropic's documentation in
+  September 2026.
+
+
+  **Cache economics.** The default cache entry lives five minutes, refreshed on each hit.
+  Writing it costs about 1.25 times normal input, and each read about a tenth. A one-hour
+  entry costs twice normal input to write, so it needs more reads to pay off. Prefixes
+  below a minimum length, which depends on the model, aren't cached at all.
+
+
+  **Batches stack with caching.** Every token in a batch is billed at half the normal
+  rate. Most batches finish within an hour. The 24-hour limit is an expiry, not a
+  promise, so keep anything a user waits for synchronous.
+
+
+  **Fallback costs.** A fallback model has its own cache, so the first calls after a
+  switch pay full price. It may also answer differently, so run your eval set on it before
+  you rely on it. Give each dependency its own breaker: the model, the vector store, the
+  reranker.

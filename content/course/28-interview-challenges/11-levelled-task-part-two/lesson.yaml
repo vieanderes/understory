@@ -1,0 +1,283 @@
+id: interview.levelled-two
+title: Levelled task, part two
+objective: Add expiry by timestamp and backup and restore to the store, keeping the earlier levels green.
+level: advanced
+minutes: 10
+concepts: [interview.time-aware-state, interview.backward-compatible-change]
+prerequisites: [interview.levelled-one]
+opening:
+  text: >-
+    You'll add expiring values and backups to the store from part one. You'll do it
+    without breaking a single level 1 or 2 test, which is what level 4 is really testing.
+
+steps:
+  - type: prose
+    id: pass-time-in
+    body: |-
+      What you need: part one's store, a `Map` of records holding `{ value }` entries. Level
+      3 gives every operation a `timestamp`, and `set` can take a **ttl**, time to live: how
+      many ticks a value lasts.
+
+      Notice the store never reads a clock. The caller says what time it is. That makes
+      expiry exact, and a test can jump to any moment with one number.
+
+  - type: predict-output
+    id: predict-expiry-boundary
+    concept: interview.time-aware-state
+    difficulty: 1
+    language: js
+    code: |
+      const entry = { value: 'blue', expiresAt: 10 + 5 };
+      const isLive = (t) => t < entry.expiresAt;
+      console.log(isLive(14), isLive(15));
+    question: What does this log?
+    choices:
+      - text: '`true false`'
+        correct: true
+        feedback: >-
+          Yes. At 15 the value has reached its expiry, so it's gone.
+      - text: '`true true`'
+        feedback: >-
+          That would need `<=`. With `<`, the moment of expiry already counts as expired.
+      - text: '`false false`'
+        feedback: >-
+          14 is still before 15, so the value is live at 14.
+
+  - type: multiple-choice
+    id: pick-what-to-store
+    concept: interview.time-aware-state
+    difficulty: 2
+    question: A field is set with a ttl. What should its entry store?
+    choices:
+      - text: 'The expiry time: `timestamp + ttl`'
+        correct: true
+        feedback: >-
+          Right. Every read is then one comparison with the time passed in.
+      - text: The ttl on its own
+        feedback: >-
+          Tempting, but a ttl means nothing without its start. You'd lose when the countdown began.
+      - text: 'A timer that deletes it later'
+        feedback: >-
+          Timers make tests wait or need fake clocks. Comparing times at read needs neither.
+
+  - type: parsons
+    id: order-level-three-upgrade
+    concept: interview.backward-compatible-change
+    difficulty: 3
+    prompt: >-
+      Your level 2 store passes. Put the level 3 upgrade in an order that keeps it green at
+      every step.
+    language: text
+    blocks:
+      - id: add-timestamp
+        code: Add a timestamp to every method, and ignore it for now
+        subgoal: Change the shape
+      - id: run-old
+        code: Run the level 1 and 2 tests, adapted with timestamps
+      - id: store-expiry
+        code: Store expiresAt in each entry, Infinity when there's no ttl
+        subgoal: Add the behaviour
+      - id: one-check
+        code: Check expiry in one helper that every read uses
+      - id: run-all
+        code: Run every test, old and new
+    distractors:
+      - id: rewrite
+        code: Start a new class with timestamps built in
+        feedback: >-
+          A rewrite throws away tested code with the clock running. Extend what passes.
+      - id: clock
+        code: Read the current time inside get
+        feedback: >-
+          Then tests can't choose the time. The statement passes it in for exactly that reason.
+
+  - type: ai-review
+    id: review-expiry-off-by-one
+    concept: interview.time-aware-state
+    difficulty: 3
+    language: js
+    request: Add ttl support to the store's set and get.
+    flawClass: edge-case
+    code: |
+      class Database {
+        records = new Map();
+        set(timestamp, key, field, value, ttl) {
+          const expiresAt = ttl === undefined ? Infinity : timestamp + ttl;
+          if (!this.records.has(key)) this.records.set(key, new Map());
+          this.records.get(key).set(field, { value, expiresAt });
+        }
+        get(timestamp, key, field) {
+          const entry = this.records.get(key)?.get(field);
+          return entry && timestamp <= entry.expiresAt ? entry.value : null;
+        }
+      }
+    prompt: >-
+      An assistant wrote this. Its test set a ttl of 5 at 10, then read at 12 and 20. Both
+      passed. A hidden test reads at 15 and fails. Tap the line at fault.
+    lines: [10]
+    reasons:
+      - text: It treats the expiry moment as still live
+        correct: true
+        feedback: >-
+          Yes. The statement says gone at 15, so the check must be `<`.
+      - text: '`Infinity` breaks the comparison'
+        feedback: >-
+          Any number is below `Infinity`, so a field with no ttl stays live. That part works.
+      - text: Expiry should be checked in set instead
+        feedback: >-
+          Set doesn't know when the value will be read. Only a read can compare the two times.
+    fix: |
+      return entry && timestamp < entry.expiresAt ? entry.value : null;
+
+  - type: prose
+    id: backup-and-restore
+    body: |-
+      Level 4 adds `backup(timestamp)` and `restore(timestamp, backupTimestamp)`. A backup
+      saves the live fields with the ttl each one has **left**.
+
+      On restore, each field gets a fresh expiry: the restore time plus what was left.
+      Storing the old expiry time would bring fields back already expired.
+
+  - type: ai-review
+    id: review-backup-expiry
+    concept: interview.time-aware-state
+    difficulty: 3
+    language: js
+    request: Add backup(timestamp), saving every live field for a later restore.
+    flawClass: edge-case
+    code: |
+      backup(timestamp) {
+        const copy = new Map();
+        for (const [key, fields] of this.records) {
+          const live = new Map();
+          for (const [field, entry] of fields) {
+            if (timestamp < entry.expiresAt) live.set(field, { ...entry });
+          }
+          if (live.size > 0) copy.set(key, live);
+        }
+        this.backups.push({ at: timestamp, data: copy });
+        return copy.size;
+      }
+    prompt: >-
+      An assistant wrote this. Restoring straight after a backup works. A hidden test
+      restores much later, and fields with a ttl come back already gone. Tap the line.
+    lines: [6]
+    reasons:
+      - text: It saves the old expiry time, not the time left
+        correct: true
+        feedback: >-
+          Yes. Save `expiresAt - timestamp`, and add it to the restore time later.
+      - text: The backup should keep expired fields too
+        feedback: >-
+          The statement saves live fields only. Expired ones are rightly left out.
+      - text: '`{ ...entry }` shares the entry with the store'
+        feedback: >-
+          Spread makes a new object, so later edits don't leak in. The saved time is wrong.
+    fix: |
+      if (timestamp < entry.expiresAt) {
+        live.set(field, { value: entry.value, left: entry.expiresAt - timestamp });
+      }
+
+  - type: code-challenge
+    id: write-levels-three-and-four
+    concept: interview.backward-compatible-change
+    difficulty: 4
+    language: ts
+    prompt: >-
+      The starter is a working level 2 store with a `timestamp` added to every method.
+      Its level 1 and 2 test already passes. Keep it green.
+
+
+      Level 3: `set(timestamp, key, field, value, ttl?)`. With a ttl, the field is live
+      while the time is below `timestamp + ttl`, and gone from that moment. Without one it
+      never expires. Get, delete and scans ignore expired fields.
+
+
+      Level 4: `backup(timestamp)` saves every live field with its remaining ttl, and
+      returns how many records have a live field. `restore(timestamp, backupTimestamp)`
+      replaces the data with the latest backup made at or before `backupTimestamp`. Each
+      restored field expires at `timestamp` plus its remaining ttl.
+
+
+      Timestamps only increase. A test stores 100,000 fields, so keep every operation quick.
+    hints:
+      - Look at what each entry stores. Level 3 needs one more fact per field.
+      - 'Store `expiresAt`, with `Infinity` for no ttl. A live check is then `timestamp < expiresAt`.'
+      - 'Write one helper that returns a record''s live fields at a time, then use it in scans and backup.'
+
+  - type: explain-back
+    id: explain-keep-green
+    concept: interview.backward-compatible-change
+    difficulty: 4
+    prompt: >-
+      You changed every method's signature for level 3. Why run the level 1 and 2 tests
+      before adding any expiry logic?
+    rubric:
+      - The signature change alone shouldn't change behaviour, and the old tests prove that.
+      - A failure then points at one small change instead of a pile of them.
+      - Earlier levels still count towards the score, so breaking them loses points you'd banked.
+    modelAnswer: >-
+      Threading the timestamp through is a shape change with no new behaviour. If the old
+      tests pass straight after it, I know the plumbing is right. When I then add expiry and
+      something fails, the cause is in the few lines I wrote last. And the earlier levels
+      still score, so I never trade banked points for new ones.
+
+recap:
+  - Pass time into every call and store an expiry time per value.
+  - Treat the expiry moment as gone, and check it in one place.
+  - Grow a design level by level with the old tests kept green.
+recall:
+  - id: card-store-expiry
+    concept: interview.time-aware-state
+    front: What should a field with a ttl store, and why?
+    back: >-
+      Its expiry time, `timestamp + ttl`. A read is then one comparison with the time passed
+      in.
+  - id: card-no-clock
+    concept: interview.time-aware-state
+    front: Why does the store take a timestamp instead of reading the clock?
+    back: >-
+      Tests can then choose any moment, so expiry is exact and checkable without waiting or
+      faking time.
+  - id: card-restore-expiry
+    concept: interview.time-aware-state
+    front: How is a field's expiry worked out on restore?
+    back: >-
+      The restore time plus the ttl it had left at backup. The old expiry time would bring
+      it back already expired.
+  - id: card-keep-green
+    concept: interview.backward-compatible-change
+    front: How do you change a method's signature without breaking earlier levels?
+    back: >-
+      Change the shape first with no new behaviour, run the old tests, then add behaviour
+      in small tested steps.
+
+references:
+  - kind: book
+    title: 'Refactoring: Improving the Design of Existing Code'
+    authors: Martin Fowler
+    year: 2018
+    venue: Addison-Wesley, 2nd edition
+    url: https://martinfowler.com/books/refactoring.html
+    note: Changing structure in small steps with the tests green after each one.
+    verified: true
+
+deepDive: >-
+  Candidates report this database task on levelled-task assessments, with
+  level 3 as timestamped operations and ttl, and level 4 as backup and restore. The exact
+  method names vary. Some versions keep the level 1 methods and add `set_at` style
+  variants, so the old calls must keep working alongside the new ones.
+
+
+  Read the boundary rule twice. "Expires at timestamp plus ttl" nearly always means gone at
+  that moment, so the live check is a strict `<`. Hidden tests probe the exact tick.
+
+
+  Why not delete expired fields eagerly? You'd need a timer or a sweep on every call.
+  Checking at read time is lazy expiry, the same idea many caches use. Expired entries
+  linger in memory until something removes them. For an interview that trade is fine, and
+  it's worth saying aloud.
+
+
+  Passing the time in is the same move as injecting a clock in production code. It keeps
+  the logic pure, which is why the tests can jump straight to tick 15.

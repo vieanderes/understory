@@ -1,0 +1,302 @@
+summary: >-
+  A model call has a price and a wait, and both are set by tokens. You pay per input token
+  and, at several times the rate, per output token. The wait is mostly output too, because a
+  model writes one token after another while it reads the prompt in one fast pass. A feature
+  that works in a demo can still be too slow for users or too expensive at real traffic, and
+  the usage numbers on every reply tell you which.
+
+
+  The levers follow from that. Shorter replies cut both cost and time. Streaming doesn't
+  change either total, but it moves the user's wait from the whole reply to the first words.
+  Prompt caching makes a long, repeated prompt start cheap and quick to read, as long as it
+  is byte-for-byte the same each time. A smaller model is cheaper and faster, and your eval
+  set tells you where it's good enough. Work nobody waits for can go to a batch API at a
+  lower price.
+
+
+  Reach for these once a feature has real traffic or a budget, and always measure first:
+  log usage per call and per feature, find the few features that dominate, and prove each
+  change with the logs and the eval set. Don't trade quality for cost blindly; a cheaper
+  answer that's wrong costs more in support tickets than it saves.
+remember:
+  - Cost is input tokens times the input price plus output tokens times the higher output price, and every reply's `usage` gives you the counts.
+  - Wall-clock time is roughly time to first token plus output tokens divided by the model's writing speed, so shorter replies are the biggest lever on latency.
+  - Streaming cuts the wait for the first words to about a second but leaves the total time and the cost the same, and only helps if each piece reaches the screen as it arrives.
+  - Prompt caching matches an exact prefix, so stable content goes first and anything that changes, like the time or the user's data, goes after it.
+  - Check caching works by reading `cache_read_input_tokens` on the second call, where zero means something early in the prompt changed.
+  - A chat resends its whole history on every turn, so input tokens grow roughly with the square of the conversation length unless you trim or summarise.
+  - Route simple requests to a smaller model only where the eval set shows each slice still passes.
+  - Log usage per call with the feature name, so you can find what eats the budget and prove a fix saved money.
+sections:
+  - title: Where the time goes
+    body: |-
+      A reply has two phases. First the model reads the whole prompt, largely in parallel,
+      and produces the first token: that's the **time to first token**. Then it writes the
+      rest one token at a time at a roughly steady rate. A useful rough model:
+
+      ```python
+      def reply_seconds(output_tokens, first_token_s=0.8, tokens_per_s=60):
+          """A rough model of wall-clock time; measure your own numbers."""
+          return first_token_s + output_tokens / tokens_per_s
+
+
+      for tokens in (100, 400, 1200):
+          print(tokens, round(reply_seconds(tokens), 1))
+      # 100 2.5
+      # 400 7.5
+      # 1200 20.8
+      ```
+
+      The two constants here are illustrative. They differ by model, provider, load and
+      prompt length, so measure time to first token and tokens per second from your own logs.
+      The shape holds, though: past a few hundred tokens, the output dominates.
+
+      That explains which fixes work. Asking for three bullet points instead of an essay
+      cuts the total. A smaller model usually writes faster and reaches its first token
+      sooner. Streaming shows the first words after the first phase, so a 20-second reply
+      starts being read after about a second. A very long prompt does raise time to first
+      token, which is where caching a long prefix helps latency as well as cost. Raising
+      `max_tokens` never speeds anything up; it only allows a longer reply.
+
+      For latency targets, track percentiles, not the mean. A p95 of 20 seconds means one
+      user in twenty waits that long, whatever the average says. Report time to first token
+      and total time separately, because streaming improves one and not the other.
+  - title: The economics of prompt caching
+    body: |-
+      With the lesson's multipliers, writing a prefix to the cache costs 1.25 times the
+      normal input price, and each later read costs 0.1 times. Work it out for a
+      40,000-token handbook at an illustrative $5 per million input tokens:
+
+      ```python
+      PRICE = {"input": 5.00, "output": 25.00}   # illustrative dollars per million tokens
+      CACHE_READ, CACHE_WRITE = 0.1, 1.25
+
+
+      def prefix_cost(prefix_tokens, calls, cached):
+          per_token = PRICE["input"] / 1_000_000
+          if not cached:
+              return calls * prefix_tokens * per_token
+          # The first call writes the cache, the rest read it (within its lifetime).
+          return prefix_tokens * per_token * (CACHE_WRITE + (calls - 1) * CACHE_READ)
+
+
+      for calls in (1, 2, 10, 1000):
+          plain = prefix_cost(40_000, calls, cached=False)
+          cached = prefix_cost(40_000, calls, cached=True)
+          print(f"{calls:5} calls  plain ${plain:8.2f}  cached ${cached:7.2f}")
+      #     1 calls  plain $    0.20  cached $   0.25
+      #     2 calls  plain $    0.40  cached $   0.27
+      #    10 calls  plain $    2.00  cached $   0.43
+      #  1000 calls  plain $  200.00  cached $  20.23
+      ```
+
+      One call costs a little more, and the second already pays it back. At volume, the
+      prefix costs about a tenth. The catch is the lifetime: the cache lasts a few minutes,
+      renewed on each read, so a prefix used once an hour is written again and again and
+      never read.
+
+      What breaks a prefix in real code is rarely obvious. A timestamp or request id at the
+      top of the system prompt. The user's name in the first line. Tools listed in a
+      different order on each call. A dictionary serialised with keys in a varying order.
+      Retrieved passages placed before the fixed instructions. The fix is the same each time:
+      order the prompt from most stable to least stable, and build the stable part from
+      constants. Then watch `cache_read_input_tokens` in the logs; a drop to zero after a
+      deploy means someone changed the prefix.
+  - title: What the cache holds, the KV cache
+    body: |-
+      While a model writes, each new token looks back at every earlier token through
+      attention. For that, every token has two vectors in every layer, a **key** and a
+      **value**. Once computed they don't change, so the server keeps them in GPU memory
+      instead of recomputing the whole text for each new token. That store is the **KV
+      cache**. It's what makes decoding fast, and it's also why long contexts are costly to
+      serve: the cache grows with the length of the context and with the number of requests
+      running at once.
+
+      Prompt caching carries the same idea across requests. The provider keeps the keys and
+      values of a prefix it has already processed. A later request that starts with exactly
+      the same tokens skips the prefill for that part and goes straight to the new text.
+
+      This explains the rules from the lesson. The match must be exact from the first token,
+      because a token's keys and values depend on every token before it: change one early
+      token and everything after it has to be recomputed. That's why stable content goes
+      first and anything per request goes last. It also explains why a cache hit cuts time
+      to first token as well as cost, since the skipped work is the prefill. And it explains
+      the short lifetime: the cache takes scarce accelerator memory, so providers keep it
+      only for minutes unless you pay for longer.
+  - title: Finding what eats the budget
+    body: |-
+      Most bills are dominated by one or two features, and they're rarely the ones people
+      guess. Log every call's usage with the feature that made it, then add it up.
+
+      ```python
+      from collections import defaultdict
+
+      # One row per model call, as your logging writes them.
+      calls = [
+          {"feature": "reply_draft", "input_tokens": 3_000, "output_tokens": 600},
+          {"feature": "reply_draft", "input_tokens": 3_200, "output_tokens": 700},
+          {"feature": "tagging", "input_tokens": 400, "output_tokens": 5},
+          {"feature": "summary", "input_tokens": 12_000, "output_tokens": 300},
+      ]
+      PRICE = {"input": 5.00, "output": 25.00}   # illustrative, per million tokens
+
+
+      def cost(row):
+          return (row["input_tokens"] * PRICE["input"] + row["output_tokens"] * PRICE["output"]) / 1e6
+
+
+      spend = defaultdict(float)
+      for row in calls:
+          spend[row["feature"]] += cost(row)
+      for feature, dollars in sorted(spend.items(), key=lambda kv: -kv[1]):
+          print(f"{feature:12} ${dollars:.4f}")
+      # summary      $0.0675
+      # reply_draft  $0.0635
+      # tagging      $0.0021
+      ```
+
+      One hidden cost deserves its own check: conversation history. Each chat call resends
+      the system prompt and every earlier turn, so input grows with every message.
+
+      ```python
+      def conversation_input_tokens(turns, system=2_000, per_turn=300):
+          """Each call resends the system prompt and every earlier turn."""
+          return sum(system + per_turn * turn for turn in range(1, turns + 1))
+
+
+      for turns in (1, 10, 40):
+          print(turns, conversation_input_tokens(turns))
+      # 1 2300
+      # 10 36500
+      # 40 326000
+      ```
+
+      Four times the turns cost about nine times the input here, and the gap widens as
+      conversations grow. The fixes are to cache the stable start, trim old turns, or replace
+      them with a short summary once the history passes a threshold. Agents have the same
+      shape, because each step resends the growing list of tool calls and results.
+  - title: Smaller models and routing
+    body: |-
+      Many tasks don't need the largest model. Tagging an email, extracting a date or
+      picking a category often runs as well on a smaller model at a fraction of the price
+      and with a faster reply. The only honest way to know is the eval set: run each
+      candidate, and pick the cheapest that holds the baseline.
+
+      ```python
+      # Candidate models, cheapest first. Names and prices are placeholders.
+      MODELS = [
+          {"name": "small", "price_in": 1.0},
+          {"name": "medium", "price_in": 3.0},
+          {"name": "large", "price_in": 5.0},
+      ]
+
+
+      def pick_model(eval_scores, baseline, tolerance=0.02):
+          """The cheapest model whose eval score is within tolerance of the baseline."""
+          for model in MODELS:
+              if eval_scores[model["name"]] >= baseline - tolerance:
+                  return model["name"]
+          return MODELS[-1]["name"]
+
+
+      tagging = {"small": 0.97, "medium": 0.98, "large": 0.98}
+      drafting = {"small": 0.71, "medium": 0.86, "large": 0.91}
+      print(pick_model(tagging, baseline=tagging["large"]))    # small
+      print(pick_model(drafting, baseline=drafting["large"]))  # large
+      ```
+
+      In real use, compare per slice rather than overall, for the reason the evals lesson
+      gives. Choosing a model per task like this is static routing. Dynamic routing picks a
+      model per request, for example with a cheap classifier that sends simple questions to the
+      small model; it saves more but adds a component that can itself be wrong, so it needs
+      its own eval. Three more levers: set `max_tokens` to cap runaway replies, retrieve
+      fewer and better passages instead of padding the context, and send work nobody waits
+      for to a batch API. Keep prices in configuration, because they change.
+pitfalls:
+  - '**Trimming the prompt to fix latency.** Input is read fast; output is written slowly. Ask for shorter replies, stream, or use a faster model.'
+  - '**Streaming into a buffer.** Collecting the whole stream before showing it gives the same wait as not streaming. Send each piece to the screen as it arrives.'
+  - '**Changing text at the start of a cached prompt.** A timestamp or user name in the first line means nothing after it is ever cached. Put stable content first and variable content last.'
+  - '**Assuming caching works.** Turning it on proves nothing. Check `cache_read_input_tokens` on repeat calls, and alert when it drops to zero.'
+  - '**Ignoring conversation growth.** Long chats and long agent runs resend everything each turn. Trim, summarise or cache the history.'
+  - '**Downgrading the model without an eval.** A cheaper model can fail one slice badly while looking fine overall. Run the eval set per slice before switching.'
+  - '**Hard-coding prices.** Prices change and differ by model. Read them from configuration and recompute costs from logged token counts.'
+  - '**Not logging usage.** Without per-call token counts and a feature name you can''t tell which feature costs what, or whether a fix saved anything.'
+interview:
+  - question: An AI feature costs twice its budget. How do you bring it down?
+    answer: >-
+      I'd measure first, then pull the levers that the numbers point at, and prove each with
+      the logs and the eval set. Per-call usage with a feature tag shows which feature and
+      which token type dominate. If it's output, I'd ask for shorter, structured replies and
+      set a sensible `max_tokens`. If it's a long repeated prefix, I'd make it byte-stable
+      and cache it, then watch `cache_read_input_tokens`. If it's growing history, I'd trim or
+      summarise old turns. For simple tasks I'd try a smaller model and keep it only where
+      every eval slice still passes. Anything nobody waits for goes to a batch API. The
+      trade-off to watch is quality: a cheaper wrong answer shows up later as support cost.
+  - question: Users say replies feel slow. What do you look at?
+    answer: >-
+      I'd split latency into time to first token and total time, because they have different
+      fixes. Total time is dominated by output length, since the model writes token by token,
+      so shorter replies and a faster, smaller model help most. The perceived wait is time to
+      first token, which streaming fixes, as long as the frontend renders each piece as it
+      arrives rather than buffering. A very long prompt raises time to first token, and
+      caching a stable prefix helps there. I'd track p50 and p95 of both from logs, not the
+      average, because the tail is what people complain about. What doesn't help is trimming
+      a short prompt or raising `max_tokens`.
+  - question: How does prompt caching work, and how do you make sure you benefit from it?
+    answer: >-
+      The provider stores the processed start of a prompt, and a later call whose prompt
+      begins with exactly the same content reads that part cheaply and quickly. With the
+      multipliers in this lesson, a write costs 1.25 times normal input and a read a tenth,
+      so a prefix reused even twice within the cache lifetime pays off. The match is exact,
+      so I order prompts from most stable to least: instructions and tools, then reference
+      documents, then the conversation and anything per request. I keep timestamps and user
+      data out of the prefix and serialise tools deterministically. Then I verify with
+      `cache_read_input_tokens` and alert when it drops. It doesn't help prompts used rarely,
+      because the cache expires after a few minutes without reads.
+  - question: What is the KV cache, and how does it relate to prompt caching?
+    answer: >-
+      The KV cache stores the attention keys and values of tokens already processed, so
+      the model doesn't recompute them for every new token it writes. Without it, each new
+      token would mean reprocessing the whole text, so it's what makes generation fast. The
+      cost is GPU memory, which grows with context length and with concurrent requests,
+      and that's a big part of why long contexts are expensive to serve. Prompt caching on
+      provider APIs keeps that cache for a prompt prefix between requests, so a repeat
+      prefix skips the prefill: cheaper input and a faster first token. Because each
+      token's keys and values depend on everything before it, the prefix must match
+      exactly, so I put stable content first and changing content last.
+  - question: When would you route requests to a smaller model?
+    answer: >-
+      When the eval set shows the smaller model holds quality on that task, slice by slice.
+      Narrow tasks like classification, extraction and tagging often run as well on a small
+      model at a fraction of the price and faster, while open-ended writing or multi-step
+      reasoning usually needs a larger one. The simplest version is static: pick the cheapest
+      passing model per task. A dynamic router picks per request, with a classifier or
+      rules, and escalates to the larger model when the small one is unsure or fails
+      validation. That saves more but adds a component that can misroute, so it needs its
+      own eval and monitoring. I wouldn't route where errors are expensive and volume is
+      low, since the savings are small.
+terms:
+  - term: Prompt caching
+    say: Caching the model's answer.
+    means: Reusing the processed form of a prompt prefix that is byte-for-byte identical to a
+      recent call, so it is read faster and cheaper. The reply is still generated fresh.
+  - term: KV cache
+    say: The same as prompt caching.
+    means: The attention keys and values a model keeps during one request, so each new token
+      doesn't recompute every earlier one. Prompt caching keeps it between requests.
+  - term: Time to first token
+    say: Latency.
+    means: The wait until the first words arrive. Total time is roughly that plus the output
+      tokens divided by the model's writing speed.
+  - term: Streaming
+    say: Makes the model faster.
+    means: Sending the reply in pieces as it is written. It cuts the wait for the first words
+      but leaves total time and cost the same.
+  - term: Output tokens
+    say: Tokens are tokens.
+    means: Tokens the model writes. They cost several times the input price and set most of the
+      wait, so shorter replies are the biggest lever on both.
+  - term: Model routing
+    say: Always use the cheapest model.
+    means: Sending simple requests to a smaller model, only for slices where the eval set shows
+      it still passes.

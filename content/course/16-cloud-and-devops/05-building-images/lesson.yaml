@@ -1,0 +1,311 @@
+id: cloud.building-images
+title: Building images you can trust
+objective: Order a Dockerfile for the build cache, keep node_modules and secrets out of the image, shrink it with a multi-stage build, and tag it so a deploy is exact.
+level: essential
+minutes: 10
+concepts: [cloud.layer-cache, cloud.build-context, cloud.multi-stage-builds, cloud.image-tags]
+prerequisites: [cloud.containers, security.secrets]
+opening:
+  text: >-
+    You'll write a Dockerfile that rebuilds in seconds, leaks no keys and says exactly what
+    it runs. Most Dockerfiles an assistant writes miss at least one of those.
+
+steps:
+  - type: prose
+    id: layers-and-cache
+    body: |-
+      Each Dockerfile instruction makes a **layer**, a saved snapshot of the files. On a
+      rebuild, Docker reuses a layer while its inputs are unchanged. We edited one source
+      file and built again:
+
+      ```text
+      #6 [2/6] WORKDIR /app                            CACHED
+      #7 [3/6] COPY package.json package-lock.json ./  CACHED
+      #8 [4/6] RUN npm ci                              CACHED
+      #9 [5/6] COPY . .                                DONE 0.4s
+      #10 [6/6] RUN npm run build                      DONE 2.1s
+      ```
+
+      Once one step changes, every later step runs again. So put what changes least first.
+
+  - type: parsons
+    id: arrange-cache-friendly
+    concept: cloud.layer-cache
+    difficulty: 1
+    language: bash
+    prompt: >-
+      Order the middle of a Dockerfile so that editing a source file never reinstalls the
+      packages.
+    blocks:
+      - id: copy-manifests
+        code: COPY package.json package-lock.json ./
+      - id: install
+        code: RUN npm ci
+      - id: copy-source
+        code: COPY . .
+      - id: build
+        code: RUN npm run build
+
+  - type: prose
+    id: build-context
+    body: >-
+      `docker build .` sends the whole folder to Docker. That's the **build context**, and
+      `COPY . .` copies all of it: your laptop's `node_modules`, your `.env` with its keys.
+
+
+      Anything in a layer ships with the image, to every server and registry that holds it.
+      A **`.dockerignore`** file lists what to leave out, like `.gitignore`: `node_modules`,
+      `.env`, `.git`, `dist`.
+
+  - type: bug-hunt
+    id: hunt-exec-format-error
+    concept: cloud.build-context
+    difficulty: 3
+    language: bash
+    code: |
+      # Dockerfile, built on a Mac, no .dockerignore
+      FROM node:24-slim
+      WORKDIR /app
+      COPY . .
+      RUN npm install
+      RUN npm run build
+
+      # the build fails at the last step:
+      > esbuild src/server.ts --bundle --outfile=dist/server.js
+      sh: 1: esbuild: Exec format error
+    prompt: >-
+      `esbuild` works on the Mac. Inside the image it won't even start. Tap the line that
+      caused it.
+    lines: [4]
+    reasons:
+      - text: It copies the Mac's `node_modules`, with a Mac program inside
+        correct: true
+        feedback: >-
+          Yes. `npm install` saw packages present and kept them. Add a `.dockerignore`.
+      - text: '`npm install` can''t run inside Docker'
+        feedback: >-
+          It ran and finished. It found `node_modules` already there, copied from the Mac.
+      - text: '`esbuild` doesn''t support Linux'
+        feedback: >-
+          It does. A fresh install inside the image fetches the Linux build of it.
+    fix: |
+      # .dockerignore
+      node_modules
+      .env
+      .git
+      dist
+
+  - type: ai-review
+    id: review-baked-key
+    concept: cloud.build-context
+    difficulty: 3
+    language: bash
+    request: Dockerise our summary API. It calls a language model, so it needs the key.
+    flawClass: security
+    code: |
+      FROM node:24-slim
+      WORKDIR /app
+      COPY package.json package-lock.json ./
+      RUN npm ci
+      COPY . .
+      ENV MODEL_API_KEY=sk-live-4f9a2c
+      CMD ["node", "server.js"]
+    prompt: >-
+      The image works first time, and it's pushed to the team's registry. Tap the line
+      you'd block this for.
+    lines: [6]
+    reasons:
+      - text: The key is saved inside the image
+        correct: true
+        feedback: >-
+          Right. `docker history` printed that line in full. Pass it with `-e` at run time.
+      - text: '`ENV` must come before `COPY`'
+        feedback: >-
+          The order changes caching, not safety. Anywhere in the file, the key lands in the image.
+      - text: '`npm ci` can''t read `MODEL_API_KEY`'
+        feedback: >-
+          The install doesn't need the key. The problem is where the key now lives.
+    fix: |
+      COPY . .
+      CMD ["node", "server.js"]
+      # at run time: docker run -e MODEL_API_KEY="$MODEL_API_KEY" summary-api
+
+  - type: prose
+    id: multi-stage
+    body: >-
+      The image still holds the build tools and the source, which the running app never
+      needs. A **multi-stage build** fixes that. One stage installs and builds. A second,
+      clean stage copies in only the output.
+
+
+      `FROM ... AS build` names the first stage. `COPY --from=build` copies from it. Ours
+      dropped from 374 MB to 348 MB, the size of Node itself.
+
+  - type: fill-blank
+    id: fill-multi-stage-build
+    concept: cloud.multi-stage-builds
+    difficulty: 3
+    language: bash
+    prompt: >-
+      Finish the second stage. It needs only the built `dist` folder, and it runs as the
+      `node` user instead of `root`.
+    template: |
+      FROM node:24-slim AS {{1}}
+      WORKDIR /app
+      COPY package.json package-lock.json ./
+      RUN npm ci
+      COPY . .
+      RUN npm run build
+
+      FROM node:24-slim
+      WORKDIR /app
+      COPY --from={{1}} /app/{{2}} ./dist
+      USER {{3}}
+      CMD ["node", "dist/server.js"]
+    blanks:
+      - key: '1'
+        answer: build
+      - key: '2'
+        answer: dist
+      - key: '3'
+        answer: node
+    bank: [build, dist, node, root, src, node_modules]
+
+  - type: prose
+    id: tags
+    body: >-
+      An image's name ends in a **tag**: `summary-api:1.4.0`. Leave it off and Docker writes
+      `latest`. But `latest` is a label that moves. Tomorrow it names a different image.
+
+
+      So `FROM node:latest` can jump a Node version under you. And if production runs
+      `latest`, nobody can say which code that is, or which image to go back to. Tag each
+      build with its commit, like `summary-api:3f2a91c`.
+
+  - type: multiple-choice
+    id: pick-rollback-tag
+    concept: cloud.image-tags
+    difficulty: 3
+    question: The new release is broken. Which deploy gets yesterday's working version back?
+    choices:
+      - text: '`summary-api:9c41e07`, yesterday''s commit tag'
+        correct: true
+        feedback: >-
+          Right. A commit tag always names the same image.
+      - text: '`summary-api:latest`'
+        feedback: >-
+          That's the broken build. It took over `latest` when it was pushed.
+      - text: '`summary-api`, with no tag'
+        feedback: >-
+          No tag means `latest`, so you'd get the broken build again.
+
+  - type: explain-back
+    id: explain-key-at-run-time
+    concept: cloud.build-context
+    difficulty: 4
+    prompt: >-
+      A teammate says the model key is safe in the image because the registry is private. Why
+      pass it at run time anyway?
+    rubric:
+      - Everything in an image's layers can be read by anyone who can pull it, now or later.
+      - Images get copied to laptops, CI caches and servers, and a private registry can leak or be shared.
+      - A run-time key can be rotated or scoped per environment without rebuilding, and never sits in the image.
+    modelAnswer: >-
+      A layer is a file anyone with the image can open. `docker history` even prints `ENV`
+      lines. And an image travels: to CI caches, to laptops, to every server, to whoever gets
+      registry access next year. A private registry is one lock on a key that should never
+      be in the box. Passed at run time, the key lives only in the environment of the
+      running container. You can rotate it without a rebuild, and staging and production can
+      use different keys.
+
+recap:
+  - Copy the package files and install before copying the source, so edits reuse the cache.
+  - Keep `node_modules`, `.env` and `.git` out with `.dockerignore`, and pass keys at run time.
+  - Ship a multi-stage image as `USER node`, tagged with its commit, never `latest`.
+
+recall:
+  - id: card-cache-order
+    concept: cloud.layer-cache
+    front: Why copy `package.json` and run `npm ci` before `COPY . .`?
+    back: >-
+      Source changes often and packages rarely. With the install first, a code edit reuses
+      the cached install layer.
+  - id: card-dockerignore
+    concept: cloud.build-context
+    front: Name three things a Node project's `.dockerignore` should list, and why.
+    back: >-
+      `node_modules` (built for your laptop), `.env` (secrets) and `.git` (history). Anything
+      copied ships in the image.
+  - id: card-multi-stage
+    concept: cloud.multi-stage-builds
+    front: What does a multi-stage build leave out of the final image?
+    back: >-
+      The build tools, dev dependencies and source. The last stage copies only the built
+      output from the build stage.
+  - id: card-latest
+    concept: cloud.image-tags
+    front: Why deploy `api:3f2a91c` rather than `api:latest`?
+    back: >-
+      A commit tag always names the same image, so you know what runs and can go back to it.
+      `latest` moves with every push.
+
+references:
+  - kind: docs
+    title: Docker build cache
+    authors: Docker
+    venue: Docker Docs
+    url: https://docs.docker.com/build/cache/
+    note: How layers are cached, and why a change rebuilds everything after it.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Build context
+    authors: Docker
+    venue: Docker Docs
+    url: https://docs.docker.com/build/concepts/context/
+    note: What the context is, and `.dockerignore`.
+    primary: true
+    verified: false
+  - kind: docs
+    title: Multi-stage builds
+    authors: Docker
+    venue: Docker Docs
+    url: https://docs.docker.com/build/building/multi-stage/
+    note: Named stages and copying files between them.
+    verified: true
+  - kind: docs
+    title: Build secrets
+    authors: Docker
+    venue: Docker Docs
+    url: https://docs.docker.com/build/building/secrets/
+    note: Why `ARG` and `ENV` are the wrong place for secrets, and secret mounts for build-time ones.
+    verified: false
+
+deepDive: >-
+  Everything ran with Docker 28.3 on a Mac, building a small TypeScript API bundled with
+  esbuild 0.25 on `node:24-slim`. The cache log is real, trimmed of timings for the cached
+  steps.
+
+
+  The `Exec format error` came from copying the Mac's `node_modules` into a Linux image.
+  esbuild ships a native program per platform, and `npm install` saw one already there.
+  With `.dockerignore` listing `node_modules`, the install fetched the Linux one and the
+  build passed. Without `.env` in `.dockerignore`, `docker run --rm image cat .env`
+  printed the key. After adding it, the file wasn't there.
+
+
+  `docker history --no-trunc` printed `ENV MODEL_API_KEY=sk-live-4f9a2c` for the flawed
+  image. `ARG` values used in a `RUN` show up there too. A secret the build itself needs,
+  such as a token for a private package registry, goes through a secret mount:
+  `RUN --mount=type=secret,id=npmrc npm ci`. It's never written to a layer.
+
+
+  Sizes: one stage 374 MB, multi-stage 348 MB. `node:24-slim` alone is 348 MB here, so the
+  final stage adds almost nothing. The saving grows with the dev dependencies: a project
+  with TypeScript, a test runner and a linter drops far more. `whoami` in the final image
+  printed `node`.
+
+
+  For the base image, `node:24-slim` pins the major version and still takes security fixes.
+  A digest, `node:24-slim@sha256:...`, pins the exact bytes, and a bot can update it by pull
+  request.

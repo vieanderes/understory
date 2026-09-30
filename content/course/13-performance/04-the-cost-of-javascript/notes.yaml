@@ -1,0 +1,267 @@
+summary: >-
+  JavaScript is the most expensive thing a page can load, byte for byte. Every script is
+  downloaded, parsed, compiled and run, and most of that happens on the main thread, the
+  same thread that answers taps and paints frames. While a task runs, nothing else can.
+  A task over 50 ms is a long task, and input that arrives during one waits in the queue.
+
+
+  The lesson shows the result: a click that waits behind a sort, an INP split into input
+  delay, processing and presentation, the fix of yielding between batches, and hydration,
+  where a server-rendered page looks ready before its handlers exist. These notes explain
+  where the CPU time goes inside the engine, how to find long tasks in the field, how to
+  yield well, when to leave the main thread, and how to shrink each part of INP.
+
+
+  The lesson for design is that responsiveness is a budget of main-thread time. Every
+  library, every re-render and every hydration spends it. On a fast laptop the budget feels
+  endless. On a mid-range phone, which runs the same code several times slower, it's where
+  most INP problems live.
+remember:
+  - Every byte of JavaScript is downloaded, parsed, compiled and executed, mostly on the main thread, which also handles input and rendering.
+  - A long task is one that runs over 50 ms, and any input that arrives during it waits until it ends.
+  - An interaction's INP time is input delay plus processing duration plus presentation delay, so find which part is big before fixing anything.
+  - Break long work into chunks and yield between them, ideally with `scheduler.yield()` where it exists and a `setTimeout` promise elsewhere.
+  - Show feedback first and yield, so the browser paints the response before the heavy work continues.
+  - Work that doesn't touch the DOM can move to a web worker, which runs on its own thread and talks through messages.
+  - Hydration downloads and runs the page's components to attach handlers, so a server-rendered page can ignore taps until it finishes.
+  - Test with the CPU throttled, because a mid-range phone runs the same script several times slower than a developer laptop.
+sections:
+  - title: Where the CPU time goes inside the engine
+    body: |-
+      A script's cost has four parts, and they fail in different ways.
+
+      **Download** depends on compressed size and the network. It happens off the main
+      thread, but nothing runs until the file arrives.
+
+      **Parse and compile** turn source into something runnable. V8, the engine in Chrome
+      and Node, parses lazily: at first it only pre-parses most functions to find their
+      boundaries, and fully parses a function when it's first called. It then compiles to
+      bytecode for its interpreter, Ignition. Functions that run often are recompiled by
+      faster tiers, Sparkplug, Maglev and TurboFan, into machine code. Browsers also cache
+      compiled code for scripts they have seen before, so repeat visits parse less. First
+      visits get none of that help.
+
+      **Execute** is your code and your framework's: top-level module code, rendering
+      components, attaching listeners. On a large app this is usually the biggest part.
+
+      That's why a kilobyte of script costs more than a kilobyte of image. An image is
+      decoded, usually off the main thread, and drawn. A script must be compiled and run, and
+      while it runs the page can't answer. Compression shrinks the download but not the
+      parse or the run: a file that travels as 80 kB may be 260 kB of source to parse.
+
+      Two practical consequences. First, measure JavaScript cost on a throttled CPU as
+      well as a throttled network: the Performance panel's CPU throttling set to 4x slowdown
+      is a reasonable stand-in for a mid-range phone. Second, fewer bytes help at every
+      stage, which is why the next lesson is about shipping less rather than running
+      faster.
+  - title: Finding long tasks in the field
+    body: |-
+      The Performance panel marks long tasks with a red triangle, but only on your machine. To see them on real devices, observe them from the page. Two entry types
+      exist in Chromium browsers.
+
+      ```js
+      // Long tasks: any main-thread task over 50 ms. Tells you when, not why.
+      new PerformanceObserver((list) => {
+        for (const entry of list.getEntries()) {
+          console.log('long task', Math.round(entry.startTime), Math.round(entry.duration));
+        }
+      }).observe({ type: 'longtask', buffered: true });
+
+      // Long animation frames: frames that took over 50 ms, with the scripts responsible.
+      new PerformanceObserver((list) => {
+        for (const entry of list.getEntries()) {
+          for (const script of entry.scripts) {
+            console.log(script.invoker, script.sourceURL, Math.round(script.duration));
+          }
+        }
+      }).observe({ type: 'long-animation-frame', buffered: true });
+      ```
+
+      The **Long Animation Frames** API is the newer and more useful one. It measures the
+      whole frame, including style and layout work, and attributes time to scripts: which
+      file, and what invoked it, such as a click listener or a timer. That's the question
+      you need answered when field INP is poor and you can't reproduce it. Send a sample of
+      these entries with your web vitals, and group them by script URL to find the
+      offender. Neither API is available in every browser, so treat the data as a sample,
+      not a census.
+
+      In the lab, a trace also shows **Total Blocking Time**: the sum, over every long task
+      between first paint and the page becoming interactive, of the part beyond 50 ms. A
+      120 ms task adds 70 ms. It's the lab stand-in for INP, and a good number to track in
+      CI.
+  - title: Yielding well
+    body: |-
+      Yielding after every fixed batch works, but the right batch size depends on the
+      device. A better pattern yields by time: do work until a deadline, then yield.
+
+      ```js
+      // Prefer scheduler.yield() where it exists (Chromium), else a 0 ms timer.
+      const yieldToMain = () =>
+        globalThis.scheduler?.yield
+          ? globalThis.scheduler.yield()
+          : new Promise((resolve) => setTimeout(resolve, 0));
+
+      // Work until the slice's deadline passes, then yield. Few yields for cheap items,
+      // many for expensive ones, and no task much longer than budgetMs.
+      async function processInSlices(items, work, budgetMs = 40) {
+        let deadline = performance.now() + budgetMs;
+        for (const item of items) {
+          work(item);
+          if (performance.now() >= deadline) {
+            await yieldToMain();
+            deadline = performance.now() + budgetMs;
+          }
+        }
+      }
+
+      // Something that behaves like a click: queued while the work runs.
+      const start = performance.now();
+      setTimeout(() => {
+        console.log(`click handled after ${Math.round(performance.now() - start)} ms`);
+      }, 10);
+
+      const busy = (ms) => {
+        const end = performance.now() + ms;
+        while (performance.now() < end);
+      };
+
+      await processInSlices(Array(100).fill(5), busy); // 500 ms of work in 5 ms items
+      console.log(`all work done after ${Math.round(performance.now() - start)} ms`);
+      // click handled after about 40 ms, long before all the work is done
+      ```
+
+      Save it as `slices.mjs` and run it with Node. Without the yields, the timer would fire
+      only after all 500 ms of work.
+
+      Why prefer `scheduler.yield()`? A `setTimeout` continuation goes to the back of the
+      task queue, so other queued work, such as third-party timers, runs before your task
+      resumes. `scheduler.yield()` lets input through and then resumes your task ahead of
+      that other work. Browsers also clamp nested timers: once timers nest more than five
+      deep, each waits at least 4 ms, which adds up in a loop that yields hundreds of times.
+      A time-based slice keeps the number of yields low.
+
+      One more rule: yielding only helps if the page can do something useful in the gap.
+      If a click handler starts work, update the screen first, then yield, then continue.
+  - title: Leaving the main thread with a web worker
+    body: |-
+      Yielding shares the main thread. A **web worker** gets a thread of its own, so
+      heavy work there never delays a tap. Workers can't touch the DOM. They receive data,
+      compute, and post results back.
+
+      ```js
+      // search-worker.js: builds and queries an index off the main thread.
+      let index = [];
+      self.onmessage = (event) => {
+        const { type, payload } = event.data;
+        if (type === 'load') {
+          index = payload.map((book) => ({ book, text: book.title.toLowerCase() }));
+        } else if (type === 'query') {
+          const q = payload.toLowerCase();
+          const hits = index.filter((row) => row.text.includes(q)).map((row) => row.book);
+          self.postMessage(hits.slice(0, 20));
+        }
+      };
+      ```
+
+      ```js
+      // main.js: the page stays responsive while the worker searches the catalogue.
+      const worker = new Worker(new URL('./search-worker.js', import.meta.url), {
+        type: 'module',
+      });
+      worker.postMessage({ type: 'load', payload: catalogue });
+      worker.onmessage = (event) => renderResults(event.data);
+      searchInput.addEventListener('input', () => {
+        worker.postMessage({ type: 'query', payload: searchInput.value });
+      });
+      ```
+
+      The cost is copying. `postMessage` uses the structured clone algorithm, so a large
+      object is copied between threads, and serialising it costs the sending thread time. For big
+      binary data, pass an `ArrayBuffer` in the transfer list to move it without copying.
+
+      Good candidates are parsing large files, searching or sorting big lists, image
+      processing, and running a small model in the browser. Poor candidates are anything
+      that mostly updates the DOM, and tasks that take a few milliseconds, where messaging
+      costs more than it saves.
+  - title: Shrinking each part of INP, and the hydration gap
+    body: |-
+      Each part of an interaction has its own fixes.
+
+      **Input delay** is time spent queued behind other tasks. Fix it by breaking up long
+      tasks, loading less script during start-up, and deferring third-party scripts that run
+      timers.
+
+      **Processing duration** is your handlers. Do the visible update first and defer the
+      rest: analytics calls, saving drafts, recalculating things off screen. In React, a
+      state update that re-renders a large tree is often the cost. Memoise expensive
+      children, or mark a non-urgent update with `startTransition` so React can interrupt
+      it for input.
+
+      **Presentation delay** is the browser's style, layout and paint for the next frame. A
+      very large DOM, layout thrashing and expensive CSS make it long. Keep the DOM smaller,
+      and use `content-visibility: auto` on long off-screen sections so the browser skips
+      rendering them.
+
+      **Hydration** is start-up work in one lump: download the bundle, run every component,
+      attach handlers. Until it's done, taps do nothing, and during it any tap waits in the
+      queue. Three things shrink the gap. **Server Components** send no JavaScript for parts
+      that never change, so there is less to hydrate. **Suspense boundaries** let React
+      hydrate in pieces, yielding between them, and it hydrates the boundary a user
+      interacts with first, then replays that interaction. And code splitting keeps
+      below-the-fold widgets out of the first bundle entirely. The aim is the same for all
+      three: less JavaScript on the critical path, run in smaller tasks.
+pitfalls:
+  - "**Judging responsiveness on a developer laptop.** Your machine runs scripts several times faster than a typical phone, so long tasks vanish. Throttle the CPU in the Performance panel and test on a real mid-range device."
+  - "**Optimising the handler when the delay is the problem.** If the input delay is 390 ms and processing is 0.3 ms, rewriting the handler changes nothing. Read the three INP parts first and fix the biggest."
+  - "**Yielding outside the loop.** One yield after all the work leaves one long task. Yield inside the loop, after each batch or when a time slice runs out."
+  - "**Doing heavy work before showing feedback.** The browser paints only between tasks, so a status set before a long task doesn't appear until it ends. Update the screen, yield, then do the work."
+  - "**Moving DOM-heavy work to a worker.** Workers can't touch the DOM, and posting large objects copies them. Use workers for pure computation and keep DOM updates small and on the main thread."
+  - "**Assuming server rendering makes a page interactive.** Server HTML paints early, but handlers arrive with the bundle. Ship less client JavaScript to the route and hydrate in pieces."
+interview:
+  - question: Why is JavaScript more expensive than an image of the same size?
+    answer: >-
+      Because after download a script still has to be parsed, compiled and executed on the
+      main thread, while an image is decoded, usually off the main thread, and drawn.
+      Compression hides the difference in transfer size: 80 kB over the wire can be 260 kB of
+      source to parse and run. Execution is often the biggest part, since frameworks render
+      components and attach listeners at start-up. The main thread also handles input and
+      painting, so all that work delays responses to taps, which shows up as poor INP. On a
+      mid-range phone every stage is several times slower than on a laptop. Browsers cache
+      compiled code for repeat visits, which helps returning users, but first visits pay
+      the full price. So I treat JavaScript bytes as a CPU budget as well as a download
+      budget.
+  - question: A page has poor INP in the field. How do you investigate?
+    answer: >-
+      First I find which interactions are slow and which of the three parts dominates.
+      The `web-vitals` attribution build tells me the target element and the input delay,
+      processing and presentation split, per visit. Long Animation Frames entries tell me
+      which scripts ran during the slow frame. If input delay dominates, something else was
+      running: start-up scripts, hydration, a third-party timer, so I'd break up or defer
+      those tasks. If processing dominates, the handler or the re-render it triggers is
+      slow, so I'd do the visible update first and defer the rest, or use `startTransition`.
+      If presentation dominates, I'd look at DOM size and forced layouts. Then I'd reproduce
+      it in the Performance panel with CPU throttling and confirm the fix in field data,
+      since the lab can't produce INP by itself.
+  - question: How do you keep a page responsive during a long computation?
+    answer: >-
+      Either split the work and yield to the main thread between chunks, or move it to a
+      web worker. Splitting keeps each task under about 50 ms, so queued input runs between
+      chunks. I'd yield by time rather than a fixed batch size, since devices differ, and
+      use `scheduler.yield()` where available because it resumes my task ahead of other
+      queued work, falling back to a `setTimeout` promise. I'd update the UI first, for
+      example a progress message, so the user sees a response. If the work doesn't need the
+      DOM, such as parsing a file or searching a big list, a worker is better: it never
+      blocks input at all. The trade-off is copying, because messages are cloned, so for
+      large data I'd transfer an `ArrayBuffer` instead of copying objects.
+  - question: What is hydration, and why can it hurt interactivity?
+    answer: >-
+      Hydration is the client-side step where React runs the components for server-rendered
+      HTML and attaches event handlers to the markup that's already there. The HTML paints
+      early, so the page looks ready, but until the bundle has downloaded, parsed and run,
+      the buttons don't respond, and any tap during hydration queues behind a long task. On a
+      phone with a large bundle that gap can be seconds. I'd shrink it in three ways: Server
+      Components for parts with no interactivity, so their code never ships; Suspense
+      boundaries so React hydrates in chunks and prioritises the part the user touches; and
+      code splitting for widgets below the fold. The trade-off is complexity: more
+      boundaries and client/server splits to reason about, so I'd target the routes with the
+      worst field INP first.

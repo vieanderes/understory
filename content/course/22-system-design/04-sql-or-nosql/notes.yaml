@@ -1,0 +1,187 @@
+summary: >-
+  Choosing a data store is choosing which questions are cheap to ask. Relational databases
+  make joins, constraints and multi-row transactions cheap, and ask you to fit data into
+  tables. Document, key-value, wide-column and graph stores each make one shape of access
+  fast, often across many machines, and give up something to do it.
+
+
+  The lesson's conclusion is the one a senior engineer usually reaches: start with
+  Postgres, use `jsonb` for the loosely structured parts, and move a specific workload
+  elsewhere when you've measured a need Postgres can't meet. These notes explain how to
+  reach that answer from access patterns, what the other stores really buy you, and the
+  Postgres features that push the limit further than most teams expect.
+
+
+  In an interview, the store is never the first thing you say. It follows from the data,
+  the access patterns and the consistency requirement, and you name the one you didn't
+  choose with its reason.
+remember:
+  - Choose a store from the queries the product runs most often, their volume, and the consistency they need, never from fashion.
+  - Postgres is the sound default because it gives you transactions, constraints, joins, `jsonb`, full-text search and vector search in one system you already operate.
+  - Many NoSQL stores scale out by giving up joins, multi-row transactions or always-fresh reads, and you design each table around one query.
+  - Denormalising copies data to make one read fast, and every copy is a write your code must keep in step.
+  - A default GIN index on `jsonb` serves containment with `@>`, and an expression index serves `->>` equality.
+  - Reach for another store when a measured need exceeds one machine, such as write volume or data size, and move only that workload.
+  - Partitioning a large table by time makes old data cheap to drop and lets queries skip partitions they don't need.
+sections:
+  - title: Start from access patterns
+    body: |-
+      Before naming a store, write the access patterns as a list with rough volumes. For a
+      library catalogue with loans:
+
+      ```text
+      look up a book by id                    3,000 a second
+      search books by title and author          400 a second
+      list a member's current loans             200 a second
+      borrow a book (must not double-lend)       20 a second
+      monthly report of loans by branch        once a month
+      ```
+
+      Read the list for what it demands.
+
+      - "Must not double-lend" needs an atomic check and write: a transaction or a unique
+        constraint. That's a relational strength.
+      - 3,000 lookups by id a second is a cache's job, whatever the store.
+      - Title search wants a text index: Postgres full-text search at this size, a search
+        engine at a much larger one.
+      - The monthly report is an analytical query. Run it on a replica, or copy data to a
+        warehouse later.
+
+      Nothing here asks for more than one Postgres plus a cache. Now change one line: "store
+      every page-turn event from e-readers, 200,000 a second". That write volume, append
+      only, read by device and time, is where a wide-column store or a log earns its place,
+      for that one workload.
+  - title: What the other models really buy you
+    body: |-
+      Each model is best understood by the query it makes cheap and the thing it gives up.
+
+      - **Key-value** (Redis, a DynamoDB table used by key): a lookup by key at memory speed
+        or at huge scale. You give up queries on anything but the key.
+      - **Document** (MongoDB and similar): one record read and written whole, with nested
+        data and flexible fields. You give up cheap joins; related data is embedded or
+        fetched in a second query.
+      - **Wide-column** (Cassandra and similar): very high write rates spread across many
+        machines by a partition key, with rows sorted within a partition. You design one
+        table per query and give up joins and ad hoc queries.
+      - **Graph** (Neo4j and similar): following relationships many hops deep, such as
+        "friends of friends who like this". You give up cheap aggregation over everything.
+      - **Search engines**: relevance ranking, fuzzy matching and facets over text. They are
+        usually a secondary index fed from the source of truth, not the source itself.
+
+      The design discipline for partitioned stores is the same everywhere: choose a
+      partition key that spreads load evenly and that every hot query includes. A key like
+      `country` puts most traffic on a few partitions. A key like `user_id` spreads it.
+
+      Guarantees vary by product and version, so compare them directly: which operations
+      are atomic, whether a read can miss a recent write, and how data is split.
+  - title: How far Postgres goes
+    body: |-
+      Postgres covers more workloads than its reputation suggests, and each feature below
+      delays the day you need a second store.
+
+      - **Read replicas** scale reads horizontally (next lesson).
+      - **`jsonb` with GIN indexes** handles flexible attributes without a document store.
+      - **Expression and partial indexes** make specific queries fast without indexing
+        everything.
+      - **Declarative partitioning** splits a huge table into smaller ones by range, list or
+        hash.
+      - **Full-text search** and **pgvector** cover text and embedding search.
+
+      Here is partitioning plus an expression index, run on PostgreSQL 17:
+
+      ```sql
+      CREATE TABLE events (
+        id         bigint GENERATED ALWAYS AS IDENTITY,
+        account_id bigint      NOT NULL,
+        at         timestamptz NOT NULL,
+        data       jsonb       NOT NULL,
+        PRIMARY KEY (id, at)
+      ) PARTITION BY RANGE (at);
+
+      CREATE TABLE events_2026_09 PARTITION OF events
+        FOR VALUES FROM ('2026-09-01') TO ('2026-10-01');
+      CREATE TABLE events_2026_10 PARTITION OF events
+        FOR VALUES FROM ('2026-10-01') TO ('2026-11-01');
+
+      CREATE INDEX ON events ((data->>'type'), at);
+
+      SELECT count(*) FROM events
+      WHERE data->>'type' = 'signup' AND at >= '2026-10-01';
+
+      DROP TABLE events_2026_09;
+      ```
+
+      `EXPLAIN` showed a bitmap index scan on the October partition only: the planner pruned
+      September. Dropping a month is instant, where deleting millions of rows would bloat
+      the table. Note the primary key includes `at`: a unique constraint on a partitioned
+      table must include the partition key.
+
+      The real limit of one Postgres is usually write volume or data size beyond one
+      primary. Sharding it is possible with extensions or by hand, and at that point
+      comparing it with a store built for scale-out is fair.
+  - title: Denormalisation and keeping copies in step
+    body: |-
+      The lesson's order document copied the customer's name into 12,000 orders. That copy
+      is a decision with two sides.
+
+      Sometimes the copy is correct. An order should record the shipping address and price
+      as they were when it was placed. Changing them later would rewrite history. Copy on
+      purpose, and name the field for what it is: `shipping_address_at_order`.
+
+      Sometimes the copy is a cache of the truth, like a display name on every comment. Then
+      you need a way to update copies:
+
+      - update them in the same transaction, if they're in the same database and few;
+      - publish a "customer renamed" event and let a consumer update copies later, accepting
+        a window where old names show;
+      - or don't copy, and join or fetch at read time.
+
+      In a relational database, normalise by default and denormalise a specific read path
+      when you've measured it's slow. In a document or wide-column store, you denormalise by
+      default, because joins are missing or expensive, and you own the job of keeping copies
+      consistent.
+pitfalls:
+  - "**Choosing NoSQL for \"scale\" at 50,000 users.** One Postgres handles that with room to spare. Name the number at which you'd move, and the workload that would move."
+  - "**Putting everything in `jsonb`.** Fields you filter, join or constrain on belong in columns with types and constraints. Keep `jsonb` for the parts that really vary."
+  - "**Filtering `jsonb` with `->>` behind a GIN index.** The default GIN operator class serves `@>`, not `->>` equality. Use containment, or add an expression index."
+  - "**A partition key that concentrates traffic.** Keys like country or status put most load on a few partitions. Choose a key with many values that hot queries include."
+  - "**Denormalising without an update plan.** Every copied field needs an answer to \"what happens when the original changes\". Decide it when you copy."
+interview:
+  - question: When would you choose a NoSQL database over Postgres?
+    answer: >-
+      When a measured access pattern needs something one Postgres can't give, most often
+      write volume or data size beyond a single primary. For example, 200,000 appends a
+      second of device events, read by device and time, fit a wide-column store partitioned
+      by device id. I'd still keep orders, users and anything needing transactions or
+      constraints in Postgres, and move only that workload. The cost of the second store is
+      real: another system to run, data to keep in step, and no joins across the two. So I
+      want numbers first, and I say what would have to be true for Postgres to stop being
+      enough.
+  - question: What do you give up when you move from a relational database to a document store?
+    answer: >-
+      Mostly joins and cross-record guarantees, in exchange for reading one record whole and
+      often easier horizontal scaling. Related data is either embedded, which is fast to
+      read but duplicates data that then needs updating in many places, or referenced, which
+      needs a second query. Multi-document transactions exist in some stores now, but
+      schemas, constraints and ad hoc queries are usually weaker, so more integrity moves
+      into application code. It's a good trade when records are read whole and rarely
+      related, such as product listings with varied attributes. It's a poor one for data
+      full of relationships, such as orders, payments and stock.
+  - question: How would you store products whose attributes vary by category?
+    answer: >-
+      Common fields as typed columns, and the varying attributes in a `jsonb` column with a
+      GIN index. Price, name, category and stock are queried and constrained everywhere, so
+      they get types, `NOT NULL` and foreign keys. Wattage for lamps and size for shirts go
+      in `attrs jsonb`. Filters use containment, `attrs @> '{"colour": "red"}'`, which the
+      default GIN index serves. If one attribute becomes a hot filter or sort, I add an
+      expression index on it, or promote it to a column. The alternative, a table of
+      attribute rows per product, makes every query a join and loses types, so I'd avoid it.
+  - question: A table has two billion rows and queries are slowing down. What are your options before changing databases?
+    answer: >-
+      First find out which queries are slow and why, then fix them in order of cost. Check
+      the plans: a missing or unusable index is the cheapest fix, and partial or expression
+      indexes target specific queries. If most queries touch recent data, partition by time
+      so the planner prunes old partitions and old data can be dropped instantly. Move reads
+      to replicas and analytical queries to a warehouse. Archive what nobody reads. Only if
+      write volume or size still exceeds one primary would I shard or move that workload to
+      a scale-out store. Each step is cheaper and less risky than a migration.

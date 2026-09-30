@@ -1,0 +1,184 @@
+summary: |-
+  Every program allocates memory, and something has to give it back. Languages answer that in three ways. A tracing garbage collector (JavaScript, Go, Java, Kotlin, C#) runs now and then and frees whatever nothing can reach. Reference counting (Swift, and mostly Python) frees an object the instant its last reference goes. Ownership (Rust) has the compiler decide, before the program runs, the exact line where each value is freed.
+
+  Each answer trades something. A collector is convenient but frees on its own schedule. Reference counting is predictable but can't free cycles without help. Ownership needs no runtime bookkeeping, and asks you to satisfy a strict compiler instead.
+
+  The part that bites in production is what none of them does for you: return a database connection, close a file or release a socket on time. Those are scarce resources, and a garbage collector neither knows nor cares. So code releases them on a known line, with `finally`, `using`, Python's `with`, Go's `defer` or Rust's `Drop`. These notes cover the mechanisms, the leaks that still happen in collected languages, and how to diagnose the classic outage: a pool that runs dry.
+remember:
+  - A garbage collector frees memory that nothing can reach, at a time it chooses, and it never closes connections, files or sockets.
+  - Reference counting frees an object the instant its count reaches zero, but two objects that point at each other never reach zero without a cycle collector or a weak reference.
+  - Rust frees each value where its single owner goes out of scope, and the compiler refuses any use after a move.
+  - Release scarce resources on a known line, with `finally`, `using`, `with`, `defer` or a helper that always does it, including on the error path.
+  - A service that hangs after exactly N requests, where N is the pool size, is almost always leaking pool clients.
+  - Memory leaks still happen under a collector whenever something reachable keeps holding data, such as an unbounded cache, a forgotten listener or a timer.
+  - Finalizers such as JavaScript's FinalizationRegistry may run late or never, so never rely on them for cleanup that matters.
+sections:
+  - title: Three memory models, and what each costs
+    body: |-
+      **Tracing garbage collection.** The collector starts from roots (globals, the stack) and marks everything reachable; the rest is freed. Most collectors are generational: new objects are checked often because most die young, old ones rarely. The cost is work you don't control. Modern collectors keep pauses short, but memory is freed later than it could be, and the heap needs headroom.
+
+      **Reference counting.** Every object carries a count of references to it. Each new reference increments it, each dropped one decrements it, and zero frees it at once. Freeing is predictable, which is why Swift objects can clean up in `deinit`. The costs are the constant bookkeeping and cycles. Python shows both halves:
+
+      ```python
+      import gc
+      import weakref
+
+
+      class Node:
+          def __init__(self, name):
+              self.name = name
+              self.other = None
+
+
+      a = Node("a")
+      b = Node("b")
+      a.other = b
+      b.other = a  # a cycle: each keeps the other's count above zero
+
+      watch = weakref.ref(a)
+      del a, b
+      print("after del:", watch() is not None)  # still alive, the counts never hit zero
+      gc.collect()
+      print("after collect:", watch() is not None)  # the cycle collector freed both
+      ```
+
+      It prints `True`, then `False`. CPython runs a cycle collector for exactly this case. Swift has none, so you break the cycle yourself by marking one side `weak`, typically a child's reference back to its parent or a closure's capture of `self`.
+
+      **Ownership.** Rust gives every value one owner and frees it when the owner's scope ends, calling its `Drop` implementation. Borrowing with `&` lends access without moving ownership, and the compiler checks that no borrow outlives the owner. There's no runtime cost for any of it. The cost is paid at compile time, in code that must convince the borrow checker.
+  - title: Cleanup on a known line, in five languages
+    body: |-
+      Every mainstream language has a construct that runs cleanup when a block exits, however it exits.
+
+      JavaScript has `try`/`finally`, and since Node 24 also explicit resource management with `using`. An object that implements `Symbol.dispose` or `Symbol.asyncDispose` is cleaned up when its block ends:
+
+      ```js
+      function openConnection(name) {
+        console.log(`open ${name}`);
+        return {
+          query: async (sql) => `rows for ${sql}`,
+          [Symbol.asyncDispose]: async () => console.log(`closed ${name}`),
+        };
+      }
+
+      async function report() {
+        await using db = openConnection('reports');
+        const rows = await db.query('SELECT 1');
+        throw new Error(`failed after ${rows}`);
+      }
+
+      report().catch((error) => console.log(error.message));
+      ```
+
+      It prints `open reports`, `closed reports`, then the error: the connection closed before the error reached the caller. Python's equivalent is a context manager:
+
+      ```python
+      from contextlib import contextmanager
+
+
+      @contextmanager
+      def borrowed(pool):
+          conn = pool.pop()
+          try:
+              yield conn
+          finally:
+              pool.append(conn)  # back in the pool, even when the block raises
+
+
+      pool = ["conn-1"]
+      try:
+          with borrowed(pool) as conn:
+              raise ValueError(f"query failed on {conn}")
+      except ValueError as error:
+          print(error)
+      print("pool:", pool)
+      ```
+
+      It prints the error and `pool: ['conn-1']`. Go uses `defer conn.Close()` right after opening, which runs when the function returns. Rust calls `Drop` at the end of the owner's scope. Swift has `defer` for scope exit and `deinit` for object destruction. The idea is the same everywhere: acquisition and release are written together, so no path can forget the release.
+  - title: Leaks that happen under a garbage collector
+    body: |-
+      A collector frees what's unreachable. A leak in a collected language is memory that's still reachable but no longer useful. The usual suspects:
+
+      - **Unbounded caches.** A module-level `Map` keyed by user or request grows for ever. Give it a size limit and evict (a `Map` keeps insertion order, which makes a small LRU cache straightforward), or a time limit.
+      - **Forgotten listeners.** `emitter.on(...)` or `addEventListener` in code that runs repeatedly adds a new closure each time, and each closure keeps whatever it captured alive. Remove listeners, or pass an `AbortSignal` so they go together.
+      - **Timers.** A `setInterval` that's never cleared keeps its callback and everything it closes over.
+      - **Closures capturing more than they need.** A callback that captures a large object keeps all of it alive as long as the callback lives.
+      - **Per-key metadata on objects you don't own.** A `WeakMap` fixes this: its keys don't keep objects alive, so entries disappear with the object.
+
+      The symptom is memory that climbs steadily under constant load and never falls after collections. The diagnosis is heap snapshots: take one, apply load, take another, and compare which object types grew and what retains them. Node can write snapshots with `node --heapsnapshot-signal` or from the inspector, and Chrome DevTools compares them.
+
+      Connection leaks look different: memory stays flat, but requests start hanging once the pool is empty. That's the next section.
+  - title: Diagnosing a pool that runs dry
+    body: |-
+      The classic incident: a service works for a while, then every request hangs. Restarting fixes it for a while. Nothing appears in the error logs because nothing errors: requests wait.
+
+      The signature is in the numbers. If requests start hanging after about the pool size (node-postgres defaults to ten clients), something borrows clients and doesn't return them. Most often it's an early return or a thrown error between `pool.connect()` and `client.release()`, exactly the bug in the lesson.
+
+      Steps that find and prevent it:
+
+      - **Look at the pool's own counters.** node-postgres exposes `totalCount`, `idleCount` and `waitingCount`. Idle at zero with waiting climbing confirms a leak or undersizing.
+      - **Look at the database.** In PostgreSQL, `pg_stat_activity` lists connections. Many sessions in state `idle in transaction` point to code that began a transaction and never finished it.
+      - **Set a timeout for acquiring a client.** In node-postgres, `connectionTimeoutMillis` defaults to no timeout, so a leak causes silent hangs. With a timeout, requests fail fast with an error you can see and alert on.
+      - **Make the leak impossible.** Prefer `pool.query()` for single queries, which borrows and returns for you, and a `withClient` helper for transactions. Ban bare `pool.connect()` in review.
+
+      Two related traps are worth naming in a design review. Serverless functions each open their own pool, so a burst of instances can exhaust the database's connection limit; a connection pooler in front of the database, such as PgBouncer, is the usual answer. And a pool larger than the database can serve only moves the queue from the application to the database.
+pitfalls:
+  - >-
+    **Assuming the collector closes connections.** It frees memory when it chooses, and
+    never returns a pool client. Release in `finally`, or use a helper or `using`.
+  - >-
+    **Releasing only on the happy path.** An error thrown between borrow and release leaks
+    the client. Put the release in `finally` so both paths run it.
+  - >-
+    **Relying on finalizers.** `FinalizationRegistry` callbacks may run late or never. Use
+    them for diagnostics at most, never for cleanup that matters.
+  - >-
+    **Strong reference cycles in Swift.** A closure stored on an object that captures `self`
+    keeps both alive for ever. Capture `[weak self]` or restructure ownership.
+  - >-
+    **Unbounded in-memory caches.** A module-level map keyed by request data grows until the
+    process runs out of memory. Bound it by size or age.
+  - >-
+    **No timeout on acquiring a client.** A leak then shows up as silent hangs rather than
+    errors. Set an acquire timeout so exhaustion fails fast and visibly.
+interview:
+  - question: Compare garbage collection, reference counting and ownership.
+    answer: >-
+      They differ in who decides when memory is freed. A tracing collector, as in JavaScript,
+      Go and Java, periodically finds everything reachable and frees the rest; it's
+      convenient and handles cycles, but frees on its own schedule and needs spare heap.
+      Reference counting, as in Swift and CPython, frees an object the instant its last
+      reference goes, which is predictable, but costs bookkeeping on every assignment and
+      can't free cycles alone, so Swift needs `weak` references and CPython adds a cycle
+      collector. Rust's ownership has the compiler insert the free where the owner's scope
+      ends, with no runtime cost, in exchange for a strict borrow checker. None of the three
+      manages connections or files for you.
+  - question: Can you have a memory leak in a garbage-collected language?
+    answer: >-
+      Yes, whenever memory stays reachable after it stops being useful, because the collector
+      only frees what's unreachable. The common causes are an unbounded cache in a module-level
+      map, event listeners added repeatedly and never removed, intervals never cleared, and
+      closures that capture large objects. The symptom is memory climbing under steady load
+      and not dropping after collections. I'd confirm it with two heap snapshots taken before
+      and after load, compare which object types grew, and follow the retainer chain to the
+      reference holding them. Fixes are bounding caches, removing listeners, often with an
+      `AbortSignal`, and using `WeakMap` for per-object metadata.
+  - question: A Node service hangs after about ten requests until it's restarted. What do you check?
+    answer: >-
+      "Ten is node-postgres's default pool size, so I'd suspect leaked pool clients first."
+      I'd check the pool's counters: idle at zero and waiting climbing confirms clients aren't
+      coming back. Then I'd search for `pool.connect()` calls and check each releases in a
+      `finally`; an early return or thrown error between borrow and release is the usual
+      bug. In PostgreSQL, `pg_stat_activity` showing sessions `idle in transaction` points at
+      unfinished transactions. The fix is releasing in `finally` or a `withClient` helper,
+      and I'd set `connectionTimeoutMillis` so future exhaustion throws a visible error
+      instead of hanging. If no leak exists, the pool may be undersized for the load.
+  - question: Why shouldn't you rely on a finalizer or destructor to close a connection in JavaScript?
+    answer: >-
+      Because JavaScript gives no guarantee about when, or whether, an object is collected.
+      `FinalizationRegistry` callbacks run some time after collection, possibly never if the
+      process exits first, and the collector runs when memory pressure suggests it, not when
+      your connections run low. A pool can be empty while plenty of memory remains, so the
+      collector never runs. Swift differs: reference counting frees at a known moment, so
+      `deinit` cleanup is predictable. In JavaScript, release deterministically with
+      `try`/`finally`, a helper that owns the borrow and release, or `using` with
+      `Symbol.asyncDispose`, which Node 24 supports.

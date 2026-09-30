@@ -1,0 +1,204 @@
+summary: >-
+  DNS turns a name into an address, and TLS proves that the address really belongs to the
+  name. Together they are the first two things every visitor's browser does before your app
+  sees a single byte. When either is wrong, the app is perfectly healthy and nobody can use
+  it.
+
+
+  DNS is a distributed, cached database. Nothing you change is pushed out: every resolver
+  keeps its copy until the record's TTL runs out, so a move is planned around time, not
+  performed in a moment. TLS rests on certificates, files that name the hosts they cover and
+  carry a trusted signature. ACME made them free and automatic, which moved the typical
+  failure from "we forgot to buy one" to "renewal broke silently three months ago".
+
+
+  These notes add the machinery under the lesson: how a lookup travels from root to answer,
+  the caching traps beyond the TTL, how a certificate chain is checked, how ACME proves
+  control of a domain, and how to watch expiry before your users notice it.
+remember:
+  - DNS changes are never pushed; each resolver keeps its cached copy until that record's TTL expires.
+  - Lower the TTL at least one old TTL before a move, and keep the old server running until the old TTL has passed after the switch.
+  - An `A` record maps a name to an IPv4 address, `AAAA` to IPv6, `CNAME` to another name, `MX` to mail servers, and `TXT` holds text such as ownership proofs.
+  - A bare domain can't be a `CNAME` because it must also carry `NS` and `SOA` records.
+  - A client accepts a certificate only if a trusted authority signed its chain, today falls within its dates, and one of its names matches the host.
+  - The server must send its intermediate certificate with its own, or clients such as curl and Node reject the connection.
+  - A wildcard covers exactly one label, and a wildcard certificate from ACME needs the DNS challenge.
+  - Monitor certificate expiry from outside, because automatic renewal fails silently.
+sections:
+  - title: How a lookup travels
+    body: |-
+      Your laptop doesn't know where anything is. It asks a **recursive resolver**, usually
+      run by your network or a public service such as 1.1.1.1. On a cold cache, the resolver
+      walks the tree from the top:
+
+      ```text
+      laptop   -> resolver   "www.shop.example?"
+      resolver -> root       "ask the .example servers"      (NS records)
+      resolver -> .example   "ask ns1.dnshost.net"           (NS records)
+      resolver -> ns1        "www.shop.example A 203.0.113.20, TTL 300"
+      resolver -> laptop     the answer, now cached for 300 s
+      ```
+
+      The last server is **authoritative** for the domain: it holds the records you edit in
+      your DNS host's dashboard. The `NS` records at your registrar say which servers those
+      are. Moving your DNS to another host means changing those `NS` records, and they have
+      TTLs of their own, often two days.
+
+      Every step caches. The resolver keeps the root's and the TLD's referrals, so most
+      lookups take one hop. Browsers and operating systems keep small caches too. That's why
+      "it works for me" says little: you're reading your caches, not everyone's.
+
+      Two tools show the difference. `dig +trace www.shop.example` walks the tree itself and
+      ignores caches, so it shows what the authoritative servers say now. Plain `dig
+      @1.1.1.1 www.shop.example` shows what one public resolver is still handing out. When a
+      change "hasn't propagated", compare the two.
+  - title: Caching traps beyond the TTL
+    body: |-
+      The TTL governs a record that exists. Three other traps catch people.
+
+      **Negative caching.** If someone looks up a name before you create it, the resolver
+      caches the "no such name" answer too. How long is set by the zone's `SOA` record,
+      often an hour or more. Testing `api.shop.example` a minute before adding it can keep
+      it missing for that resolver long after you add it. Create records first, then test.
+
+      **The forgotten `AAAA`.** You move the `A` record to the new server and leave an old
+      `AAAA` record in place. Visitors with IPv6, a large share of mobile users, still reach
+      the old machine. When you move a site, move or remove every address record for the
+      name.
+
+      **Clients that ignore the TTL.** Some long-running programs resolve a name once and
+      keep the address until they restart. After a database or API moves, a service can
+      keep calling the old address for days. Restarting clients after a move, or checking
+      that your runtime re-resolves, closes that gap.
+
+      A move then looks like this:
+
+      ```text
+      day -1   set TTL to 300 on every record for the name
+      day 0    wait until the old TTL has passed since that change
+               point A and AAAA at the new server
+               watch traffic arrive at the new server, and fall away at the old one
+      day 0+   keep the old server up at least one old TTL, then switch it off
+      day 1    raise the TTL again, to an hour or a day
+      ```
+
+      Raising the TTL afterwards matters. Short TTLs mean more lookups, slightly slower first
+      visits, and less protection when your DNS host has an outage.
+  - title: How a certificate is checked
+    body: |-
+      A certificate is signed by an authority, but rarely by a root one. The root's key stays
+      offline. It signs an **intermediate** certificate, and the intermediate signs yours.
+      Browsers and operating systems ship a list of trusted roots, so the client needs to
+      rebuild the chain: your certificate, the intermediate, then a root it already trusts.
+
+      The server must send the intermediate alongside its own certificate. Certbot writes
+      both into `fullchain.pem` for this reason. Point your server at `cert.pem` alone and
+      some browsers still work, because they fill the gap themselves, while curl, Node and
+      most server-side clients fail with an error about the local issuer. That's the classic
+      "the site works but the webhook can't reach us" bug.
+
+      Then the client checks the dates and the names. Names live only in the Subject
+      Alternative Name list now; the old Common Name field isn't used for matching by modern
+      browsers.
+
+      Every publicly trusted certificate is also written to public **Certificate
+      Transparency** logs, searchable by anyone. That catches wrongly issued certificates
+      for your domain. It also means every host name you put on a public certificate is
+      public, including `staging-internal.shop.example`.
+
+      Two DNS records support TLS. A `CAA` record lists which authorities may issue for your
+      domain, such as `shop.example. 3600 IN CAA 0 issue "letsencrypt.org"`. And the
+      `Strict-Transport-Security` response header tells browsers to use HTTPS only, for a
+      period you set, so a network attacker can't downgrade a visit to plain HTTP.
+  - title: ACME challenges, renewal and watching expiry
+    body: |-
+      ACME proves control of a domain in one of three ways. With **HTTP-01**, the authority
+      fetches a token from `http://your-domain/.well-known/acme-challenge/` on port 80, so
+      port 80 must stay open even if you redirect everything to HTTPS. With **DNS-01**, you
+      publish a `TXT` record under `_acme-challenge`, which needs an API key for your DNS
+      host and is the only way to get a wildcard. **TLS-ALPN-01** answers on port 443.
+
+      Let's Encrypt certificates last 90 days, and tools renew them when about 30 days remain.
+      The short life is deliberate: it forces automation, and a leaked key stays useful for
+      less time. The cost is that renewal must never quietly stop. It does stop, when port
+      80 gets closed, a DNS key expires or a server is rebuilt without the timer.
+
+      So check from outside, the way a visitor sees it. This script connects, reads the
+      certificate and fails when fewer than 14 days remain. Run from a scheduled job, it
+      turns a silent failure into an alert.
+
+      ```ts
+      import { connect } from "node:tls";
+
+      function daysLeft(host: string): Promise<number> {
+        return new Promise((resolve, reject) => {
+          const socket = connect({ host, port: 443, servername: host }, () => {
+            const cert = socket.getPeerCertificate();
+            socket.end();
+            resolve(Math.floor((new Date(cert.valid_to).getTime() - Date.now()) / 86_400_000));
+          });
+          socket.setTimeout(5000, () => socket.destroy(new Error(`timeout: ${host}`)));
+          socket.on("error", reject);
+        });
+      }
+
+      const left = await daysLeft("example.com");
+      if (left < 14) {
+        console.error(`certificate renewal is failing: ${left} days left`);
+        process.exitCode = 1;
+      }
+      ```
+
+      `connect` verifies the chain and the name by default, so a broken chain or a missing
+      name rejects with an error, which should alert too. `servername` sends the host name
+      during the handshake, which servers hosting many sites need to pick the right
+      certificate.
+pitfalls:
+  - '**Changing a record with a long TTL and switching the old server off.** Resolvers keep sending users there for up to a full TTL. Lower the TTL a TTL in advance and keep the old server up.'
+  - '**Testing a name before creating it.** The "no such name" answer gets cached too. Create the record, then look it up.'
+  - '**Leaving an old `AAAA` record.** IPv6 users keep reaching the old server. Move or remove every address record for the name.'
+  - '**Serving the certificate without its intermediate.** Browsers may cope while curl, Node and webhooks fail. Serve the full chain.'
+  - '**A certificate that misses a name.** `www` and the bare domain are two names. List every host you serve, or use a wildcard for one level of subdomains.'
+  - '**Closing port 80 after moving to HTTPS.** HTTP-01 renewal needs it, so renewal fails months later. Keep 80 open and redirect it.'
+  - '**Trusting automatic renewal without watching it.** It breaks silently. Check expiry from outside and alert well before the date.'
+interview:
+  - question: You changed a DNS record an hour ago. Some users see the new site and some the old. Explain, and say how you'd plan the change next time.
+    answer: >-
+      DNS is cached, not pushed, so each resolver serves its copy until the TTL it received
+      runs out. Users whose resolver fetched the record shortly before my change keep the old
+      address for up to one full TTL, which could be a day. Next time I'd lower the TTL to
+      a few minutes, wait at least the old TTL so every cached copy has the short one, then
+      switch. I'd keep the old server running for a while afterwards, check both `A` and
+      `AAAA` records, and raise the TTL again once traffic has moved. The trade-off of a
+      short TTL is more lookups and more exposure to DNS host outages, so it's a temporary
+      setting.
+  - question: Walk me through what happens during a TLS handshake from the certificate's point of view. What can go wrong?
+    answer: >-
+      The client sends the host name it wants, the server sends its certificate and
+      intermediate, and the client checks three things before trusting the key inside. The
+      chain must lead to a root it trusts, the current date must fall inside the validity
+      period, and a Subject Alternative Name must match the host, with wildcards covering one
+      label. Then the key is used to agree session keys. Failures map to those checks: a
+      missing intermediate, where browsers may cope and curl won't; an expired certificate
+      after a silent renewal failure; or a missing name, such as `www`. Clock skew on the
+      client can fake an expiry too. I'd monitor expiry and chain validity from outside.
+  - question: How do you get and renew TLS certificates for a service automatically, and what are the risks?
+    answer: >-
+      With ACME, usually from Let's Encrypt, run by the reverse proxy or a tool such as
+      certbot. The authority checks control of the domain with a token served over HTTP on
+      port 80, or with a `TXT` record for the DNS challenge, which is required for wildcards.
+      Certificates last 90 days and renew with about 30 left. The risk is silent failure:
+      port 80 closed by a later firewall change, an expired DNS API key, a rebuilt server
+      without the renewal job. So I'd alert on expiry from an outside check, add a `CAA`
+      record so only my chosen authority can issue, and remember that Certificate
+      Transparency logs make every name on the certificate public.
+  - question: Why can't the root of a domain be a CNAME, and how do people work around it?
+    answer: >-
+      Because a `CNAME` says "this name is an alias", so it can't sit beside other records
+      for the same name, and the apex always has `NS` and `SOA` records. That's a problem
+      when a platform or CDN gives you a host name rather than an address. The workarounds:
+      many DNS hosts offer a flattened alias record that you configure like a `CNAME` and
+      that they resolve and serve as `A` and `AAAA`. Or use `A` records to fixed addresses
+      if the platform publishes them. Or redirect the bare domain to `www`, which can be a
+      `CNAME`. The flattened record is the cleanest, at the cost of tying you to a DNS host
+      that supports it.

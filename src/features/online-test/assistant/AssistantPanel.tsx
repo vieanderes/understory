@@ -1,0 +1,659 @@
+'use client';
+
+import { ArrowUp, Check, ChevronDown, Copy, CornerDownRight, Square, X } from 'lucide-react';
+import {
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+  type CSSProperties,
+  type KeyboardEvent,
+  type ReactNode,
+} from 'react';
+import {
+  AssistantError,
+  type AssistantContext,
+  type AssistantPort,
+  type AssistantProviderId,
+} from '@/core/ports/assistant';
+import {
+  ASSISTANT_MODELS,
+  createAssistantPort,
+  formatPairingCode,
+  MCP_TIMEOUT_MS,
+  pushMcpContext,
+  type AssistantModel,
+} from '@/adapters/assistant';
+import { cn } from '@/lib/cn';
+import { useAssistantDraft } from '../assistant-draft';
+import { Markdown } from './Markdown';
+import {
+  keyStore,
+  modelStore,
+  providerStore,
+  readModel,
+  readPairingCode,
+  useApiKey,
+  useLocalCliAvailability,
+  useModel,
+  useOrigin,
+  usePairingCode,
+  useProvider,
+} from './prefs';
+
+/*
+ * The simulator's assistant, like an assessment's built-in AI assistant (docs/ONLINE-TEST.md, section 6).
+ * The parent owns the transcript: the question goes to onMessage at once, the reply when
+ * it is finished (or stopped), so the report shows exactly what the candidate saw.
+ */
+
+export interface AssistantMessage {
+  role: 'user' | 'assistant';
+  text: string;
+  at: number;
+}
+
+export interface AssistantPanelProps {
+  context: AssistantContext;
+  transcript: AssistantMessage[];
+  onMessage: (message: AssistantMessage) => void;
+  createPort?: (id: AssistantProviderId) => AssistantPort;
+  /** The line shown before the first message. Tests say the reviewer reads it; the tutor does not. */
+  intro?: string;
+  placeholder?: string;
+  /** One-tap starters for an empty conversation. */
+  suggestions?: readonly string[];
+  /** The empty state's question, above the intro. */
+  greeting?: string;
+  /** Shown beside "Thinking" while a reply is on its way: the tutor's cairn builds itself. */
+  thinkingMark?: ReactNode;
+  /** Focus the question box on open: the panel was opened to ask something. */
+  autoFocus?: boolean;
+}
+
+const PROVIDER_LABEL: Record<AssistantProviderId, string> = {
+  'api-key': 'Your API key',
+  'claude-cli': 'Your Claude account, here',
+  mcp: 'Your Claude account (MCP)',
+};
+
+const MODEL_LABEL: Record<AssistantModel, string> = {
+  'claude-sonnet-5-5': 'Sonnet 5.5',
+  'claude-opus-5-5': 'Opus 5.5',
+  'claude-haiku-4-5-20251001': 'Haiku 4.5',
+};
+
+const FOCUS = 'focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent';
+const FIELD = cn(
+  'border-border bg-surface text-fg rounded-control w-full border px-1 text-sm',
+  'placeholder:text-faint hover:border-border-strong',
+  FOCUS,
+);
+
+function defaultCreatePort(id: AssistantProviderId): AssistantPort {
+  return createAssistantPort(id, {
+    getKey: keyStore.get,
+    pairingCode: readPairingCode(),
+    model: readModel,
+  });
+}
+
+/** Message times, read in event handlers only. */
+const timestamp = (): number => Date.now();
+
+function errorText(error: unknown): string {
+  if (error instanceof AssistantError) return error.message;
+  return 'The assistant failed to answer. Ask again.';
+}
+
+/** Replies are Markdown: code blocks highlighted, lists and emphasis kept (Markdown.tsx). */
+function ReplyText({ text }: { text: string }) {
+  return <Markdown text={text} />;
+}
+
+function CopyButton({ value, label }: { value: string; label: string }) {
+  const [copied, setCopied] = useState(false);
+  const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  useEffect(() => () => clearTimeout(timer.current), []);
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopied(true);
+      clearTimeout(timer.current);
+      timer.current = setTimeout(() => setCopied(false), 2000);
+    } catch {
+      // Clipboard blocked: the text is on screen to select by hand.
+    }
+  };
+  const Icon = copied ? Check : Copy;
+  return (
+    <button
+      type="button"
+      onClick={copy}
+      aria-label={copied ? 'Copied' : label}
+      title={label}
+      className={cn(
+        'text-muted hover:text-fg hover:bg-raised rounded-control inline-flex size-5 shrink-0 items-center justify-center',
+        'transition-press active:scale-98',
+        FOCUS,
+      )}
+    >
+      <Icon aria-hidden size={16} strokeWidth={2} />
+    </button>
+  );
+}
+
+function ProviderSetup({
+  provider,
+  onEdit,
+}: {
+  provider: AssistantProviderId;
+  /** Typing a key makes the provider ready; the setup stays open until closed. */
+  onEdit: () => void;
+}) {
+  const keyId = useId();
+  const modelId = useId();
+  const apiKey = useApiKey();
+  const model = useModel();
+  const origin = useOrigin();
+  const pairing = usePairingCode();
+
+  const modelField =
+    provider === 'mcp' ? null : (
+      <div>
+        <label htmlFor={modelId} className="t-label">
+          Model
+        </label>
+        <select
+          id={modelId}
+          value={model}
+          onChange={(event) => modelStore.set(event.target.value)}
+          className={cn(FIELD, 'mt-0.5 h-5')}
+        >
+          {ASSISTANT_MODELS.map((id) => (
+            <option key={id} value={id}>
+              {MODEL_LABEL[id]}
+            </option>
+          ))}
+        </select>
+      </div>
+    );
+
+  if (provider === 'api-key') {
+    return (
+      <div className="flex flex-col gap-2">
+        <div>
+          <label htmlFor={keyId} className="t-label">
+            Anthropic API key
+          </label>
+          <input
+            id={keyId}
+            type="password"
+            autoComplete="off"
+            spellCheck={false}
+            value={apiKey}
+            placeholder="sk-ant-..."
+            onChange={(event) => {
+              onEdit();
+              keyStore.set(event.target.value.trim());
+            }}
+            className={cn(FIELD, 'mt-0.5 h-5 font-mono')}
+          />
+          <p className="text-muted mt-0.5 text-sm">
+            Kept in this browser. Sent only to this app, which passes it to Anthropic and never
+            stores it.
+          </p>
+        </div>
+        {modelField}
+      </div>
+    );
+  }
+
+  if (provider === 'claude-cli') {
+    return (
+      <div className="flex flex-col gap-2">
+        <p className="text-muted text-sm">
+          Uses the account logged in to Claude Code on this machine. Nothing to set up.
+        </p>
+        {modelField}
+      </div>
+    );
+  }
+
+  const endpoint = `${origin}/api/mcp`;
+  const command = `claude mcp add --transport http understory ${endpoint}`;
+  // claude.ai reaches connectors from its own servers, so a localhost URL only works for
+  // Claude Code and Claude Desktop's local connections, not for the web or phone apps.
+  const local = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:|\/|$)/.test(origin);
+  const formatted = pairing ? formatPairingCode(pairing) : '';
+  return (
+    <div className="flex flex-col gap-2 text-sm">
+      <div>
+        <p className="t-label">Pairing code</p>
+        <div className="mt-0.5 flex items-center gap-1">
+          <span className="t-figure text-lg font-semibold">{formatted}</span>
+          <CopyButton value={formatted} label="Copy pairing code" />
+        </div>
+      </div>
+      <div>
+        <p className="t-label">Connect your Claude app once</p>
+        <p className="text-muted mt-0.5">
+          {local
+            ? 'In Claude Code, run the command below. The Claude web and phone apps need the deployed site, not localhost.'
+            : 'In Claude (web, desktop or phone): Settings, Connectors, Add custom connector, with this URL. Or run the command below in Claude Code.'}
+        </p>
+        {local ? null : (
+          <div className="border-border bg-sunken rounded-control mt-0.5 flex items-start gap-0.5 border py-0.5 pr-0.5 pl-1">
+            <code className="min-w-0 flex-1 py-0.5 font-mono text-sm break-all">{endpoint}</code>
+            <CopyButton value={endpoint} label="Copy connector URL" />
+          </div>
+        )}
+      </div>
+      <div>
+        <p className="t-label">Claude Code</p>
+        <div className="border-border bg-sunken rounded-control mt-0.5 flex items-start gap-0.5 border py-0.5 pr-0.5 pl-1">
+          <code className="min-w-0 flex-1 py-0.5 font-mono text-sm break-all">{command}</code>
+          <CopyButton value={command} label="Copy command" />
+        </div>
+      </div>
+      <p className="text-muted">
+        Then ask here, and tell Claude: answer my simulator question, code {formatted}.
+      </p>
+    </div>
+  );
+}
+
+export function AssistantPanel({
+  context,
+  transcript,
+  onMessage,
+  createPort,
+  intro = 'Ask about the task, the language or your code. The reviewer reads this conversation.',
+  placeholder = 'Ask the assistant',
+  suggestions = [],
+  greeting = 'How can I help with this task?',
+  thinkingMark,
+  autoFocus = false,
+}: AssistantPanelProps) {
+  const storedProvider = useProvider();
+  const cli = useLocalCliAvailability();
+  const apiKey = useApiKey();
+  const pairing = usePairingCode();
+  // A remembered local provider falls back while it is unavailable (another machine).
+  const provider: AssistantProviderId =
+    storedProvider === 'claude-cli' && cli !== 'available' ? 'mcp' : storedProvider;
+
+  const [draft, setDraft] = useAssistantDraft();
+  const [streaming, setStreaming] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [setupChoice, setSetupChoice] = useState<boolean | null>(null);
+  const controller = useRef<AbortController | null>(null);
+  const scroller = useRef<HTMLDivElement>(null);
+
+  const providerId = useId();
+  const draftId = useId();
+  const setupId = useId();
+  const hintId = useId();
+
+  const ready = provider !== 'api-key' || apiKey.length > 0;
+  // Open by itself until the provider is ready; after that the candidate decides.
+  const setupOpen = setupChoice ?? !ready;
+  const busy = streaming !== null;
+
+  const port = useMemo(() => (createPort ?? defaultCreatePort)(provider), [createPort, provider]);
+
+  // The connected app reads the code through the bridge; keep it current between
+  // questions. This syncs an external system, it sets no React state.
+  useEffect(() => {
+    if (provider !== 'mcp' || !pairing || createPort) return;
+    const timer = setTimeout(() => void pushMcpContext(pairing, context), 1000);
+    return () => clearTimeout(timer);
+  }, [provider, pairing, context, createPort]);
+
+  useEffect(() => {
+    const element = scroller.current;
+    if (element) element.scrollTop = element.scrollHeight;
+  }, [transcript.length, streaming]);
+
+  useEffect(() => () => controller.current?.abort(), []);
+
+  const send = async (override?: string) => {
+    const text = (override ?? draft).trim();
+    if (!text || busy) return;
+    const question: AssistantMessage = { role: 'user', text, at: timestamp() };
+    onMessage(question);
+    setDraft('');
+    setError(null);
+    setStreaming('');
+
+    const abort = new AbortController();
+    controller.current = abort;
+    const turns = [...transcript, question].map(({ role, text: body }) => ({ role, text: body }));
+    let reply = '';
+    try {
+      for await (const chunk of port.send({ turns, context }, abort.signal)) {
+        reply += chunk;
+        setStreaming(reply);
+      }
+    } catch (caught) {
+      if (!abort.signal.aborted) setError(errorText(caught));
+    } finally {
+      if (reply.trim()) onMessage({ role: 'assistant', text: reply, at: timestamp() });
+      if (controller.current === abort) controller.current = null;
+      setStreaming(null);
+    }
+  };
+
+  const stop = () => controller.current?.abort();
+
+  const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
+      event.preventDefault();
+      void send();
+    }
+  };
+
+  const waitingOnApp = busy && streaming === '' && provider === 'mcp';
+
+  const connected =
+    provider === 'mcp'
+      ? 'Claude via MCP'
+      : provider === 'claude-cli'
+        ? 'Claude on this machine'
+        : 'Your API key';
+
+  const empty = transcript.length === 0 && !busy;
+  const lastReply = transcript.findLastIndex((message) => message.role === 'assistant');
+
+  return (
+    <section aria-label="Assistant" className="bg-surface flex h-full min-h-0 flex-1 flex-col">
+      <div
+        ref={scroller}
+        className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-2 pt-2 pb-3"
+        role="log"
+        aria-label="Conversation"
+        tabIndex={0}
+      >
+        {empty ? (
+          <div className="flex flex-col gap-3">
+            <div className="flex flex-col gap-0.5">
+              <p className="text-lg font-semibold tracking-tight text-balance">{greeting}</p>
+              <p className="text-muted text-sm text-pretty">{intro}</p>
+            </div>
+            {suggestions.length > 0 ? (
+              <ul aria-label="Suggestions" className="-mx-1 flex flex-col">
+                {suggestions.map((suggestion, index) => (
+                  <li
+                    key={suggestion}
+                    className="stream-in"
+                    style={{ '--i': index } as CSSProperties}
+                  >
+                    <button
+                      type="button"
+                      disabled={!ready}
+                      onClick={() => void send(suggestion)}
+                      className={cn(
+                        'group text-muted hover:text-fg hover:bg-raised rounded-control flex min-h-5 w-full items-center gap-1 px-1 text-left text-sm',
+                        'transition-press disabled:text-faint active:scale-98',
+                        FOCUS,
+                      )}
+                    >
+                      <CornerDownRight
+                        aria-hidden
+                        size={16}
+                        strokeWidth={2}
+                        className="text-faint group-hover:text-fg transition-press shrink-0"
+                      />
+                      <span className="min-w-0 flex-1">{suggestion}</span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+          </div>
+        ) : null}
+        <ol className="flex flex-col gap-3">
+          {transcript.map((message, index) =>
+            message.role === 'user' ? (
+              <li key={`${index}-${message.at}`} className="flex justify-end pl-4">
+                <p className="sr-only">You</p>
+                <div className="bg-raised rounded-panel px-1.5 py-1 text-sm break-words whitespace-pre-wrap">
+                  {message.text}
+                </div>
+              </li>
+            ) : (
+              <li key={`${index}-${message.at}`} className="group/reply flex flex-col gap-0.5">
+                <div className="min-w-0 break-words">
+                  <p className="sr-only">Assistant</p>
+                  <ReplyText text={message.text} />
+                </div>
+                <div
+                  className={cn(
+                    '-ml-1 flex',
+                    // The latest answer keeps its action in view; older ones show it on hover.
+                    index === lastReply
+                      ? null
+                      : 'transition-press pointer-fine:opacity-0 pointer-fine:group-hover/reply:opacity-100 pointer-fine:focus-within:opacity-100',
+                  )}
+                >
+                  <CopyButton value={message.text} label="Copy the answer" />
+                </div>
+              </li>
+            ),
+          )}
+          {busy ? (
+            <li className="flex flex-col gap-1">
+              {streaming ? (
+                <div className="min-w-0 break-words" aria-live="polite" aria-busy="true">
+                  <ReplyText text={streaming} />
+                </div>
+              ) : (
+                <div
+                  className="text-muted flex flex-col gap-0.5 text-sm"
+                  aria-live="polite"
+                  aria-busy="true"
+                >
+                  <span className="flex items-center gap-1">
+                    {thinkingMark ?? <Thinking />}
+                    <span>Thinking…</span>
+                    <Elapsed />
+                  </span>
+                  {waitingOnApp ? (
+                    <span className="text-faint text-pretty">
+                      Waiting for your Claude app. Tell it to answer code{' '}
+                      {formatPairingCode(pairing)}. It gives up after {MCP_TIMEOUT_MS / 60_000}{' '}
+                      minutes.
+                    </span>
+                  ) : null}
+                </div>
+              )}
+            </li>
+          ) : null}
+        </ol>
+      </div>
+
+      {error ? (
+        <p role="alert" className="text-danger px-2 pb-1 text-sm">
+          {error}
+        </p>
+      ) : null}
+
+      {setupOpen ? (
+        <div
+          id={setupId}
+          role="group"
+          aria-labelledby={`${setupId}-title`}
+          className="rule-t bg-raised flex flex-col gap-2 px-2 pt-1 pb-2"
+        >
+          <div className="-mr-1 flex items-center justify-between gap-1">
+            <p id={`${setupId}-title`} className="text-sm font-semibold">
+              Connection
+            </p>
+            <button
+              type="button"
+              onClick={() => setSetupChoice(false)}
+              aria-label="Close connection settings"
+              title="Close"
+              className={cn(
+                'text-muted hover:text-fg hover:bg-sunken rounded-control inline-flex size-5 items-center justify-center',
+                'transition-press active:scale-98',
+                FOCUS,
+              )}
+            >
+              <X aria-hidden size={16} strokeWidth={2} />
+            </button>
+          </div>
+          <div>
+            <label htmlFor={providerId} className="t-label">
+              Assistant
+            </label>
+            <select
+              id={providerId}
+              value={provider}
+              onChange={(event) => {
+                providerStore.set(event.target.value);
+                setError(null);
+              }}
+              disabled={busy}
+              className={cn(FIELD, 'disabled:text-faint mt-0.5 h-5 font-medium')}
+            >
+              <option value="mcp">{PROVIDER_LABEL.mcp}</option>
+              {cli === 'available' ? (
+                <option value="claude-cli">{PROVIDER_LABEL['claude-cli']}</option>
+              ) : null}
+              <option value="api-key">{PROVIDER_LABEL['api-key']}</option>
+            </select>
+          </div>
+          <ProviderSetup
+            provider={provider}
+            onEdit={() => setSetupChoice((choice) => choice ?? true)}
+          />
+        </div>
+      ) : null}
+
+      <form
+        className="shrink-0 p-1"
+        onSubmit={(event) => {
+          event.preventDefault();
+          void send();
+        }}
+      >
+        <div
+          className={cn(
+            'border-border bg-raised rounded-panel flex flex-col border transition-colors',
+            'focus-within:border-border-strong focus-within:bg-surface',
+          )}
+        >
+          <label htmlFor={draftId} className="sr-only">
+            Ask the assistant
+          </label>
+          <textarea
+            id={draftId}
+            value={draft}
+            onChange={(event) => setDraft(event.target.value)}
+            onKeyDown={onKeyDown}
+            rows={1}
+            placeholder={placeholder}
+            aria-describedby={hintId}
+            autoComplete="off"
+            autoFocus={autoFocus}
+            className="placeholder:text-faint field-sizing-content max-h-30 min-h-6 w-full resize-none bg-transparent px-1.5 pt-1.5 pb-0.5 text-sm outline-none"
+          />
+          <p id={hintId} className="sr-only">
+            Enter sends, Shift and Enter starts a new line.
+          </p>
+          <div className="flex items-center justify-between gap-1 p-0.5 pl-1">
+            <button
+              type="button"
+              aria-expanded={setupOpen}
+              aria-controls={setupId}
+              aria-label={`Connection: ${connected}. Assistant settings`}
+              title="Assistant settings"
+              onClick={() => setSetupChoice(!setupOpen)}
+              className={cn(
+                'rounded-control inline-flex h-4 min-w-0 items-center gap-0.5 px-0.5 text-sm',
+                'transition-press active:scale-98',
+                setupOpen ? 'text-fg bg-sunken' : 'text-muted hover:text-fg hover:bg-sunken',
+                FOCUS,
+              )}
+            >
+              <span
+                aria-hidden
+                className={cn('size-1 shrink-0 rounded-full', ready ? 'bg-success' : 'bg-warning')}
+              />
+              <span className="truncate">{connected}</span>
+              <ChevronDown
+                aria-hidden
+                size={16}
+                strokeWidth={2}
+                className={cn('transition-press shrink-0', setupOpen && 'rotate-180')}
+              />
+            </button>
+            {busy ? (
+              <button
+                type="button"
+                onClick={stop}
+                aria-label="Stop"
+                title="Stop"
+                className={cn(
+                  'bg-fg text-bg rounded-control inline-flex size-4 shrink-0 items-center justify-center',
+                  'transition-press active:scale-95',
+                  FOCUS,
+                )}
+              >
+                <Square aria-hidden size={12} strokeWidth={2.5} fill="currentColor" />
+              </button>
+            ) : (
+              <button
+                type="submit"
+                aria-label="Send"
+                title="Send (Enter)"
+                disabled={!draft.trim() || !ready}
+                className={cn(
+                  'bg-accent text-accent-fg hover:bg-accent-hover rounded-control inline-flex size-4 shrink-0 items-center justify-center',
+                  'transition-press disabled:text-faint active:scale-95 disabled:bg-transparent',
+                  FOCUS,
+                )}
+              >
+                <ArrowUp aria-hidden size={16} strokeWidth={2.5} />
+              </button>
+            )}
+          </div>
+        </div>
+      </form>
+    </section>
+  );
+}
+
+/** The default thinking mark, for the simulator: one dot, breathing. */
+function Thinking() {
+  return <span aria-hidden className="bg-muted size-1 shrink-0 animate-pulse rounded-full" />;
+}
+
+/*
+ * Seconds since the question, read from a shared one-second clock rather than a timer in
+ * state, so a reply that takes a while visibly counts instead of looking stuck.
+ */
+let clockTimer: ReturnType<typeof setInterval> | undefined;
+const clockListeners = new Set<() => void>();
+function subscribeClock(onChange: () => void): () => void {
+  clockListeners.add(onChange);
+  clockTimer ??= setInterval(() => clockListeners.forEach((notify) => notify()), 1000);
+  return () => {
+    clockListeners.delete(onChange);
+    if (clockListeners.size === 0) {
+      clearInterval(clockTimer);
+      clockTimer = undefined;
+    }
+  };
+}
+const readClock = () => Math.floor(Date.now() / 1000);
+
+function Elapsed() {
+  const [start] = useState(readClock);
+  const now = useSyncExternalStore(subscribeClock, readClock, () => start);
+  const seconds = Math.max(0, now - start);
+  return <span className="t-figure text-faint font-mono">{seconds}s</span>;
+}

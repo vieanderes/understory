@@ -1,0 +1,308 @@
+summary: >-
+  Authentication proves who is calling. Access control, or authorisation, decides what that
+  caller may touch. Most real breaches in this area aren't clever cryptography failures.
+  They're a session id that survives login, a reset link that works twice, or an endpoint
+  that checks "is someone signed in" and forgets "is this theirs". OWASP's Top 10 for 2025
+  ranks A01 Broken Access Control first and lists A07 Authentication Failures separately.
+
+
+  The lesson covers the three habits that close most of it: a fresh session id at login,
+  single-use short-lived reset tokens with a reply that reveals nothing, and tests that call
+  each endpoint as the owner, a stranger and nobody. These notes go underneath: putting the
+  ownership check in the query or in row-level security so it can't be forgotten, the
+  cookie settings a session needs, an atomic way to spend a reset token, and how to test
+  access across a whole API.
+
+
+  You need all of this on any system with accounts. The question to ask of every handler
+  is the same: which rows can this caller reach, and where in the code is that enforced? If
+  the answer is "the front end hides the button", the rule isn't enforced at all.
+remember:
+  - Authentication says who you are and authorisation says what you may do, and most access bugs check the first and forget the second.
+  - Enforce ownership where the data is read, as `WHERE id = $1 AND owner_id = $2`, so a foreign row is never loaded.
+  - Answer "not yours" with the same `404` as "doesn't exist", so ids can't be probed.
+  - Issue a new session id at login and on any change of privilege, and delete the old one on the server.
+  - A session cookie is `HttpOnly`, `Secure` and `SameSite`, with idle and absolute timeouts enforced by the server.
+  - A reset token is random, stored as a hash, spent atomically in one `UPDATE`, and expires in under an hour.
+  - Guessable or unguessable, an id in a URL is not a permission, so UUIDs don't fix IDOR.
+  - Test every endpoint as owner, stranger, wrong role and signed out, and make the test fail when the check is removed.
+sections:
+  - title: Put the check where the data is read
+    body: |-
+      The lesson's `getNote` loads a note and then compares `ownerId`. That works, but it
+      relies on every handler remembering a second step. Moving the owner into the query makes
+      the safe path the only path: a foreign row is never loaded, so there's nothing to leak.
+
+      ```sql
+      SELECT id, subject FROM tickets WHERE id = $1 AND owner_id = $2;
+      UPDATE tickets SET subject = $3 WHERE id = $1 AND owner_id = $2;
+      ```
+
+      For writes, check the affected row count. Zero rows means "not found or not yours",
+      which becomes the same `404`.
+
+      **Row-level security** (RLS) in PostgreSQL goes one step further: the database adds the
+      condition to every query on the table, including ones a developer writes next year.
+
+      ```ts
+      import { PGlite } from '@electric-sql/pglite';
+
+      const db = new PGlite();
+      await db.exec(`
+        CREATE TABLE tickets (id integer PRIMARY KEY, owner_id integer NOT NULL, subject text);
+        INSERT INTO tickets VALUES (1, 7, 'Refund not received'), (2, 8, 'Cannot change email');
+        ALTER TABLE tickets ENABLE ROW LEVEL SECURITY;
+        CREATE POLICY tickets_owner ON tickets
+          USING (owner_id = current_setting('app.user_id')::integer)
+          WITH CHECK (owner_id = current_setting('app.user_id')::integer);
+        CREATE ROLE app_user;
+        GRANT SELECT, INSERT, UPDATE, DELETE ON tickets TO app_user;
+      `);
+
+      async function asUser<T>(userId: number, work: () => Promise<T>): Promise<T> {
+        await db.exec('BEGIN');
+        try {
+          // true: the setting lasts only for this transaction, so a pooled connection can't leak it.
+          await db.query("SELECT set_config('app.user_id', $1, true)", [String(userId)]);
+          await db.exec('SET LOCAL ROLE app_user');
+          return await work();
+        } finally {
+          await db.exec('COMMIT');
+        }
+      }
+
+      console.log(await asUser(7, async () => (await db.query('SELECT id FROM tickets')).rows));
+      // [ { id: 1 } ]
+      console.log(await asUser(7, async () => (await db.query('SELECT id FROM tickets WHERE id = 2')).rows));
+      // []
+      await asUser(7, () => db.query("INSERT INTO tickets VALUES (3, 8, 'planted')")).catch((e) =>
+        console.log(e.message),
+      ); // new row violates row-level security policy for table "tickets"
+      ```
+
+      `USING` filters what a user can see and change. `WITH CHECK` stops them writing a row
+      they wouldn't be allowed to see, such as a ticket planted in someone else's name.
+
+      Two caveats. Superusers, roles with `BYPASSRLS` and, by default, the table's owner skip
+      the policies, which is why the example switches to `app_user`; `ALTER TABLE ... FORCE ROW
+      LEVEL SECURITY` makes the owner obey them too. And RLS is a backstop, not a replacement
+      for the application check, because the app still decides who the user is.
+  - title: IDOR is more than one endpoint
+    body: |-
+      An **insecure direct object reference** is any place where a client-supplied id reaches
+      data without an ownership check. OWASP's API Security Top 10 calls it Broken Object Level
+      Authorization and ranks it first. The obvious case is `GET /tickets/2`. The ones that
+      slip through review are quieter:
+
+      - **Nested resources.** `DELETE /orders/5/items/9` checks that order 5 is yours, then
+        deletes item 9 without checking it belongs to order 5.
+      - **Lists and exports.** `GET /tickets?ownerId=8` trusts a filter from the query string.
+        The owner comes from the session, never from the request.
+      - **Bulk endpoints.** `POST /tickets/close` with `{"ids": [1, 2, 3]}` checks the first id
+        and closes all three.
+      - **Mass assignment.** An update handler that spreads the request body into the row lets
+        a client send `ownerId` or `role`. Accept an explicit list of writable fields.
+      - **Side channels.** Different error messages, response times or `403` versus `404` tell
+        an attacker which ids exist.
+      - **Indirect references.** A file download by storage key, a signed URL that never
+        expires, or a WebSocket subscription to `ticket:2` with no check on subscribe.
+
+      Random UUIDs make ids hard to guess, which is worth having, but ids leak through URLs,
+      logs, shared links and other API responses. Treat an id as a name, never as proof of
+      access.
+
+      **Vertical** escalation is the other direction: a customer reaching an admin action. The
+      fix is a role or permission check on the server for every privileged route, denied by
+      default. A route table where each entry must declare its required permission, and a
+      test that fails when one doesn't, turns "someone forgot" into a failing build.
+  - title: Session cookies and their lifetime
+    body: |-
+      A session id is a bearer credential: whoever holds it is the user. Everything about
+      the cookie aims to keep it from being read, sent where it shouldn't go, or living too
+      long.
+
+      ```js
+      import { randomBytes } from 'node:crypto';
+
+      function sessionCookie(sid, maxAgeSeconds) {
+        return [
+          `__Host-sid=${sid}`,
+          'Path=/',
+          'HttpOnly',
+          'Secure',
+          'SameSite=Lax',
+          `Max-Age=${maxAgeSeconds}`,
+        ].join('; ');
+      }
+
+      const sid = randomBytes(32).toString('base64url'); // 256 bits from the OS's CSPRNG
+      console.log(sessionCookie(sid, 60 * 60 * 8));
+      // __Host-sid=...; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=28800
+      ```
+
+      `HttpOnly` keeps it away from JavaScript, so an XSS bug can't read it. `Secure` sends
+      it only over HTTPS. `SameSite=Lax` stops most cross-site sends, which blunts CSRF. The
+      `__Host-` prefix makes the browser reject the cookie unless it's `Secure`, has
+      `Path=/` and has no `Domain`, so a subdomain can't plant or overwrite it.
+
+      The cookie's `Max-Age` is only a hint to the browser. The server enforces the real
+      limits on the session record: an **idle timeout** (for example 30 minutes without a
+      request) and an **absolute timeout** (for example 8 hours or a day, whatever the risk
+      allows). Logout deletes the record on the server; clearing the cookie alone leaves a
+      stolen copy working.
+
+      Rotate the id at every change of privilege, not only login: after a password change,
+      after stepping up with MFA, when an admin starts impersonating a customer. After a
+      password reset, delete every existing session for that user, because the reset may be
+      the owner locking out someone who stole the old password.
+  - title: Spending a reset token safely
+    body: |-
+      Three details turn the lesson's `checkResetToken` into something you can ship. The
+      token is stored as a hash, so a database leak doesn't hand over live reset links.
+      Lookup is by that hash, which is fast and leaks nothing through timing, because the
+      attacker doesn't control the digest. And checking and spending happen in one statement,
+      so two requests racing with the same link can't both win.
+
+      ```ts
+      import { createHash, randomBytes } from 'node:crypto';
+      import { PGlite } from '@electric-sql/pglite';
+
+      const db = new PGlite();
+      await db.exec(`CREATE TABLE reset_tokens (
+        token_hash text PRIMARY KEY, user_id integer NOT NULL,
+        expires_at timestamptz NOT NULL, used_at timestamptz)`);
+
+      const sha256 = (s: string) => createHash('sha256').update(s).digest('hex');
+
+      async function issue(userId: number): Promise<string> {
+        const token = randomBytes(32).toString('base64url'); // goes in the email link only
+        await db.query(
+          "INSERT INTO reset_tokens VALUES ($1, $2, now() + interval '30 minutes', NULL)",
+          [sha256(token), userId],
+        );
+        return token;
+      }
+
+      async function spend(token: string): Promise<number | null> {
+        const { rows } = await db.query<{ user_id: number }>(
+          `UPDATE reset_tokens SET used_at = now()
+           WHERE token_hash = $1 AND used_at IS NULL AND expires_at > now()
+           RETURNING user_id`,
+          [sha256(token)],
+        );
+        return rows[0]?.user_id ?? null;
+      }
+
+      const token = await issue(7);
+      console.log(await spend(token)); // 7
+      console.log(await spend(token)); // null: already used
+      console.log(await spend('made-up')); // null
+      ```
+
+      A fast hash is fine here, unlike for passwords, because the token has 256 random bits:
+      there is nothing to guess. Issuing a new token should delete the user's older ones, and
+      the reply to "forgot password" is identical and takes about the same time whether or not
+      the email exists. Sending the email from a background job helps with the timing.
+
+      The login form has the same enumeration problem. Return one message for "no such user"
+      and "wrong password", and still run the password hash for an unknown user, against a
+      dummy hash, so the response time doesn't give it away. Against credential stuffing, where
+      attackers replay passwords leaked elsewhere, add rate limits per account and per IP,
+      check new passwords against known breached lists, and offer MFA.
+  - title: Testing access control across an API
+    body: |-
+      The lesson's three tests per endpoint scale with a table. List the endpoints, list the
+      callers, and state the expected status for each pair. A missing check then fails a test
+      the moment it's introduced.
+
+      ```js
+      import { test } from 'node:test';
+      import assert from 'node:assert/strict';
+
+      const tickets = new Map([[1, { ownerId: 7 }], [2, { ownerId: 8 }]]);
+
+      // The system under test: a tiny router. In a real app, call your HTTP handlers.
+      function handle(route, caller, id) {
+        if (!caller) return 401;
+        const ticket = tickets.get(id);
+        if (route === 'refund') return caller.role === 'admin' ? 200 : 403;
+        if (!ticket || ticket.ownerId !== caller.id) return 404;
+        return 200;
+      }
+
+      const owner = { id: 7, role: 'customer' };
+      const stranger = { id: 8, role: 'customer' };
+      const admin = { id: 1, role: 'admin' };
+
+      const matrix = [
+        ['read', owner, 1, 200], ['read', stranger, 1, 404], ['read', null, 1, 401],
+        ['read', owner, 99, 404],
+        ['refund', admin, 1, 200], ['refund', owner, 1, 403], ['refund', null, 1, 401],
+      ];
+
+      for (const [route, caller, id, expected] of matrix) {
+        test(`${route} ticket ${id} as ${caller ? `user ${caller.id}` : 'nobody'} gives ${expected}`, () => {
+          assert.equal(handle(route, caller, id), expected);
+        });
+      }
+      ```
+
+      Run it with `node --test`. The refund route answers `403` rather than `404` because its
+      existence isn't a secret: every customer knows there's a refund feature. Hiding with
+      `404` is for objects, not for features.
+
+      Make each test earn its place: delete the ownership line in the handler and watch the
+      stranger row fail. A test that still passes without the check proves nothing. In an
+      integration suite, the callers are real sessions created by signing in, and the matrix
+      runs against the HTTP layer so middleware ordering bugs show up too.
+pitfalls:
+  - '**Checking authentication and calling it authorisation.** "Is there a session?" passes for every signed-in user. Ask "may this user do this to this object?" in every handler, or in the query.'
+  - '**Taking the owner from the request.** An `ownerId` in the body or query string is whatever the client wants. The owner always comes from the session.'
+  - '**Keeping the session id through login.** Login is exactly when a planted id becomes valuable. Regenerate it, and delete the old record server-side.'
+  - '**Logging out by clearing the cookie.** A copied session id keeps working until the server forgets it. Delete the session record, and after a password reset delete them all.'
+  - '**Storing reset tokens in plain text.** A read-only database leak becomes account takeover for anyone with a pending link. Store a SHA-256 of the token and look it up by that hash.'
+  - '**Hiding admin features in the front end.** A hidden button still leaves a callable route. Enforce roles on the server and deny by default.'
+interview:
+  - question: What is IDOR and how do you prevent it systematically, not endpoint by endpoint?
+    answer: >-
+      IDOR is an endpoint that uses a client-supplied id to fetch or change data without
+      checking the caller may touch that object. Preventing it systematically means making the
+      unsafe path hard to write. I scope data access by the caller: repository functions take
+      the user or tenant and add `AND owner_id = $2`, so nobody writes a bare lookup by id.
+      Where the database allows it, row-level security enforces the same rule underneath, as
+      a backstop. Then tests: a matrix of endpoints against owner, stranger, wrong role and
+      signed out, run in CI, so a missing check fails the build. Unguessable ids help at the
+      margin but aren't a control, because ids leak through links and logs. The trade-off
+      of RLS is operational: per-request settings and pooled connections need care.
+  - question: Why should a stranger get 404 rather than 403 for someone else's resource?
+    answer: >-
+      Because `403` confirms the resource exists, and that's information. With sequential ids,
+      an attacker can walk the range and learn how many orders you have, or which usernames or
+      documents exist, even without reading any of them. Answering `404` makes "not yours"
+      indistinguishable from "not there". It also falls out naturally when the ownership
+      check is in the query: the row isn't found. I'd use `403` when existence is public,
+      such as an admin-only feature every user knows about, where a `403` is more honest and
+      helps debugging. The response time and body should match too, or the difference
+      moves to a side channel.
+  - question: Walk me through a secure password reset flow.
+    answer: >-
+      The user enters an email, and the reply is always "if that account exists, we've sent a
+      link", sent after the same work either way. If the account exists, I generate 32 random
+      bytes, store only their SHA-256 with the user id and an expiry of 30 to 60 minutes, and
+      delete older tokens for that user. The link carries the raw token. On submit, one
+      `UPDATE ... WHERE token_hash = $1 AND used_at IS NULL AND expires_at > now() RETURNING
+      user_id` spends it atomically, so a replay or a race gets nothing. Then I set the new
+      password, delete every session for that user, and send a notification that the
+      password changed. Rate limits on the request endpoint stop it being used to flood
+      someone's inbox.
+  - question: How do you defend a login endpoint against credential stuffing?
+    answer: >-
+      Assume attackers hold valid passwords from other breaches, so defend at several layers.
+      Rate limits per account slow guessing on one user, and per IP and per network slow
+      spraying across many, with a CAPTCHA or proof-of-work challenge when signals look
+      automated rather than a hard lock that attackers can use to lock users out. New
+      passwords are checked against known breached lists. MFA, ideally passkeys, makes a
+      correct password insufficient on its own. The endpoint doesn't reveal which accounts
+      exist: one error message and similar timing, including hashing against a dummy for
+      unknown users. And I alert on spikes in failures, because detection lets you respond
+      while an attack is running.

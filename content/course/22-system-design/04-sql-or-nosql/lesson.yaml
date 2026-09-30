@@ -1,0 +1,245 @@
+id: sysdesign.sql-or-nosql
+title: SQL or NoSQL
+objective: Match relational, document, key-value, wide-column and graph stores to access patterns, and know how far Postgres goes before you need another.
+level: advanced
+minutes: 10
+concepts: [sysdesign.data-models, sysdesign.nosql-trade-offs, sysdesign.postgres-reach]
+prerequisites: [sysdesign.caching-patterns, db.schema-design, db.storage-and-pooling]
+opening:
+  text: >-
+    You'll choose a data store from how the data is read and written, not from what's
+    fashionable. Most of the time the answer is still Postgres, and you'll know why.
+
+steps:
+  - type: prose
+    id: name-data-models
+    body: |-
+      A database's **data model** is the shape it stores data in. Each makes some questions
+      cheap:
+
+      - **relational**: tables, joins and transactions across rows
+      - **document**: one JSON document per thing, read whole
+      - **key-value**: a value fetched by its key, nothing more
+      - **wide-column**: huge tables split across machines by one key
+      - **graph**: nodes and edges, for following relationships
+
+      Start from the questions your app asks most often.
+
+  - type: multiple-choice
+    id: pick-key-value
+    concept: sysdesign.data-models
+    difficulty: 1
+    question: You fetch login sessions by id, thousands a second, and nothing else. Which store fits best?
+    choices:
+      - text: A key-value store
+        correct: true
+        feedback: >-
+          Yes. One key in, one value out, as fast as memory allows.
+      - text: A graph database
+        feedback: >-
+          Graphs shine at following relationships. A session has none to follow.
+      - text: A relational join across tables
+        feedback: >-
+          Nothing here needs a join. It's a single lookup by id.
+
+  - type: predict-output
+    id: predict-duplicated-name
+    concept: sysdesign.nosql-trade-offs
+    difficulty: 2
+    language: json
+    code: |
+      {
+        "orderId": 9001,
+        "customer": { "id": 7, "name": "R. Patel" },
+        "total": 30
+      }
+    question: Customer 7 has 12,000 orders stored like this. They change their name. How many documents must change?
+    choices:
+      - text: '12,000'
+        correct: true
+        feedback: >-
+          Yes. The name is copied into every order, so every copy needs updating.
+      - text: '1'
+        feedback: >-
+          That's what a separate customers table gives you. Here the name lives inside each order.
+      - text: '0'
+        feedback: >-
+          Keeping old names is sometimes what you want. But if the name must change, all copies do.
+
+  - type: prose
+    id: name-trade-offs
+    body: |-
+      That's the **NoSQL trade-off** in miniature. Many NoSQL stores spread across machines
+      by giving something up: joins, multi-row transactions, or always-fresh reads.
+
+      So you design each table or document around one query, and copy data where that query
+      needs it. Reads get fast and simple. Writes and changes get harder, and your code keeps
+      the copies in step.
+
+  - type: prose
+    id: name-postgres-reach
+    body: |-
+      That's part of **Postgres's reach**. A `jsonb` column stores a JSON document per row.
+      A **GIN index** lists, for each key and value inside, the rows that contain it.
+      Full-text search and pgvector cover search and embeddings.
+
+      So a single Postgres is a sound default. Reach for another store when you've measured a
+      need it can't meet, such as writes beyond one machine.
+
+  - type: sql
+    id: sql-jsonb-containment
+    concept: sysdesign.postgres-reach
+    difficulty: 2
+    prompt: >-
+      Products have different attributes, stored as `jsonb`. `@>` means "contains". Find the
+      ids of the red products with it, in id order.
+    setup: |
+      CREATE TABLE products (id integer PRIMARY KEY, attrs jsonb NOT NULL);
+      INSERT INTO products VALUES
+        (1, '{"colour": "red", "size": "M"}'),
+        (2, '{"colour": "blue", "wattage": 60}'),
+        (3, '{"colour": "red", "wattage": 40}');
+    starter: |
+      SELECT id, attrs FROM products;
+    solution: |
+      SELECT id FROM products WHERE attrs @> '{"colour": "red"}' ORDER BY id;
+    checks:
+      ordered: true
+    showSchema: true
+    hints:
+      - 'Put the condition in a `WHERE` clause: `attrs @> ...`.'
+      - 'The right side is a JSON object in quotes: `''{"colour": "red"}''`.'
+      - 'Only the `id` column, then `ORDER BY id`.'
+
+  - type: ai-review
+    id: review-gin-not-used
+    concept: sysdesign.postgres-reach
+    difficulty: 4
+    language: sql
+    request: Index the events table so we can count signups quickly.
+    flawClass: performance
+    code: |
+      CREATE INDEX events_data ON events USING gin (data);
+
+      SELECT count(*)
+      FROM events
+      WHERE data->>'type' = 'signup';
+    prompt: >-
+      An assistant wrote this. On a 50-row test table it was instant. On 300,000 rows,
+      `EXPLAIN` shows a sequential scan. Tap the line at fault.
+    lines: [5]
+    reasons:
+      - text: This GIN index can't serve `->>` equality
+        correct: true
+        feedback: >-
+          Right. It serves `@>`. Our run went from 16 ms to under 0.1 ms.
+      - text: A GIN index only works on text columns
+        feedback: >-
+          GIN is the usual index for `jsonb`. The query has to use an operator it supports.
+      - text: '`count(*)` always reads every row'
+        feedback: >-
+          Postgres can count rows found through an index. The filter is what forced the scan.
+    fix: |
+      WHERE data @> '{"type": "signup"}';
+
+  - type: fill-blank
+    id: fill-gin-index
+    concept: sysdesign.postgres-reach
+    difficulty: 3
+    prompt: Index the events table so the signup count can use it.
+    language: sql
+    template: |
+      CREATE INDEX events_data ON events USING {{1}} (data);
+
+      SELECT count(*) FROM events
+      WHERE data {{2}} '{"type": "signup"}';
+    blanks:
+      - key: '1'
+        answer: gin
+      - key: '2'
+        answer: '@>'
+    bank: [gin, btree, '@>', '->>', '=']
+
+  - type: explain-back
+    id: explain-postgres-default
+    concept: sysdesign.postgres-reach
+    difficulty: 3
+    prompt: >-
+      A new product has 50,000 users and some loosely structured data. Why start with Postgres
+      rather than a document database?
+    rubric:
+      - Postgres handles flexible data with jsonb and indexes, alongside relational data.
+      - It keeps joins, transactions and constraints, which most products need somewhere.
+      - Its limits are far beyond this scale, and moving later is possible if a measured need appears.
+    modelAnswer: >-
+      At 50,000 users one Postgres has plenty of headroom. The loose data fits in a `jsonb`
+      column with a GIN index. I keep transactions, constraints and joins for everything
+      else. A document store would make those harder for no gain. If one access pattern
+      outgrows Postgres later, I can move that part, with numbers to justify it.
+
+recap:
+  - Pick a data model from the questions your app asks most.
+  - Expect NoSQL stores to trade joins and transactions for scale-out.
+  - Default to Postgres, with jsonb for flexible data, until a measured need says otherwise.
+recall:
+  - id: card-five-models
+    concept: sysdesign.data-models
+    front: Name the five common data models.
+    back: >-
+      Relational, document, key-value, wide-column and graph.
+  - id: card-design-around-queries
+    concept: sysdesign.nosql-trade-offs
+    front: In a NoSQL store, what do you design each table or document around?
+    back: >-
+      One access pattern. You copy data where that query needs it, and keep the copies in step
+      yourself.
+  - id: card-nosql-gives-up
+    concept: sysdesign.nosql-trade-offs
+    front: What do many NoSQL stores give up to scale out?
+    back: >-
+      Joins, transactions across rows, or immediate consistency, in some mix.
+  - id: card-jsonb-operator
+    concept: sysdesign.postgres-reach
+    front: Which `jsonb` operator does a default GIN index speed up for "has this key and value"?
+    back: >-
+      Containment, `@>`, as in `data @> '{"type": "signup"}'`. Plain `->>` equality can't use
+      it.
+
+references:
+  - kind: docs
+    title: JSON Types
+    authors: The PostgreSQL Global Development Group
+    venue: PostgreSQL Documentation
+    url: https://www.postgresql.org/docs/current/datatype-json.html
+    note: jsonb, containment, and which operators a GIN index supports.
+    primary: true
+    verified: true
+  - kind: book
+    title: Designing Data-Intensive Applications
+    authors: Martin Kleppmann
+    year: 2017
+    venue: O'Reilly Media
+    url: https://dataintensive.net/
+    note: Chapter 2 compares the relational, document and graph models.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Full Text Search
+    authors: The PostgreSQL Global Development Group
+    venue: PostgreSQL Documentation
+    url: https://www.postgresql.org/docs/current/textsearch.html
+    note: Search inside Postgres before you add a search engine.
+    verified: true
+
+deepDive: >-
+  The GIN run used 300,000 rows on PostgreSQL 17.11. The containment query used a bitmap
+  index scan in 0.087 ms. The `->>` equality query fell back to a parallel sequential scan
+  in 16.0 ms. If you must filter with `->>`, an expression index works:
+  `CREATE INDEX ON events ((data->>'type'))`.
+
+
+  "NoSQL" names what these stores are not, so the label hides big differences. Some
+  document stores now offer multi-document transactions, and some relational databases
+  scale writes across machines. Compare the actual guarantees: which operations are atomic,
+  what a read may miss, and how data is split. The question is always which access patterns
+  must be cheap, and which consistency the product can live with.

@@ -1,0 +1,252 @@
+summary: >-
+  Retrieval-augmented generation answers a question from your documents instead of the
+  model's memory. At question time your code searches an index, puts the best chunks in the
+  prompt as numbered sources, and tells the model to answer only from them, cite them, and
+  say when they don't cover it. It fixes the two things a bare model can't: it has never
+  seen your private documents, and what it learnt in training goes stale.
+
+
+  RAG is a pipeline, and each stage fails in its own way. Ingestion can chunk badly or lag
+  behind edits. Retrieval can miss the right chunk, which no prompt can recover. Generation
+  can ignore the sources or cite one it never saw. So a production RAG system checks each
+  stage separately: hit rate for retrieval, citation checks in code for generation, and a
+  fallback that says "I don't know" when either fails.
+
+
+  Reach for RAG when answers must come from a body of text that changes or is too large for
+  one prompt: help centres, policies, manuals, tickets. When everything fits in the context
+  window and rarely changes, sending it all can be simpler. When the task is a behaviour or
+  a format rather than knowledge, prompting or fine-tuning fits better than retrieval.
+remember:
+  - Retrieval quality caps answer quality, because the model can only use the chunks it was sent.
+  - A grounded prompt numbers the sources and sets two rules, answer only from them with citations and say you don't know when they don't cover it.
+  - Prompt rules lower the rate of invented answers but don't remove it, so code checks that every citation points at a source sent in this prompt.
+  - With no chunk above the relevance threshold, return a fixed "not found" answer without calling the model, because a model with no sources answers from memory.
+  - Measure retrieval on its own with hit rate at k on labelled questions, and fix retrieval before touching prompt wording or model size.
+  - RAG supplies knowledge at question time, fine-tuning changes behaviour and style, and neither replaces the other.
+  - Every stage has a failure mode (stale index, missed chunk, ignored source, false citation), so log chunk ids and scores per answer to tell them apart.
+sections:
+  - title: Checking citations in code
+    body: |-
+      The lesson's `answer` stops at the model's reply. Production code goes one step
+      further: it parses the citations, rejects answers that cite nothing or cite a number
+      outside the prompt, and returns the ids of the chunks actually used, so the interface
+      can link to them.
+
+      ```python
+      import re
+
+      RULES = (
+          "Answer only from the numbered sources. Cite them like [1]. "
+          "If the sources don't answer the question, say you don't know."
+      )
+      NOT_FOUND = "I couldn't find that in our help pages."
+      CITATION = re.compile(r"\[(\d+)\]")
+
+      def answer_with_sources(question, search, ask_model, min_score=0.5, k=3):
+          hits = [(cid, text) for score, cid, text in search(question) if score >= min_score][:k]
+          if not hits:
+              return {"text": NOT_FOUND, "sources": []}
+          sources = "\n".join(f"[{n}] {text}" for n, (_, text) in enumerate(hits, start=1))
+          reply = ask_model(system=RULES, prompt=f"{sources}\n\nQuestion: {question}")
+
+          cited = {int(n) for n in CITATION.findall(reply)}
+          # Every number must point at a source in this prompt, and there must be at least one.
+          if not cited or not cited <= set(range(1, len(hits) + 1)):
+              return {"text": NOT_FOUND, "sources": [], "rejected": reply}
+          return {"text": reply, "sources": [hits[n - 1][0] for n in sorted(cited)]}
+
+      def search(question):
+          return [
+              (0.91, "refunds-2", "Refunds take five working days."),
+              (0.74, "returns-1", "Return an item within 30 days."),
+              (0.20, "hours-1", "We open at 9."),
+          ]
+
+      stub = lambda reply: (lambda system, prompt: reply)
+      print(answer_with_sources("Refund time?", search, stub("Five working days [1].")))
+      # {'text': 'Five working days [1].', 'sources': ['refunds-2']}
+      print(answer_with_sources("Refund time?", search, stub("About 60 days [4].")))
+      # rejected: [4] was never sent
+      ```
+
+      Two details matter. The numbers map back to chunk ids through `hits`, the list for
+      this prompt, never through the whole index. And the rejected reply is kept for
+      logging, because a rising rejection rate is an early warning that a prompt or model
+      change has broken grounding. A reply that honestly says "I don't know" carries no
+      citation and falls back to the same message, which is the right outcome. A valid
+      citation proves the source was sent, not that it supports the sentence; checking
+      support needs an evaluation, covered in the evals lesson.
+  - title: Measuring retrieval, and reading the misses
+    body: |-
+      Hit rate at k is the share of labelled questions whose answering chunk appears in the
+      top k results. It's the ceiling for answer accuracy. The number alone is not enough:
+      the misses tell you what to fix.
+
+      ```python
+      def hit_rate(cases, search, k=5):
+          """cases: (question, id of the chunk that answers it). search returns ids, best first."""
+          hits = sum(1 for question, expected in cases if expected in search(question)[:k])
+          return hits / len(cases)
+
+      def misses(cases, search, k=5):
+          return [(q, expected, search(q)[:k]) for q, expected in cases if expected not in search(q)[:k]]
+
+      INDEX = {
+          "How long do refunds take?": ["refunds-2", "refunds-1", "returns-1"],
+          "Can I return a gift card?": ["returns-1", "refunds-1", "hours-1"],
+          "What does E-4417 mean?": ["errors-4471", "errors-list", "errors-4417"],
+          "When do you open?": ["hours-1"],
+      }
+      CASES = [
+          ("How long do refunds take?", "refunds-2"),
+          ("Can I return a gift card?", "giftcards-1"),
+          ("What does E-4417 mean?", "errors-4417"),
+          ("When do you open?", "hours-1"),
+      ]
+      search = lambda q: INDEX[q]
+      print(hit_rate(CASES, search, k=1), hit_rate(CASES, search, k=3))  # 0.5 0.75
+      for m in misses(CASES, search, k=3):
+          print(m)  # the gift card chunk never appears at all
+      ```
+
+      Each kind of miss points at a different stage. The error code is found, but third:
+      a ranking problem, fixed by hybrid search or a reranker. The gift card chunk never
+      appears: either the page doesn't exist, which is a content gap, or it wasn't indexed,
+      which is an ingestion bug. Neither is a prompt problem. Build the labelled set from
+      real user questions, not questions you wrote while reading the documents, because
+      yours will share the documents' wording and flatter the search.
+  - title: Where the context goes, and how much of it
+    body: |-
+      More sources are not always better. Each chunk costs input tokens, so cost and
+      latency grow with `k`. Irrelevant chunks also distract: a model given one right
+      passage and four near misses is more likely to blend them than one given the right
+      passage alone. That is why the lesson's `answer` has both a threshold and a cap. The
+      threshold drops weak matches, the cap bounds the bill.
+
+      A common production shape is to retrieve widely and send narrowly: fetch 20 to 50
+      candidates cheaply, rerank them with a slower model that reads each candidate next to
+      the question, and send the best 3 to 5. Reranking costs one extra call per query but
+      usually improves precision more than any prompt wording can.
+
+      Other context choices are often overlooked:
+
+      - **Metadata in the source line.** `[1] Refund policy, updated March: ...` lets the
+        model prefer the current page and lets the reader judge the citation.
+      - **Deduplication.** Overlapping chunks from the same page repeat text. Merge
+        neighbours or keep one.
+      - **Permissions.** Filter by what the asker may read inside the search, before the top
+        k is chosen. A model must never be the thing that decides access.
+      - **Stable prefix.** Keep the rules first and identical across calls, so a provider
+        that caches repeated prompt prefixes can reuse them.
+
+      Long context windows don't retire RAG. Sending a whole handbook each time costs its
+      full token count on every question, and relevant facts buried in a long prompt are
+      used less reliably than facts placed close to the question.
+  - title: RAG, long context or fine-tuning
+    body: |-
+      Interviewers like this comparison because each option solves a different problem.
+
+      **RAG** adds knowledge at question time. It suits facts that change, facts too many
+      to fit in a prompt, and answers that must cite a source. Updating it means
+      re-indexing a document, which takes minutes. Its weak point is retrieval: a missed
+      chunk is a wrong or empty answer.
+
+      **Long context** sends everything, every time. It's the simplest option when the
+      material is small and stable, such as one contract or a short policy. It costs the
+      full token count per call and slows the first token, and there is nothing to search,
+      so nothing to cite with precision unless you number the sections yourself.
+
+      **Fine-tuning** changes behaviour: tone, format, a narrow classification, a style of
+      answer. It is a poor way to add facts. Knowledge learnt that way can't be cited,
+      can't be updated without training again, and can't be removed when a document is
+      withdrawn or access changes.
+
+      They combine. A fine-tuned model can answer in the house style from retrieved
+      sources, and a long-context model can take more retrieved chunks. The deciding
+      questions are: does the knowledge change, must answers be traceable, and do different
+      users see different documents? Any yes points to retrieval.
+pitfalls:
+  - "**Rules that invite guessing.** \"Use the sources to help\" lets the model fill gaps from memory. Say \"answer only from the sources\" and give it an explicit way out: \"say you don't know\"."
+  - "**Calling the model with no sources.** An empty or weak retrieval still produces a fluent answer. Return a fixed not-found message, and log the question as a content gap."
+  - "**Checking citations against the whole index.** A cited id that exists somewhere proves nothing. Check against the ids sent in this prompt."
+  - "**Tuning the prompt when retrieval is the problem.** If the right chunk reaches the top 5 only 60% of the time, answers can't beat that. Measure hit rate first and fix chunking, hybrid search or reranking."
+  - "**A labelled set written from the documents.** Questions phrased like the source text are retrieved without effort and hide real failures. Collect questions from users, logs and support tickets."
+  - "**Stale indexes.** A policy edited yesterday but re-indexed next week gives confident old answers. Re-index on change events, and show the source's date with each citation."
+  - "**Filtering permissions after retrieval, or in the prompt.** Filtering after the top k leaves empty results; asking the model to hide documents can be talked around. Filter inside the search by the asker's groups."
+interview:
+  - question: Walk me through building a RAG system for a help centre.
+    answer: >-
+      Two pipelines: ingestion, which chunks, embeds and indexes the pages, and the query
+      path, which retrieves, prompts, checks and answers. Ingestion splits pages on their
+      headings into chunks of a few hundred tokens, keeps the title and section with each,
+      and indexes them for both vector and keyword search, re-running when a page changes.
+      At question time I run hybrid search, drop weak matches, send the best few as numbered
+      sources with rules to answer only from them and cite, then check in code that every
+      citation points at a source I sent. If retrieval finds nothing or the check fails, the
+      user gets a clear not-found answer and a link to support. Before launch I measure hit
+      rate on real questions, because retrieval caps everything downstream.
+  - question: Your RAG assistant gives wrong answers a third of the time. How do you find out why?
+    answer: >-
+      I split the failure by stage before changing anything, starting with retrieval. For a
+      sample of wrong answers, I check whether the answering chunk was in what we sent. If
+      it usually wasn't, the fix is retrieval: chunking, hybrid search, a reranker, or a
+      missing page. If it was there and the model ignored it or contradicted it, the fix is
+      generation: stricter rules, fewer distracting chunks, or a stronger model. Logging chunk
+      ids and scores per answer makes this a query rather than guesswork. Then I turn the
+      failures into labelled cases, so hit rate and answer quality are tracked on every
+      change. Rewording the prompt first is the common mistake, since no wording recovers a
+      chunk that was never retrieved.
+  - question: How do you stop a RAG system from hallucinating?
+    answer: >-
+      You can't stop it entirely, so you reduce it in the prompt and catch it in code. The
+      prompt tells the model to answer only from numbered sources, cite them, and say it
+      doesn't know when they don't cover the question, which gives it an honest exit. Code
+      refuses to call the model when nothing relevant was retrieved, and checks that every
+      citation refers to a source in this prompt; failures go to a fallback. For claims that
+      cite a real source but misstate it, I run an evaluation, often a model judging
+      faithfulness against human labels, on a sample of traffic. The trade-off is more
+      "I don't know" answers, which is usually the right price for a support tool.
+  - question: When would you choose RAG over fine-tuning, or over putting everything in a long context window?
+    answer: >-
+      RAG when knowledge changes, must be cited, or differs by user; fine-tuning for
+      behaviour; long context when the material is small and stable. Fine-tuning bakes facts
+      into weights, where they can't be cited, updated without retraining, or removed when
+      access changes, so it's the wrong tool for a policy handbook but a good one for a
+      fixed output style. Long context is simplest for one contract or a short policy, but
+      it pays for every token on every call and slows the first token, and facts deep in a
+      long prompt are used less reliably. At scale, retrieval sends only what matters. The
+      options combine, for example a fine-tuned model answering from retrieved sources.
+  - question: How would you show citations in a chat interface?
+    answer: >-
+      Inline markers like [1] in the answer, each linked to a sources panel that shows the
+      document title, the quoted passage and a link to open it, so a reader can check a
+      claim in one click. The backend is what makes them trustworthy: it checks that every
+      cited id was really retrieved for this answer before the reply reaches the screen,
+      and drops or flags any that weren't. When nothing retrieved supports an answer, the
+      interface says "not found in your documents" rather than showing an uncited reply.
+      For accessibility, the markers are real links with a label such as "source 1", not
+      bare superscript numbers. The trade-off is a little more screen space and a check on
+      every reply, which is cheap next to one confident answer that cites nothing real.
+
+terms:
+  - term: RAG
+    say: Teaching the model your documents.
+    means: "Retrieval-augmented generation: search an index at question time and put the best
+      chunks in the prompt as numbered sources. The model's weights don't change."
+  - term: Hallucination
+    say: The model lying.
+    means: Fluent, confident output that the sources or the facts don't support. It comes from
+      predicting likely text; grounding and checks lower it but don't remove it.
+  - term: Grounded
+    say: The answer has citations.
+    means: The answer is built only from the sources sent, cites them, and says so when they
+      don't cover the question. Code checks each citation points at a source actually sent.
+  - term: Hit rate at k
+    say: How accurate the search is.
+    means: The share of labelled questions where at least one relevant chunk lands in the top k.
+      Measure it before touching the prompt or the model.
+  - term: Fine-tuning
+    say: The way to add your knowledge to a model.
+    means: Further training that changes the weights. It suits behaviour, style and format;
+      facts that change belong in retrieval.

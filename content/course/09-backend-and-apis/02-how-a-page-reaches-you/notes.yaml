@@ -1,0 +1,178 @@
+summary: >-
+  A URL is an address with parts, and each part is used by a different step. The scheme picks
+  the protocol, the host is looked up in DNS, the port picks the program, the path and query
+  travel inside the HTTP request, and the fragment never leaves the browser.
+
+
+  Before a single byte of your request reaches the server, three setup steps happen in order:
+  DNS turns the host name into an IP address, TCP opens a connection to it, and TLS proves the
+  server's identity and encrypts the line. Only then does HTTP carry the request and bring
+  back the response. Each step costs at least one round trip across the network, which is why
+  a first visit is slower than the next one.
+
+
+  This is the model you debug with. An error names the step that failed: `Could not resolve
+  host` is DNS, `Failed to connect` is TCP, a certificate error is TLS, and any status code at
+  all means the first three worked. It's also the model behind performance work: caching DNS,
+  reusing connections and moving servers closer to users all remove round trips from this
+  journey.
+remember:
+  - An `https` request goes DNS, then TCP, then TLS, then HTTP, and each later step needs the earlier ones to have worked.
+  - Any HTTP status, even a `404` or `500`, proves that DNS, TCP and TLS all succeeded.
+  - '`Could not resolve host` is a DNS failure, `Failed to connect` means nothing listens on that address and port, and a certificate error is TLS.'
+  - The fragment after `#` is never sent to the server, and the host travels to DNS without the path or query.
+  - Build query strings with `URL` and `searchParams`, or `encodeURIComponent` for one value, never by gluing raw text.
+  - A cold `https` request over TCP needs about three round trips before the first response byte, and a reused connection needs one.
+  - HTTP/2 sends many requests over one connection at once, and HTTP/3 runs over QUIC on UDP with the TLS handshake built in.
+sections:
+  - title: DNS in more detail
+    body: |-
+      Your computer doesn't know every address. It asks a **recursive resolver**, usually run
+      by your internet provider or a public service. The resolver, if it has no cached answer,
+      walks the hierarchy: a root server points it to the servers for `.example`, which point
+      it to the domain's **authoritative** servers, which give the answer.
+
+      Answers come as records:
+
+      - `A` holds an IPv4 address, such as `104.20.23.154`.
+      - `AAAA` holds an IPv6 address.
+      - `CNAME` says "this name is an alias for that one", and the lookup continues there.
+
+      Every answer carries a **TTL**, the number of seconds it may be cached. The browser, the
+      operating system and the resolver all cache, which is why most lookups take a few
+      milliseconds. It's also why a DNS change takes time to reach everyone: the old answer
+      lives on until its TTL runs out. Before moving a site to a new server, teams lower the
+      TTL a day ahead so the switch spreads quickly.
+
+      One host can return several addresses. Clients try them, and a client that has both
+      IPv4 and IPv6 addresses races connections to both and keeps whichever answers first.
+      That's why `curl -v` against `localhost` sometimes shows `::1`, the IPv6 loopback address,
+      and sometimes `127.0.0.1`.
+  - title: Round trips, and where the time goes
+    body: |-
+      A **round trip** is a message there and an answer back. Its time, the RTT, depends on
+      distance: a few milliseconds across a city, about 80 to 150 ms across an ocean. Setup
+      steps each need at least one:
+
+      ```text
+      DNS lookup        about 1 RTT to the resolver, often cached
+      TCP handshake     1 RTT: SYN, SYN-ACK, then ACK with data
+      TLS 1.3           1 RTT (TLS 1.2 needed 2)
+      HTTP request      1 RTT, plus the server's own work
+      ```
+
+      `curl` can print the time at which each step finished:
+
+      ```bash
+      $ curl -s -o /dev/null -w 'dns %{time_namelookup}\ntcp %{time_connect}\ntls %{time_appconnect}\nfirst byte %{time_starttransfer}\n' https://example.com/
+      dns 0.054770
+      tcp 0.080171
+      tls 0.122228
+      first byte 0.163829
+      ```
+
+      The numbers are cumulative seconds. Here DNS took 55 ms, the TCP handshake 25 ms, TLS
+      42 ms and the request itself 42 ms. A slow `time_starttransfer` with fast setup means
+      the server is slow. A slow `time_namelookup` points at DNS.
+
+      Most tuning removes round trips. **Keep-alive** reuses a connection, so later requests
+      skip DNS, TCP and TLS. A **CDN** puts servers near users, which shrinks every RTT.
+      TLS session resumption skips most of the handshake on a return visit.
+  - title: TLS, certificates and HTTP versions
+    body: |-
+      TLS does two jobs. It **encrypts** the connection, and it **authenticates** the server.
+      The server presents a certificate that names the host and is signed, through a chain,
+      by an authority your system trusts. The client checks three things: the chain ends at a
+      trusted root, the name matches the host you asked for, and the dates are valid. Any
+      failure stops the journey before HTTP starts.
+
+      Because one IP address can host many sites, the client names the host inside the TLS
+      hello, an extension called **SNI**, so the server can pick the right certificate. The
+      same hello negotiates which HTTP version to speak, through **ALPN**.
+
+      The versions differ in how they use the connection:
+
+      - **HTTP/1.1** sends one request at a time per connection, so browsers open several
+        connections to load a page.
+      - **HTTP/2** multiplexes many requests as streams over one TCP connection. One lost
+        packet still stalls every stream, because TCP delivers bytes in order.
+      - **HTTP/3** runs over **QUIC**, on UDP. Streams are independent, so a lost packet only
+        stalls its own stream, and the transport and TLS 1.3 handshakes happen together.
+
+      Methods, statuses and headers mean the same in all three. Your handler code doesn't
+      change.
+  - title: Encoding URLs correctly
+    body: |-
+      Some characters mean something in a URL: `?` starts the query, `&` separates pairs, `#`
+      starts the fragment, `/` separates path segments. A value containing them has to be
+      **percent-encoded**. The `URL` class does it for you:
+
+      ```ts
+      const url = new URL('https://shop.example/search');
+      url.searchParams.set('q', 'fish & chips');
+      url.searchParams.set('sort', 'price');
+      console.log(url.href);
+      // https://shop.example/search?q=fish+%26+chips&sort=price
+
+      console.log(encodeURIComponent('fish & chips/2')); // fish%20%26%20chips%2F2
+      console.log(encodeURI('https://shop.example/a b?q=1&r=2'));
+      // https://shop.example/a%20b?q=1&r=2
+
+      const parsed = new URL('https://shop.example/search?q=fish+%26+chips');
+      console.log(parsed.searchParams.get('q')); // fish & chips
+      console.log(new URL('HTTPS://Shop.Example:443/a/../b').href); // https://shop.example/b
+      ```
+
+      `encodeURIComponent` encodes everything that could end a value, so it's the one for a
+      single query value or path segment. `encodeURI` leaves `?`, `&` and `/` alone because it
+      expects a whole URL, which makes it wrong for values. `searchParams` writes a space as
+      `+`, the form encoding, and reads both `+` and `%20` back as a space.
+
+      The last line shows normalisation: the scheme and host are lower-cased, the default port
+      is dropped and `..` is resolved. Compare URLs after parsing them, never as raw strings.
+pitfalls:
+  - '**Concatenating user input into a URL.** A `&` or `#` in the value cuts it short or injects a parameter. Use `searchParams.set` or `encodeURIComponent`.'
+  - '**Using `encodeURI` on a value.** It leaves `&`, `?` and `/` untouched. It is for whole URLs; values need `encodeURIComponent`.'
+  - '**Reading a `404` as "the server is down".** A status means the server answered. Look at the path and the routing, not the network.'
+  - '**Putting secrets in the fragment or query and assuming they stay private.** Query strings land in server logs and browser history. The fragment stays in the browser, but any script on the page can read it.'
+  - '**Changing DNS and expecting everyone to see it at once.** Cached answers live until their TTL expires. Lower the TTL before a planned move.'
+  - '**Disabling certificate checks to make an error go away.** `curl -k` or `NODE_TLS_REJECT_UNAUTHORIZED=0` removes the protection TLS exists for. Fix the certificate or the host name instead.'
+interview:
+  - question: What happens when you type a URL into the browser and press Enter?
+    answer: >-
+      The browser parses the URL, finds the host, and then does four hops. DNS resolves the
+      host to an IP address, usually from a cache, otherwise through a recursive resolver
+      walking root, top-level domain and authoritative servers. TCP opens a connection with a
+      three-way handshake. TLS verifies the certificate against trusted authorities and the
+      host name, agrees keys, and negotiates HTTP/2 through ALPN. Then the browser sends
+      `GET /path` with headers such as `Host` and cookies, and the server answers with a
+      status, headers and HTML. The browser parses it, fetches the CSS, scripts and images it
+      references, often over the same connection, and renders. With HTTP/3, TCP and TLS
+      merge into one QUIC handshake over UDP.
+  - question: A user reports the site is slow on first load but fine afterwards. Where would you look?
+    answer: >-
+      At connection setup, because that's the part a second load skips. A cold `https` request
+      pays for DNS, the TCP handshake and the TLS handshake before any response byte, each at
+      least one round trip. I'd measure with `curl -w` timing variables or the browser's
+      timing panel to see which step dominates. Fixes follow the cause: a CDN shortens every
+      round trip for distant users, TLS 1.3 and HTTP/3 cut handshake trips, preconnect hints
+      start setup early, and fewer third-party origins mean fewer handshakes. If setup is fast
+      and time to first byte is slow, the problem is the server's own work instead.
+  - question: What's the difference between `encodeURI` and `encodeURIComponent`?
+    answer: >-
+      `encodeURIComponent` is for one piece, such as a query value or a path segment, and
+      encodes every reserved character including `&`, `?`, `/` and `#`. `encodeURI` is for an
+      entire URL, so it leaves those characters alone because they give the URL its
+      structure. Using `encodeURI` on a value like `fish & chips` leaves the `&`, which the
+      server reads as the start of a new parameter. In practice I avoid both and build URLs
+      with the `URL` class and `searchParams.set`, which encodes values correctly and makes
+      it hard to get wrong.
+  - question: How would you tell from a failed request which layer is broken?
+    answer: >-
+      Read which step the error names, because each hop fails in its own way. An unresolved
+      host is DNS: a typo, a missing record or a resolver problem. A refused connection means
+      the address was found but nothing listens on that port, so the process is down or the
+      port is wrong. A timeout while connecting often means a firewall drops the packets. A
+      certificate error is TLS: an expired certificate or a name mismatch. Any HTTP status
+      means all of that worked, and the problem is in the application. `curl -v` shows how far
+      the request got, so I start there.

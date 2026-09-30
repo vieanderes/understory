@@ -1,0 +1,252 @@
+summary: >-
+  A transaction groups statements so the database treats them as one change: all of them
+  take effect at `COMMIT`, or none of them do. It's how a transfer never leaves money half
+  moved, how an order and its line items appear together, and how a failed request leaves no
+  trace. ACID names the four guarantees: atomicity, consistency, isolation and durability.
+
+
+  The mechanics are short in SQL and quick to get wrong in application code. A transaction
+  lives on one connection, so code that sends `BEGIN` and `COMMIT` through a pool can scatter
+  them across connections. A thrown error between the two can leave a connection open in a
+  transaction, holding locks. And an `UPDATE` that matches no row is not an error, so a
+  transaction can commit a half-done job unless the code checks what each statement did.
+
+
+  Reach for a transaction whenever two or more writes must agree. Keep it short, keep network
+  calls to other services out of it, and remember what it doesn't give you: it doesn't stop
+  two concurrent transactions from each making a valid but conflicting change. That's
+  isolation, the subject of the next lessons.
+remember:
+  - A transaction makes several statements one unit, so either every change is committed or none is.
+  - A transaction belongs to one connection, so in Node borrow one client with `pool.connect()`, run every statement on it, and release it in `finally`.
+  - After any error inside a transaction, Postgres refuses further statements until `ROLLBACK`, and a `COMMIT` at that point rolls back.
+  - An `UPDATE` or `DELETE` that matches zero rows succeeds, so check `rowCount` when the business rule needs exactly one.
+  - Durability comes from the write-ahead log, which is flushed to disk before `COMMIT` returns.
+  - Keep transactions short and never wait on another service inside one, because open transactions hold locks and hold back vacuum.
+  - Every statement outside `BEGIN` is its own transaction, so a single `UPDATE` of many rows is already all or nothing.
+  - Atomicity isn't isolation, so two transactions can each commit correctly and still conflict, which needs constraints, locks or a stricter isolation level.
+sections:
+  - title: A transaction helper for application code
+    body: |-
+      Every codebase that uses `node-postgres` ends up with a helper like this, so the
+      `BEGIN`, `COMMIT`, `ROLLBACK` and release rules live in one place:
+
+      ```ts
+      type Client = {
+        query: (text: string, values?: unknown[]) => Promise<{ rows: any[]; rowCount: number | null }>;
+        release: (destroy?: boolean | Error) => void;
+      };
+      type Pool = { connect: () => Promise<Client> };
+
+      async function withTransaction<T>(pool: Pool, work: (client: Client) => Promise<T>): Promise<T> {
+        const client = await pool.connect();
+        try {
+          await client.query('BEGIN');
+          const result = await work(client);
+          await client.query('COMMIT');
+          client.release();
+          return result;
+        } catch (error) {
+          try {
+            await client.query('ROLLBACK');
+            client.release();
+          } catch (rollbackError) {
+            // The connection is in an unknown state, so the pool must not reuse it.
+            client.release(rollbackError as Error);
+          }
+          throw error;
+        }
+      }
+
+      async function transfer(pool: Pool, fromId: number, toId: number, pence: number) {
+        return withTransaction(pool, async (client) => {
+          const debit = await client.query(
+            'UPDATE accounts SET balance_pence = balance_pence - $1 WHERE id = $2 AND balance_pence >= $1',
+            [pence, fromId],
+          );
+          if (debit.rowCount !== 1) throw new Error('Insufficient funds or no such account');
+          const credit = await client.query(
+            'UPDATE accounts SET balance_pence = balance_pence + $1 WHERE id = $2',
+            [pence, toId],
+          );
+          // An UPDATE that matches no row is not an error, so check it, or the debit stands alone.
+          if (credit.rowCount !== 1) throw new Error('No such account to credit');
+          const { rows } = await client.query(
+            'INSERT INTO transfers (from_id, to_id, pence) VALUES ($1, $2, $3) RETURNING id',
+            [fromId, toId, pence],
+          );
+          return rows[0].id;
+        });
+      }
+      ```
+
+      Tested against Postgres, a transfer to account 99, which doesn't exist, was refused and
+      both balances stayed put. Without the `credit.rowCount` check, the same call committed:
+      Ana lost £1 and nobody received it. The database did its job; the code asked for the
+      wrong thing.
+
+      Passing an error to `release` tells the `node-postgres` pool to close that connection
+      instead of reusing it. The debit also guards itself: `AND balance_pence >= $1` makes the
+      check and the change one statement, so no other transaction can spend the money between
+      a read and a write.
+  - title: Errors, the aborted state and savepoints
+    body: |-
+      When a statement fails inside a transaction, Postgres marks the whole transaction as
+      failed. Every later statement gets the same answer until you end it:
+
+      ```sql
+      BEGIN;
+      UPDATE accounts SET balance_pence = balance_pence + 9000 WHERE id = 2;
+      UPDATE accounts SET balance_pence = balance_pence - 9000 WHERE id = 1;
+      -- ERROR: new row for relation "accounts" violates check constraint
+      --        "accounts_balance_pence_check"   (SQLSTATE 23514)
+      SELECT * FROM accounts;
+      -- ERROR: current transaction is aborted, commands ignored until end of
+      --        transaction block                 (SQLSTATE 25P02)
+      COMMIT;   -- performs a rollback
+      ```
+
+      Afterwards Ben still has 1000 and Ana 5000. `COMMIT` on a failed transaction doesn't
+      commit anything; Postgres reports it as a rollback. In code, seeing `25P02` in logs means
+      an earlier error was swallowed and the code kept going.
+
+      A **savepoint** lets you undo part of a transaction and carry on. It suits imports,
+      where one bad row shouldn't cancel the rest:
+
+      ```sql
+      BEGIN;
+      INSERT INTO import_rows VALUES (1, 'ana@example.com');
+      SAVEPOINT row_2;
+      INSERT INTO import_rows VALUES (2, 'ana@example.com');
+      -- ERROR: duplicate key value violates unique constraint "import_rows_email_key"
+      ROLLBACK TO SAVEPOINT row_2;
+      INSERT INTO import_rows VALUES (3, 'ben@example.com');
+      COMMIT;
+      -- rows 1 and 3 are saved
+      ```
+
+      ORMs use savepoints for nested transactions. They cost a little each, so for a large
+      import it's often better to validate rows first, or use `INSERT ... ON CONFLICT DO
+      NOTHING` for the expected conflicts.
+  - title: Durability, the write-ahead log and commit cost
+    body: |-
+      Postgres never writes a change to the table files first. It appends a record of the
+      change to the **write-ahead log** (WAL), and `COMMIT` returns only after that record is
+      flushed to durable storage. The table pages themselves are written later, in the
+      background. After a crash, Postgres replays the log from the last checkpoint: committed
+      transactions come back, and anything uncommitted is ignored.
+
+      Two practical consequences follow.
+
+      **Each commit costs a flush.** Inserting 10,000 rows as 10,000 separate statements
+      outside a transaction means 10,000 commits, each waiting on the disk. Wrapping them in
+      one transaction, or using a multi-row `INSERT` or `COPY`, pays that cost once. Bulk jobs
+      should commit in batches of a few thousand rows: fast, without one enormous transaction.
+
+      **Durability has a dial.** Setting `synchronous_commit = off` lets `COMMIT` return before
+      the flush. A crash can then lose the last fraction of a second of commits, but can't
+      corrupt the database. It's a reasonable trade for data such as analytics events, and a
+      bad one for payments. The setting can be changed per transaction.
+
+      Durability on one machine isn't durability against losing the machine. That comes from
+      replicas and backups: a synchronous replica makes `COMMIT` wait until another server has
+      the WAL too, at the cost of latency on every write.
+  - title: Keep transactions short, and side effects out
+    body: |-
+      A transaction holds its row locks until it ends. While it's open, other writers to those
+      rows wait, and Postgres can't clean up old row versions that the transaction might
+      still need, so tables bloat during long transactions. Two settings guard against
+      forgotten ones: `idle_in_transaction_session_timeout` ends a session that sits idle
+      inside a transaction, and `transaction_timeout` (Postgres 17 and later) caps a
+      transaction's total length. Both are off by default.
+
+      The worst thing to put inside a transaction is a call to another service: a payment
+      provider, an email API, an AI model. It holds locks for as long as the network takes,
+      and it breaks atomicity anyway, because a `ROLLBACK` can't take back an email or a
+      charge. If the commit fails after the charge succeeded, the customer paid for nothing.
+
+      The standard fix is the **transactional outbox**. Write the business change and a
+      message describing it in the same transaction, then let a separate worker send the
+      messages:
+
+      ```sql
+      BEGIN;
+      WITH new_order AS (
+        INSERT INTO orders (customer_id, total_pence) VALUES (7, 2599)
+        RETURNING id, customer_id, total_pence
+      )
+      INSERT INTO outbox (topic, payload)
+      SELECT 'order.placed',
+             jsonb_build_object('orderId', id, 'customerId', customer_id, 'totalPence', total_pence)
+      FROM new_order;
+      COMMIT;
+
+      -- the worker, in its own short transaction
+      SELECT id, topic, payload FROM outbox
+      WHERE sent_at IS NULL
+      ORDER BY id
+      LIMIT 100
+      FOR UPDATE SKIP LOCKED;
+      ```
+
+      The order and its message commit together or not at all. The worker sends each message,
+      then sets `sent_at`. It may send a message twice if it crashes between the two, so the
+      receiver must be idempotent. `SKIP LOCKED` lets several workers share the queue without
+      taking the same rows.
+pitfalls:
+  - "**Sending `BEGIN` and `COMMIT` through `pool.query`.** Each call may use a different connection, so the statements aren't in one transaction. Borrow one client with `pool.connect()`."
+  - "**Forgetting to release or roll back on an error.** The connection stays `idle in transaction`, holding locks, and the pool shrinks. Put `ROLLBACK` in `catch` and the release in every path."
+  - "**Assuming a zero-row `UPDATE` failed.** It succeeded and changed nothing. Check `rowCount` whenever exactly one row must change."
+  - "**Catching an error inside a transaction and carrying on.** Every later statement fails with `current transaction is aborted`. Roll back, or use a savepoint around the statement you expect to fail."
+  - "**Calling another service between `BEGIN` and `COMMIT`.** It holds locks for the length of a network call, and a rollback can't undo it. Use an outbox, or call after the commit with an idempotency key."
+  - "**Reading a value, computing in code, and writing it back.** Two transactions can read the same balance and both write, and one update is lost. Do the arithmetic in the `UPDATE` itself, or lock the row with `SELECT ... FOR UPDATE`."
+  - "**One commit per row in a bulk import.** Each commit waits for a disk flush. Commit in batches."
+interview:
+  - question: Explain ACID.
+    answer: >-
+      They're the four guarantees a transaction gives. Atomicity: all of its changes take
+      effect or none do, even if the server crashes midway. Consistency: it moves the database
+      from one state that satisfies every constraint to another; the database enforces the
+      rules you declared, not rules that live only in code. Isolation: concurrent transactions
+      don't see each other's uncommitted work, and how far that goes depends on the isolation
+      level; Postgres defaults to read committed, which still allows some anomalies. Durability:
+      once `COMMIT` returns, the change survives a crash, because the write-ahead log was
+      flushed first. The one people overestimate is isolation.
+  - question: How would you implement a money transfer between two accounts in Node and Postgres?
+    answer: >-
+      In one transaction on one client from the pool, with the balance check inside the
+      `UPDATE`. I'd borrow a client with `pool.connect()`, send `BEGIN`, debit with `UPDATE
+      ... SET balance = balance - $1 WHERE id = $2 AND balance >= $1` and require `rowCount`
+      to be 1, credit the other account and check that too, insert a transfer record, then
+      `COMMIT`. Any error triggers `ROLLBACK`, and the client is released in every path. The
+      conditional update means no other transaction can spend the money between a check and
+      the write. I'd add a `CHECK (balance >= 0)` constraint as a backstop, and an idempotency
+      key on the transfer so a retried request can't move the money twice.
+  - question: Would you call a payment provider's API inside a database transaction?
+    answer: >-
+      No. The call can take seconds, and the transaction holds its locks the whole time, so
+      other requests queue behind it. Worse, it doesn't make the charge atomic with the data:
+      if the commit fails after the charge succeeds, a rollback can't refund the customer. I'd
+      record the intent first, such as an order in a `pending` state, commit, then call the
+      provider with an idempotency key, and record the result in a second short transaction,
+      with webhooks or a reconciliation job to catch calls whose outcome we never saw. For
+      messages to other systems I'd use a transactional outbox.
+  - question: What happens if the server crashes in the middle of a transaction? And right after `COMMIT` returns?
+    answer: >-
+      Mid-transaction, nothing is kept. Changes were written to the write-ahead log and maybe
+      to pages in memory, but there's no commit record, so recovery treats them as never
+      having happened. After `COMMIT` returns, the change survives: Postgres flushed the WAL
+      record to disk before answering, and recovery replays it on restart. The exceptions are
+      settings that trade durability for speed, like `synchronous_commit = off`, which can lose
+      the last moment of commits, and disks that lie about flushes. Surviving the loss of the
+      whole machine needs a replica or backups, which is a separate decision.
+  - question: What's the transactional outbox pattern, and what problem does it solve?
+    answer: >-
+      It solves the dual-write problem: updating the database and notifying another system
+      can't be atomic, so one can happen without the other. With an outbox, the same
+      transaction that changes the data inserts a row describing the event into an outbox
+      table. Both commit together or neither does. A separate worker reads unsent rows, often
+      with `FOR UPDATE SKIP LOCKED` so several workers can share the load, publishes them and
+      marks them sent. Delivery is at least once, because the worker can crash after
+      publishing and before marking, so consumers must be idempotent. The cost is an extra
+      table, a worker and a little delay.

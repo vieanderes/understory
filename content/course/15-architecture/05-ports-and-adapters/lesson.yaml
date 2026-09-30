@@ -1,0 +1,328 @@
+id: arch.hexagonal
+title: Ports and adapters
+objective: Point dependencies inward with a port the domain owns, pass adapters in, and test the rules against an in-memory adapter.
+level: advanced
+minutes: 10
+concepts: [arch.ports-and-adapters, arch.dependency-rule, arch.dependency-injection]
+prerequisites: [arch.layers, testing.doubles-and-integration, ts.everyday-types]
+opening:
+  text: >-
+    You'll write business rules that run without a database, a server or a framework. Then
+    swapping any of those becomes a small job, not a rewrite.
+
+steps:
+  - type: prose
+    id: domain-depends-on-database
+    body: >-
+      In lesson 4 the domain called the data-access layer below it, so domain files import
+      database code. Draw an arrow from each file to what it imports. That's the
+      **dependency direction**, and here it runs from the rules to the database.
+
+
+      So every test of a rule needs a running database. And changing the database means
+      editing the rules.
+
+  - type: multiple-choice
+    id: pick-what-must-run
+    concept: arch.dependency-rule
+    difficulty: 1
+    language: js
+    code: |
+      // domain/lend-book.js
+      import { db } from '../database/connection.js';
+
+      export async function lendBook(memberId, bookId) {
+        const reply = await db.query(
+          'SELECT count(*) AS n FROM loans WHERE member_id = $1', [memberId]);
+        if (Number(reply.rows[0].n) >= 3) return { ok: false };
+        await db.query('INSERT INTO loans (member_id, book_id) VALUES ($1, $2)',
+          [memberId, bookId]);
+        return { ok: true };
+      }
+    question: What does a test of the three-loan limit need?
+    choices:
+      - text: Nothing but Node
+        feedback: >-
+          The file imports a live connection on line 2, and the rule is wrapped round two
+          queries. It can't run alone.
+      - text: A running database with a loans table
+        correct: true
+        feedback: >-
+          Right. The rule can't run without the layer below it.
+      - text: A running web server
+        feedback: >-
+          The handlers sit above the domain, so the domain doesn't need them. It's the layer
+          below that it can't shake off.
+
+  - type: prose
+    id: name-ports-and-adapters
+    body: >-
+      Turn it round. The domain writes down what it needs, and imports nothing:
+
+
+      ```js
+      // domain/lend-book.js: a loans store must have countOpen and save
+      export async function lendBook(memberId, bookId, loans) {
+        if (await loans.countOpen(memberId) >= 3) return { ok: false };
+        await loans.save({ memberId, bookId });
+        return { ok: true };
+      }
+      ```
+
+
+      That list of needs is a **port**. An **adapter** fills it for one technology:
+      PostgreSQL in production, an array in tests.
+
+  - type: prose
+    id: name-dependency-injection
+    body: >-
+      `lendBook` doesn't import its store. Whoever calls it passes one in. That's
+      **dependency injection**: a function is handed what it depends on. The handler passes
+      the PostgreSQL adapter, and a test passes an array-backed fake.
+
+
+      Now the arrows point inward. The adapter depends on the port's shape, and the domain
+      depends on nothing. That's the **dependency rule**.
+
+  - type: parsons
+    id: arrange-postgres-adapter
+    concept: arch.ports-and-adapters
+    difficulty: 2
+    language: js
+    prompt: >-
+      Build the PostgreSQL adapter for the loans port. It takes a `db` connection and
+      returns the two functions `lendBook` calls.
+    blocks:
+      - id: open-adapter
+        code: export function postgresLoans(db) {
+      - id: return-port
+        code: return {
+        indent: 1
+        subgoal: The port's two functions
+      - id: count-open
+        code: async countOpen(memberId) {
+        indent: 2
+      - id: count-query
+        code: const reply = await db.query('SELECT count(*) AS n FROM loans WHERE member_id = $1', [memberId]);
+        indent: 3
+      - id: count-return
+        code: return Number(reply.rows[0].n);
+        indent: 3
+      - id: count-close
+        code: '},'
+        indent: 2
+      - id: save-loan
+        code: async save(loan) { await db.query('INSERT INTO loans (member_id, book_id) VALUES ($1, $2)', [loan.memberId, loan.bookId]); },
+        indent: 2
+      - id: close-all
+        code: '}; }'
+    distractors:
+      - id: count-open-request
+        code: async countOpen(req) {
+        feedback: >-
+          A port speaks the domain's language: member ids, not HTTP requests. The adapter must
+          match it.
+
+  - type: bug-hunt
+    id: hunt-request-in-domain
+    concept: arch.dependency-rule
+    difficulty: 3
+    language: js
+    code: |
+      // src/domain/return-book.js
+      export async function returnBook(req, loans) {
+        const memberId = req.headers['x-member-id'];
+        const loan = await loans.find(req.params.loanId);
+        if (loan.memberId !== memberId) {
+          return { ok: false, reason: 'not your loan' };
+        }
+        await loans.markReturned(loan.id);
+        return { ok: true };
+      }
+    prompt: >-
+      This domain file imports nothing, and it takes a port. It still breaks the dependency
+      rule. Tap the line that shows how.
+    lines: [3]
+    reasons:
+      - text: The domain reads an HTTP request
+        correct: true
+        feedback: >-
+          Yes. `req` is the web framework's shape. Pass `memberId` and `loanId` in as plain
+          values.
+      - text: '`loans.find` should be a SQL query'
+        feedback: >-
+          The port is the good part. SQL in here would tie the rule to one database again.
+      - text: The owner check belongs in the handler
+        feedback: >-
+          It's a business rule, so the domain is its home. Lesson 4 showed what happens when
+          a handler keeps one.
+    fix: |
+      export async function returnBook(memberId, loanId, loans) {
+        const loan = await loans.find(loanId);
+
+  - type: ai-review
+    id: review-count-in-javascript
+    concept: arch.ports-and-adapters
+    difficulty: 4
+    language: js
+    request: Write the PostgreSQL adapter for the loans port.
+    flawClass: performance
+    code: |
+      export function postgresLoans(db) {
+        return {
+          async countOpen(memberId) {
+            const reply = await db.query('SELECT * FROM loans');
+            return reply.rows.filter((row) => row.member_id === memberId).length;
+          },
+          async save(loan) {
+            await db.query(
+              'INSERT INTO loans (member_id, book_id) VALUES ($1, $2)',
+              [loan.memberId, loan.bookId]);
+          },
+        };
+      }
+    prompt: >-
+      An assistant wrote this. The domain tests use the in-memory adapter, so they never ran
+      it. With two million loans, every checkout takes seconds. Tap the line at fault.
+    lines: [4]
+    reasons:
+      - text: It fetches every loan to count one member's
+        correct: true
+        feedback: >-
+          Yes. Right answer, huge cost. Count in SQL, with a `WHERE`.
+      - text: '`countOpen` should return the rows'
+        feedback: >-
+          The port promises a number, and the domain only needs a number. The shape is right.
+      - text: An adapter shouldn't contain SQL
+        feedback: >-
+          It's the one place SQL should be. The adapter's job is to use its technology well.
+    fix: |
+      async countOpen(memberId) {
+        const reply = await db.query(
+          'SELECT count(*) AS n FROM loans WHERE member_id = $1', [memberId]);
+        return Number(reply.rows[0].n);
+      },
+
+  - type: code-challenge
+    id: write-loan-port
+    concept: arch.dependency-injection
+    difficulty: 4
+    language: ts
+    prompt: >-
+      `renewLoan` reads a table inside its own module, so no test can give it loans. Make it
+      take a third argument, `loans`, of type `LoanStore`, and use only `loans.find` and
+      `loans.save`.
+
+
+      Then write `memoryLoans(rows)`: an adapter that keeps loans in a `Map` by `id`. Every
+      refusal and reason stays as it is.
+
+
+      So `renewLoan('l1', 95, memoryLoans([{ id: 'l1', dueDay: 100, renewals: 0 }]))` returns
+      `{ ok: true, dueDay: 114 }`.
+    hints:
+      - Only the two lines that touch `table` change in `renewLoan`. The rules stay put.
+      - '`memoryLoans` returns an object with a `find` and a `save`, both working on a `Map` it creates.'
+      - 'Start the adapter with `const table = new Map<string, Loan>();` and fill it from `rows`.'
+
+  - type: explain-back
+    id: explain-inward-arrows
+    concept: arch.dependency-rule
+    difficulty: 4
+    prompt: >-
+      A team moves from one database to another, and their business rules don't change by a
+      line. Why does pointing every dependency inward make that possible?
+    rubric:
+      - The domain imports nothing from the database, so it only knows a port it defined itself.
+      - The database code lives in an adapter that depends on the port, not the other way round.
+      - Swapping the database means writing a new adapter for the same port and passing it in, and the domain never notices.
+    modelAnswer: >-
+      The rules never knew which database they had. The domain declared a port, a few plain
+      functions it needs, and imported nothing else. All the SQL sat in an adapter outside,
+      and that adapter depended on the port. So the arrow ran from the database code to the
+      domain, never back. Changing databases meant writing a second adapter with the same
+      functions and passing that one in. The domain's code, and its tests, stayed as they
+      were.
+
+recap:
+  - Let the domain declare a port for what it needs, and write one adapter per technology.
+  - Pass adapters in, so the caller or a test decides which one runs.
+  - Point every dependency inward, so the domain imports no framework, database or network code.
+
+recall:
+  - id: card-port-and-adapter
+    concept: arch.ports-and-adapters
+    front: What is a port, and what is an adapter?
+    back: >-
+      A port is an interface the domain defines for something it needs. An adapter
+      implements it for one technology, such as PostgreSQL or an array.
+  - id: card-dependency-rule
+    concept: arch.dependency-rule
+    front: What does the dependency rule say?
+    back: >-
+      Source code dependencies point inward, towards the domain. The domain imports nothing
+      from frameworks, databases or the network.
+  - id: card-dependency-injection
+    concept: arch.dependency-injection
+    front: What is dependency injection?
+    back: >-
+      Handing a function what it depends on, such as a store, instead of letting it import
+      one. The caller or a test chooses the adapter.
+  - id: card-leaky-domain
+    concept: arch.dependency-rule
+    front: A domain function imports nothing but takes `req` as a parameter. What's wrong?
+    back: >-
+      It depends on the web framework's request shape. Pass plain values in, so the rule
+      runs from a job or a test as well.
+
+references:
+  - kind: essay
+    title: Hexagonal architecture the original 2005 article
+    authors: Alistair Cockburn
+    year: 2005
+    venue: alistair.cockburn.us
+    url: https://alistair.cockburn.us/hexagonal-architecture/
+    note: The pattern under both its names, ports and adapters, with the reasons for it.
+    primary: true
+    verified: true
+  - kind: essay
+    title: Inversion of Control Containers and the Dependency Injection pattern
+    authors: Martin Fowler
+    year: 2004
+    venue: martinfowler.com
+    url: https://martinfowler.com/articles/injection.html
+    note: Where the name dependency injection comes from, and passing collaborators in through the constructor or a parameter.
+    verified: true
+  - kind: docs
+    title: no-restricted-imports
+    authors: OpenJS Foundation and ESLint contributors
+    venue: ESLint documentation
+    url: https://eslint.org/docs/latest/rules/no-restricted-imports
+    note: The rule that can stop the domain importing adapters or database packages.
+    verified: true
+
+deepDive: >-
+  We ran all of it on Node 24. The domain function, given an in-memory adapter, lent three
+  books and refused the fourth in 0.07 ms. Given the PostgreSQL adapter over a fake
+  connection, it sent a `SELECT count(*)` and made the same decision. ESLint 9.39.5, with
+  `no-restricted-imports` set on `src/domain`, rejected a domain file that imported an
+  adapter and passed an adapter that imported the domain.
+
+
+  Why "hexagonal"? The original article drew the app as a hexagon only to leave room for
+  several ports. Some are driven by the outside, like an HTTP handler or a scheduled job
+  calling in. Others are driven by the domain, like storage or email. Both kinds get
+  adapters. Tests are one more adapter on the driving side. You'll also meet the same idea
+  as "clean architecture" or "onion architecture".
+
+
+  In JavaScript a port is only a convention: an object with the right functions.
+  TypeScript makes it checkable. Declare an `interface` in the domain, and the compiler
+  refuses an adapter that misses a function or returns the wrong type. The challenge in
+  this lesson does that.
+
+
+  The pattern has a price. Every port is an extra file and an extra hop when reading code.
+  A small script with one database doesn't need it. Reach for a port when a rule is worth
+  testing alone, or when a technology is likely to change. The next lesson applies it to
+  the thing most likely to change of all: the model.

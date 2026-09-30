@@ -1,0 +1,366 @@
+summary: >-
+  The frontend round usually hands you one small feature and a slow, unreliable mock API.
+  The autocomplete is the favourite because it packs every frontend concern into forty
+  lines: async data that arrives out of order, a screen for every state, keyboard support
+  and a screen reader contract.
+
+
+  Three ideas carry it. Tag each request so only the latest one may change the screen.
+  Hold the state as one `status` value, so impossible mixes like "loading and failed" cannot
+  exist. Wire the input as an ARIA combobox, so focus stays in the input while
+  `aria-activedescendant` tells a screen reader which option is highlighted.
+
+
+  Graders care less about styling than about behaviour under stress: type fast, answer out
+  of order, fail a request, press Escape mid-flight, then do it all without a mouse. If
+  you can say why each of those works in your code, you pass the round. The same state
+  thinking carries over to the other favourite, a data table with sort, filter and pages.
+remember:
+  - Tag every request with an increasing id and ignore any answer whose id is not the latest; that check, not the abort, keeps the screen right.
+  - Debounce reduces how many requests go out, but two can still overlap, so debounce never replaces the latest-wins check.
+  - One `status` field with the values idle, loading, success, empty and error makes impossible states unrepresentable, unlike separate booleans.
+  - Anything that closes the list (Escape, a blank box, a choice) must also make answers still in flight stale.
+  - A combobox keeps DOM focus in the input; the arrows move a highlight and `aria-activedescendant` names the highlighted option's id.
+  - The pieces are `role="combobox"` with `aria-expanded` and `aria-controls` on the input, a `listbox` of `option` elements with ids and `aria-selected`.
+  - Loading and empty messages go in a `role="status"` region and a failure in `role="alert"`, so screen readers announce changes they cannot see.
+  - A data table is a pure function of rows and view state that filters, then sorts, then slices, with the view state kept in the URL.
+sections:
+  - title: The same autocomplete as a reducer, with debounce, abort and a cache
+    body: |-
+      The challenge solution keeps a few `useState` values and a ref. Once you add debounce,
+      a cache and cancelling, the transitions multiply, and a reducer keeps them in one
+      place. Each action is a fact ("typed", "received"), and the reducer decides what the
+      screen becomes. The stale check is one line in two cases.
+
+      ```tsx
+      import { useEffect, useId, useReducer, useRef } from 'react';
+
+      type Status = 'idle' | 'loading' | 'success' | 'empty' | 'error';
+      type State = { query: string; status: Status; results: string[]; active: number; requestId: number };
+      type Action =
+        | { type: 'typed'; query: string; cached?: string[] }
+        | { type: 'received'; requestId: number; results: string[] }
+        | { type: 'failed'; requestId: number }
+        | { type: 'moved'; delta: 1 | -1 }
+        | { type: 'closed' }
+        | { type: 'chosen'; value: string };
+
+      const initial: State = { query: '', status: 'idle', results: [], active: -1, requestId: 0 };
+
+      function settled(results: string[]): Pick<State, 'status' | 'results' | 'active'> {
+        return { status: results.length === 0 ? 'empty' : 'success', results, active: -1 };
+      }
+
+      export function reducer(state: State, action: Action): State {
+        switch (action.type) {
+          case 'typed': {
+            // A new query makes every answer in flight stale, cached or not.
+            const next = { ...state, query: action.query, requestId: state.requestId + 1 };
+            if (action.query.trim() === '') return { ...next, status: 'idle', results: [], active: -1 };
+            if (action.cached) return { ...next, ...settled(action.cached) };
+            return { ...next, status: 'loading', results: [], active: -1 };
+          }
+          case 'received':
+            if (action.requestId !== state.requestId) return state;
+            return { ...state, ...settled(action.results) };
+          case 'failed':
+            if (action.requestId !== state.requestId) return state;
+            return { ...state, status: 'error', results: [], active: -1 };
+          case 'moved': {
+            if (state.status !== 'success') return state;
+            const count = state.results.length;
+            const active =
+              action.delta === 1 ? (state.active + 1) % count : state.active <= 0 ? count - 1 : state.active - 1;
+            return { ...state, active };
+          }
+          case 'closed':
+            return { ...state, status: 'idle', results: [], active: -1, requestId: state.requestId + 1 };
+          case 'chosen':
+            return { ...initial, query: action.value, requestId: state.requestId + 1 };
+        }
+      }
+
+      type Props = {
+        search: (query: string, signal: AbortSignal) => Promise<string[]>;
+        label?: string;
+        delayMs?: number;
+      };
+
+      export function Autocomplete({ search, label = 'Search', delayMs = 250 }: Props) {
+        const id = useId();
+        const [state, dispatch] = useReducer(reducer, initial);
+        const cache = useRef(new Map<string, string[]>());
+        const { query, status, results, active, requestId } = state;
+        const open = status === 'success';
+
+        // One request per loading state. The cleanup clears the timer and aborts the fetch,
+        // so a newer query, Escape or an unmount all stop the old one.
+        useEffect(() => {
+          if (status !== 'loading') return;
+          const controller = new AbortController();
+          const timer = setTimeout(() => {
+            search(query, controller.signal).then(
+              (found) => {
+                cache.current.set(query, found);
+                dispatch({ type: 'received', requestId, results: found });
+              },
+              () => {
+                if (!controller.signal.aborted) dispatch({ type: 'failed', requestId });
+              },
+            );
+          }, delayMs);
+          return () => {
+            clearTimeout(timer);
+            controller.abort();
+          };
+        }, [status, query, requestId, search, delayMs]);
+
+        function onKeyDown(event: React.KeyboardEvent<HTMLInputElement>) {
+          if (event.key === 'Escape') {
+            dispatch({ type: 'closed' });
+          } else if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+            if (!open) return;
+            event.preventDefault();
+            dispatch({ type: 'moved', delta: event.key === 'ArrowDown' ? 1 : -1 });
+          } else if (event.key === 'Enter' && open && active >= 0) {
+            event.preventDefault();
+            dispatch({ type: 'chosen', value: results[active]! });
+          }
+        }
+
+        const message = status === 'loading' ? 'Loading' : status === 'empty' ? 'No results' : '';
+
+        return (
+          <div>
+            <label htmlFor={`${id}-input`}>{label}</label>
+            <input
+              id={`${id}-input`}
+              role="combobox"
+              aria-expanded={open}
+              aria-controls={`${id}-list`}
+              aria-autocomplete="list"
+              aria-activedescendant={open && active >= 0 ? `${id}-option-${active}` : undefined}
+              value={query}
+              onChange={(event) => {
+                const text = event.target.value;
+                dispatch({ type: 'typed', query: text, cached: cache.current.get(text) });
+              }}
+              onKeyDown={onKeyDown}
+            />
+            <p role="status">{message}</p>
+            {status === 'error' && <p role="alert">Search failed</p>}
+            {open && (
+              <ul id={`${id}-list`} role="listbox" aria-label={`${label} results`}>
+                {results.map((option, index) => (
+                  <li
+                    key={option}
+                    id={`${id}-option-${index}`}
+                    role="option"
+                    aria-selected={index === active}
+                    onClick={() => dispatch({ type: 'chosen', value: option })}
+                  >
+                    {option}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        );
+      }
+      ```
+
+      Three details are worth saying aloud. The cache is read in the event handler and passed
+      in the action, so a cache hit never sets state inside an effect. The effect's cleanup
+      is the debounce: typing again changes `requestId`, React runs the cleanup, and the
+      pending timer never fires. And the id check stays even though the fetch is aborted,
+      because an abort can lose the race with a response that has already resolved.
+  - title: How debounce, abort, the id check and the cache divide the work
+    body: |-
+      Candidates often treat these four as alternatives. They solve different problems, and
+      a strong answer names each one's job.
+
+      - **Debounce** cuts load. Typing "london" sends one request instead of six. It says
+        nothing about order: pause, type, pause, and two requests overlap.
+      - **The request id** keeps the screen correct. It is the only one of the four that
+        guarantees an older answer can never overwrite a newer one.
+      - **`AbortController`** saves bandwidth and server work. An aborted `fetch` rejects
+        with an `AbortError`, which you must not show as "Search failed". That is why the
+        failure branch checks `controller.signal.aborted` first.
+      - **The cache** makes repeated queries instant, which matters most for backspacing.
+        Key it by the exact query string, and cap it (an LRU of 50 to 100 entries is
+        plenty) so a long session does not grow memory without limit.
+
+      A few more choices an interviewer may probe. A debounce of 150 to 300 ms feels live
+      without flooding the server. Some teams skip queries shorter than two characters.
+      Keeping the previous results visible while the next request loads avoids a flicker,
+      at the cost of showing results that no longer match the text; if you do it, mark
+      them as updating. And a server that is slow for everyone needs a timeout, which is
+      one more reason to have an `error` state with a retry.
+  - title: Testing a race without a network
+    body: |-
+      The challenge's fake `search` is the technique to name in the interview: each call
+      returns a promise and hands its `resolve` and `reject` to the test. The test then
+      answers in whatever order it likes, so "the latest request wins" becomes a
+      deterministic assertion instead of a flaky timing test.
+
+      ```tsx
+      function fakeSearch() {
+        const calls: { query: string; resolve: (r: string[]) => void; reject: (e: Error) => void }[] = [];
+        const search = (query: string) =>
+          new Promise<string[]>((resolve, reject) => calls.push({ query, resolve, reject }));
+        return { calls, search };
+      }
+
+      test('an older answer that lands last is ignored', async () => {
+        const user = userEvent.setup();
+        const api = fakeSearch();
+        render(<Autocomplete search={api.search} delayMs={0} />);
+        const box = screen.getByRole('combobox', { name: 'Search' });
+        await user.type(box, 'c');
+        await waitFor(() => expect(api.calls).toHaveLength(1));
+        await user.type(box, 'a');
+        await waitFor(() => expect(api.calls).toHaveLength(2));
+        await act(async () => api.calls[1]!.resolve(['Cairo']));
+        await act(async () => api.calls[0]!.resolve(['Cardiff']));
+        expect(screen.getAllByRole('option').map((o) => o.textContent)).toEqual(['Cairo']);
+      });
+      ```
+
+      The test waits for each call before typing the next letter. With a zero delay and
+      two letters typed at once, the first request would fire before the second letter
+      lands, and the call count would not be what you expect.
+
+      Query by role and accessible name (`getByRole('combobox', { name: 'Search' })`).
+      A test written that way fails if the label or role is missing, so it checks
+      accessibility for free. For the debounce itself, either pass a short delay as the
+      example does, or use fake timers with `userEvent.setup({ advanceTimers })` so the
+      clock moves only when the test says so.
+  - title: The other favourite, a data table with state in the URL
+    body: |-
+      The second common task is a table with filter, sort and pagination. The winning move
+      is the same as the autocomplete's: keep the logic out of the component. A pure
+      function turns rows plus a view into what to render, and the component only draws
+      it. The view lives in the query string, so a refresh, the back button and a shared
+      link all keep it.
+
+      ```ts
+      type Row = { name: string; city: string; score: number };
+      type View = { filter: string; sort: keyof Row; dir: 'asc' | 'desc'; page: number; perPage: number };
+
+      // Filter, then sort, then slice: in any other order page 2 shows the wrong rows.
+      export function tableView(rows: Row[], view: View) {
+        const needle = view.filter.trim().toLowerCase();
+        const matching = needle === '' ? rows : rows.filter((row) => row.name.toLowerCase().includes(needle));
+        const sign = view.dir === 'asc' ? 1 : -1;
+        const sorted = matching.toSorted((a, b) => {
+          const x = a[view.sort];
+          const y = b[view.sort];
+          return sign * (typeof x === 'number' && typeof y === 'number' ? x - y : String(x).localeCompare(String(y)));
+        });
+        const pages = Math.max(1, Math.ceil(sorted.length / view.perPage));
+        const page = Math.min(Math.max(1, view.page), pages);
+        const start = (page - 1) * view.perPage;
+        return { rows: sorted.slice(start, start + view.perPage), page, pages, total: sorted.length };
+      }
+
+      export function readView(search: string): View {
+        const params = new URLSearchParams(search);
+        const sort = params.get('sort');
+        return {
+          filter: params.get('q') ?? '',
+          sort: sort === 'city' || sort === 'score' ? sort : 'name',
+          dir: params.get('dir') === 'desc' ? 'desc' : 'asc',
+          page: Number(params.get('page')) || 1,
+          perPage: 20,
+        };
+      }
+      ```
+
+      Notice the page is clamped. A URL that says `page=9` after a filter leaves two pages
+      must not render an empty table. And every value read from the URL is validated,
+      because the URL is user input. On the accessibility side, a sortable column header
+      holds a `<button>`, and the `th` carries `aria-sort="ascending"` or `"descending"`
+      on the sorted column only.
+pitfalls:
+  - >-
+    **Aborting instead of checking ids.** An abort feels like it cancels the answer, but a
+    response that already resolved still runs its `.then`. Keep the id check and treat the
+    abort as a bandwidth saving.
+  - >-
+    **Showing "Search failed" for an aborted request.** An aborted `fetch` rejects, so a
+    plain `catch` flashes an error every time the user types. Check `signal.aborted` (or the
+    request id) before dispatching a failure.
+  - >-
+    **Booleans for each state.** `isLoading`, `hasError` and `isEmpty` allow eight
+    combinations for five real states. Use one `status` union and derive what to render
+    from it.
+  - >-
+    **Closing without invalidating.** Escape hides the list, then a late answer reopens it.
+    Every action that closes or clears must bump the request id too.
+  - >-
+    **Moving DOM focus onto the options.** It breaks typing, because keystrokes now go to
+    the list. Keep focus in the input and point `aria-activedescendant` at the option id.
+  - >-
+    **Invented or wrong ARIA.** Assistants produce plausible attributes such as
+    `aria-activeoption`, or reach for `role="menu"`. Check every attribute against the APG
+    combobox pattern; only real ones are announced.
+  - >-
+    **Forgetting `preventDefault` on the arrow keys.** In a text input, ArrowUp and
+    ArrowDown also move the caret to the start or end. Prevent the default when the list
+    is open.
+  - >-
+    **A cache without a cap, or a cache keyed loosely.** Key by the exact query you sent,
+    and bound the size with an LRU so memory stays flat in a long session.
+interview:
+  - question: Your autocomplete debounces and aborts old requests. Why do you still need a request id?
+    answer: >-
+      Because neither debounce nor abort guarantees order, and the id check does. Debounce
+      only reduces how many requests go out; if I pause, type and pause again, two are in
+      flight, and the network can deliver the older one last. Abort usually stops the old
+      one, but if its response has already resolved, the `.then` still runs. So each
+      request carries an increasing id, and the reducer ignores any answer whose id is not
+      the latest. I keep abort for bandwidth and server load, and debounce for request
+      volume. The trade-off is a little more state, one number, for a guarantee that holds
+      whatever the network does.
+  - question: Why model the component with one status instead of isLoading and hasError flags?
+    answer: >-
+      One status makes impossible states impossible to represent. With two booleans there
+      are four combinations, and "loading and failed" is one that someone will eventually
+      render. With a union of idle, loading, success, empty and error, each screen has
+      exactly one value, and a reducer decides every transition in one place, so I can test
+      the transitions as a pure function without rendering. The cost is a little ceremony
+      for a tiny component. For three states in a throwaway prototype I might use
+      `useState`, but once there is debounce, caching and keyboard state, the reducer pays
+      for itself.
+  - question: Walk me through the ARIA for your autocomplete. Why not move focus to the options?
+    answer: >-
+      It follows the APG combobox pattern. The input has `role="combobox"`,
+      `aria-expanded` saying whether the list shows, and `aria-controls` naming the
+      listbox. The list is `role="listbox"` with `option` children, each with an id and
+      `aria-selected`. Focus stays in the input so typing keeps working; the arrow keys
+      move a highlight, and `aria-activedescendant` on the input holds the highlighted
+      option's id, which screen readers announce. If focus moved into the list, the next
+      keystroke would go to the list, not the text. Loading and empty messages sit in a
+      `role="status"` region and failure in `role="alert"`. The trade-off is that
+      `aria-activedescendant` needs stable ids and must be cleared when the list closes, or
+      it points at nothing.
+  - question: How would you test that the latest request wins?
+    answer: >-
+      With a fake search whose promises the test settles by hand. Each call pushes its
+      `resolve` and `reject` into an array, so the test can type "ca" then "cat", resolve
+      the second call, then the first, and assert that only the second call's results show.
+      It is deterministic, needs no network and no real timers, and it exercises the exact
+      bug. I query by role and accessible name, so the test also fails if the combobox loses
+      its label. I would add cases for a failure arriving after a newer success, and for
+      Escape followed by a late answer. The limit is that it tests my component, not the
+      real API's latency, so I would still watch it once in a browser with throttled network.
+  - question: What would you add if this autocomplete had to go to production?
+    answer: >-
+      First the load and resilience pieces, then polish. Debounce around 200 ms, a minimum
+      query length, an LRU cache keyed by query, and `AbortController` so the server stops
+      work on abandoned queries. A timeout that turns a hung request into the error state
+      with a retry. On the accessibility side, Home and End, Alt plus ArrowDown to open, and
+      a visible highlight that matches `aria-activedescendant`. I would also highlight the
+      matched text and keep previous results while loading, marked as updating, to avoid
+      flicker. The main trade-off is caching: it hides server changes, so for fast-changing
+      data I would give entries a short lifetime instead of keeping them for the session.

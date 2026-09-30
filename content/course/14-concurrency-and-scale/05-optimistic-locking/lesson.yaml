@@ -1,0 +1,294 @@
+id: scale.locks
+title: Optimistic locking
+objective: Stop a stale save from erasing a newer one with a version column, and retry or report the conflict.
+level: advanced
+minutes: 10
+concepts: [scale.optimistic-locking, scale.pessimistic-locking]
+prerequisites: [scale.race-conditions, db.isolation-levels]
+opening:
+  text: >-
+    You'll stop one person's save from silently erasing another's, even when both had the
+    form open for ten minutes. It's a version number and one extra condition.
+
+steps:
+  - type: prose
+    id: two-tabs
+    body: >-
+      Two support agents open ticket 7 at once. Ana adds a reply and saves. Ten minutes
+      later, Ben saves his copy of the form. His copy never had Ana's reply, so her work is
+      gone, and nobody is told.
+
+
+      That's a lost update again, with a twist. The change is a whole form, so `SET x = x -
+      1` can't help. And locking the row for ten minutes would freeze everyone else.
+
+  - type: prose
+    id: name-optimistic
+    body: |-
+      Give the row a `version` number. The form carries the version it loaded, and the save
+      only goes through if nobody has saved since:
+
+      ```sql
+      UPDATE tickets SET reply = $1, version = version + 1
+      WHERE id = $2 AND version = $3;
+      ```
+
+      That's **optimistic locking**. Nobody waits. If someone saved first, the version has
+      moved, and the update changes zero rows.
+
+  - type: predict-output
+    id: predict-version-check
+    concept: scale.optimistic-locking
+    difficulty: 1
+    language: sql
+    code: |
+      -- Ana and Ben both loaded ticket 7 at version 3.
+      -- Ana saves first:
+      UPDATE tickets SET reply = 'New link sent', version = version + 1
+      WHERE id = 7 AND version = 3;
+      -- UPDATE 1
+
+      -- Ben saves second, still holding version 3:
+      UPDATE tickets SET reply = 'Fixed', version = version + 1
+      WHERE id = 7 AND version = 3;
+    question: What does Postgres answer to Ben's `UPDATE`?
+    choices:
+      - text: '`UPDATE 1`, and Ana''s reply is gone'
+        feedback: >-
+          That's what happens without the version check. Here the row is already at version 4.
+      - text: '`UPDATE 0`'
+        correct: true
+        feedback: >-
+          Right. The row is at version 4 now, so Ben's `WHERE` matches nothing.
+      - text: An error about a conflict
+        feedback: >-
+          Matching zero rows isn't an error to Postgres. Your code has to check the count.
+
+  - type: sql
+    id: guard-both-saves
+    concept: scale.optimistic-locking
+    difficulty: 2
+    prompt: >-
+      Ana and Ben both loaded ticket 7 at version 3. Run it: Ben's save erases Ana's. Guard
+      both saves with the version, and bump it, so Ben's is refused.
+    setup: |
+      CREATE TABLE tickets (
+        id integer PRIMARY KEY,
+        status text NOT NULL,
+        reply text,
+        version integer NOT NULL
+      );
+      INSERT INTO tickets VALUES (7, 'open', NULL, 3);
+    starter: |
+      -- Ana loaded version 3, and saves first
+      UPDATE tickets SET status = 'waiting', reply = 'New link sent'
+      WHERE id = 7;
+
+      -- Ben also loaded version 3, and saves second
+      UPDATE tickets SET status = 'closed', reply = 'Fixed'
+      WHERE id = 7;
+    solution: |
+      -- Ana loaded version 3, and saves first
+      UPDATE tickets SET status = 'waiting', reply = 'New link sent', version = version + 1
+      WHERE id = 7 AND version = 3;
+
+      -- Ben also loaded version 3, and saves second
+      UPDATE tickets SET status = 'closed', reply = 'Fixed', version = version + 1
+      WHERE id = 7 AND version = 3;
+    checks:
+      query: SELECT id, status, reply, version FROM tickets ORDER BY id
+    hints:
+      - Each `WHERE` should also say which version that person loaded.
+      - A save that goes through must move the version on, or the next stale save still matches.
+      - 'Add `, version = version + 1` to each `SET`, and `AND version = 3` to each `WHERE`.'
+
+  - type: prose
+    id: when-zero-rows
+    body: >-
+      In code, the result's `rowCount` says how many rows changed. Zero means someone saved
+      first. What next depends on who's saving.
+
+
+      A person gets **`409 Conflict`**, the status for "this clashes with the current
+      state". Send the newer ticket, so they can redo their change on it. A program, like an
+      AI classifier adding a label, reads again and retries.
+
+  - type: ai-review
+    id: review-version-never-bumped
+    concept: scale.optimistic-locking
+    difficulty: 3
+    language: js
+    request: Refuse a ticket save if someone else saved since the form loaded.
+    flawClass: logic
+    code: |
+      async function saveTicket(id, form) {
+        const result = await db.query(
+          `UPDATE tickets SET status = $1, reply = $2
+           WHERE id = $3 AND version = $4`,
+          [form.status, form.reply, id, form.version],
+        );
+        if (result.rowCount === 0) {
+          return Response.json({ error: "Changed by someone else" }, { status: 409 });
+        }
+        return Response.json({ ok: true });
+      }
+    prompt: >-
+      This came back from the assistant with a passing test: a stale version gets 409. In
+      production, two agents still overwrite each other. Tap the line at fault.
+    lines: [3]
+    reasons:
+      - text: The save never moves the version on
+        correct: true
+        feedback: >-
+          Yes. The version stays put, so every stale form still matches. Add `version = version + 1`.
+      - text: '`409` should be `404`'
+        feedback: >-
+          The ticket exists, so 404 would mislead. 409 is right. The check never fires.
+      - text: '`rowCount` should be compared with 1'
+        feedback: >-
+          Zero is the "someone saved first" case, so that check is right. It can't happen yet.
+    fix: |
+      `UPDATE tickets SET status = $1, reply = $2, version = version + 1
+       WHERE id = $3 AND version = $4`,
+
+  - type: code-challenge
+    id: write-save-with-retry
+    concept: scale.optimistic-locking
+    difficulty: 3
+    language: ts
+    prompt: >-
+      An AI classifier adds labels to tickets while agents edit them. Write
+      `saveWithRetry(store, id, change)`. Read the ticket, apply `change`, and save with
+      `store.saveIf(id, version, data)`.
+
+
+      If `saveIf` returns `false`, start again from a fresh read. Give up after 3 attempts by
+      throwing an `Error`. Return the ticket that was saved.
+    hints:
+      - Wrap the read, the change and the save in a loop that runs at most 3 times.
+      - Read inside the loop. A retry must apply `change` to the newer ticket, not the old one.
+      - "Start with `for (let attempt = 1; attempt <= 3; attempt++) {` and return when `saveIf` says `true`."
+
+  - type: prose
+    id: optimistic-or-pessimistic
+    body: >-
+      In "Two writers at once" you locked a row with `FOR UPDATE`, so other writers wait
+      until your transaction ends. That's **pessimistic locking**: expect a clash, and lock
+      first.
+
+
+      It suits short work on busy rows. Optimistic locking suits long gaps and rare clashes,
+      because nobody waits and a clash is only detected.
+
+  - type: multiple-choice
+    id: pick-pessimistic
+    concept: scale.pessimistic-locking
+    difficulty: 3
+    question: Which of these suits `FOR UPDATE` better than a version check?
+    choices:
+      - text: A wallet charged many times a second
+        correct: true
+        feedback: >-
+          Right. Clashes are constant and each charge is quick, so waiting costs little.
+      - text: A wiki page edited over ten minutes
+        feedback: >-
+          A lock held for ten minutes blocks every other editor. Check a version on save instead.
+      - text: A profile form that rarely clashes
+        feedback: >-
+          Rare clashes are the optimistic case. A version check costs nothing until one happens.
+
+  - type: explain-back
+    id: explain-why-not-lock-the-form
+    concept: scale.optimistic-locking
+    difficulty: 4
+    prompt: >-
+      A teammate suggests `SELECT ... FOR UPDATE` when an agent opens a ticket, and `COMMIT`
+      when they save. Why is a version check better here?
+    rubric:
+      - The lock would last as long as the person edits, minutes or for ever if they close the tab.
+      - Everyone else touching that ticket would wait, and the transaction ties up a connection meanwhile.
+      - A version check holds nothing, and it only costs something in the rare case of a clash.
+    modelAnswer: >-
+      A person can keep a form open for ten minutes, or close the tab and never save. With
+      `FOR UPDATE` the row stays locked all that time. Every other agent, and every job that
+      touches the ticket, would wait behind it. The open transaction would hold a database
+      connection too. A version column holds nothing. Both agents edit freely, and
+      only the second save is refused, with a 409 so they can redo it.
+
+recap:
+  - Add a version column, and save with `AND version = $n` and `version = version + 1`.
+  - Treat zero rows changed as a conflict, a 409 for a person and a fresh retry for a program.
+  - Pick `FOR UPDATE` for short work on busy rows, and versions for long, rare clashes.
+
+recall:
+  - id: card-optimistic
+    concept: scale.optimistic-locking
+    front: How does optimistic locking detect that someone saved first?
+    back: >-
+      The `UPDATE` includes `AND version = <the one I loaded>`. If it changes zero rows, the
+      version has moved on.
+  - id: card-bump-version
+    concept: scale.optimistic-locking
+    front: Why must every guarded save also set `version = version + 1`?
+    back: >-
+      Otherwise the version never moves, and a stale form still matches and overwrites the
+      newer data.
+  - id: card-409
+    concept: scale.optimistic-locking
+    front: A person's save changes zero rows. What should the API answer?
+    back: >-
+      `409 Conflict`, with the current version, so they can redo their change on top of it.
+  - id: card-pessimistic
+    concept: scale.pessimistic-locking
+    front: When would you choose pessimistic over optimistic locking?
+    back: >-
+      When clashes are common and the work is short. Waiting for a row lock is then cheaper
+      than redoing the work.
+
+references:
+  - kind: docs
+    title: UPDATE
+    authors: The PostgreSQL Global Development Group
+    venue: PostgreSQL 17 documentation
+    url: https://www.postgresql.org/docs/17/sql-update.html
+    note: An `UPDATE` with a `WHERE` condition, and the count of rows it reports.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Explicit Locking
+    authors: The PostgreSQL Global Development Group
+    venue: PostgreSQL 17 Documentation
+    url: https://www.postgresql.org/docs/17/explicit-locking.html
+    note: Row-level locks, `FOR UPDATE` and what waits for what.
+    verified: true
+  - kind: essay
+    title: How to do distributed locking
+    authors: Martin Kleppmann
+    year: 2016
+    venue: martin.kleppmann.com
+    url: https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html
+    note: Why a lock held across machines needs a fencing token, which the deep dive sketches.
+    primary: true
+    verified: true
+
+deepDive: >-
+  We ran the ticket saves on PostgreSQL 17. Without the version check, Ben's save replaced
+  Ana's reply and reported `UPDATE 1`. With it, Ben got `UPDATE 0` and the row kept Ana's
+  reply at version 4.
+
+
+  HTTP has the same idea built in. A server can send the version as an `ETag` header. The
+  client sends it back in `If-Match` when it saves, and a stale save gets `412
+  Precondition Failed`. Many ORMs offer a version column too, and raise an error when the
+  guarded update changes nothing.
+
+
+  Retrying is right for a program and wrong for a person. A program can re-apply "add the
+  label urgent" to any version. A person's edit was a decision about the text they saw, so
+  show them the newer text instead of merging for them.
+
+
+  Locks across machines come up in "Scheduled jobs", as leases. A lease expires on the
+  clock, and a paused holder may wake and write after it has lost the lease. The fix is a
+  fencing token: a number that rises with each grant, checked by the store on every write.
+  That check is a version check in disguise.

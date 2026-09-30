@@ -1,0 +1,275 @@
+id: ai.failures
+title: When model calls fail
+objective: "Handle rate limits, timeouts, cut-off replies and refusals, and retry only what is worth retrying."
+level: advanced
+minutes: 10
+concepts: [ai.retries-and-backoff, ai.timeouts, ai.stop-reasons]
+prerequisites: [ai.agents, pyai.generators-and-decorators]
+opening:
+  text: >-
+    You'll keep an AI feature standing on a bad day, when the provider is busy and replies
+    come back half-written. Every production AI service meets these failures weekly.
+
+steps:
+  - type: prose
+    id: what-fails
+    body: >-
+      Model calls fail as a matter of routine. You hit your **rate limit**, `429`. The
+      provider is busy, `529` overloaded. The network drops, or nothing comes back in time.
+      These are **transient**: the same request may work in a moment.
+
+
+      Others never will. A `400` means the request itself is wrong, say a prompt that's too
+      long. A `401` means a bad key. Retrying those only wastes time and money.
+
+  - type: prose
+    id: sdk-retries
+    body: |-
+      The SDK already retries transient errors twice, with backoff, before it raises. You
+      can tune it, and catch what's left by type:
+
+      ```python
+      fast = client.with_options(max_retries=4)
+      try:
+          reply = fast.messages.create(**request)
+      except anthropic.RateLimitError:
+          show("Busy right now. Try again in a minute.")
+      except anthropic.BadRequestError as error:
+          log.error(error)   # a bug in our request: fix it, don't retry it
+      ```
+
+  - type: multiple-choice
+    id: pick-no-retry
+    concept: ai.retries-and-backoff
+    difficulty: 1
+    question: Which of these should your code never retry?
+    choices:
+      - text: '`400`: the prompt is too long'
+        correct: true
+        feedback: >-
+          Right. The same request fails the same way. Shorten it instead.
+      - text: '`429`: rate limit reached'
+        feedback: >-
+          That clears as the minute rolls over. Wait, then retry.
+      - text: '`529`: the provider is overloaded'
+        feedback: >-
+          Busy is temporary. Back off and try again.
+      - text: A timeout with no reply
+        feedback: >-
+          A slow moment often passes. Retry, within a deadline.
+
+  - type: bug-hunt
+    id: hunt-retry-everything
+    concept: ai.retries-and-backoff
+    difficulty: 2
+    language: python
+    code: |
+      def summarise(document):
+          while True:
+              try:
+                  return ask(client, f"Summarise: {document}")
+              except Exception as error:
+                  log.warning(f"retrying: {error}")
+                  time.sleep(5)
+    prompt: >-
+      A 900-page contract hit this overnight. The log shows 8,000 lines of `retrying: 400
+      prompt is too long`. Tap the line to fix.
+    lines: [5]
+    reasons:
+      - text: It retries every error, even ones that can't pass
+        correct: true
+        feedback: >-
+          Yes. Catch only transient errors, and give up after a few tries.
+      - text: The wait should be longer than 5 seconds
+        feedback: >-
+          A longer wait still retries a request that can never work.
+      - text: '`log.warning` should be `log.error`'
+        feedback: >-
+          The level is cosmetic. The loop never stops on a permanent error.
+    fix: |
+      def summarise(document):
+          return call_with_retries(lambda: ask(client, f"Summarise: {document}"), time.sleep)
+
+  - type: prose
+    id: timeouts
+    body: >-
+      The SDK waits up to 10 minutes for a reply by default. Fine for a nightly batch job.
+      Not for a person watching a spinner.
+
+
+      Give every call a deadline that fits its use, such as `client.with_options(timeout=20)`
+      for chat. And a timed-out call is retried too, so the worst wait is the timeout
+      multiplied by the number of attempts.
+
+  - type: ai-review
+    id: review-timeout-times-retries
+    concept: ai.timeouts
+    difficulty: 3
+    language: python
+    request: Make the chat reply fail fast if the provider is slow. Users hate waiting.
+    flawClass: performance
+    code: |
+      chat_client = client.with_options(timeout=60, max_retries=5)
+
+      def reply(messages):
+          return chat_client.messages.create(model="claude-opus-5", max_tokens=800,
+              messages=messages)
+    prompt: >-
+      An assistant wrote this. On a slow afternoon, users watched the spinner for six
+      minutes before an error. Tap the line at fault.
+    lines: [1]
+    reasons:
+      - text: Six attempts of 60 seconds each can take six minutes
+        correct: true
+        feedback: >-
+          Yes. Retries multiply the timeout. Pick both from the wait you'll accept.
+      - text: '`max_tokens` of 800 is slow to write'
+        feedback: >-
+          Streaming would help the feel, but the six minutes came from the settings above.
+      - text: '`with_options` changes every client'
+        feedback: >-
+          It returns a new client with those settings. The settings themselves are the trouble.
+    fix: |
+      # Worst case about 45 seconds: 3 attempts of 15.
+      chat_client = client.with_options(timeout=15, max_retries=2)
+
+  - type: code-challenge
+    id: write-call-with-retries
+    concept: ai.retries-and-backoff
+    difficulty: 3
+    language: python
+    starter: retry.starter.py
+    solution: retry.solution.py
+    tests: retry.tests.py
+    prompt: >-
+      Write `call_with_retries(call, sleep, attempts=4)`. Return `call()`. Retry on
+      `RateLimitError`, `OverloadedError` and `APITimeoutError`, waiting 1, 2, then 4
+      seconds.
+
+
+      If a `RateLimitError` has a `retry_after`, wait that long instead. Never retry
+      `BadRequestError`. After the last attempt, let the error reach the caller.
+    hints:
+      - '`except (RateLimitError, OverloadedError, APITimeoutError) as error:` catches the three.'
+      - On the last attempt, `raise` with no argument re-raises the error you caught.
+      - '`getattr(error, "retry_after", None)` works on errors without that attribute too.'
+
+  - type: bug-hunt
+    id: hunt-truncated-json
+    concept: ai.stop-reasons
+    difficulty: 3
+    language: python
+    code: |
+      reply = client.messages.create(model="claude-opus-5", max_tokens=300,
+          system="Reply with the invoice lines as JSON.",
+          messages=[{"role": "user", "content": invoice_text}])
+      lines = json.loads(reply.content[0].text)
+    prompt: >-
+      Short invoices work. Long ones fail with `JSONDecodeError: Unterminated string`. The
+      reply's `stop_reason` was `"max_tokens"`. Tap the line at fault.
+    lines: [1]
+    reasons:
+      - text: The reply was cut off at 300 tokens
+        correct: true
+        feedback: >-
+          Right. Raise the cap, and check `stop_reason` before parsing.
+      - text: The model writes invalid JSON for long invoices
+        feedback: >-
+          It was writing valid JSON. It hit the cap mid-string.
+      - text: '`json.loads` can''t read long text'
+        feedback: >-
+          Length isn't a problem for the parser. The text ends too soon.
+    fix: |
+      reply = client.messages.create(model="claude-opus-5", max_tokens=4000,
+          system="Reply with the invoice lines as JSON.",
+          messages=[{"role": "user", "content": invoice_text}])
+      if reply.stop_reason != "end_turn":
+          raise ValueError(f"Reply stopped early: {reply.stop_reason}")
+      lines = json.loads(reply.content[0].text)
+
+  - type: explain-back
+    id: explain-backoff
+    concept: ai.retries-and-backoff
+    difficulty: 3
+    prompt: >-
+      A batch job with 50 workers retries every `429` straight away. Why does that make the
+      rate limiting worse?
+    rubric:
+      - Each instant retry is another request against a limit that's already used up.
+      - All the workers retry together, so the load never drops.
+      - Waiting longer each time, with some randomness, lets the limit recover.
+    modelAnswer: >-
+      A `429` means we're over the limit. Retrying at once sends more requests into the same
+      wall. With 50 workers doing it together, the load stays high and the limit never
+      resets. Backing off, with a random wobble so they don't all return together, lets it
+      recover.
+
+recap:
+  - Retry transient errors with backoff and a cap, and never retry a bad request.
+  - Give each call a deadline, remembering retries multiply it.
+  - Check `stop_reason` before trusting a reply.
+
+recall:
+  - id: card-transient
+    concept: ai.retries-and-backoff
+    front: Which failures are worth retrying?
+    back: >-
+      Transient ones: `429` rate limits, `529` overloads, timeouts and dropped connections.
+      Not a `400` or a `401`.
+  - id: card-retry-after
+    concept: ai.retries-and-backoff
+    front: How long should you wait after a `429`?
+    back: >-
+      As long as the `retry-after` header says, if there is one. Otherwise back off, doubling
+      the wait each time.
+  - id: card-timeout-budget
+    concept: ai.timeouts
+    front: What's the worst-case wait with a 20-second timeout and 2 retries?
+    back: >-
+      About a minute: three attempts of up to 20 seconds each.
+  - id: card-stop-reasons
+    concept: ai.stop-reasons
+    front: What do the stop reasons `max_tokens` and `refusal` tell you?
+    back: >-
+      `max_tokens`: the reply was cut off, so it may be incomplete. `refusal`: the model
+      declined. Neither is a normal finished answer.
+
+references:
+  - kind: docs
+    title: Claude API errors
+    authors: Anthropic
+    venue: Claude Platform documentation
+    url: https://platform.claude.com/docs/en/api/errors
+    note: Every HTTP error code, including 429 and 529, and which to retry.
+    primary: true
+    verified: true
+  - kind: source
+    title: anthropic-sdk-python
+    authors: Anthropic
+    venue: GitHub
+    url: https://github.com/anthropics/anthropic-sdk-python
+    note: Default retries and timeouts, `with_options`, and the error classes.
+    primary: true
+    verified: true
+  - kind: essay
+    title: Exponential Backoff And Jitter
+    authors: Marc Brooker
+    year: 2015
+    venue: AWS Architecture Blog
+    url: https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/
+    note: Why randomised, growing waits beat retrying at once.
+    verified: true
+
+deepDive: >-
+  **What the SDK retries.** The Anthropic Python SDK retries connection errors, `408`,
+  `409`, `429` and every `5xx` status, twice by default, with exponential backoff. It
+  honours `retry-after` when the server sends it. Everything else raises at once.
+
+
+  **Refusals.** Some models can stop with `stop_reason` `"refusal"` when a request crosses
+  a safety line. Check for it before reading the text. Some APIs can then try a fallback
+  model for you.
+
+
+  **Fail usefully.** When retries run out, the user needs a plain message and your logs
+  need the request id. Every reply object carries one, and support teams ask for it first.

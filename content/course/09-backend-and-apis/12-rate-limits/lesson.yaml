@@ -1,0 +1,259 @@
+id: backend.rate-limits
+title: Rate limits
+objective: "Limit each caller's requests with a counter, answer `429` with `Retry-After`, and retry politely when you're the one limited."
+level: essential
+minutes: 10
+concepts: [backend.rate-limiting, backend.backoff]
+prerequisites: [backend.calling-other-apis, backend.sessions-and-tokens]
+opening:
+  text: >-
+    You'll stop one caller from flooding your API, or running up your model bill, with a
+    few lines of code. And when an API limits you, your code will wait its turn instead of
+    making things worse.
+
+steps:
+  - type: prose
+    id: why-limit
+    body: >-
+      One caller can send thousands of requests a minute: a script, a scraper, or your page
+      stuck in a loop. In front of a model, each one costs money. Model APIs bill by the
+      amount of text in and out.
+
+
+      A **rate limit** caps how many requests one caller may make in a stretch of time.
+      Past it, the server says no, cheaply, before any real work.
+
+  - type: prose
+    id: fixed-window
+    body: |-
+      The simplest limiter is a **fixed window**: count each caller's requests, and start
+      the count again every minute.
+
+      ```js
+      let window = windows.get(caller);
+      if (!window || now - window.start >= 60000) {
+        window = { start: now, count: 0 };
+        windows.set(caller, window);
+      }
+      window.count = window.count + 1;
+      ```
+
+      `windows` is a `Map` from caller to count. Past the limit, the request is refused.
+
+  - type: multiple-choice
+    id: pick-who-is-counted
+    concept: backend.rate-limiting
+    difficulty: 1
+    question: Your limiter runs after the session check. What should it count requests by?
+    choices:
+      - text: The signed-in user's id from the session
+        correct: true
+        feedback: >-
+          Right. The server set that id, so no caller can change it.
+      - text: An `X-Client-Id` header the page sends
+        feedback: >-
+          The caller writes that header. A new value on each request means a fresh count every time.
+      - text: The path of the request
+        feedback: >-
+          Then every user shares one count, and one busy caller blocks everyone else.
+
+  - type: prose
+    id: too-many-requests
+    body: |-
+      A refused request gets **`429 Too Many Requests`**, with a **`Retry-After`** header: the
+      seconds to wait before trying again. Here's the fourth request of a minute against a
+      limit of three:
+
+      ```bash
+      $ curl -i localhost:3000/api/ask
+      HTTP/1.1 429 Too Many Requests
+      content-type: application/json
+      retry-after: 60
+
+      {"error":"Too many requests"}
+      ```
+
+  - type: fill-blank
+    id: fill-429-response
+    concept: backend.rate-limiting
+    difficulty: 2
+    language: js
+    prompt: >-
+      `wait` holds the seconds until this caller's window ends. Refuse the request the way
+      clients expect. Fill the gaps.
+    template: |
+      if (wait > 0) {
+        return Response.json(
+          { error: "Too many requests" },
+          { status: {{1}}, headers: { "{{2}}": String({{3}}) } },
+        );
+      }
+    blanks:
+      - key: '1'
+        answer: '429'
+      - key: '2'
+        answer: Retry-After
+      - key: '3'
+        answer: wait
+    bank: ['429', '403', '503', Retry-After, Expires, wait, caller]
+
+  - type: code-challenge
+    id: write-fixed-window
+    concept: backend.rate-limiting
+    difficulty: 3
+    language: ts
+    editable: '13-14'
+    prompt: >-
+      Write `check(caller, now)`, a fixed-window limiter of 3 requests per 60 seconds per
+      caller. `now` is the time in milliseconds.
+
+
+      Return `0` when the request may go ahead. Otherwise return the whole seconds left in
+      this caller's window, rounded up with `Math.ceil`. A caller's window starts at their
+      first request and lasts `WINDOW_MS`.
+    hints:
+      - Keep one `Window` per caller in `windows`, and make a new one when there's none or it has ended.
+      - Add one to the count on every request, then compare it with `LIMIT`.
+      - 'The window ends at `window.start + WINDOW_MS`. Subtract `now` and divide by 1000 for seconds.'
+
+  - type: prose
+    id: backing-off
+    body: >-
+      Now you're the caller, and the model API says `429`. Wait as long as `Retry-After`
+      says, then try again.
+
+
+      With no `Retry-After`, or after a `503 Service Unavailable`, wait a little longer after
+      each failure: one second, two, then four. That's **exponential backoff**. Stop after a
+      few tries and show an error. Most model SDKs already do this for you.
+
+  - type: ai-review
+    id: review-instant-retry
+    concept: backend.backoff
+    difficulty: 3
+    language: js
+    request: If the model API says we're rate limited, keep trying until it works.
+    flawClass: performance
+    code: |
+      async function askModel(question) {
+        let response = await callModelApi(question);
+        while (response.status === 429) {
+          response = await callModelApi(question);
+        }
+        return response.json();
+      }
+    prompt: >-
+      An assistant wrote this. On a quiet day it works. At a busy moment the model API bans
+      your key for an hour. Tap the line at fault.
+    lines: [4]
+    reasons:
+      - text: It retries at once, with no wait and no end
+        correct: true
+        feedback: >-
+          Yes. Each instant retry is another request over the limit. Wait, and give up eventually.
+      - text: '`429` should be checked with `response.ok`'
+        feedback: >-
+          `ok` would lump 429 with every other error. Spotting 429 is right; retrying at once isn't.
+      - text: '`response.json()` needs `await`'
+        feedback: >-
+          `return` passes the promise on, and the caller awaits it. The loop is what floods the API.
+    fix: |
+      async function askModel(question) {
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          const response = await callModelApi(question);
+          if (response.status !== 429) return response.json();
+          const seconds = Number(response.headers.get("Retry-After") ?? attempt);
+          await new Promise((resolve) => setTimeout(resolve, seconds * 1000));
+        }
+        throw new Error("Still rate limited after 3 tries");
+      }
+
+  - type: explain-back
+    id: explain-429-cheaply
+    concept: backend.rate-limiting
+    difficulty: 3
+    prompt: >-
+      Your `/api/ask` endpoint calls a paid model. Explain where the rate limit goes in the
+      handler, and what a limited caller receives.
+    rubric:
+      - The limit runs early, after the caller is known and before the model is called.
+      - It counts by an identity the server trusts, such as the session's user id.
+      - A limited caller gets 429 with Retry-After, and the model is never called or paid for.
+    modelAnswer: >-
+      Right after the session check, before anything expensive. The limiter counts requests
+      by the signed-in user's id, which the caller can't fake. Once they pass the limit, the
+      handler answers `429`, and `Retry-After` says how long to wait. The model is never
+      called for that request, so it costs nothing. A polite client knows when to try
+      again.
+
+recap:
+  - Count each caller's requests in a fixed window, keyed by an identity the server trusts.
+  - "Refuse extra requests early with `429` and a `Retry-After` header."
+  - When you're limited, wait as told, back off after each failure, and give up in the end.
+
+recall:
+  - id: card-rate-limit
+    concept: backend.rate-limiting
+    front: What does a rate limit protect, on an endpoint in front of a model?
+    back: >-
+      The server and your bill. Each extra request would cost work and model charges.
+  - id: card-429
+    concept: backend.rate-limiting
+    front: What status and header does a limited request get?
+    back: >-
+      `429 Too Many Requests`, with `Retry-After` giving the seconds to wait.
+  - id: card-limit-key
+    concept: backend.rate-limiting
+    front: Why count by the session's user id, not a header the page sends?
+    back: >-
+      The caller controls their own headers. A fresh value would reset the count every time.
+  - id: card-backoff
+    concept: backend.backoff
+    front: What is exponential backoff?
+    back: >-
+      Waiting longer after each failed try, such as one, two, then four seconds, and giving
+      up after a few.
+
+references:
+  - kind: rfc
+    title: 'RFC 6585: Additional HTTP Status Codes'
+    authors: M. Nottingham and R. Fielding
+    year: 2012
+    venue: IETF
+    url: https://www.rfc-editor.org/rfc/rfc6585
+    note: Defines `429 Too Many Requests` and its optional `Retry-After`.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Retry-After header
+    authors: MDN contributors
+    venue: MDN Web Docs
+    url: https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Retry-After
+    note: Seconds or a date, and its use with 429 and 503.
+    verified: true
+  - kind: essay
+    title: Exponential Backoff And Jitter
+    authors: Marc Brooker
+    year: 2015
+    venue: AWS Architecture Blog
+    url: https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/
+    note: Why retries should wait longer each time, and why a little randomness helps.
+    verified: true
+
+deepDive: >-
+  A fixed window lets a burst through at its edges: three requests at the end of one
+  minute and three at the start of the next. Sliding windows and token buckets smooth
+  that out. The security and system design chapters build both.
+
+
+  A `Map` in one process only counts the requests that process sees. Run two servers and
+  each keeps its own count. Shared limits live in a store every server can reach, such as
+  Redis, which later chapters cover.
+
+
+  Many APIs also tell you where you stand before you hit the wall, with headers such as
+  `x-ratelimit-remaining`. Model APIs often limit tokens per minute as well as requests.
+
+
+  Add a little randomness, called jitter, to each backoff wait. Otherwise every client that
+  failed together retries together, and fails together again.

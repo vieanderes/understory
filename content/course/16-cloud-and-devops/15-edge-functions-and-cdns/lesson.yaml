@@ -1,0 +1,284 @@
+id: cloud.edge
+title: Edge functions and CDNs
+objective: Decide what runs at the edge, and account for data locality.
+level: advanced
+minutes: 10
+concepts: [cloud.cdn, cloud.edge-functions, cloud.data-locality]
+prerequisites: [perf.caching-layers, cloud.serverless]
+opening:
+  text: >-
+    You'll decide which code belongs a few milliseconds from the user, and which must stay
+    next to the database. Put it in the wrong place and "the edge" makes a page slower.
+
+steps:
+  - type: prose
+    id: name-cdn
+    body: >-
+      A **CDN**, a content delivery network, is hundreds of servers around the world that
+      keep copies of your responses. Each location is an **edge**, near some users. Your
+      **origin** is the one place your own servers run.
+
+
+      A reader in Sydney gets a cached page from Sydney in 5 ms, not from Frankfurt in 280
+      ms. The performance chapter showed which responses a CDN may keep.
+
+  - type: multiple-choice
+    id: pick-cache-miss
+    concept: cloud.cdn
+    difficulty: 1
+    question: The Sydney edge has no copy of an article yet. A reader asks for it. What happens?
+    choices:
+      - text: The edge fetches it from the origin and keeps it
+        correct: true
+        feedback: >-
+          Right. This reader pays the long trip. The next Sydney reader doesn't.
+      - text: The reader gets a 404 until it's cached
+        feedback: >-
+          A miss isn't an error. The edge asks the origin on the reader's behalf.
+      - text: The origin copies it to every edge at once
+        feedback: >-
+          Edges fill on demand. A page nobody in Sydney reads never reaches Sydney.
+
+  - type: prose
+    id: name-edge-functions
+    body: >-
+      An **edge function** is your code, run by the CDN at every location, before or instead
+      of the origin. The runtime is restricted: web standard APIs such as `fetch`, `Request`
+      and `Response`, no Node modules, and tight CPU and memory limits.
+
+
+      That suits small decisions about a request: a redirect, a header, a cookie check.
+      Lesson 14's serverless function is different. It runs in one region, with a fuller
+      runtime.
+
+  - type: multiple-choice
+    id: pick-edge-job
+    concept: cloud.edge-functions
+    difficulty: 2
+    question: Which job suits an edge function?
+    choices:
+      - text: Building a 40-page PDF invoice
+        feedback: >-
+          That's seconds of CPU and plenty of memory. Edge runtimes give a function very
+          little of either.
+      - text: Redirecting `/` to `/de` by the visitor's country
+        correct: true
+        feedback: >-
+          Yes. Tiny, needs no database, and every visitor gets it 5 ms away.
+      - text: Saving an order with five SQL statements
+        feedback: >-
+          Every statement would cross the world to the database. That work belongs beside the
+          data.
+
+  - type: parsons
+    id: arrange-edge-auth
+    concept: cloud.edge-functions
+    difficulty: 3
+    language: js
+    prompt: >-
+      Turn away signed-out visitors at the edge. `new Response(body, { status })` builds a
+      reply on the spot. `fetch(request)` passes the request on to the origin.
+    blocks:
+      - id: open-handler
+        code: export default async function handler(request) {
+      - id: read-cookie
+        code: const cookie = request.headers.get('cookie') || '';
+        indent: 1
+        subgoal: Look only at what the request carries
+      - id: check-session
+        code: if (!cookie.includes('session=')) {
+        indent: 1
+      - id: refuse
+        code: "return new Response('Sign in first', { status: 401 });"
+        indent: 2
+        subgoal: Answer from the edge
+      - id: close-if
+        code: '}'
+        indent: 1
+      - id: pass-on
+        code: return fetch(request);
+        indent: 1
+        subgoal: Otherwise let the origin handle it
+      - id: close-handler
+        code: '}'
+    distractors:
+      - id: query-far-database
+        code: const user = await db.query('SELECT * FROM users WHERE session = $1', [cookie]);
+        feedback: >-
+          That's a trip to a far database on every request. The edge should decide from the
+          request alone.
+
+  - type: prose
+    id: name-data-locality
+    body: |-
+      We simulated a dashboard handler that runs three queries, one after another. The user
+      is in Sydney and the database in Frankfurt.
+
+      ```text
+      code at the Sydney edge        933 ms
+      code beside the database       326 ms
+      ```
+
+      From the edge, every query crossed the world. That's **data locality**: code belongs
+      near its data, because it talks to the database many times and to the user once.
+
+  - type: ai-review
+    id: review-random-bucket
+    concept: cloud.edge-functions
+    difficulty: 4
+    language: js
+    request: Split visitors 50/50 between two cached versions of the pricing page, at the edge.
+    flawClass: logic
+    code: |
+      export default async function handler(request) {
+        const bucket = Math.random() < 0.5 ? 'a' : 'b';
+        const url = new URL(request.url);
+        url.pathname = `/variants/${bucket}${url.pathname}`;
+        return fetch(url, request);
+      }
+    prompt: >-
+      An assistant wrote this. The tester loaded the page once and saw version B, fast, from
+      the cache. Real visitors see prices change when they refresh. Tap the line at fault.
+    lines: [2]
+    reasons:
+      - text: The bucket is drawn again on every request
+        correct: true
+        feedback: >-
+          Yes. Draw once, store it in a cookie, and read the cookie after that.
+      - text: '`fetch` can''t be called from an edge function'
+        feedback: >-
+          `fetch` is the main tool there. It's how the function reaches the cache and the
+          origin.
+      - text: The split should happen at the origin
+        feedback: >-
+          Then every visitor pays the long trip to be sorted. The edge is the right place. The
+          draw is wrong.
+    fix: |
+      const cookie = request.headers.get('cookie') || '';
+      let bucket = cookie.includes('bucket=b') ? 'b' : 'a';
+      if (!cookie.includes('bucket=')) {
+        bucket = Math.random() < 0.5 ? 'a' : 'b';   // first visit only, then set the cookie
+      }
+
+  - type: code-challenge
+    id: write-best-placement
+    concept: cloud.data-locality
+    difficulty: 4
+    language: ts
+    prompt: >-
+      Write `bestPlacement(network, queries)` to compare the two places for a handler.
+      `network` holds round trips in ms. `edgeRttMs` and `originRttMs` run from the user.
+      `edgeToDbRttMs` and `originToDbRttMs` run to the database. `queryMs` is the database's own
+      time per query.
+
+
+      Each placement costs one user trip, plus one database trip and one `queryMs` per query.
+      Return `{ edgeMs, originMs, best }`, where `best` is `'edge'`, `'origin'` or `'same'`.
+
+
+      Take trips of 5, 280, 280 and 1, and a `queryMs` of 2. Three queries give 851 and 289,
+      so `'origin'`.
+    hints:
+      - Work out the two totals first. They use the same formula with different numbers.
+      - Queries run one after another, so their cost is multiplied, not shared.
+      - 'Start with `const edgeMs = network.edgeRttMs + queries * (network.edgeToDbRttMs + network.queryMs);`'
+
+  - type: explain-back
+    id: explain-edge-slower
+    concept: cloud.data-locality
+    difficulty: 4
+    prompt: >-
+      A team moves its API handlers to edge functions "to be closer to users". The database
+      stays in one region, and far-away users find the app slower. Why?
+    rubric:
+      - Each handler makes several database queries, and every one now crosses the long distance.
+      - Before the move, only the single user-to-server trip was long, and queries were a millisecond away.
+      - Code belongs near its data, so the edge suits work that needs no far queries, or data replicated nearby.
+    modelAnswer: >-
+      The long distance didn't go away. It moved. Before, a far user paid one long round trip
+      to the server, and the server's queries took a millisecond each. Now the code is near
+      the user, so each query crosses the world, and there are several per request. One long
+      trip became three or four. I'd keep data-heavy handlers beside the database. The edge
+      can keep the redirects, header checks and cached pages, which need no database at all.
+
+recap:
+  - Serve cacheable pages from the CDN's edge, and keep the origin for the misses.
+  - Give edge functions small decisions that need no far data, like redirects and cookie checks.
+  - Count the round trips to the database before moving code, because it belongs near its data.
+
+recall:
+  - id: card-cdn-hit
+    concept: cloud.cdn
+    front: What does a CDN hit save, besides the user's time?
+    back: >-
+      The origin's work. The request never reaches it, so the CDN absorbs traffic that would
+      overload one server.
+  - id: card-edge-function
+    concept: cloud.edge-functions
+    front: What is an edge function good for, and what limits it?
+    back: >-
+      Small per-request decisions such as redirects, headers and cookie checks. It runs in a
+      restricted runtime with tight CPU and memory limits.
+  - id: card-edge-vs-serverless
+    concept: cloud.edge-functions
+    front: How does an edge function differ from a regional serverless function?
+    back: >-
+      It runs at every CDN location in a web-standard runtime. A serverless function runs in
+      one region, near the database, with a fuller runtime.
+  - id: card-data-locality
+    concept: cloud.data-locality
+    front: Why can an edge function that queries a far database be slower than the origin?
+    back: >-
+      It pays the long round trip on every query. Beside the database, only the one trip to
+      the user is long.
+
+references:
+  - kind: rfc
+    title: 'RFC 9111: HTTP Caching'
+    authors: R. Fielding, M. Nottingham and J. Reschke (eds)
+    year: 2022
+    venue: IETF
+    url: https://www.rfc-editor.org/rfc/rfc9111
+    note: The rules a CDN follows as a shared cache, which decide what can be a hit.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Limits
+    authors: Cloudflare
+    venue: Cloudflare Workers docs
+    url: https://developers.cloudflare.com/workers/platform/limits/
+    note: One edge platform's CPU time, memory and subrequest limits per request.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Edge Runtime
+    authors: Vercel
+    venue: Vercel documentation
+    url: https://vercel.com/docs/functions/runtimes/edge
+    note: Which web standard APIs an edge runtime offers, and which Node APIs it leaves out.
+    verified: true
+
+deepDive: >-
+  We can't run a CDN on a laptop, so the numbers here come from a simulation in Node 24. A
+  local HTTP server played the database, at 2 ms per query. Timers added the round trips: 5
+  ms to the edge, 280 ms to the far region. Averaged over ten visits, three queries took 933
+  ms from the edge and 326 ms from beside the database. One query took 347 ms against 303
+  ms. With no queries the edge won, 11 ms against 286 ms. Timers overshoot a little, so the
+  code challenge's clean sums come out lower. Treat them as a model, not a benchmark.
+
+
+  The limits are real and they vary. When we fetched its limits page in September 2026, one
+  platform listed 128 MB of memory per function, and 10 ms of CPU time on its free plan.
+  Waiting on `fetch` doesn't count as CPU time, which is why proxying suits the edge and
+  rendering a PDF doesn't. Check your own provider's page before you design around a number.
+
+
+  Platforms are closing the gap from the data side: read replicas in many regions,
+  key-value stores at the edge, and connection pooling over HTTP. Each brings the trade you
+  met in the consistency lesson. A replica near the user is fast to read and may be stale.
+  Writes still travel to one primary.
+
+
+  A cache key is part of the design too. If an edge function picks a variant, by country or
+  by test bucket, each variant needs its own cache entry. Rewrite the path, as the review
+  step does, or the cache will serve one visitor's variant to the next.

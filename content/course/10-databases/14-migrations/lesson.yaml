@@ -1,0 +1,266 @@
+id: db.migrations
+title: Migrations
+objective: Change the schema of a live database with migration files, safe defaults and expand and contract.
+level: essential
+minutes: 10
+concepts: [db.migrations, db.expand-contract, db.ddl-locks]
+prerequisites: [db.isolation-levels]
+opening:
+  text: >-
+    You'll change a table that real users are writing to, without errors and without taking the
+    site down. It's the database skill that separates a side project from a product.
+
+steps:
+  - type: prose
+    id: what-a-migration-is
+    body: >-
+      Your laptop, your teammate's and production all hold a copy of the database. When the
+      schema changes, every copy must change the same way.
+
+
+      A **migration** is a numbered file of schema changes. A tool runs each file once, in
+      order, and records it in a table so it never runs twice:
+
+
+      ```text
+
+      migrations/0001_create_users.sql
+
+      migrations/0002_create_orders.sql
+
+      migrations/0003_add_country_to_users.sql
+
+      ```
+
+
+      Tools such as Prisma Migrate, Drizzle Kit and node-pg-migrate all work this way.
+
+  - type: sql
+    id: add-column-with-default
+    concept: db.migrations
+    difficulty: 2
+    prompt: >-
+      Migration 0003 adds a required `country` to users. Run it: the table already has users,
+      and they'd have none. Every existing user is in the UK, so give the column a default of
+      `'GB'`.
+    setup: |
+      CREATE TABLE users (id integer PRIMARY KEY, email text NOT NULL UNIQUE);
+      INSERT INTO users VALUES (1, 'ana@example.com'), (2, 'ben@example.com'), (3, 'cleo@example.com');
+    starter: |
+      ALTER TABLE users ADD COLUMN country text NOT NULL;
+      SELECT * FROM users;
+    solution: |
+      ALTER TABLE users ADD COLUMN country text NOT NULL DEFAULT 'GB';
+      SELECT * FROM users;
+    checks:
+      query: SELECT * FROM users ORDER BY id
+    showSchema: true
+    hints:
+      - The error says the existing rows would hold NULL in a `NOT NULL` column.
+      - '`DEFAULT ''GB''` goes after `NOT NULL`, and fills the existing rows too.'
+
+  - type: prose
+    id: live-tables-and-locks
+    body: >-
+      On your laptop, `ALTER TABLE` finishes instantly. In production, many forms of it need
+      the whole table to themselves. They wait for every running query to finish.
+
+
+      While it waits, every new query on that table queues behind it. One slow report plus one
+      migration, and the site freezes. So migrations start with `SET lock_timeout = '5s';`. If
+      the lock doesn't come quickly, the migration gives up and you try later.
+
+  - type: prose
+    id: expand-and-contract
+    body: >-
+      During a deploy, old and new copies of your app run side by side. Rename `name` to
+      `full_name` in one step, and every old copy breaks at once.
+
+
+      **Expand and contract** never breaks either version. Expand: add the new column, and make
+      the app write both. Fill in the old rows. Switch reads to the new column. Contract: drop
+      the old one, once nothing reads it.
+
+  - type: parsons
+    id: order-the-rename
+    concept: db.expand-contract
+    difficulty: 3
+    language: sql
+    prompt: >-
+      Rename `users.name` to `full_name` without breaking a running app. Put the migrations and
+      deploys in order. One line doesn't belong.
+    blocks:
+      - id: add-column
+        code: ALTER TABLE users ADD COLUMN full_name text;
+      - id: deploy-write-both
+        code: '-- deploy: the app writes name and full_name'
+      - id: backfill
+        code: UPDATE users SET full_name = name WHERE full_name IS NULL;
+      - id: deploy-read-new
+        code: '-- deploy: the app reads full_name only'
+      - id: drop-old
+        code: ALTER TABLE users DROP COLUMN name;
+    distractors:
+      - id: rename-in-place
+        code: ALTER TABLE users RENAME COLUMN name TO full_name;
+        feedback: >-
+          A rename breaks every running copy that still asks for `name`. Expand and contract
+          avoids it.
+
+  - type: sql
+    id: backfill-then-require
+    concept: db.expand-contract
+    difficulty: 3
+    prompt: >-
+      `full_name` is added, and new rows fill it. Make it required: run the starter and read why
+      it fails. Fill in the old rows from `name` first.
+    setup: |
+      CREATE TABLE users (id integer PRIMARY KEY, name text NOT NULL, full_name text);
+      INSERT INTO users VALUES
+        (1, 'Ana Silva', NULL), (2, 'Ben Okafor', NULL), (3, 'Cleo Park', 'Cleo Park');
+    starter: |
+      ALTER TABLE users ALTER COLUMN full_name SET NOT NULL;
+      SELECT * FROM users;
+    solution: |
+      UPDATE users SET full_name = name WHERE full_name IS NULL;
+      ALTER TABLE users ALTER COLUMN full_name SET NOT NULL;
+      SELECT * FROM users;
+    checks:
+      query: >-
+        SELECT id, name, full_name,
+          (SELECT is_nullable FROM information_schema.columns
+           WHERE table_name = 'users' AND column_name = 'full_name') AS full_name_nullable
+        FROM users ORDER BY id
+    showSchema: true
+    hints:
+      - Two users have no `full_name` yet, so `NOT NULL` is refused.
+      - An `UPDATE` copying `name` into the empty ones goes before the `ALTER`.
+
+  - type: prose
+    id: create-index-concurrently
+    body: >-
+      Adding an index is a migration too. Plain `CREATE INDEX` blocks every write to the table
+      until it finishes, and on a big table that takes minutes.
+
+
+      `CREATE INDEX CONCURRENTLY` builds it while writes carry on. It's slower, and it can't run
+      inside a transaction. Tools that wrap each migration in one need telling to skip that file.
+
+  - type: ai-review
+    id: review-index-blocks-checkout
+    concept: db.ddl-locks
+    difficulty: 3
+    language: sql
+    request: Orders by date are slow on the admin page. Add an index in a migration.
+    flawClass: performance
+    code: |
+      -- migrations/0042_index_orders_placed_at.sql
+      CREATE INDEX orders_placed_at_idx ON orders (placed_at);
+    prompt: >-
+      An assistant wrote this. It ran in a second on staging. In production, `orders` has 50
+      million rows, and checkout stalled for four minutes. Tap the line at fault.
+    lines: [2]
+    reasons:
+      - text: A plain `CREATE INDEX` blocks writes until it's built
+        correct: true
+        feedback: >-
+          Right. `CREATE INDEX CONCURRENTLY` lets checkout keep writing orders meanwhile.
+      - text: The index should be on `id`
+        feedback: >-
+          `id` is already indexed as the primary key. The page sorts by `placed_at`.
+      - text: Indexes must be created before the table has rows
+        feedback: >-
+          You can add one any time. The question is whether writes wait while it's built.
+    fix: |
+      -- migrations/0042_index_orders_placed_at.sql (run outside a transaction)
+      CREATE INDEX CONCURRENTLY orders_placed_at_idx ON orders (placed_at);
+
+  - type: explain-back
+    id: explain-why-not-rename
+    concept: db.expand-contract
+    difficulty: 3
+    prompt: >-
+      A teammate wants to rename a column with one `ALTER TABLE ... RENAME` in the next release.
+      Why is that risky, and what would you do instead?
+    rubric:
+      - During a deploy, old and new copies of the app run at the same time.
+      - The rename breaks every copy still using the old name at once.
+      - Add the new column, write both, backfill, switch reads, then drop the old column later.
+    modelAnswer: >-
+      A deploy isn't instant. For a while, old copies of the app run next to new ones. The
+      moment the rename lands, every old copy asking for the old name fails. Instead I'd expand
+      and contract. Add the new column, deploy code that writes both, and backfill the old rows.
+      Then switch reads, and drop the old column in a later release.
+
+recap:
+  - Change the schema through numbered migration files, run once on every copy.
+  - Add required columns with a default, and backfill before `SET NOT NULL`.
+  - Rename by expand and contract, and build indexes `CONCURRENTLY`.
+
+recall:
+  - id: card-migration
+    concept: db.migrations
+    front: What is a migration?
+    back: >-
+      A numbered file of schema changes that a tool runs once, in order, on every copy of the
+      database, recording which have run.
+  - id: card-add-required-column
+    concept: db.migrations
+    front: How do you add a `NOT NULL` column to a table that already has rows?
+    back: Give it a `DEFAULT`, or add it nullable, backfill, then `SET NOT NULL`.
+  - id: card-expand-contract
+    concept: db.expand-contract
+    front: What are the steps of expand and contract for a rename?
+    back: >-
+      Add the new column, write both, backfill, read the new one, then drop the old one.
+  - id: card-lock-queue
+    concept: db.ddl-locks
+    front: Why can a waiting `ALTER TABLE` freeze a busy site?
+    back: >-
+      It waits for the whole table, and every new query on the table queues behind it. A
+      `lock_timeout` makes it give up instead.
+
+references:
+  - kind: docs
+    title: ALTER TABLE
+    authors: The PostgreSQL Global Development Group
+    venue: PostgreSQL 18 documentation
+    url: https://www.postgresql.org/docs/18/sql-altertable.html
+    note: Which forms take which locks, and how `ADD COLUMN ... DEFAULT` avoids a rewrite.
+    primary: true
+    verified: true
+  - kind: docs
+    title: CREATE INDEX
+    authors: The PostgreSQL Global Development Group
+    venue: PostgreSQL 18 documentation
+    url: https://www.postgresql.org/docs/18/sql-createindex.html
+    note: Building an index without locking out writes, and why it can't run in a transaction.
+    primary: true
+    verified: true
+  - kind: docs
+    title: 19.11. Client Connection Defaults
+    authors: The PostgreSQL Global Development Group
+    venue: PostgreSQL 18 documentation
+    url: https://www.postgresql.org/docs/18/runtime-config-client.html
+    note: '`lock_timeout` and `statement_timeout`.'
+    verified: true
+
+deepDive: >-
+  Since Postgres 11, `ADD COLUMN ... DEFAULT 'GB'` is instant, even on a huge table. Postgres
+  stores the default once and hands it out for old rows. A default that changes per row, such
+  as `DEFAULT random()`, still rewrites the table.
+
+
+  Backfill a big table in batches, such as 10,000 rows per statement, each its own
+  transaction. One giant `UPDATE` holds locks for its whole run and leaves a lot of cleanup
+  work behind.
+
+
+  `SET NOT NULL` checks every row while holding a strong lock. On a large table, add
+  `CHECK (full_name IS NOT NULL) NOT VALID`, then `VALIDATE CONSTRAINT` separately, which lets
+  writes continue while it checks. After that, `SET NOT NULL` trusts the check and skips its
+  scan.
+
+
+  Many teams keep migrations forward-only. Rather than a "down" script, a mistake is fixed by
+  a new migration, since production data rarely goes back cleanly.

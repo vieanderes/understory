@@ -1,0 +1,89 @@
+# Signal: fetches the day's news, writes data/news/, validates it and commits it.
+# The pipeline is a plain Node CLI (scripts/news/run.ts), so the same command runs from a
+# systemd timer on a VPS later (docs/SIGNAL.md).
+#
+# Safety: a failure in any step before "Commit" leaves the branch untouched. The job then
+# ends red, which is the alert, and the app keeps showing the last good day.
+name: Signal news
+
+on:
+  schedule:
+    # 05:30 UTC: after the US evening, before the Berlin morning.
+    - cron: '30 5 * * *'
+  workflow_dispatch:
+    inputs:
+      date:
+        description: 'Day to write, YYYY-MM-DD. Empty means today (UTC).'
+        required: false
+        type: string
+      no_llm:
+        description: 'Use extractive briefs even when a key is set.'
+        required: false
+        type: boolean
+        default: false
+
+# Two runs must never write the same files at the same time. A second run waits.
+concurrency:
+  group: signal-news
+  cancel-in-progress: false
+
+# Least privilege: the job needs to push one commit and nothing else.
+permissions:
+  contents: write
+
+jobs:
+  news:
+    name: Fetch, validate, commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      - name: Run the pipeline
+        id: pipeline
+        env:
+          # Optional. Without it every brief is extractive and the run still succeeds.
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SIGNAL_MODEL: ${{ vars.SIGNAL_MODEL }}
+          # Inputs go through the environment, never into the script text, so a crafted
+          # input cannot become shell code.
+          INPUT_DATE: ${{ inputs.date }}
+          INPUT_NO_LLM: ${{ inputs.no_llm }}
+        run: |
+          args=()
+          if [ -n "$INPUT_DATE" ]; then args+=(--date "$INPUT_DATE"); fi
+          if [ "$INPUT_NO_LLM" = "true" ]; then args+=(--no-llm); fi
+          if [ -z "$SIGNAL_MODEL" ]; then unset SIGNAL_MODEL; fi
+          pnpm exec tsx scripts/news/run.ts "${args[@]}"
+
+      - name: Validate the written files
+        run: pnpm exec tsx scripts/news/validate.ts
+
+      - name: Commit when data/news changed
+        env:
+          # For example "Signal: 2026-09-17 (11 items)". Written by the pipeline.
+          MESSAGE: ${{ steps.pipeline.outputs.message }}
+        run: |
+          git add data/news
+          if git diff --cached --quiet; then
+            echo "No change in data/news. Nothing to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "${MESSAGE:-Signal: update}"
+          # Someone may have pushed while the job ran. Replay the one commit on top.
+          if ! git pull --rebase origin "$GITHUB_REF_NAME"; then
+            # Only another Signal run touches data/news, so a conflict means the day is
+            # already on the branch. That run wins, and this one has nothing to add.
+            git rebase --abort
+            echo "Another run already wrote data/news. Nothing to push."
+            exit 0
+          fi
+          git push origin "HEAD:$GITHUB_REF_NAME"

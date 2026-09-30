@@ -1,0 +1,223 @@
+summary: >-
+  Validation at the trust boundary means that nothing a client sends is used until your
+  server has turned it into a value of a known shape. The boundary is the top of every
+  handler: the request body, the query string, path parameters, headers and cookies are all
+  text someone else wrote. Browsers, `curl`, scripts and edited pages all reach the same
+  handler, so the handler is the only place a check protects anything.
+
+
+  The technique is **parse, don't validate**. A schema such as zod's takes unknown input and
+  either hands back a new, typed value holding only the fields it names, or a list of
+  problems you answer with a 400. The rest of your code then works with that value and never
+  touches the raw body again. That one habit closes mass assignment, type confusion and a
+  long tail of crashes on odd input.
+
+
+  Reach for a schema at every edge where data enters: requests, webhook payloads, environment
+  variables at start-up, rows from a third-party API and JSON produced by an AI model. Don't
+  expect it to do everything. A schema checks shape and ranges. Whether the product exists,
+  whether there is stock and whether this user may order it are business rules, checked
+  further in, and the database's own constraints stay as the last line of defence.
+remember:
+  - Every request body, query string, header and cookie is unchecked text until your server parses it, whoever appears to have sent it.
+  - "Parse, don't validate: turn unknown input into a new typed value, and use only that value from then on."
+  - Save and spread `result.data`, never the raw body, or fields the schema never named reach your data, which is mass assignment.
+  - Answer bad input with a 4xx that says which field failed and why, and never let a parse error become a 500.
+  - Query strings and path parameters are always strings, so parse them with explicit coercion, and know that `z.coerce.boolean()` turns `"false"` into `true`.
+  - Client-side checks are for fast feedback to the person typing, and they protect nothing.
+  - A schema checks shape and ranges; existence, ownership and stock are business rules checked later, with database constraints as the backstop.
+sections:
+  - title: One schema, three jobs
+    body: |-
+      A zod schema does three things at once. It checks the input, it builds a clean copy,
+      and it gives you the TypeScript type, so the type and the runtime check can never drift
+      apart.
+
+      ```ts
+      import { z } from 'zod';
+
+      const OrderSchema = z.object({
+        productId: z.string().min(1),
+        quantity: z.number().int().min(1).max(10),
+        note: z.string().max(200).optional(),
+      });
+      type Order = z.infer<typeof OrderSchema>;
+
+      const result = OrderSchema.safeParse({ productId: '', quantity: 11, isAdmin: true });
+      if (!result.success) {
+        console.log(z.flattenError(result.error).fieldErrors);
+        // { productId: ['Too small: expected string to have >=1 characters'],
+        //   quantity: ['Too big: expected number to be <=10'] }
+      }
+      ```
+
+      Two details are worth knowing. zod collects every problem, not only the first, so a
+      form can show all of them in one round trip. And `isAdmin` doesn't appear in the error
+      or the output: `z.object` strips unknown keys by default.
+
+      `safeParse` returns a result you branch on. `parse` throws a `ZodError` instead, which
+      suits code where a failure is a bug, such as reading environment variables at start-up.
+      At a request boundary, bad input is expected, so `safeParse` and an explicit 400 read
+      better than a thrown error caught somewhere else.
+
+      Share the schema. The same `OrderSchema` can validate a React form for instant
+      feedback and the route handler for safety, so the two checks agree by construction.
+  - title: Strings that pretend to be numbers
+    body: |-
+      A JSON body carries real numbers and booleans. A query string doesn't: `?page=3` gives
+      you the string `"3"`. So query and path parameters need coercion, and coercion has
+      traps.
+
+      ```ts
+      import { z } from 'zod';
+
+      const ListQuery = z.object({
+        page: z.coerce.number().int().min(1).default(1),
+        status: z.enum(['open', 'closed']).optional(),
+      });
+
+      const params = new URLSearchParams('page=3&status=open&debug=1');
+      ListQuery.parse(Object.fromEntries(params)); // { page: 3, status: 'open' }
+      ListQuery.parse({});                          // { page: 1 }
+
+      z.coerce.number().parse('');       // 0, because Number('') is 0
+      z.coerce.boolean().parse('false'); // true, because Boolean('false') is true
+      z.stringbool().parse('false');     // false
+      ```
+
+      `z.coerce.number()` calls `Number()` on the input, so an empty string becomes `0`. The
+      `min(1)` above catches it; without it, `?page=` would quietly mean page zero. For
+      flags, use `z.stringbool()`, which understands `"true"`, `"false"`, `"1"`, `"0"` and a
+      few more.
+
+      JSON numbers have their own edge cases. `JSON.parse('{"q":1e400}')` gives `Infinity`,
+      which `z.number()` refuses. And `JSON.parse('{"id":9007199254740993}')` gives
+      `9007199254740992`, silently off by one, because JavaScript numbers are exact only up to
+      2^53. That's why APIs send large ids, money in minor units above that range, and
+      database `bigint` values as strings.
+  - title: Where validation stops and business rules begin
+    body: |-
+      A schema answers "is this shaped like an order?". It can't answer "does product
+      `kettle` exist?", "is it in stock?" or "may this user order it?". Those need the
+      database and the session, and they belong in the next layer.
+
+      ```text
+      1. read the body, with a size limit        -> 413 if too big
+      2. parse JSON                               -> 400 if not JSON
+      3. schema: shape, types, ranges             -> 400 (or 422) listing the fields
+      4. business rules: exists, in stock, owned  -> 404, 409 or 422
+      5. database constraints: unique, foreign key, check -> the backstop for races
+      ```
+
+      Step 5 matters because steps 3 and 4 can pass for two requests at the same moment.
+      Two sign-ups with the same email both find no existing user, then both insert. Only a
+      unique constraint stops the second one, so catch that error and turn it into a 409.
+
+      On status codes: 400 Bad Request covers any malformed request. RFC 9110 also defines
+      422 Unprocessable Content for a request that parses but can't be processed. Teams
+      differ: some use 400 for everything, some use 400 for broken JSON and 422 for a
+      well-formed body that fails the rules. Pick one convention and document it. The body
+      matters more than the number: a problem details object with the field and the reason,
+      so a client can highlight the right input.
+
+      Validate output too. A handler that returns a raw database row can leak a password
+      hash or an internal flag the day someone adds a column. Build the response from named
+      fields, or parse it through a response schema.
+  - title: Every edge, not only request bodies
+    body: |-
+      Anything your code didn't produce is input. The same parse belongs at each of these
+      edges:
+
+      - **Path and query parameters.** `/orders/abc` should be a 400 or 404, not a database
+        error about casting `abc` to an integer.
+      - **Headers and cookies.** A missing or malformed `Authorization` header is input like
+        any other.
+      - **Webhooks.** Verify the signature first, then parse the payload. A signed body can
+        still have a shape your code didn't expect after the sender changes its API.
+      - **Third-party API responses.** A provider can change a field or return an error page
+        with status 200. Parse what you rely on.
+      - **Environment variables.** Parse `process.env` at start-up with `parse`, so a missing
+        key stops the deploy instead of failing on the first request.
+      - **AI model output.** Asking a model for JSON doesn't guarantee valid JSON of your
+        shape. Parse its answer with a schema, and on failure retry or fall back.
+
+      Hand-written merges of raw input have one more trap. A naive recursive merge copies a
+      `__proto__` key onto `Object.prototype`, which then shows up on every object in the
+      process:
+
+      ```ts
+      function merge(target: any, source: any) {
+        for (const key of Object.keys(source)) {
+          if (typeof source[key] === 'object' && source[key] !== null) {
+            target[key] ??= {};
+            merge(target[key], source[key]);
+          } else {
+            target[key] = source[key];
+          }
+        }
+        return target;
+      }
+
+      merge({}, JSON.parse('{"name":"Ana","__proto__":{"isAdmin":true}}'));
+      console.log(({} as any).isAdmin); // true, for every object
+      ```
+
+      That's **prototype pollution**. Parsing into a schema first removes the unknown key
+      before any merge sees it.
+pitfalls:
+  - '**Spreading the raw body after a successful check.** `{ ...user, ...body }` keeps every field the client sent, including `role`. Spread `result.data`, which holds only the fields you named.'
+  - '**Letting `request.json()` throw.** Text that isn''t JSON makes it throw before any schema runs, and an uncaught throw is a 500 that blames your server. Catch it and answer 400.'
+  - '**Trusting a hidden form field or a disabled input.** Anyone can change them in the dev tools. Treat them like any other client field, and derive prices, owners and roles on the server.'
+  - '**Using `z.coerce.boolean()` for query flags.** Any non-empty string, including `"false"`, becomes `true`. Use `z.stringbool()` or an explicit `z.enum([''true'', ''false''])`.'
+  - '**Sending large ids as JSON numbers.** Integers above 2^53 lose precision in `JSON.parse` without any error. Send them as strings.'
+  - '**Stopping at the schema.** A shape check can''t catch two requests racing for the last item or the same email. Keep unique and check constraints in the database and map their errors to 409.'
+  - '**Echoing internal error text.** Returning a database or parser message can reveal table names and versions. Return your own message naming the field, and log the rest.'
+interview:
+  - question: What does "parse, don't validate" mean, and why does it matter in a TypeScript backend?
+    answer: >-
+      It means the check produces a new, typed value, rather than answering yes or no about
+      the input. With zod, `safeParse` hands back `data` holding only the declared fields
+      with the declared types, and the rest of the code only ever sees that. A validator that
+      returns `true` leaves you holding the original `any`, so nothing stops someone saving
+      the raw body with extra fields, or a string where a number belongs. Parsing also gives
+      you the static type from the same schema, so the type and the runtime check can't
+      drift. The cost is a dependency and some allocation per request, which is negligible
+      next to the bugs it prevents. For very hot internal paths between trusted services,
+      teams sometimes skip it, but never at a public edge.
+  - question: The frontend already validates the form. Why validate again on the server?
+    answer: >-
+      Because the server check is the only one every request passes through. The form's
+      checks run only in a browser that loaded that form; `curl`, a script, a mobile app on
+      an old version or an edited page skip them. So client checks are a user experience
+      feature: instant feedback without a round trip. The server check is the security and
+      integrity feature. The way to avoid duplicated effort is to share one schema between
+      both, so they can't disagree. And even the server schema isn't the end: uniqueness and
+      stock need the database, because two valid requests can race.
+  - question: What is mass assignment, and how do you prevent it?
+    answer: >-
+      Mass assignment is when a client sets fields it should never control because the
+      server copies the request body into a record wholesale. The classic case is a profile
+      update that spreads the body, so sending `"role":"admin"` promotes the caller. The fix
+      is an allow-list: a schema per operation naming exactly the fields that operation may
+      change, and code that writes only the parsed value. Separate schemas matter, because
+      the fields a user may set on sign-up differ from the ones an admin may set. A
+      deny-list, removing `role` and `isAdmin`, fails the day someone adds a new sensitive
+      column.
+  - question: Would you return 400 or 422 for a request that fails validation?
+    answer: >-
+      Either is defensible, so I'd pick one convention for the whole API and document it. RFC
+      9110 defines 400 for a malformed request and 422 Unprocessable Content for one the
+      server understands but can't process. A common split is 400 when the body isn't valid
+      JSON or the shape is wrong, and 422 when a well-formed body breaks a rule. What matters
+      more is the body: a problem details object with a stable type and a list of fields and
+      reasons, so clients can show errors next to inputs. Mixing both codes at random is the
+      real mistake, because clients end up handling two paths for one situation.
+  - question: How would you safely use JSON output from an LLM in your backend?
+    answer: >-
+      Treat it exactly like untrusted client input: parse it against a schema before any
+      code relies on it. Even with a structured output mode, the model can return a missing
+      field, a wrong enum value or text around the JSON. So I'd `JSON.parse` in a try, run
+      `safeParse` with a zod schema, and on failure retry once with the validation errors fed
+      back, then fall back to a safe default or an error. I'd also never let model output
+      choose things like a user id or a price directly. The trade-off is an extra model call
+      on retries, which is far cheaper than a corrupted record.

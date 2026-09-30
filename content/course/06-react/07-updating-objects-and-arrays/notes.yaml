@@ -1,0 +1,231 @@
+summary: >-
+  React decides whether to render again by asking one cheap question: is the new state the
+  same value as the old one? For objects and arrays, "the same" means the same reference in
+  memory, checked with `Object.is`. React never looks inside. So a value changed in place and
+  handed back looks identical, and the update is skipped.
+
+
+  The rule that follows is to treat state as read-only. To change an array or object, build a
+  new one that contains the change, and hand that to the setter. Spread, `map`, `filter` and
+  the copying array methods (`toSorted`, `toSpliced`, `with`) do this. Items you didn't change
+  are shared between the old value and the new one, which keeps the copying cheap.
+
+
+  This isn't a quirk to work around. Immutable updates are what make React's other features reliable. A memoised row can skip
+  rendering because its item kept its identity. Undo can keep old states. And every render sees
+  a snapshot that no later code can change under it.
+remember:
+  - React skips an update when `Object.is(next, previous)` is true, so a mutated object or array handed back never renders.
+  - Never change state in place; build a new array or object with the change and pass that to the setter.
+  - '`push`, `pop`, `shift`, `unshift`, `splice`, `sort`, `reverse`, `fill` and index assignment mutate; spread, `map`, `filter`, `concat`, `slice`, `toSorted`, `toReversed`, `toSpliced` and `with` copy.'
+  - Spread copies one level, so copy every object on the path to the change and share everything else.
+  - Unchanged items keep their identity after an immutable update, which is what lets `memo` components and cached values skip work.
+  - Mutating an object and then setting a new outer array renders, but leaves memoised children and old snapshots wrong.
+  - When the next state depends on the previous one, use an updater, `setList((prev) => [...prev, item])`, and keep it pure.
+  - Deeply nested state is a design smell; flatten it into records keyed by id.
+sections:
+  - title: What React compares, and why it doesn't look inside
+    body: |-
+      Every setter call ends in a comparison of the new state with the current one using
+      `Object.is`. It behaves like `===` except for two edge cases: it treats `NaN` as equal to
+      itself, and `0` as different from `-0`.
+
+      ```js
+      console.log(Object.is(NaN, NaN), NaN === NaN); // true false
+      console.log(Object.is(0, -0), 0 === -0); // false true
+
+      const list = ['Ana', 'Ben'];
+      list.push('Cleo');
+      console.log(Object.is(list, list)); // true: same array, so no render
+      ```
+
+      If the values are equal, React skips re-rendering the component and its children. The
+      React docs add one nuance: React may still call your component once before it decides
+      to bail out, but it won't update the page or render the children.
+
+      Why not compare contents? Because a deep comparison costs time proportional to the size of
+      the state, on every update, and still can't tell you which part changed. A reference check
+      is constant time whatever the size. It moves the work to the writer: whoever changes state
+      creates a new reference, and that new reference is the signal. The same convention powers
+      `memo`, `useMemo`, `useCallback` and effect dependencies, which all compare with
+      `Object.is`. Once you update immutably, all of them work with no extra effort. Mutate
+      once, and every one of them can be fooled.
+  - title: The immutable toolbox
+    body: |-
+      Node 20 and later, and all current browsers, have copying versions of the classic
+      mutating array methods. With them every common update is one expression:
+
+      ```ts
+      type Item = { id: string; name: string; packed: boolean };
+
+      // Insert at an index
+      const withSocks = items.toSpliced(1, 0, { id: 'd', name: 'Socks', packed: false });
+      // Remove at an index
+      const withoutFirst = items.toSpliced(0, 1);
+      // Replace at an index
+      const renamed = items.with(2, { ...items[2]!, name: 'Sun hat' });
+      // Update one item by id
+      const toggled = items.map((item) => (item.id === 'b' ? { ...item, packed: !item.packed } : item));
+      // Sort a copy
+      const byName = items.toSorted((x, y) => x.name.localeCompare(y.name));
+
+      // Move an item from one index to another
+      function move<T>(list: readonly T[], from: number, to: number): T[] {
+        const item = list[from]!;
+        return list.toSpliced(from, 1).toSpliced(to, 0, item);
+      }
+      ```
+
+      Objects used as a lookup by id follow the same idea. A computed key updates one entry,
+      and rest destructuring removes one:
+
+      ```ts
+      const doneT1 = { ...byId, t1: { ...byId.t1!, done: true } };
+      const { t2: _removed, ...withoutT2 } = byId;
+      ```
+
+      Copying first and then mutating the copy is also fine, because the copy is yours:
+      `const next = [...items]; next.sort(compare); setItems(next);`. What matters is that no
+      object React already holds is changed. `structuredClone` on the whole state is the wrong
+      tool: it gives every item a new identity, so every memoised child renders again, and it
+      costs time proportional to the whole state.
+  - title: Structural sharing, and what it buys
+    body: |-
+      An immutable update doesn't copy everything. Toggling one item in a list of a thousand
+      creates one new array and one new item object. The other 999 items are the same objects
+      as before, shared by the old and new arrays.
+
+      ```ts
+      const toggled = items.map((item) => (item.id === 'b' ? { ...item, packed: !item.packed } : item));
+      console.log(toggled === items, toggled[0] === items[0], toggled[1] === items[1]); // false true false
+      ```
+
+      That sharing is what makes large lists fast. Wrap the row in `memo`, give it a stable
+      callback, and only the changed row renders:
+
+      ```tsx
+      const Row = memo(function Row({ item, onToggle }: { item: Item; onToggle: (id: string) => void }) {
+        return (
+          <li>
+            <label>
+              <input type="checkbox" checked={item.packed} onChange={() => onToggle(item.id)} />
+              {item.name}
+            </label>
+          </li>
+        );
+      });
+
+      function PackingList({ initial }: { initial: Item[] }) {
+        const [list, setList] = useState(initial);
+        const toggle = useCallback((id: string) => {
+          setList((prev) => prev.map((item) => (item.id === id ? { ...item, packed: !item.packed } : item)));
+        }, []);
+        return <ul>{list.map((item) => <Row key={item.id} item={item} onToggle={toggle} />)}</ul>;
+      }
+      ```
+
+      We ran this in a test: ticking Charger rendered one row, Charger. Now mutate instead,
+      `item.packed = !item.packed` followed by `return [...prev]`. The array is new, so the list
+      renders and a counter above it says `1 packed`. But the Charger row receives the same
+      `item` object, `memo` skips it, and its checkbox stays unticked. The screen now disagrees
+      with itself.
+  - title: Nested state and how to flatten it
+    body: |-
+      Spread copies one level. To change something three levels down, you copy every object on
+      the path: the outer object, the middle one, then the one that changes. Everything off the
+      path is shared.
+
+      ```ts
+      setBoard({
+        ...board,
+        columns: board.columns.map((column) =>
+          column.id === columnId
+            ? { ...column, cards: column.cards.map((card) => (card.id === cardId ? { ...card, title } : card)) }
+            : column,
+        ),
+      });
+      ```
+
+      That's correct, and hard to read. When updates look like this, the shape of the state is
+      the problem. Store each kind of thing once, in a record keyed by id, and let parents refer
+      to children by id:
+
+      ```ts
+      type Board = {
+        columnOrder: string[];
+        columns: Record<string, { id: string; title: string; cardIds: string[] }>;
+        cards: Record<string, { id: string; title: string }>;
+      };
+
+      // Renaming a card now touches one entry, whatever column it sits in.
+      setBoard((prev) => ({
+        ...prev,
+        cards: { ...prev.cards, [cardId]: { ...prev.cards[cardId]!, title } },
+      }));
+      ```
+
+      Moving a card between columns becomes two `cardIds` edits and leaves the card object
+      alone. This is the same normalisation a database uses, for the same reason: one copy of
+      each fact, so an update can't miss a duplicate. Immer is the other option, letting you
+      write mutating code against a draft, but flat state usually removes the need.
+pitfalls:
+  - >-
+    **Calling `sort` or `reverse` on state.** Both reorder the array React already holds, so
+    the setter sees the same reference and nothing renders. Use `toSorted` and `toReversed`.
+  - >-
+    **Mutating an item and spreading the array.** `item.done = true; setList([...list])`
+    renders, but the old snapshot is changed too and memoised rows skip the update. Replace the
+    item with `{ ...item, done: true }`.
+  - >-
+    **Mutating inside an updater.** In Strict Mode, React calls updater functions twice in
+    development to catch impure ones. A toggle that flips `prev[i].packed` in place runs twice
+    and ends where it started. Return new objects from updaters.
+  - >-
+    **Forgetting a level.** `{ ...user, address: user.address }` followed by
+    `user.address.city = 'York'` still mutates the shared address. Spread every level on the
+    path to the change.
+  - >-
+    **Deep cloning everything.** `structuredClone(state)` gives every item a new identity, so
+    every memoised child renders and every cached value recomputes. Copy only the path you
+    change.
+  - >-
+    **Ids made from the length.** `id: String(list.length)` repeats after a removal and breaks
+    keys. Generate an id that can't repeat when the item is created.
+interview:
+  - question: Why does React require immutable state updates?
+    answer: >-
+      Because React detects change by reference. When you call a setter it compares the new
+      value with the old using `Object.is`, and skips the render if they're the same object.
+      A mutated array handed back is the same object, so nothing happens. The reference check
+      is constant time however large the state, which is why React chose it over deep
+      comparison. The same convention powers `memo`, `useMemo` and effect dependencies, so
+      immutable updates make all of them correct at once. There's a readability cost for deep
+      structures, which I handle by flattening state into records keyed by id, or with Immer
+      when a team prefers mutating syntax.
+  - question: A teammate mutates an item, then calls `setItems([...items])`. It renders. What's the problem?
+    answer: >-
+      It renders because the outer array is new, but the item object is the same one, now
+      changed. Three things break. A memoised row gets the same `item` reference, skips
+      rendering and shows the old value while the rest of the page shows the new one. Any code
+      holding the previous state, an undo stack or a comparison with the last render, sees the
+      change too, because it points at the same object. And in Strict Mode an updater that
+      mutates runs twice, so a toggle flips back. The fix is to replace the item:
+      `items.map((i) => (i.id === id ? { ...i, done: true } : i))`.
+  - question: What does a shallow copy mean, and how do you update nested state correctly?
+    answer: >-
+      A shallow copy creates a new outer object whose properties point at the same values as
+      before; nested objects are shared, not copied. So `{ ...user, name }` is fine, but changing
+      `user.address.city` needs a new address object too: `{ ...user, address: { ...user.address,
+      city } }`. The rule is to copy every object on the path from the root to the change and
+      share the rest. That sharing is intentional, because unchanged branches keeping their
+      identity is what lets memoised components skip work. If updates get three levels deep, I
+      restructure the state into flat records keyed by id rather than writing longer spreads.
+  - question: How would you structure state for a large editable list so updates stay fast?
+    answer: >-
+      Keep items immutable, update one with `map` so the rest keep their identity, and render
+      rows through `memo` with stable callbacks. Then toggling one item renders one row. The
+      callback matters: an inline arrow is new every render and defeats `memo`, so I use
+      `useCallback` with an updater, which needs no dependencies. For nested data I normalise
+      into records by id, so an update touches one entry. Beyond a few thousand rows the
+      bottleneck becomes the DOM, and I'd add windowing. I'd measure with the React profiler
+      before adding `memo` everywhere, because it has its own cost.

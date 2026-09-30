@@ -1,0 +1,297 @@
+id: backend.authorisation
+title: Authorisation
+objective: Write ownership checks and roles, and find an IDOR.
+level: essential
+minutes: 10
+concepts: [backend.authorisation, backend.ownership-checks, backend.roles, backend.idor]
+prerequisites: [backend.sessions-and-tokens]
+opening:
+  text: >-
+    You'll find the bug that lets one customer read every other customer's orders, and close
+    it with one line. Then you'll decide who may refund, cancel and delete without writing a
+    special case per person.
+
+steps:
+  - type: prose
+    id: after-the-session
+    body: |-
+      Last lesson, a session told the server who's asking. Every handler here runs after that
+      check, with `session.userId` set to the caller:
+
+      ```js
+      // GET /orders/:id, after the session check
+      const order = orders.find((o) => o.id === id);
+      if (!order) return Response.json({ error: "no such order" }, { status: 404 });
+      return Response.json(order);
+      ```
+
+      Signed-out callers never get this far. They got a 401.
+
+  - type: predict-output
+    id: predict-read-someone-elses-order
+    concept: backend.idor
+    difficulty: 1
+    language: bash
+    code: |
+      $ curl -b "sid=ana-session" localhost:3000/orders/7
+    question: Ana is signed in. Order 7 belongs to Ben. What does she get back?
+    choices:
+      - text: '`200` with Ben''s order'
+        correct: true
+        feedback: >-
+          Right. The handler checks she's signed in, then hands over any order she names.
+      - text: '`403`, since it isn''t hers'
+        feedback: >-
+          Nothing in the handler asks whose order it is. Being signed in was the only test.
+      - text: '`404`, because she can''t see it'
+        feedback: >-
+          Order 7 exists, and `find` finds it. The code never compares its owner with Ana.
+
+  - type: prose
+    id: authn-then-authz
+    body: |-
+      The session said who Ana is. It never said what she may do. That second question is
+      **authorisation**: may this caller do this action to this thing?
+
+      Skip it and you have an **IDOR**, an insecure direct object reference. Ids count up, so
+      a short loop reads every order:
+
+      ```js
+      for (let id = 1; id <= 500; id++) {
+        const response = await fetch(`/orders/${id}`);
+        if (response.ok) console.log(await response.json());
+      }
+      ```
+
+  - type: bug-hunt
+    id: hunt-list-everything
+    concept: backend.idor
+    difficulty: 2
+    language: js
+    code: |
+      // GET /orders, after the session check
+      if (request.method === "GET" && path === "/orders") {
+        const mine = orders.filter((o) => o.status !== "deleted");
+        return Response.json(orders);
+      }
+    prompt: Ana's orders page lists Ben's orders too. Tap the line at fault.
+    lines: [4]
+    reasons:
+      - text: It returns every order, not the caller's
+        correct: true
+        feedback: >-
+          Yes. Filter by `o.ownerId === session.userId` and return that list.
+      - text: The filter should keep deleted orders
+        feedback: >-
+          Deleted orders are a separate matter. The list is never narrowed to Ana's.
+      - text: The route should check `POST`, not `GET`
+        feedback: >-
+          Reading a list is a `GET`. The route is right; its answer holds everyone's orders.
+    fix: |
+      // GET /orders, after the session check
+      if (request.method === "GET" && path === "/orders") {
+        const mine = orders.filter((o) => o.ownerId === session.userId);
+        return Response.json(mine);
+      }
+
+  - type: prose
+    id: ownership-in-the-query
+    body: >-
+      The fix is an **ownership check**, and the safest place for it is inside the lookup
+      itself: find the order with this id *and* this owner.
+
+
+      Then an order that isn't the caller's doesn't exist for them. There's no second step to
+      forget, and they get a 404, not a 403 that confirms the order is real. The list gets the
+      same filter.
+
+  - type: fill-blank
+    id: fill-owner-filter
+    concept: backend.ownership-checks
+    difficulty: 2
+    language: js
+    prompt: >-
+      Make both handlers see only the caller's orders. Fill the gaps.
+    template: |
+      // GET /orders
+      return Response.json(orders.{{1}}((o) => o.ownerId === session.{{2}}));
+
+      // GET /orders/:id
+      const order = orders.find((o) => o.id === id {{3}} o.ownerId === session.userId);
+      if (!order) return Response.json({ error: "no such order" }, { status: 404 });
+    blanks:
+      - key: '1'
+        answer: filter
+      - key: '2'
+        answer: userId
+      - key: '3'
+        answer: '&&'
+    bank: [filter, find, userId, id, '&&', '||']
+
+  - type: prose
+    id: roles
+    body: >-
+      Ownership covers customers. Staff need to see orders they don't own, and only some staff
+      may refund. Writing `if (user.name === "Priya")` doesn't scale.
+
+
+      A **role** is a named bundle of permissions: `staff` may read any order and refund,
+      `admin` may also delete. A check asks whether the role holds the permission. Nothing
+      granted means no, so a new action is closed until someone opens it.
+
+
+  - type: ai-review
+    id: review-refund-or
+    concept: backend.authorisation
+    difficulty: 4
+    language: js
+    request: Only staff may refund, and only paid orders.
+    flawClass: logic
+    code: |
+      // POST /orders/:id/refund
+      const order = orders.find((o) => o.id === id);
+      if (!order) return Response.json({ error: "no such order" }, { status: 404 });
+      if (session.role !== "staff" && order.status !== "paid") {
+        return Response.json({ error: "staff only, paid orders only" }, { status: 403 });
+      }
+      return Response.json(refund(order));
+    prompt: >-
+      An assistant wrote this. Staff refunding a paid order works. A customer refunding an
+      unpaid one gets `403`. Both tests pass. Then a customer refunds their own paid order.
+      Tap the line at fault.
+    lines: [4]
+    reasons:
+      - text: '`&&` only refuses when both conditions fail'
+        correct: true
+        feedback: >-
+          Yes. A customer with a paid order fails one test, not both. The refund runs.
+      - text: The ownership check is missing
+        feedback: >-
+          Staff refund other people's orders on purpose. The role is the rule here, and the
+          condition lets it slip.
+      - text: '`403` should be `401`'
+        feedback: >-
+          The caller is signed in, so `403` is right. The condition in front of it is wrong.
+    fix: |
+      // POST /orders/:id/refund
+      const order = orders.find((o) => o.id === id);
+      if (!order) return Response.json({ error: "no such order" }, { status: 404 });
+      if (session.role !== "staff" || order.status !== "paid") {
+        return Response.json({ error: "staff only, paid orders only" }, { status: 403 });
+      }
+      return Response.json(refund(order));
+
+  - type: code-challenge
+    id: write-can
+    concept: backend.roles
+    difficulty: 4
+    language: ts
+    prompt: >-
+      Write `can(user, action, order)`. The starter holds `permissions`, a list per role.
+      An entry `order:read` allows the action on any order. An entry `order:read:own` allows
+      it only when `order.ownerId` is `user.id`.
+
+
+      Look up the user's role, and return `true` only if an entry grants the action. Anything
+      not granted, including an action nobody has heard of, is `false`.
+
+
+      So a `customer` with `order:read:own` may read their own order and nobody else's.
+    hints:
+      - Build the two strings to look for from `action`, then check the role's list.
+      - The `:own` entry needs one more comparison before it says yes.
+      - "Start with `const granted = permissions[user.role];`"
+
+  - type: explain-back
+    id: explain-why-404-not-403
+    concept: backend.ownership-checks
+    difficulty: 4
+    prompt: |-
+      ```js
+      // GET /orders/:id
+      const order = orders.find((o) => o.id === id && o.ownerId === session.userId);
+      if (!order) return Response.json({ error: "no such order" }, { status: 404 });
+      return Response.json(order);
+      ```
+
+      Ana asks for Ben's order and gets `404`, not `403`. Why is that the better design?
+    rubric:
+      - The owner is part of the lookup, so a foreign record is never fetched. There's no separate check to forget.
+      - '`403` would confirm the order exists, which is information an attacker can use to count the table.'
+      - The same filter serves the list endpoint, so one rule covers every way of reading orders.
+    modelAnswer: >-
+      A `403` says "that order is real, and it's not yours". Repeat it across ids and you've
+      mapped the table. With the owner inside the lookup, an order Ana doesn't own is never
+      found. She gets the same `404` as for an id that was never used. The rule lives in the
+      lookup, so there's no second check to leave out. The list endpoint uses the same filter.
+
+recap:
+  - Ask who may do this action to this thing, after the session says who they are.
+  - Put the owner inside the lookup so a foreign record is never found.
+  - Grant actions to roles, and deny anything not granted.
+
+recall:
+  - id: card-authn-vs-authz
+    concept: backend.authorisation
+    front: What question does authorisation answer that authentication doesn't?
+    back: >-
+      Whether this identified caller may do this action to this resource. Authentication only
+      says who they are.
+  - id: card-idor
+    concept: backend.idor
+    front: What makes an endpoint an IDOR?
+    back: >-
+      It returns any record whose id the caller supplies, without checking the caller may see
+      it.
+  - id: card-owner-in-query
+    concept: backend.ownership-checks
+    front: Where is the safest place for an ownership check?
+    back: >-
+      Inside the lookup, matching the id and the caller's id together, so a foreign record is
+      never found.
+  - id: card-deny-by-default
+    concept: backend.roles
+    front: What should a role check return for an action no role was granted?
+    back: >-
+      `false`. Anything not granted is denied, so a new action is closed until someone opens
+      it.
+
+references:
+  - kind: docs
+    title: A01 Broken Access Control
+    authors: OWASP
+    venue: OWASP Top 10:2021
+    url: https://owasp.org/Top10/2021/A01_2021-Broken_Access_Control/
+    note: The most common web weakness, with IDOR as its first example, and deny by default.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Insecure Direct Object Reference Prevention Cheat Sheet
+    authors: OWASP
+    venue: OWASP Cheat Sheet Series
+    url: https://cheatsheetseries.owasp.org/cheatsheets/Insecure_Direct_Object_Reference_Prevention_Cheat_Sheet.html
+    note: Why random ids alone don't fix an IDOR, and the access check per object.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Authorization Cheat Sheet
+    authors: OWASP
+    venue: OWASP Cheat Sheet Series
+    url: https://cheatsheetseries.owasp.org/cheatsheets/Authorization_Cheat_Sheet.html
+    note: Deny by default, least privilege, and checking on every request.
+    verified: true
+
+deepDive: >-
+  Random ids don't fix an IDOR. They only make guessing slower, and ids leak anyway: in
+  emails, in links people share, in other endpoints' responses. The check per object is what
+  closes it.
+
+
+  Authorisation belongs where the data is read and changed, not only in one check in front
+  of the routes. That check covers the paths it knows about; a new endpoint arrives without
+  it. A lookup that filters by owner protects every path that runs it. With a database,
+  chapter 10, the owner goes into the query itself.
+
+
+  Role checks that trust a `role` field sent by the client are the same bug in a different
+  coat. The role comes from the session the server stored, never from the request.

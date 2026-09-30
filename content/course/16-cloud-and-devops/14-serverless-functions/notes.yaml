@@ -1,0 +1,207 @@
+summary: >-
+  A serverless function hands the whole server to the platform. You deploy a handler, the
+  platform runs as many copies as traffic needs, and you pay per call and per millisecond,
+  with nothing to pay while nobody calls. For spiky, short, stateless work, such as
+  webhooks, image resizing, scheduled jobs and small APIs, that is hard to beat.
+
+
+  The model has three sharp edges. The first request to a new instance waits for a cold
+  start. Every call has a time limit, which a slow model reply can pass. And because each
+  instance is its own process with its own connections, a traffic spike becomes a
+  connection spike that can lock everyone out of the database.
+
+
+  These notes cover what the platform does around your handler, how to shrink cold starts,
+  how to size and share database connections, what to do with work that outlives the time
+  limit, and where the per-request price stops being a bargain.
+remember:
+  - A function instance serves requests one after another, and the platform adds instances as concurrent requests arrive.
+  - Work in module scope runs once per instance and is reused by every warm call, so clients and config belong there.
+  - The number of instances you need is requests per second times seconds per request, so a slow model call multiplies instances.
+  - Each instance holds its own connections, so put a pooler between functions and PostgreSQL and keep each instance's pool at one.
+  - Set the time limit above the slowest reply you accept, and move longer work to a queue with a job id the client can poll.
+  - Don't start work after returning a response, because the platform may freeze the instance before it runs.
+  - Per-request pricing wins for idle or spiky traffic and loses to an always-on server under steady high load.
+sections:
+  - title: The life of an instance
+    body: |-
+      On AWS Lambda, as on most function platforms, an instance goes through three phases.
+      **Init** starts the runtime, loads your code and runs everything at module scope.
+      **Invoke** runs the handler for one request. When the platform has no more work for
+      the instance, **shutdown** removes it, minutes or hours later.
+
+      Between requests the instance is **frozen**: its process is paused, not stopped. That
+      has two consequences. Anything at module scope survives, which is why a database
+      client created there is reused. And anything you started but didn't await is paused
+      too.
+
+      ```js
+      export const handler = async (event) => {
+        const order = JSON.parse(event.body);
+        sendReceiptEmail(order); // not awaited: may run on the next call, or never
+        return { statusCode: 200, body: 'ok' };
+      };
+      ```
+
+      Once the handler returns, the platform may freeze the instance before that email goes
+      out. It might finish during the next call to the same instance, or the instance may be
+      removed first. Await the work, or put it on a queue and return.
+
+      A Lambda instance handles one request at a time, so 40 requests in flight means 40
+      instances. Some platforms, such as Cloud Run, let one instance serve many requests at
+      once, which changes the connection sums below. Read how yours behaves.
+
+      Shrinking cold starts comes down to doing less before the first request. Bundle and
+      tree-shake so the runtime loads fewer files. Import heavy libraries inside the code
+      path that needs them. Avoid network calls at module scope that aren't needed on every
+      request. When none of that is enough, platforms sell pre-warmed instances; on Lambda
+      it's called **provisioned concurrency**, and you pay for it by the hour, idle or not.
+  - title: How many instances, and how many connections
+    body: |-
+      The count of instances follows from **Little's law**: work in flight equals arrival
+      rate times how long each piece takes.
+
+      ```ts
+      function concurrentInstances(requestsPerSecond: number, secondsPerRequest: number): number {
+        return Math.ceil(requestsPerSecond * secondsPerRequest);
+      }
+
+      concurrentInstances(50, 0.2); // 10 instances for a quick handler
+      concurrentInstances(50, 6); // 300 for a handler that waits on a model
+      ```
+
+      Same traffic, thirty times the instances, because each call waits six seconds for a
+      reply. That's the surprise with AI endpoints: the model's latency sets your
+      concurrency, and your concurrency sets your connection count.
+
+      The fix has two parts. Give each instance a pool of one, since it serves one request
+      at a time, created outside the handler:
+
+      ```js
+      import pg from 'pg';
+
+      const pool = new pg.Pool({
+        connectionString: process.env.DATABASE_URL,
+        max: 1,
+        idleTimeoutMillis: 10_000,
+        connectionTimeoutMillis: 2_000,
+      });
+
+      export const handler = async () => {
+        const result = await pool.query('SELECT count(*) AS n FROM tickets');
+        return { statusCode: 200, body: String(result.rows[0].n) };
+      };
+      ```
+
+      Then point `DATABASE_URL` at a pooler rather than PostgreSQL itself: PgBouncer in
+      transaction mode, a managed equivalent such as Amazon RDS Proxy, or your host's pooled
+      connection string. Three hundred instances then share a few dozen real connections.
+      The connection timeout makes an overloaded pooler fail fast instead of eating the
+      whole time limit. Also cap the function's concurrency in the platform settings, so a
+      runaway spike queues or is throttled instead of flooding everything behind it.
+  - title: Work that outlives the time limit
+    body: |-
+      Raising the time limit fixes a four-to-eight-second model call. It doesn't fix a job
+      that takes ten minutes, and a caller holding an HTTP request open that long is fragile
+      anyway. The pattern is to accept, queue and report.
+
+      ```text
+      POST /reports            -> 202 Accepted, { "jobId": "r_81f2" }
+                                  handler puts { jobId, params } on a queue
+      queue -> worker function    does the slow work, writes the result and status
+      GET /reports/r_81f2      -> { "status": "running" } ... later { "status": "done", "url": ... }
+      ```
+
+      Queue-triggered functions are delivered **at least once**. If a worker times out or
+      throws, the message comes back and runs again, so the worker must be idempotent: check
+      whether the job id is already done before doing it, and write results with an upsert
+      keyed by that id. After a set number of failed attempts, send the message to a
+      dead-letter queue so one poisoned job doesn't retry forever.
+
+      For chat-style AI features, streaming is the other answer. Lambda and most platforms
+      can stream a response body, so the user sees the first tokens in a second while the
+      whole reply still takes eight. Streaming improves how long the user waits for
+      something; the time limit still has to cover the full reply.
+  - title: When the price shape stops paying
+    body: |-
+      Function pricing is a small fee per request plus duration times memory, often quoted
+      in GB-seconds. The same formula shows where the model stops being cheap.
+
+      ```ts
+      type FunctionPrice = { perMillionRequests: number; perGbSecond: number };
+
+      function functionMonthlyCost(
+        price: FunctionPrice,
+        requestsPerMonth: number,
+        secondsPerRequest: number,
+        memoryGb: number,
+      ): number {
+        const requestCost = (requestsPerMonth / 1_000_000) * price.perMillionRequests;
+        const computeCost = requestsPerMonth * secondsPerRequest * memoryGb * price.perGbSecond;
+        return requestCost + computeCost;
+      }
+
+      const price = { perMillionRequests: 0.2, perGbSecond: 0.0000166667 }; // illustrative
+      functionMonthlyCost(price, 100_000, 0.3, 0.5); // about 0.27
+      functionMonthlyCost(price, 100_000_000, 0.3, 0.5); // about 270
+      ```
+
+      The cost grows in a straight line with traffic, with no ceiling. A server's cost is
+      flat until it's full. Somewhere the lines cross, and past that point, steady high
+      traffic is cheaper on always-on instances. Work out where for your own numbers and
+      prices.
+
+      Duration is billed while you wait, too. A function that spends six seconds waiting on
+      a model API pays for six seconds of memory doing nothing. For high-volume AI endpoints
+      that is often the argument for a long-running server, which can wait on hundreds of
+      replies at once in one process.
+pitfalls:
+  - '**Creating clients inside the handler.** Every call pays the connection handshake, hundreds of milliseconds with password hashing. Create clients at module scope so warm calls reuse them.'
+  - '**Connecting functions straight to PostgreSQL.** Instances times pool size passes `max_connections` in a spike and new clients are refused. Use a pooler, a pool of one per instance, and a concurrency cap.'
+  - '**Firing work after the response.** The instance can freeze before the promise runs, so emails and writes go missing at random. Await it, or hand it to a queue.'
+  - '**Leaving the default time limit.** Three seconds on Lambda is shorter than most model replies. Set it above your slowest accepted reply, and stream long answers.'
+  - '**Non-idempotent queue workers.** At-least-once delivery means a retried job runs twice, charging or emailing twice. Key the work by a job id and skip it if already done.'
+  - '**Assuming functions are always cheaper.** Cost grows with every request and every second spent waiting. Model the break-even against an always-on instance before committing a high-volume path.'
+interview:
+  - question: What are the trade-offs of serverless functions compared with a long-running server?
+    answer: >-
+      Functions trade control and steady-state cost for zero operations and zero idle cost.
+      The platform scales per request and bills per call and millisecond, which is ideal for
+      spiky or low traffic, webhooks and scheduled jobs. The costs are cold starts on new
+      instances, a time limit per call, no shared in-process state, and connections that
+      multiply with instances, which needs a pooler in front of the database. Under steady
+      high traffic the per-request price overtakes a server's flat price, and time spent
+      waiting on slow APIs is billed too. I'd put bursty, short, stateless work on functions
+      and keep long-lived connections, websockets and high, steady request volumes on
+      servers or containers.
+  - question: A serverless API takes down its PostgreSQL database during a traffic spike. What happened and how do you fix it?
+    answer: >-
+      Each function instance opened its own connections, and the platform started more
+      instances than the database's `max_connections` allows, so new clients were refused
+      with "too many clients already". The fix is layered. Put a pooler between functions and
+      the database, PgBouncer in transaction mode or a managed proxy, so many instances share
+      a few real connections. Give each instance a pool of one, created at module scope, with
+      a short connection timeout. Cap the function's concurrency so a spike queues instead of
+      flooding. Then load test it. The trade-off of transaction pooling is that session
+      state, such as prepared statements or `SET` commands, doesn't carry across
+      transactions.
+  - question: How would you handle an AI feature that takes 30 seconds to two minutes per request on a function platform?
+    answer: >-
+      I wouldn't hold the HTTP request open that long. The API function validates the input,
+      writes a job row, puts a message on a queue and returns `202` with a job id. A worker
+      function triggered by the queue does the model calls with a time limit well above the
+      worst case, and writes the result keyed by that job id. The client polls a status
+      endpoint or gets a push when it's done. Because queues deliver at least once, the worker
+      checks whether the job is already done before starting, and failed jobs go to a
+      dead-letter queue after a few attempts. If the user needs to watch it happen, I'd stream
+      progress instead of polling, accepting a longer-held connection.
+  - question: How do you reduce cold starts?
+    answer: >-
+      By doing less before the first request, then paying for warmth only if that isn't
+      enough. A cold start is runtime start-up plus loading code plus module-scope work, so I
+      bundle and tree-shake to load fewer files, lazy-load heavy dependencies on the paths
+      that need them, and avoid network calls at module scope unless every request needs
+      them. More memory often means more CPU on function platforms, which speeds start-up
+      too. If a latency target still isn't met, provisioned or minimum instances keep some
+      warm, at an hourly cost whether used or not. I'd also check whether it matters: a cold
+      start on one request in a thousand may be fine for a webhook and not for a checkout.

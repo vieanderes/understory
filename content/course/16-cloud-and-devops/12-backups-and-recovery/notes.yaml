@@ -1,0 +1,232 @@
+summary: >-
+  Backups exist for the day something deletes or corrupts data: a bad migration, a
+  `DELETE` without a `WHERE`, a bug that writes nonsense for an hour, or an attacker with
+  your credentials. Replicas don't help on that day, because they copy the damage within
+  milliseconds. Only a copy from an earlier moment does.
+
+
+  Two numbers drive the design. The recovery point objective, RPO, is how much recent data
+  you can afford to lose. The recovery time objective, RTO, is how long you can afford to be
+  down while restoring. A nightly `pg_dump` gives an RPO of up to a day. A base backup with
+  archived write-ahead log gives an RPO of seconds and lets you pick the exact moment to
+  restore to.
+
+
+  A backup is only as good as the last time you restored it. These notes cover how
+  point-in-time recovery is set up and watched, how logical and physical backups differ,
+  where backups must live to survive the disasters they're for, and an automated restore
+  test you can run every week.
+remember:
+  - A replica protects against losing a machine and a backup protects against losing data, because a replica applies every mistake too.
+  - Point-in-time recovery needs a base backup plus every archived WAL file since, and replays up to a target time you choose.
+  - RPO is how much data you can lose and RTO is how long recovery may take; measure both in restore tests instead of assuming them.
+  - An untested backup is a hope, so restore on a schedule to a scratch database, check the data, and alert when the test fails.
+  - Keep backups off the server, in another account or provider, with credentials that production can't use to delete them.
+  - "`pg_dump` makes a consistent logical copy of one database that restores across major versions; physical backups copy the whole cluster, restore faster and are the base for PITR."
+  - After a bad `DELETE`, restore to a separate instance and copy the lost rows back, rather than rolling the live database back and losing every write since.
+  - A failing `archive_command` lets WAL pile up on the primary until the disk fills, so monitor archiving as closely as the database itself.
+sections:
+  - title: Point-in-time recovery, configured and watched
+    body: |-
+      On the primary, three settings turn archiving on. `archive_mode` needs a restart; the
+      others need only a reload.
+
+      ```text
+      # postgresql.conf on the primary
+      wal_level = replica            # the default; enough for archiving
+      archive_mode = on
+      archive_command = 'test ! -f /wal/%f && cp %p /wal/%f'
+      archive_timeout = 60           # switch to a new WAL file at least every 60 s
+      ```
+
+      `archive_command` runs once per finished WAL file, with `%p` its path and `%f` its
+      name. PostgreSQL treats exit code 0 as "safely stored" and recycles the file, so the
+      command must only succeed once the copy is durable. The `test ! -f` refuses to
+      overwrite an existing file, which is the example PostgreSQL's own documentation gives.
+      In production, a dedicated tool such as pgBackRest or WAL-G does this job: it
+      compresses, encrypts, uploads to object storage and verifies.
+
+      A quiet database fills a 16 MB WAL file slowly, and an unfinished file isn't archived.
+      `archive_timeout` bounds that, so your RPO is at most about a minute even at night.
+
+      To restore, copy a base backup into an empty data directory, create `recovery.signal`,
+      and set:
+
+      ```text
+      restore_command = 'cp /wal/%f %p'
+      recovery_target_time = '2026-09-18 17:50:48+00'
+      recovery_target_action = 'pause'
+      ```
+
+      `pause` is the default. The server stops at the target and lets you run queries, so you
+      can check the missing rows are there before going further. If the moment is wrong,
+      restart with a different target. When it's right, `SELECT pg_wal_replay_resume();`
+      ends recovery and the server accepts writes.
+
+      Watch the archiver. The view `pg_stat_archiver` shows `last_archived_time`,
+      `failed_count` and `last_failed_wal`. If the command keeps failing, because the bucket
+      is full or a credential expired, PostgreSQL keeps every unarchived file in `pg_wal`.
+      The disk fills, and the primary stops. Alert when the last archived file is older than
+      a few minutes.
+  - title: Logical dumps or physical backups
+    body: |-
+      PostgreSQL offers two kinds of backup, and larger systems use both.
+
+      A **logical** backup, `pg_dump`, reads the data through SQL and writes the statements
+      and rows needed to rebuild it. It runs inside one transaction snapshot, so the copy is
+      consistent even while writes continue, and it doesn't block ordinary reads or writes.
+      It does block schema changes such as `ALTER TABLE` on tables it's dumping, so don't
+      schedule migrations during the dump.
+
+      Dumps are portable. You can restore a PostgreSQL 17 dump into 18, which makes them the
+      usual tool for upgrades and for copying data to a laptop. With the custom format, `-Fc`,
+      `pg_restore` can restore a single table, or run in parallel with `--jobs`. What they
+      aren't is fast or fine-grained: a large database takes hours to dump and longer to
+      restore, because every index is rebuilt, and the RPO is the time since the last dump.
+
+      A dump covers one database, not the roles and permissions around it. Save those
+      separately with `pg_dumpall --globals-only`, or a restore on a fresh server reports an
+      error for every owner and grant that names a missing role. Restoring with `--no-owner` sidesteps missing roles when you only need
+      the data.
+
+      A **physical** backup, from `pg_basebackup` or a tool like pgBackRest, copies the data
+      files of the whole cluster. It restores only to the same major version, and it's
+      all-or-nothing: you can't pull out one table. In return, restore time is about copying
+      files, with no index rebuilds, and together with archived WAL it gives point-in-time
+      recovery.
+
+      A sensible default for a production database: physical base backups nightly or weekly,
+      continuous WAL archiving, and a logical dump now and then for upgrades and as a second,
+      independent format. Managed databases run the physical side for you and let you choose
+      the retention period.
+  - title: Where backups live
+    body: |-
+      A backup must survive the event it exists for. Walk through the events and ask where
+      your copy would be.
+
+      **The disk or server fails.** Backups on the same disk die with it, as the lesson's
+      review showed. Copy them to another machine at least.
+
+      **The region or provider has an outage.** Copies in the same data centre can be
+      unreachable exactly when you need them. Keep at least one copy in another region.
+
+      **An attacker or a buggy script gets production credentials.** If those credentials can
+      delete backups, the attacker deletes them first, which is standard practice in
+      ransomware attacks. Write backups with credentials that can add but not delete, into a
+      separate account, and turn on object locking or immutable retention where your storage
+      supports it, so even an administrator can't remove a copy before its date.
+
+      The old **3-2-1 rule** sums it up: three copies of the data, on two kinds of storage,
+      with one off-site. Modern versions add one immutable copy and zero errors in the last
+      restore test.
+
+      Encrypt backups, since a dump is the whole database in one file. Keep the key somewhere
+      other than next to the backups, and make sure it's available during a disaster: a
+      backup you can't decrypt is lost.
+
+      Decide retention deliberately. Longer retention recovers from slower-noticed mistakes,
+      such as corruption found three weeks later. It also keeps personal data around after
+      users ask for deletion, so document how long backups live and let them expire on
+      schedule.
+
+      Remember what isn't in the database: uploaded files in object storage, secrets,
+      configuration, and the infrastructure definitions. A restore that brings back bookings
+      but not the images they point to isn't a full recovery.
+  - title: A restore test that runs itself
+    body: |-
+      A restore test belongs on a schedule, with a check that can fail loudly. This script
+      ran against PostgreSQL 17: it restored a 5,000-row dump, reported the time, checked the
+      data, and dropped the scratch database afterwards.
+
+      ```bash
+      #!/bin/bash
+      # Weekly: restore the newest dump into a scratch database and prove it's usable.
+      set -euo pipefail
+
+      DUMP=$(ls -t /backups/bookings-*.dump | head -n 1)
+      MAX_AGE_HOURS=26   # nightly dumps, plus slack
+      SCRATCH=restore_test_$(date +%s)
+
+      createdb "$SCRATCH"
+      trap 'dropdb --if-exists "$SCRATCH"' EXIT
+
+      start=$(date +%s)
+      pg_restore --no-owner --jobs 4 --dbname "$SCRATCH" "$DUMP"
+      seconds=$(( $(date +%s) - start ))
+
+      rows=$(psql -d "$SCRATCH" -Atc "SELECT count(*) FROM bookings")
+      age=$(psql -d "$SCRATCH" -Atc \
+        "SELECT floor(extract(epoch FROM now() - max(created_at)) / 3600) FROM bookings")
+
+      echo "restored $DUMP in ${seconds}s: $rows bookings, newest ${age}h old"
+
+      if [ "$rows" -eq 0 ] || [ "$age" -gt "$MAX_AGE_HOURS" ]; then
+        echo "restore test failed" >&2
+        exit 1
+      fi
+      ```
+
+      Each line earns its place. `set -euo pipefail` makes any failed command fail the test,
+      so a broken restore can't print a cheerful line. The `trap` drops the scratch database
+      even when a check fails. The age check is the RPO test: if the newest booking in the
+      backup is older than expected, the nightly job has silently stopped, which a count
+      alone would miss. The timing is your measured RTO for this path.
+
+      Run it on a machine other than production, pulling the dump from off-site storage,
+      so the test also proves the copy got there. Report the result to your monitoring, and
+      alert on a failure or on a missing result, since a test that stopped running looks the
+      same as one that passes.
+
+      Once a quarter, go further: rebuild a whole environment from backups by following the
+      written runbook, with someone who didn't write it. That tests the steps, the
+      permissions and the keys, not only the files.
+pitfalls:
+  - "**Treating replicas as backups.** They copy a bad `DELETE` in milliseconds. Keep real backups with history, and use replicas for availability."
+  - "**Backups on the same server or account.** One disk failure or one stolen credential takes both. Copy off-site with credentials that can't delete."
+  - "**Never restoring.** Gaps in the WAL archive, missing roles and lost keys only show during a restore. Test on a schedule and alert on failures."
+  - "**Restoring over the live database after a mistake.** Every write since the target time is lost. Restore to a separate instance and copy back the rows you need."
+  - "**An unmonitored `archive_command`.** When it fails, WAL piles up until the primary's disk is full. Alert on `pg_stat_archiver` failures and on the age of the last archived file."
+  - "**Dumping databases but not roles.** A restore on a new server fails on ownership and grants. Save `pg_dumpall --globals-only` too, or restore with `--no-owner`."
+  - "**Forgetting files and secrets.** Bookings come back without the uploads and keys they need. List everything the system needs to run, and back up each part."
+interview:
+  - question: What's the difference between a replica and a backup? Do you need both?
+    answer: >-
+      A replica is a live copy that follows the primary within moments; a backup is a copy
+      of an earlier moment kept elsewhere. They protect against different failures, so yes,
+      I'd want both for anything important. A replica gives availability: if the primary's
+      machine dies, you promote the replica in seconds and lose almost nothing. But it
+      applies every change, including a `DELETE` without a `WHERE`, a bad migration or an
+      attacker's writes. A backup, ideally a base backup with archived WAL, lets you go
+      back to the minute before the mistake. A delayed replica narrows the gap, but only for
+      mistakes you notice within its delay.
+  - question: Design a backup strategy for a production PostgreSQL database with an RPO of five minutes and an RTO of one hour.
+    answer: >-
+      Continuous WAL archiving to object storage for the RPO, and regular physical base
+      backups sized to meet the RTO. With `archive_timeout` of 60 seconds, a completed WAL
+      file reaches storage within about a minute, well inside five. Restore time is copying
+      the base backup plus replaying WAL since, so I'd take base backups often enough that
+      replay stays short, perhaps daily, and measure it. Backups go to another account and
+      region with delete-protected retention, encrypted with a separately held key. I'd
+      monitor archive failures and run a weekly automated restore that records the actual
+      time. If the measured restore creeps towards an hour, I'd take base backups more often
+      or keep a standby.
+  - question: Someone ran a `DELETE` without a `WHERE` on the bookings table ten minutes ago. What do you do?
+    answer: >-
+      Contain it, restore to the side, and copy back only what was lost. First I'd check
+      whether the application is still making things worse, and pause the affected feature
+      if needed. Then I'd note the time of the delete from logs or the audit trail and run
+      point-in-time recovery to a separate instance, targeting the moment before it, pausing to
+      verify the rows are there. Rolling the live database back would lose ten minutes of
+      other bookings. Instead I copy the deleted rows from the restored instance into
+      production, checking for conflicts with anything created since. Afterwards, a review:
+      why could a person run that against production, and what guard stops it next time.
+  - question: How do you know your backups actually work?
+    answer: >-
+      Because I restore them regularly and a machine checks the result. A weekly job fetches
+      the latest backup from off-site storage, restores it into a scratch database on
+      separate infrastructure, and runs checks: key tables have rows, the newest record is
+      within the expected age, which tests the RPO, and the restore finished within the
+      target time, which measures the RTO. The job reports to monitoring, and a failure or a
+      missing report alerts. Quarterly, someone who didn't write the runbook rebuilds an
+      environment from it. The cost is compute and time, which is small next to discovering
+      a gap in the archive during a real outage.

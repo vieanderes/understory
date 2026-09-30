@@ -1,0 +1,1160 @@
+summary: >-
+  The reference solution is a small Node 24 project called `typed-cart`. It starts as one plain JavaScript file, `cart.js`, written by hand: add, merge, set, remove and total, with prices in whole pence. That draft is then ported to TypeScript. `cart.ts` holds a `readonly` data model and pure functions that return a result instead of throwing when a shopper asks for too much. `parse-item.ts` is the boundary: it takes `unknown` from a JSON reply and returns a checked item or every problem it found, without `as`. `env.ts` checks the environment with a zod schema at start-up and stops the program with the variable's name if anything is wrong. `main.ts` wires them together: read the settings, fetch a saved cart, parse it, build the cart, print a receipt. esbuild bundles it into `dist/app.js` with a source map. One npm script, `check`, runs `tsc --noEmit`, ESLint, Prettier, 23 tests and the build, and the same script runs in a pre-commit hook and in CI. A committed lockfile, `npm ci`, an `engines` range and `engine-strict=true` make every machine install the same packages on the same Node, or refuse. Everything below was built and run on Node 24.21.0 with TypeScript 6.0.3, ESLint 10.11.0, Prettier 3.9.9, esbuild 0.28.2 and zod 4.6.5, and every command passed.
+remember:
+  - >-
+    Money is a whole number of pence from the moment it enters, so sums are exact and formatting to pounds happens once, at the edge.
+  - >-
+    Cart functions never change the cart they're given: each returns a new cart, so an old value can't shift under code that still holds it.
+  - >-
+    A shopper asking for eleven mugs is an expected outcome, so it comes back as a result. A throw is kept for bugs and broken start-up.
+  - >-
+    Data from outside is `unknown` until a parser has checked every field and built a fresh object, because a type annotation or `as` checks nothing at run time.
+  - >-
+    The environment is parsed once at start-up with a schema. A missing or malformed variable stops the program at once, named but never printed.
+  - >-
+    `tsc --noEmit` is the only step that checks types; esbuild and Node's type stripping delete them without looking, so the check must be its own gate.
+  - >-
+    One `check` script runs types, lint, format, tests and build, and the hook and CI both call it, so passing on a laptop means passing in CI.
+  - >-
+    "Runs the same on any machine" comes from a committed lockfile installed with `npm ci`, plus an `engines` range that npm enforces with `engine-strict=true`.
+  - >-
+    Module settings describe the program that runs the code: Node runs the tests straight from `.ts` files, so the imports say `./cart.ts` and `tsconfig.json` allows it.
+sections:
+  - title: '1. The rules, and the map of the project'
+    body: |-
+      Decide the rules before writing code. A cart with vague rules gets vague code, and vague code is where the bugs live. These are the rules this solution enforces:
+
+      - A **quantity** is a whole number from 1 to 10 for each product. `2.5`, `0`, `-1` and `NaN` are refused.
+      - Adding a product that's already in the cart **merges** into its line. The merged total must still be 10 or fewer.
+      - Setting a quantity to **0 removes** the line, the way a shop's quantity box behaves.
+      - Setting the quantity of a product that isn't in the cart is an error. Removing one that isn't there is not: the cart already looks as asked.
+      - **Prices are whole pence.** `450` means £4.50. Nothing inside the cart ever holds a decimal amount.
+      - Every item that arrives from outside is checked before the cart sees it.
+
+      Then the map. Each file has one job, and the arrows only point one way: `main.ts` knows everything, `cart.ts` knows nothing about the outside world.
+
+      ```text
+      first-draft/cart.js       the first version, plain JavaScript, by hand
+      first-draft/check.js      a script that prints results to eyeball
+      src/cart.ts               the data model and the quantity rules
+      src/parse-item.ts         the boundary: unknown in, checked items out
+      src/env.ts                the environment schema
+      src/main.ts               start-up: env, fetch, parse, build, print
+      tests/check.ts            a tiny test helper
+      tests/*.test.ts, run.ts   the tests
+      package.json              scripts, engines, dependencies
+      package-lock.json         the exact installed tree, committed
+      tsconfig.json             how tsc checks
+      eslint.config.js          lint rules
+      .prettierrc.json          format settings
+      .npmrc                    engine-strict=true
+      .githooks/pre-commit      runs npm run check
+      ci.sh                     what CI runs
+      .env.example              the variables, with safe sample values
+      ```
+
+      The build follows the brief. First the JavaScript draft, then the setup, the typed model, the boundary and the environment. Then the entry point, and last the gates.
+  - title: '2. The first draft, in plain JavaScript, by hand'
+    body: |-
+      The brief says to write this part without an assistant. That's the point of it: you find out which parts you can already do, and the bugs you make are yours to understand. Keep it to one file and a script that prints what happens.
+
+      ```js
+      // first-draft/cart.js: the first version, plain JavaScript, written by hand.
+      // Prices are whole pence, so every sum is exact.
+
+      export const MAX_QUANTITY = 10;
+
+      export function emptyCart() {
+        return { lines: [] };
+      }
+
+      function checkQuantity(quantity) {
+        if (!Number.isInteger(quantity) || quantity < 1 || quantity > MAX_QUANTITY) {
+          throw new RangeError(
+            `Quantity must be a whole number from 1 to ${MAX_QUANTITY}, got ${quantity}`,
+          );
+        }
+      }
+
+      export function addItem(cart, product, quantity = 1) {
+        checkQuantity(quantity);
+        const existing = cart.lines.find((line) => line.product.id === product.id);
+        if (!existing) {
+          return { lines: [...cart.lines, { product, quantity }] };
+        }
+        const merged = existing.quantity + quantity;
+        checkQuantity(merged);
+        return {
+          lines: cart.lines.map((line) => (line === existing ? { ...line, quantity: merged } : line)),
+        };
+      }
+
+      export function setQuantity(cart, productId, quantity) {
+        if (quantity === 0) return removeItem(cart, productId);
+        checkQuantity(quantity);
+        if (!cart.lines.some((line) => line.product.id === productId)) {
+          throw new Error(`No line for ${productId}`);
+        }
+        return {
+          lines: cart.lines.map((line) => (line.product.id === productId ? { ...line, quantity } : line)),
+        };
+      }
+
+      export function removeItem(cart, productId) {
+        return { lines: cart.lines.filter((line) => line.product.id !== productId) };
+      }
+
+      export function itemCount(cart) {
+        return cart.lines.reduce((sum, line) => sum + line.quantity, 0);
+      }
+
+      export function subtotalPence(cart) {
+        return cart.lines.reduce((sum, line) => sum + line.product.pricePence * line.quantity, 0);
+      }
+      ```
+
+      Three habits from the JavaScript chapter carry the design. **Spread and `map` return new arrays and objects**, so `addItem` never touches the cart it was given. **`find` returns the line or `undefined`**, and the `line === existing` test in `map` swaps exactly that one line. **`reduce` with a starting value of `0`** totals an empty cart to `0` instead of throwing.
+
+      A quick script shows it working. This is the draft's whole test suite, and it's enough for a first pass:
+
+      ```js
+      // first-draft/check.js
+      import { addItem, emptyCart, itemCount, setQuantity, subtotalPence } from './cart.js';
+
+      const tea = { id: 'tea', name: 'Loose-leaf tea', pricePence: 450 };
+      const mug = { id: 'mug', name: 'Enamel mug', pricePence: 1200 };
+
+      const start = emptyCart();
+      const cart = addItem(addItem(addItem(start, tea, 2), mug), tea, 3);
+      console.log(itemCount(cart), subtotalPence(cart)); // 6 3450
+      console.log(start.lines.length); // 0
+
+      try {
+        addItem(cart, tea, 6);
+      } catch (error) {
+        console.log(error.message);
+      }
+
+      console.log(setQuantity(cart, 'tea', 0).lines.length); // 1
+      console.log(0.1 + 0.2, 10 + 20); // 0.30000000000000004 30
+      ```
+
+      ```text
+      $ node first-draft/check.js
+      6 3450
+      0
+      Quantity must be a whole number from 1 to 10, got 11
+      1
+      0.30000000000000004 30
+      ```
+
+      The second line proves `start` was never changed. The last line is why prices are pence: `0.1 + 0.2` in floating point isn't `0.3`, but `10 + 20` is exactly `30`. Whole numbers stay exact up to `Number.MAX_SAFE_INTEGER`, far past any basket.
+
+      Now read the draft as a reviewer would. Four weaknesses show up, and each one drives a step of the port:
+
+      - Nothing says what a product or a cart looks like. Pass `{ price: 4.5 }` and the total quietly becomes `NaN`.
+      - An over-limit request **throws**. A shopper asking for too much isn't a bug, but every caller now needs a `try` block, and forgetting one crashes the program.
+      - The error is a sentence. Code that wants to react differently to "too many" and "not in the cart" has to compare strings.
+      - Nothing checks what goes in. A product fetched from a server reaches the cart exactly as it arrived.
+  - title: '3. Setting up the project'
+    body: |-
+      Make the folder a package, then install the tools with exact versions you've chosen on purpose:
+
+      ```bash
+      npm init -y
+      npm install zod@4.6.5
+      npm install -D typescript@6.0.3 esbuild@0.28.2 eslint@10.11.0 @eslint/js@10.0.1 typescript-eslint@8.70.1 prettier@3.9.9 eslint-config-prettier@10.1.8 @types/node@24.13.6
+      ```
+
+      zod is a **dependency**: `main.ts` imports it at run time, and the bundle includes it. Everything else is a **devDependency**, needed to check and build but not to run. Then write the scripts, the module type and the Node range:
+
+      ```json
+      {
+        "name": "typed-cart",
+        "version": "1.0.0",
+        "private": true,
+        "type": "module",
+        "engines": {
+          "node": "^24.0.0"
+        },
+        "scripts": {
+          "build": "esbuild src/main.ts --bundle --platform=node --format=esm --target=node24 --sourcemap --outfile=dist/app.js",
+          "start": "node --enable-source-maps dist/app.js",
+          "start:local": "node --env-file=.env --enable-source-maps dist/app.js",
+          "typecheck": "tsc --noEmit",
+          "lint": "eslint .",
+          "format": "prettier --write .",
+          "test": "node tests/run.ts",
+          "check": "tsc --noEmit && eslint . && prettier --check . && npm test && npm run build"
+        },
+        "dependencies": {
+          "zod": "^4.6.5"
+        },
+        "devDependencies": {
+          "@eslint/js": "^10.0.1",
+          "@types/node": "^24.13.6",
+          "esbuild": "^0.28.2",
+          "eslint": "^10.11.0",
+          "eslint-config-prettier": "^10.1.8",
+          "prettier": "^3.9.9",
+          "typescript": "~6.0.3",
+          "typescript-eslint": "^8.70.1"
+        }
+      }
+      ```
+
+      Each line has a reason:
+
+      - `"type": "module"` makes Node treat `.js` files as modules, so `import` works without a warning.
+      - `"engines"` says which Node runs this project. `^24.0.0` accepts any Node 24 and refuses 25. Section 13 shows why it matters.
+      - `"typescript": "~6.0.3"` uses a **tilde** where npm wrote a caret. typescript-eslint 8.70.1 declares support for TypeScript below 6.1.0, so a caret, which would accept a future 6.1, could pair two versions that were never tested together. The tilde allows patches only.
+      - `build` and `start` are separate, so what CI builds is what runs. `start:local` adds `--env-file=.env` for your own machine.
+      - `test` runs a TypeScript file straight with Node 24, which strips the types and runs what's left.
+      - `check` is the one gate. It's built with `&&`, so the first failure stops the chain and the exit code is not 0.
+
+      Last, two small files. `.gitignore` keeps installed packages, build output and local secrets out of Git:
+
+      ```text
+      node_modules/
+      dist/
+      .env
+      ```
+
+      `.npmrc` holds one npm setting, explained in section 14:
+
+      ```text
+      engine-strict=true
+      ```
+
+      `package-lock.json` is **not** ignored. It's the most important file for "runs the same on any machine", and it gets committed with the first install.
+  - title: '4. The typed data model'
+    body: |-
+      The port starts with types, because they're the rules written where the checker can hold you to them. This is the top of `src/cart.ts`:
+
+      ```ts
+      // src/cart.ts
+      /** A product as the cart sees it. Prices are whole pence, so sums stay exact. */
+      export type Product = {
+        readonly id: string;
+        readonly name: string;
+        readonly pricePence: number;
+      };
+
+      export type CartLine = {
+        readonly product: Product;
+        readonly quantity: number;
+      };
+
+      export type Cart = {
+        readonly lines: readonly CartLine[];
+      };
+
+      export const MAX_QUANTITY = 10;
+
+      /** Everything a shopper can get wrong. Each member carries what a message needs. */
+      export type CartError =
+        | { readonly code: 'bad-quantity'; readonly quantity: number }
+        | { readonly code: 'over-limit'; readonly product: Product; readonly wanted: number }
+        | { readonly code: 'not-in-cart'; readonly productId: string };
+
+      export type CartResult =
+        { readonly ok: true; readonly cart: Cart } | { readonly ok: false; readonly error: CartError };
+      ```
+
+      **The field is called `pricePence`, not `price`.** The unit lives in the name, so nobody passes pounds by accident, and a reviewer can see the unit without opening another file.
+
+      **`readonly` goes all the way down.** `readonly lines: CartLine[]` would stop someone reassigning `lines`, but not calling `push` on it. `readonly CartLine[]` stops both. Here's what the checker says when a caller tries:
+
+      ```text
+      src/zz-probe.ts(4,12): error TS2339: Property 'push' does not exist on type 'readonly CartLine[]'.
+      ```
+
+      That line came from a throwaway file that called `cart.lines.push(...)`. `readonly` is erased when the code runs, so it guards callers, not the running program. The pure functions in the next section are what keep the cart unchanged at run time.
+
+      **`CartError` is a discriminated union.** Each member has a literal `code` and carries exactly what a message needs. That's the refused number, the product and its would-be total, or the missing id. A caller can `switch` on `code` and the checker narrows each branch.
+
+      **`CartResult` says "a cart or an error" in the type.** A function that returns it can't be misread as always working, and TypeScript refuses `result.cart` until you've checked `result.ok`.
+
+      Why a type alias and not a class? The cart is data. Plain objects print in a log, compare with `JSON.stringify` in a test and cross a network as they are. A class would add a prototype and `this` without adding a rule the functions don't already enforce.
+  - title: '5. The quantity rules as pure functions'
+    body: |-
+      The rest of `src/cart.ts` is the draft's logic with two changes: expected failures come back as results, and the checker now knows every shape.
+
+      ```ts
+      const ok = (cart: Cart): CartResult => ({ ok: true, cart });
+      const fail = (error: CartError): CartResult => ({ ok: false, error });
+
+      function isAllowedQuantity(quantity: number): boolean {
+        return Number.isInteger(quantity) && quantity >= 1 && quantity <= MAX_QUANTITY;
+      }
+
+      export function emptyCart(): Cart {
+        return { lines: [] };
+      }
+
+      export function addItem(cart: Cart, product: Product, quantity = 1): CartResult {
+        if (!isAllowedQuantity(quantity)) return fail({ code: 'bad-quantity', quantity });
+
+        const existing = cart.lines.find((line) => line.product.id === product.id);
+        if (existing === undefined) {
+          return ok({ lines: [...cart.lines, { product, quantity }] });
+        }
+
+        const wanted = existing.quantity + quantity;
+        if (wanted > MAX_QUANTITY) return fail({ code: 'over-limit', product, wanted });
+
+        return ok({
+          lines: cart.lines.map((line) => (line === existing ? { ...line, quantity: wanted } : line)),
+        });
+      }
+
+      /** Sets a line's quantity. Zero removes the line, the way a shop's quantity box does. */
+      export function setQuantity(cart: Cart, productId: string, quantity: number): CartResult {
+        if (!cart.lines.some((line) => line.product.id === productId)) {
+          return fail({ code: 'not-in-cart', productId });
+        }
+        if (quantity === 0) return ok(removeItem(cart, productId));
+        if (!isAllowedQuantity(quantity)) return fail({ code: 'bad-quantity', quantity });
+
+        return ok({
+          lines: cart.lines.map((line) => (line.product.id === productId ? { ...line, quantity } : line)),
+        });
+      }
+
+      /** Removing a line that isn't there is not an error: the cart already looks as asked. */
+      export function removeItem(cart: Cart, productId: string): Cart {
+        return { lines: cart.lines.filter((line) => line.product.id !== productId) };
+      }
+
+      export function itemCount(cart: Cart): number {
+        return cart.lines.reduce((sum, line) => sum + line.quantity, 0);
+      }
+
+      export function subtotalPence(cart: Cart): number {
+        return cart.lines.reduce((sum, line) => sum + line.product.pricePence * line.quantity, 0);
+      }
+
+      /** 1250 becomes "£12.50". Integer maths only, so no rounding can creep in. */
+      export function formatPence(pence: number): string {
+        const pounds = Math.floor(pence / 100);
+        const rest = String(pence % 100).padStart(2, '0');
+        return `£${pounds}.${rest}`;
+      }
+
+      function assertNever(value: never): never {
+        throw new Error(`Unhandled cart error: ${JSON.stringify(value)}`);
+      }
+
+      export function describeError(error: CartError): string {
+        switch (error.code) {
+          case 'bad-quantity':
+            return `Choose a whole number from 1 to ${MAX_QUANTITY}, not ${error.quantity}.`;
+          case 'over-limit':
+            return `That would make ${error.wanted} ${error.product.name}; the limit is ${MAX_QUANTITY}.`;
+          case 'not-in-cart':
+            return `${error.productId} isn't in the cart.`;
+          default:
+            return assertNever(error);
+        }
+      }
+      ```
+
+      Walk through the decisions:
+
+      - **`existing === undefined`**, not `!existing`. `find` returns a line or `undefined`, and saying which one you mean reads better than relying on truthiness.
+      - **`setQuantity` checks the line exists first.** So `setQuantity(cart, 'tea', 0)` on a cart without tea is "not in the cart", not a silent success. The order of checks is part of the rules.
+      - **`formatPence` never divides for display.** `Math.floor(pence / 100)` gives whole pounds and `pence % 100` the rest, padded to two digits. `toFixed(2)` would work here too, but integer maths can't round, so there's nothing to reason about.
+      - **`assertNever` makes a forgotten case a build error.** Add a fourth member to `CartError` and forget its `case`: the `default` branch then passes a real value where `never` is required, and `tsc` fails. The `throw` inside only runs if something outside the types sends a code that isn't in the union.
+
+      Errors versus results is the biggest change from the draft. **A result is for an outcome the caller should plan for**: a shopper asks for eleven, types `2.5`, or edits a line that another tab removed. The return type forces every caller to look. **A throw is for something that shouldn't happen**, where the right move is to stop: a bug, or a program started with broken settings. You'll see both in `main.ts`.
+  - title: '6. Validating every item at the boundary'
+    body: |-
+      Items arrive as JSON from a server. `response.json()` hands back whatever was sent, and TypeScript can't know what that is. So the boundary gets its own module. It takes `unknown` and returns a checked item or the list of problems.
+
+      ```ts
+      // src/parse-item.ts
+      import { MAX_QUANTITY, type Product } from './cart.ts';
+
+      /** One item as it arrives from outside: a product and how many. */
+      export type IncomingItem = {
+        readonly product: Product;
+        readonly quantity: number;
+      };
+
+      export type ParseResult<T> =
+        | { readonly ok: true; readonly value: T }
+        | { readonly ok: false; readonly problems: readonly string[] };
+
+      function isRecord(input: unknown): input is Record<string, unknown> {
+        return typeof input === 'object' && input !== null && !Array.isArray(input);
+      }
+
+      function readText(input: Record<string, unknown>, field: string, problems: string[]): string {
+        const value = input[field];
+        if (typeof value !== 'string' || value.trim() === '') {
+          problems.push(`${field} must be non-empty text`);
+          return '';
+        }
+        return value.trim();
+      }
+
+      // Number.isInteger is false for NaN, Infinity and fractions, so 4.5 and NaN fail here too.
+      function isWholeNumberIn(value: unknown, min: number, max: number): value is number {
+        return typeof value === 'number' && Number.isInteger(value) && value >= min && value <= max;
+      }
+
+      function readPricePence(input: Record<string, unknown>, problems: string[]): number {
+        const value = input.pricePence;
+        if (!isWholeNumberIn(value, 0, Number.MAX_SAFE_INTEGER)) {
+          problems.push('pricePence must be a whole number of pence, 0 or more');
+          return 0;
+        }
+        return value;
+      }
+
+      function readQuantity(input: Record<string, unknown>, problems: string[]): number {
+        const value = input.quantity;
+        if (!isWholeNumberIn(value, 1, MAX_QUANTITY)) {
+          problems.push(`quantity must be a whole number from 1 to ${MAX_QUANTITY}`);
+          return 0;
+        }
+        return value;
+      }
+
+      /** Takes anything, returns a checked item or every problem found. Never throws. */
+      export function parseItem(input: unknown): ParseResult<IncomingItem> {
+        if (!isRecord(input)) return { ok: false, problems: ['item must be an object'] };
+
+        const problems: string[] = [];
+        const id = readText(input, 'id', problems);
+        const name = readText(input, 'name', problems);
+        const pricePence = readPricePence(input, problems);
+        const quantity = readQuantity(input, problems);
+
+        if (problems.length > 0) return { ok: false, problems };
+        // A new object with checked fields only, so unknown extras never travel further.
+        return { ok: true, value: { product: { id, name, pricePence }, quantity } };
+      }
+
+      export type ParsedItems = {
+        readonly items: readonly IncomingItem[];
+        readonly rejected: readonly { readonly index: number; readonly problems: readonly string[] }[];
+      };
+
+      /** A list where some items are bad still yields the good ones, and says which were dropped. */
+      export function parseItems(input: unknown): ParseResult<ParsedItems> {
+        if (!Array.isArray(input)) return { ok: false, problems: ['items must be a list'] };
+
+        const items: IncomingItem[] = [];
+        const rejected: { index: number; problems: readonly string[] }[] = [];
+        input.forEach((raw: unknown, index) => {
+          const result = parseItem(raw);
+          if (result.ok) items.push(result.value);
+          else rejected.push({ index, problems: result.problems });
+        });
+        return { ok: true, value: { items, rejected } };
+      }
+      ```
+
+      How it earns the type without a single `as`:
+
+      - **`isRecord` is a type predicate.** Its `input is Record<string, unknown>` return type tells the checker what `true` means. It rules out `null`, because `typeof null` is `"object"`, and arrays, which are objects too. After it, reading `input.pricePence` is allowed, and the value read is `unknown`.
+      - **`isWholeNumberIn` narrows to `number`.** `typeof value === 'number'` comes first, because `Number.isInteger` accepts anything and narrows nothing. `Number.isInteger` then refuses `NaN`, `Infinity` and fractions, so `4.5` (pounds sent by mistake) fails.
+      - **Each reader pushes a problem and carries on.** One bad item reports every wrong field at once, which is kinder to whoever has to fix the data.
+      - **The result is a new object built from checked fields.** An extra `admin: true` in the input never travels further, and `id` and `name` are trimmed on the way in.
+      - **`ParseResult<T>` is generic**, so one shape serves a single item and a whole list.
+
+      `parseItems` makes a policy decision worth saying out loud: a list with some bad items keeps the good ones and reports the rest. For a saved cart that's the kind choice. For a payment it wouldn't be, and you'd refuse the whole list instead. A body that isn't a list at all is refused whole, because there's nothing sensible to keep.
+
+      Why hand-written, when zod is already installed for the environment? Two reasons. The course teaches the parser by hand first, and this module is small enough that every rule is visible. The trade-off is length: each new field costs a few lines. With twenty fields, a zod schema such as `z.object({ pricePence: z.number().int().min(0) })` would describe the same checks in less code and derive the type with `z.infer`.
+
+      Here's the boundary on a real run. The saved cart had one price sent as text and one quantity of 12:
+
+      ```text
+      Skipped item 3: pricePence must be a whole number of pence, 0 or more
+      Skipped item 4: quantity must be a whole number from 1 to 10
+      ```
+
+      Without the parser, `'3.50'` would have reached `subtotalPence`, and `+` would have joined text instead of adding.
+  - title: '7. The environment schema'
+    body: |-
+      The program needs two settings: where the saved cart lives and how long to wait for it. Every environment variable arrives as text, or not at all. So the environment gets a schema, checked once when the program starts.
+
+      ```ts
+      // src/env.ts
+      import { z } from 'zod';
+
+      const EnvSchema = z.object({
+        CART_API_URL: z.url(),
+        REQUEST_TIMEOUT_MS: z.coerce.number().int().positive().default(5000),
+      });
+
+      export type Env = z.infer<typeof EnvSchema>;
+
+      /**
+       * Checks the environment once, at start-up. A bad value stops the program here, with the
+       * variable's name, instead of failing later somewhere that has nothing to do with config.
+       */
+      export function parseEnv(source: Record<string, string | undefined>): Env {
+        const result = EnvSchema.safeParse(source);
+        if (!result.success) {
+          // Names and messages only. The rejected values may be secrets, so they never get printed.
+          const lines = result.error.issues.map((issue) => `  ${issue.path.join('.')}: ${issue.message}`);
+          throw new Error(`Invalid environment:\n${lines.join('\n')}`);
+        }
+        return result.data;
+      }
+      ```
+
+      - **`z.url()`** refuses a missing or malformed address.
+      - **`z.coerce.number().int().positive()`** turns `"2500"` into `2500` and refuses `"soon"`.
+      - **`.default(5000)`** fills a missing timeout. A wrong timeout is still an error: the default only covers a gap.
+      - **`z.infer<typeof EnvSchema>`** derives the `Env` type from the schema, so the two can't drift apart.
+      - **`parseEnv` takes its source as a parameter.** `main.ts` passes `process.env`, and the tests pass plain objects, so no test has to change global state.
+
+      It uses `safeParse` and throws its own error, rather than `parse`, for one reason: the message. It lists each variable's name and zod's message, one per line, and never the value. A rejected `DATABASE_URL` would contain a password, and start-up errors end up in logs that many people read.
+
+      This is what a missing and a malformed variable look like in the real build. Node also prints the source line and a stack trace, trimmed here:
+
+      ```text
+      $ npm -s start
+      Error: Invalid environment:
+        CART_API_URL: Invalid input: expected string, received undefined
+          at parseEnv (/home/you/typed-cart/src/env.ts:20:11)
+
+      $ CART_API_URL=http://localhost:8080 REQUEST_TIMEOUT_MS=soon npm -s start
+      Error: Invalid environment:
+        REQUEST_TIMEOUT_MS: Invalid input: expected number, received NaN
+          at parseEnv (/home/you/typed-cart/src/env.ts:20:11)
+      ```
+
+      Both runs exit with code 1 before a single request is made. That's **failing fast**. Without the schema, `REQUEST_TIMEOUT_MS=soon` would reach `AbortSignal.timeout` as `NaN`, and the error would appear there, far from its cause, with a message about timeouts rather than configuration.
+
+      For local runs, the values live in `.env`, which is ignored by Git. The committed `.env.example` documents every variable with safe sample values:
+
+      ```bash
+      # Copy to .env for local runs. .env is in .gitignore and never committed.
+      CART_API_URL=http://localhost:8080
+      REQUEST_TIMEOUT_MS=5000
+      ```
+
+      `npm run start:local` loads it with `node --env-file=.env`. A variable already set in the shell wins over the file, so `REQUEST_TIMEOUT_MS=100 npm run start:local` overrides it for one run.
+  - title: '8. The entry point, and a real run'
+    body: |-
+      `main.ts` is the only file that touches the outside world: the environment, the network and the console. Everything it calls is pure and tested.
+
+      ```ts
+      // src/main.ts
+      import {
+        addItem,
+        describeError,
+        emptyCart,
+        formatPence,
+        itemCount,
+        subtotalPence,
+      } from './cart.ts';
+      import { parseEnv } from './env.ts';
+      import { parseItems } from './parse-item.ts';
+
+      const env = parseEnv(process.env);
+
+      const response = await fetch(`${env.CART_API_URL}/saved-cart`, {
+        signal: AbortSignal.timeout(env.REQUEST_TIMEOUT_MS),
+      });
+      if (!response.ok) throw new Error(`Saved cart request failed with ${response.status}`);
+
+      const body: unknown = await response.json();
+      const parsed = parseItems(body);
+      if (!parsed.ok) throw new Error(`Saved cart is unreadable: ${parsed.problems.join(', ')}`);
+
+      for (const { index, problems } of parsed.value.rejected) {
+        console.warn(`Skipped item ${index}: ${problems.join('; ')}`);
+      }
+
+      let cart = emptyCart();
+      for (const { product, quantity } of parsed.value.items) {
+        const result = addItem(cart, product, quantity);
+        if (result.ok) cart = result.cart;
+        else console.warn(`Skipped: ${describeError(result.error)}`);
+      }
+
+      for (const line of cart.lines) {
+        console.log(
+          `${line.quantity} x ${line.product.name}  ${formatPence(line.product.pricePence * line.quantity)}`,
+        );
+      }
+      console.log(`${itemCount(cart)} items, subtotal ${formatPence(subtotalPence(cart))}`);
+      ```
+
+      Read it top to bottom and you can see where each kind of failure goes:
+
+      - Broken settings **throw** in `parseEnv`, before anything else runs.
+      - A slow server is cut off by `AbortSignal.timeout`, which rejects the `fetch`. The rejection is uncaught, so Node prints it and exits with 1. For a command-line tool that's the right end.
+      - A failed response throws with its status, after checking `response.ok`. A 500 is not a saved cart.
+      - The body is annotated `unknown`, so nothing can use it before `parseItems` has.
+      - A bad item is **skipped with a warning**. A quantity rule that fails is **skipped with a warning**. Neither stops the program, because both are results, not bugs.
+
+      `let cart` is the one reassigned variable, and that's deliberate. Each `addItem` returns a new cart, and the loop keeps the latest. The objects never change; only which one the name points at.
+
+      A top-level `await` works because the file is a module, and the build keeps it as one with `--format=esm`.
+
+      Here's a real run against a stand-in server. Its saved cart held five items, and one repeat pushes tea to 11:
+
+      ```text
+      $ npm run -s start:local
+      Skipped item 3: pricePence must be a whole number of pence, 0 or more
+      Skipped item 4: quantity must be a whole number from 1 to 10
+      Skipped: That would make 11 Loose-leaf tea; the limit is 10.
+      2 x Loose-leaf tea  £9.00
+      1 x Enamel mug  £12.00
+      3 items, subtotal £21.00
+      ```
+
+      The warnings go to standard error through `console.warn` and the receipt to standard output, so `npm run -s start:local > receipt.txt` saves only the receipt.
+  - title: '9. tsconfig.json, line by line'
+    body: |-
+      `tsconfig.json` tells `tsc` what to read and how strictly. Here every setting either catches a real bug or describes a real host.
+
+      ```json
+      {
+        "compilerOptions": {
+          "target": "es2024",
+          "module": "nodenext",
+          "moduleResolution": "nodenext",
+          "types": ["node"],
+          "strict": true,
+          "noUncheckedIndexedAccess": true,
+          "noEmit": true,
+          "allowImportingTsExtensions": true,
+          "erasableSyntaxOnly": true,
+          "verbatimModuleSyntax": true
+        },
+        "include": ["src", "tests"]
+      }
+      ```
+
+      - **`strict`** turns on the whole strict family, including `noImplicitAny` and `strictNullChecks`. TypeScript 6 has it on by default, and writing it anyway tells the next reader it was chosen.
+      - **`noUncheckedIndexedAccess`** adds `undefined` to reads such as `input[field]`, so a missing property can't pass as present.
+      - **`noEmit`** makes `tsc` a checker only. esbuild writes the output, and Node runs the tests from source.
+      - **`module` and `moduleResolution` set to `nodenext`** describe the program that runs the code: Node. It wants file extensions written out, so imports say `./cart.ts`.
+      - **`allowImportingTsExtensions`** permits those `.ts` endings. It's only allowed with `noEmit`, because `tsc` never rewrites an import path. Remove it and `tsc` fails with `TS5097: An import path can only end with a '.ts' extension when 'allowImportingTsExtensions' is enabled.`
+      - **`erasableSyntaxOnly`** refuses TypeScript features that produce code, such as `enum`. Node's type stripping can only delete types, and an `enum` there fails with `ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX`. With this flag, `tsc` reports `TS1294` first, on your machine, not in a test run.
+      - **`verbatimModuleSyntax`** makes every type-only import say `type`, as in `import { MAX_QUANTITY, type Product }`. A tool working one file at a time can then drop it safely. Leave out `type` and `tsc` says `TS1484: 'Product' is a type and must be imported using a type-only import`.
+      - **`types: ["node"]`** loads Node's own types from `@types/node`, so `process` and `fetch` are known.
+      - **`target: es2024`** tells the checker which built-ins exist. Node 24 has all of them.
+      - **`include`** covers `src` and `tests`. The tests are code too, and a test with a type error is a test you can't trust.
+
+      There's no `skipLibCheck`. This project's dependencies ship sound declarations, and `tsc` runs in a few seconds without it.
+  - title: '10. The build'
+    body: |-
+      esbuild turns `src/main.ts` and everything it imports into one file:
+
+      ```text
+      esbuild src/main.ts --bundle --platform=node --format=esm --target=node24 --sourcemap --outfile=dist/app.js
+      ```
+
+      - **`--bundle`** follows every `import` from `main.ts`, zod included, and joins them into one file.
+      - **`--platform=node`** leaves Node's built-ins alone and targets Node, not a browser.
+      - **`--format=esm`** keeps the output a module, which the top-level `await` needs.
+      - **`--target=node24`** lets esbuild leave modern syntax as written, because Node 24 runs it.
+      - **`--sourcemap`** writes `dist/app.js.map`, and `start` runs Node with `--enable-source-maps`, so a crash points at `src/env.ts:20`, not line 19,733 of the bundle.
+
+      The real output:
+
+      ```text
+      $ npm run build
+
+        dist/app.js      740.8kb
+        dist/app.js.map    1.4mb
+
+      ⚡ Done in 25ms
+      ```
+
+      The bundle is large, and esbuild's `--analyze` flag says why: the project's own four files come to about 5 kB, and nearly all the rest is zod. For a program that runs on a server and starts once, that doesn't matter. In a browser bundle it would, and you'd weigh a lighter check.
+
+      The build **doesn't check types**. esbuild deletes them without looking, which is why it takes milliseconds. A type error builds without complaint. That's the reason `check` runs `tsc --noEmit` before it builds, and why CI must run the whole of `check`, not only the build.
+
+      `dist/` is in `.gitignore`. It's made from the source on every build, and a committed copy would soon disagree with the code beside it.
+  - title: '11. Lint and format'
+    body: |-
+      ESLint reads `eslint.config.js`, a list of settings objects where later ones win:
+
+      ```js
+      import js from '@eslint/js';
+      import prettier from 'eslint-config-prettier';
+      import tseslint from 'typescript-eslint';
+
+      export default [
+        { ignores: ['dist/'] },
+        js.configs.recommended,
+        ...tseslint.configs.strict,
+        {
+          // Node's globals, so the recommended no-undef rule knows they exist.
+          languageOptions: { globals: { console: 'readonly', process: 'readonly' } },
+          rules: { eqeqeq: 'error' },
+        },
+        prettier,
+      ];
+      ```
+
+      - **`js.configs.recommended`** is ESLint's own set: assignments in conditions, undefined names, errors rethrown without their cause, and more.
+      - **`tseslint.configs.strict`** adds typescript-eslint's rules for TypeScript files, including bans on `any` and on the non-null `!`. It also switches off core rules that `tsc` already covers, such as `no-undef`, for `.ts` files.
+      - **The globals object** tells ESLint that `console` and `process` exist, for the plain JavaScript draft, which `no-undef` still checks.
+      - **`eqeqeq`** refuses `==` and `!=`, because their type coercion hides bugs.
+      - **`eslint-config-prettier`** goes last. It switches off rules about layout, so ESLint and Prettier never argue.
+
+      The lint gate caught a real problem during this build. The first version of `expectThrows` threw a new error from inside a `catch` without passing on the original. ESLint prints full paths; they're shortened here:
+
+      ```text
+      tests/check.ts
+        30:34  error  There is no `cause` attached to the symptom error being thrown  preserve-caught-error
+      ```
+
+      The fix was to pass `{ cause: error }` to the new `Error`, so the original stays reachable. That's the right fix, not a disable comment: the rule was right.
+
+      To prove the gate works the other way, `===` in `setQuantity` was changed to `==` for one run:
+
+      ```text
+      src/cart.ts
+        61:16  error  Expected '===' and instead saw '=='  eqeqeq
+      ```
+
+      Prettier needs almost nothing. `.prettierrc.json` makes two choices:
+
+      ```json
+      {
+        "singleQuote": true,
+        "printWidth": 100
+      }
+      ```
+
+      `.prettierignore` names what it should leave alone: the build output, and the lockfile npm writes:
+
+      ```text
+      dist/
+      package-lock.json
+      ```
+
+      `check` runs `prettier --check .`, which reports messy files and fails. `npm run format` runs `--write`, which fixes them, and you run it yourself. A hook that rewrites files would tidy the copies on disk, not the ones already staged for the commit.
+  - title: '12. Tests, with no framework'
+    body: |-
+      The Testing chapter comes later, so these tests use only what you've met: a function that throws on a mismatch, a `try` that catches it, and an exit code. Node 24 runs them straight from `.ts` files.
+
+      ```ts
+      // tests/check.ts
+      /*
+       * A tiny test helper, built from what the course has taught so far: throw on a mismatch,
+       * catch it, count it, and end with exit code 1 if anything failed.
+       */
+      let failures = 0;
+
+      export function test(name: string, run: () => void): void {
+        try {
+          run();
+          console.log(`ok    ${name}`);
+        } catch (error) {
+          failures += 1;
+          const message = error instanceof Error ? error.message : String(error);
+          console.log(`FAIL  ${name}\n      ${message}`);
+        }
+      }
+
+      /** Compares by JSON, which suits the plain objects and arrays a cart is made of. */
+      export function expectEqual(actual: unknown, expected: unknown): void {
+        const a = JSON.stringify(actual);
+        const e = JSON.stringify(expected);
+        if (a !== e) throw new Error(`expected ${e}, got ${a}`);
+      }
+
+      export function expectThrows(run: () => unknown, text: string): void {
+        try {
+          run();
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          if (!message.includes(text)) {
+            throw new Error(`threw "${message}", expected "${text}"`, { cause: error });
+          }
+          return;
+        }
+        throw new Error('expected an error, but nothing was thrown');
+      }
+
+      export function finish(): void {
+        if (failures > 0) {
+          console.log(`${failures} failed`);
+          process.exitCode = 1;
+        }
+      }
+      ```
+
+      ```ts
+      // tests/run.ts
+      // Each file registers its tests as it is imported; finish() then sets the exit code.
+      import './cart.test.ts';
+      import './parse-item.test.ts';
+      import './env.test.ts';
+      import { finish } from './check.ts';
+
+      finish();
+      ```
+
+      `run.ts` imports each test file for its effect: importing it runs its `test` calls. ES modules finish their imports before the importing file's own code runs, so `finish()` runs after the last test. It sets `process.exitCode` rather than calling `process.exit`, so any output still waiting is written first.
+
+      `expectEqual` compares by `JSON.stringify`, which fits plain data with keys in a known order. It would call `{ a: 1, b: 2 }` and `{ b: 2, a: 1 }` different, and it can't see `undefined` properties. A test framework's deep equality handles both, and that's one reason you'll switch to one later.
+
+      The cart tests check each rule, including the edges: exactly 10 is allowed, 11 is not, and nothing ever changes the cart passed in.
+
+      ```ts
+      // tests/cart.test.ts
+      import {
+        addItem,
+        describeError,
+        emptyCart,
+        formatPence,
+        itemCount,
+        MAX_QUANTITY,
+        removeItem,
+        setQuantity,
+        subtotalPence,
+        type Cart,
+        type CartResult,
+      } from '../src/cart.ts';
+      import { expectEqual, test } from './check.ts';
+
+      const tea = { id: 'tea', name: 'Loose-leaf tea', pricePence: 450 };
+      const mug = { id: 'mug', name: 'Enamel mug', pricePence: 1200 };
+
+      /** Unwraps a result the test expects to succeed, so each test reads as a story. */
+      function cartOf(result: CartResult): Cart {
+        if (!result.ok) throw new Error(`unexpected ${describeError(result.error)}`);
+        return result.cart;
+      }
+
+      test('adds a new product as a new line', () => {
+        const cart = cartOf(addItem(emptyCart(), tea, 2));
+        expectEqual(cart.lines, [{ product: tea, quantity: 2 }]);
+      });
+
+      test('adding the same product again merges the lines', () => {
+        const cart = cartOf(addItem(cartOf(addItem(emptyCart(), tea, 2)), tea, 3));
+        expectEqual(cart.lines, [{ product: tea, quantity: 5 }]);
+      });
+
+      test('never changes the cart it was given', () => {
+        const before = cartOf(addItem(emptyCart(), tea, 2));
+        const snapshot = JSON.stringify(before);
+        addItem(before, tea, 1);
+        addItem(before, mug, 1);
+        setQuantity(before, 'tea', 7);
+        removeItem(before, 'tea');
+        expectEqual(JSON.stringify(before), snapshot);
+      });
+
+      test('rejects quantities that are not whole numbers from 1 to the limit', () => {
+        for (const quantity of [0, -1, 2.5, Number.NaN, MAX_QUANTITY + 1]) {
+          const result = addItem(emptyCart(), tea, quantity);
+          expectEqual(result.ok, false);
+        }
+      });
+
+      test('accepts the limit exactly', () => {
+        const cart = cartOf(addItem(emptyCart(), tea, MAX_QUANTITY));
+        expectEqual(itemCount(cart), MAX_QUANTITY);
+      });
+
+      test('a merge that passes the limit fails and names the total', () => {
+        const cart = cartOf(addItem(emptyCart(), tea, 8));
+        const result = addItem(cart, tea, 3);
+        expectEqual(result, { ok: false, error: { code: 'over-limit', product: tea, wanted: 11 } });
+      });
+
+      test('setting a quantity replaces it, and zero removes the line', () => {
+        const cart = cartOf(addItem(cartOf(addItem(emptyCart(), tea, 2)), mug, 1));
+        expectEqual(itemCount(cartOf(setQuantity(cart, 'tea', 6))), 7);
+        expectEqual(cartOf(setQuantity(cart, 'tea', 0)).lines, [{ product: mug, quantity: 1 }]);
+      });
+
+      test('setting the quantity of a missing product is an error', () => {
+        const result = setQuantity(emptyCart(), 'tea', 2);
+        expectEqual(result, { ok: false, error: { code: 'not-in-cart', productId: 'tea' } });
+      });
+
+      test('totals are exact whole pence', () => {
+        const cart = cartOf(addItem(cartOf(addItem(emptyCart(), tea, 3)), mug, 2));
+        expectEqual(subtotalPence(cart), 3750);
+        expectEqual(formatPence(subtotalPence(cart)), '£37.50');
+        expectEqual(formatPence(5), '£0.05');
+      });
+
+      test('every error has a message', () => {
+        expectEqual(
+          describeError({ code: 'bad-quantity', quantity: 0 }),
+          'Choose a whole number from 1 to 10, not 0.',
+        );
+        expectEqual(describeError({ code: 'not-in-cart', productId: 'tea' }), "tea isn't in the cart.");
+      });
+      ```
+
+      `cartOf` is the one helper worth copying. It turns a result the test expects to succeed into a cart, and fails with the error's message if it didn't. Tests read as stories instead of stacks of `if (result.ok)`.
+
+      The boundary tests feed the parser what a real server might send: text where a number belongs, pounds instead of pence, `null`, an array, and extra fields.
+
+      ```ts
+      // tests/parse-item.test.ts
+      import { parseItem, parseItems } from '../src/parse-item.ts';
+      import { expectEqual, test } from './check.ts';
+
+      const good = { id: 'tea', name: 'Loose-leaf tea', pricePence: 450, quantity: 2 };
+
+      test('a good item becomes a product and a quantity', () => {
+        expectEqual(parseItem(good), {
+          ok: true,
+          value: { product: { id: 'tea', name: 'Loose-leaf tea', pricePence: 450 }, quantity: 2 },
+        });
+      });
+
+      test('extra fields are dropped, and text is trimmed', () => {
+        const result = parseItem({ ...good, id: ' tea ', admin: true });
+        expectEqual(result.ok && result.value.product, {
+          id: 'tea',
+          name: 'Loose-leaf tea',
+          pricePence: 450,
+        });
+      });
+
+      test('a price sent as text is refused, not joined', () => {
+        expectEqual(parseItem({ ...good, pricePence: '450' }), {
+          ok: false,
+          problems: ['pricePence must be a whole number of pence, 0 or more'],
+        });
+      });
+
+      test('pounds with a decimal point are refused', () => {
+        expectEqual(parseItem({ ...good, pricePence: 4.5 }).ok, false);
+      });
+
+      test('every problem is reported at once', () => {
+        expectEqual(parseItem({ id: '', pricePence: -1, quantity: 11 }), {
+          ok: false,
+          problems: [
+            'id must be non-empty text',
+            'name must be non-empty text',
+            'pricePence must be a whole number of pence, 0 or more',
+            'quantity must be a whole number from 1 to 10',
+          ],
+        });
+      });
+
+      test('anything that is not an object is refused', () => {
+        for (const input of [null, undefined, 'tea', 42, [good]]) {
+          expectEqual(parseItem(input), { ok: false, problems: ['item must be an object'] });
+        }
+      });
+
+      test('a list keeps the good items and names the bad ones', () => {
+        const result = parseItems([good, { ...good, quantity: 0 }, null]);
+        expectEqual(result.ok && result.value.items.length, 1);
+        expectEqual(result.ok && result.value.rejected.map((r) => r.index), [1, 2]);
+      });
+
+      test('a body that is not a list is refused whole', () => {
+        expectEqual(parseItems({ items: [good] }), { ok: false, problems: ['items must be a list'] });
+      });
+      ```
+
+      The environment tests prove the schema converts, defaults and refuses. They also prove a rejected value never appears in the error:
+
+      ```ts
+      // tests/env.test.ts
+      import { parseEnv } from '../src/env.ts';
+      import { expectEqual, expectThrows, test } from './check.ts';
+
+      test('reads a complete environment, turning text into numbers', () => {
+        const env = parseEnv({ CART_API_URL: 'https://api.example.com', REQUEST_TIMEOUT_MS: '2500' });
+        expectEqual(env, { CART_API_URL: 'https://api.example.com', REQUEST_TIMEOUT_MS: 2500 });
+      });
+
+      test('fills in the default timeout', () => {
+        expectEqual(parseEnv({ CART_API_URL: 'https://api.example.com' }).REQUEST_TIMEOUT_MS, 5000);
+      });
+
+      test('a missing URL stops start-up and names the variable', () => {
+        expectThrows(() => parseEnv({}), 'CART_API_URL');
+      });
+
+      test('a timeout that is not a number stops start-up', () => {
+        expectThrows(
+          () => parseEnv({ CART_API_URL: 'https://api.example.com', REQUEST_TIMEOUT_MS: 'soon' }),
+          'REQUEST_TIMEOUT_MS',
+        );
+      });
+
+      test('the error never repeats the rejected value', () => {
+        expectThrows(() => parseEnv({ CART_API_URL: 'not a url s3cret' }), 'CART_API_URL');
+        try {
+          parseEnv({ CART_API_URL: 'not a url s3cret' });
+        } catch (error) {
+          expectEqual(error instanceof Error && error.message.includes('s3cret'), false);
+        }
+      });
+      ```
+
+      The real run, all 23:
+
+      ```text
+      $ npm test
+      ok    adds a new product as a new line
+      ok    adding the same product again merges the lines
+      ok    never changes the cart it was given
+      ok    rejects quantities that are not whole numbers from 1 to the limit
+      ok    accepts the limit exactly
+      ok    a merge that passes the limit fails and names the total
+      ok    setting a quantity replaces it, and zero removes the line
+      ok    setting the quantity of a missing product is an error
+      ok    totals are exact whole pence
+      ok    every error has a message
+      ok    a good item becomes a product and a quantity
+      ok    extra fields are dropped, and text is trimmed
+      ok    a price sent as text is refused, not joined
+      ok    pounds with a decimal point are refused
+      ok    every problem is reported at once
+      ok    anything that is not an object is refused
+      ok    a list keeps the good items and names the bad ones
+      ok    a body that is not a list is refused whole
+      ok    reads a complete environment, turning text into numbers
+      ok    fills in the default timeout
+      ok    a missing URL stops start-up and names the variable
+      ok    a timeout that is not a number stops start-up
+      ok    the error never repeats the rejected value
+      ```
+
+      A test that fails must fail the run, or the gate is decoration. Changing one expected value to `'£37.5'` gave this, and `npm test` exited with 1:
+
+      ```text
+      FAIL  totals are exact whole pence
+            expected "£37.5", got "£37.50"
+      ```
+  - title: '13. One gate: the check script, the hook and CI'
+    body: |-
+      Every check is useless if it doesn't run. So there's one script, and two places call it.
+
+      ```text
+      "check": "tsc --noEmit && eslint . && prettier --check . && npm test && npm run build"
+      ```
+
+      The order is cheapest and most basic first. A type error stops the chain at once, and `&&` means ESLint never starts. This is `check` with a string put where a quantity belongs:
+
+      ```text
+      src/cart.ts(45,51): error TS2322: Type 'string' is not assignable to type 'number'.
+      ```
+
+      The pre-commit hook is `.githooks/pre-commit`, in a committed folder. Each clone points Git at it once with `git config core.hooksPath .githooks`, and the file must be executable:
+
+      ```bash
+      #!/bin/sh
+      # Same script as CI, so passing here means passing there.
+      npm run check
+      ```
+
+      In the reference repository, a commit with `==` in `cart.ts` was refused: ESLint printed the `eqeqeq` error, the hook exited with 1, and `git log` still showed one commit.
+
+      A hook is a convenience, not a guarantee. `git commit --no-verify` skips it, and a fresh clone doesn't have it until someone runs the `git config` line. **CI is the gate that counts**, because it runs on every push, on a clean machine, and nobody can skip it. CI runs `ci.sh`:
+
+      ```bash
+      #!/bin/sh
+      # ci.sh, run by CI on every push and pull request.
+      set -e
+      npm ci
+      npm run check
+      ```
+
+      `set -e` stops the script at the first failing command. `npm ci` installs exactly what the lockfile says. Then CI runs the same `check` as the hook, so a change that passes on your laptop passes there too. If CI ran fewer checks than the hook, a skipped hook would take those checks with it.
+  - title: '14. Runs the same on any machine'
+    body: |-
+      "It works on my machine" has three usual causes: different package versions, a different Node, and different settings. Each has a fix in this project.
+
+      **Package versions: the lockfile and `npm ci`.** `package.json` holds ranges. `^10.11.0` for ESLint means any 10.x from 10.11.0 up. Without a lockfile, an install next month could pick a newer version. `package-lock.json` records the exact version of every package in the tree, including the dependencies of dependencies. It's committed. `npm ci` installs exactly that tree, from an empty `node_modules`, and stops with an error if `package.json` and the lockfile disagree. In this build, deleting `node_modules` and `dist` and running `npm ci` then `npm run check` passed with no changes.
+
+      **The Node version: `engines` and `engine-strict`.** On its own, `engines` is advice. With Node 22.15.0 and no `.npmrc`, `npm ci` printed a warning and installed anyway:
+
+      ```text
+      npm warn EBADENGINE Unsupported engine {
+      npm warn EBADENGINE   package: 'typed-cart@1.0.0',
+      npm warn EBADENGINE   required: { node: '^24.0.0' },
+      npm warn EBADENGINE   current: { node: 'v22.15.0', npm: '11.12.0' }
+      npm warn EBADENGINE }
+      ```
+
+      Then `npm test` crashed, far from the cause, because that Node version doesn't run `.ts` files by default:
+
+      ```text
+      TypeError [ERR_UNKNOWN_FILE_EXTENSION]: Unknown file extension ".ts" for /home/you/typed-cart/tests/run.ts
+      ```
+
+      With `engine-strict=true` in the committed `.npmrc`, the same install refuses at once, with the reason:
+
+      ```text
+      $ npm ci
+      npm error code EBADENGINE
+      npm error engine Unsupported engine
+      npm error engine Not compatible with your version of node/npm: typed-cart@1.0.0
+      npm error notsup Not compatible with your version of node/npm: typed-cart@1.0.0
+      npm error notsup Required: {"node":"^24.0.0"}
+      npm error notsup Actual:   {"node":"v22.15.0","npm":"11.12.0"}
+      ```
+
+      That's failing fast again, applied to the machine instead of the settings.
+
+      **Settings: the schema and `.env.example`.** Section 7 covered it. The schema says exactly what a machine must provide, and a machine that provides less stops at start-up, naming the variable.
+
+      **One build for every environment.** No setting is written into the bundle. `CART_API_URL` is read when the program starts, so the same `dist/app.js` that CI built and tested can run against a staging API on one server and the live one on another. Had it been baked in with esbuild's `--define`, each environment would need its own build, and you'd ship a build you never tested.
+  - title: '15. Decisions and trade-offs'
+    body: |-
+      - **Whole pence over decimal pounds.** Sums are exact and comparisons are safe. The cost is one conversion at each edge: `formatPence` on the way out, and a parser that refuses `4.5` on the way in. Currencies without two decimal places would need a different minor unit per currency.
+      - **Immutable carts over in-place changes.** Any old cart stays valid, tests compare before and after, and a later undo is a matter of keeping the previous value. The cost is a new array on each change, which is nothing at 10 lines.
+      - **Results for shopper mistakes, throws for bugs and broken start-up.** The type forces callers to handle what will happen, and the program still stops loudly on what shouldn't. The cost is a little ceremony at each call, which `cartOf` removes in tests.
+      - **Skip bad items over refusing the whole saved cart.** Kind for a basket, where losing one item beats losing all of them. For an order or a payment, refuse the whole list.
+      - **A hand-written parser for items, zod for the environment.** The parser shows every rule and uses nothing untaught. zod earns its place where coercion and defaults would take many lines. With many more item fields, a zod schema would win there too.
+      - **A 10-item limit as a constant.** One place to change it. A real shop would take it from stock data per product, and the `over-limit` error already carries the product so its message could name a different limit.
+      - **No test framework yet.** The helper is about 40 lines and depends on nothing. It lacks deep equality, isolation between tests and useful diffs, which is why the Testing chapter brings a real runner.
+      - **A caret for most tools, a tilde for TypeScript.** Carets take compatible fixes; the tilde keeps TypeScript inside the range typescript-eslint supports. The lockfile pins everything either way, so the ranges only matter when someone updates on purpose.
+      - **Strict Node version over any recent Node.** `engine-strict` refuses Node 22 at install time instead of failing mysteriously in the tests. The cost is that contributors must switch Node versions for this project.
+checklist:
+  - >-
+    The plain JavaScript draft exists and runs, and it was written without an assistant.
+  - >-
+    Every price field ends in `Pence` and holds a whole number; the only decimal point appears in `formatPence` output.
+  - >-
+    `Cart`, `CartLine` and `Product` are `readonly` all the way down, including `readonly CartLine[]`.
+  - >-
+    No cart function mutates its input, and a test proves the original cart is unchanged after every operation.
+  - >-
+    Quantities of 0, -1, 2.5, `NaN` and 11 are refused, exactly 10 is accepted, and a merge past 10 fails with the total it would reach.
+  - >-
+    Setting a quantity to 0 removes the line, and setting one for a product not in the cart returns a `not-in-cart` error.
+  - >-
+    Expected failures come back as a `CartResult`; `throw` appears only for bugs, broken settings and failed requests.
+  - >-
+    `describeError` switches on `code` and ends in `assertNever`, so a new error kind without a message fails `tsc`.
+  - >-
+    Data from `response.json()` is typed `unknown` and passes through `parseItems` before any other code touches it.
+  - >-
+    There is no `as`, no `any` and no non-null `!` in `src/`.
+  - >-
+    The parser builds a fresh object from checked fields, and tests cover text prices, decimal prices, `null`, arrays and extra fields.
+  - >-
+    The environment is parsed once at start-up with the zod schema, and its error names each variable without printing its value.
+  - >-
+    `.env` is in `.gitignore`, and `.env.example` lists every variable with a safe sample value.
+  - >-
+    `tsconfig.json` has `strict`, `noUncheckedIndexedAccess`, `noEmit`, `erasableSyntaxOnly` and `verbatimModuleSyntax`, and includes `tests`.
+  - >-
+    `npm run check` runs `tsc --noEmit`, ESLint, `prettier --check`, the tests and the build, joined with `&&`, and exits 0.
+  - >-
+    A failing test makes `npm test` exit with a code other than 0.
+  - >-
+    `start` runs the built `dist/app.js` with `--enable-source-maps`, and `dist/` is not committed.
+  - >-
+    The pre-commit hook and `ci.sh` both run `npm run check`, and CI installs with `npm ci`.
+  - >-
+    `package-lock.json` is committed, `engines` names Node 24, and `.npmrc` sets `engine-strict=true`.

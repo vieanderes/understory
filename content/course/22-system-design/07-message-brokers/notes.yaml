@@ -1,0 +1,201 @@
+summary: >-
+  A message broker sits between the services that produce work or events and the services
+  that act on them. It lets the producer answer quickly, absorbs bursts, and lets consumers
+  fail and recover without losing messages. The lesson separates the two kinds, queues that
+  hand each message to one worker and logs that keep an ordered history for many readers,
+  and shows partitions, consumer groups and idempotent consumers.
+
+
+  These notes cover the parts interviews probe next: exactly what at-least-once means and
+  where duplicates come from, how to publish an event reliably alongside a database write,
+  what to do with messages that keep failing, and how to size partitions and watch consumer
+  lag.
+
+
+  Reach for a queue when a job must happen once, eventually: send an email, resize an
+  image, charge a card. Reach for a log when many systems need the same events, in order,
+  with the ability to replay: search indexing, analytics, audit, feeding a cache. Many
+  systems run both.
+remember:
+  - A queue hands each message to one consumer and deletes it once acknowledged; a log keeps messages in order so many consumer groups can each read everything and replay it.
+  - Kafka keeps order only within a partition, and the message key chooses the partition, so events that must stay in order share a key.
+  - The number of partitions caps how many consumers in one group can work in parallel.
+  - Committing after processing gives at-least-once delivery, committing before gives at-most-once, and only an idempotent consumer turns at-least-once into an effect that happens once.
+  - An idempotent consumer records the message id in the same transaction as its effect, under a unique key.
+  - The outbox pattern writes the event to a table in the same transaction as the data, and a relay publishes it, so an event is never lost or sent for a rolled-back change.
+  - Consumer lag, how far a group is behind the newest message, is the number to alert on.
+sections:
+  - title: Delivery guarantees and where duplicates come from
+    body: |-
+      A consumer does two things per message: process it, and record that it's done, by
+      acknowledging in a queue or committing an offset in a log. The order of those two
+      steps decides the guarantee.
+
+      ```text
+      commit, then process   a crash in between loses the message    at most once
+      process, then commit   a crash in between repeats the message  at least once
+      ```
+
+      Losing messages is rarely acceptable, so almost everyone processes then commits and
+      handles duplicates. Duplicates arrive in several ways:
+
+      - a consumer crashes after processing and before committing;
+      - a consumer is slow, its partition is reassigned in a rebalance, and the new owner
+        starts from the last committed offset;
+      - in SQS, a message not deleted within its **visibility timeout** becomes visible
+        again and goes to another consumer, and standard queues may deliver a message twice
+        on their own;
+      - a producer retries a send after a timeout, when the first send had in fact arrived.
+
+      **Exactly-once** in Kafka means idempotent producers plus transactions, for pipelines
+      that read from Kafka and write back to Kafka. As soon as the effect is outside Kafka,
+      such as a database row or an email, the guarantee stops at the boundary. The practical
+      target is **effectively once**: at-least-once delivery plus an idempotent effect.
+  - title: Publishing reliably with an outbox
+    body: |-
+      The producer side has its own trap, the **dual write**. Save an order, then publish
+      "order created". If the process dies between the two, the order exists and nobody
+      hears of it. Publish first, and a failed save leaves an event about an order that
+      doesn't exist.
+
+      The **outbox pattern** makes the event part of the database transaction:
+
+      ```sql
+      CREATE TABLE outbox (
+        id      bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        topic   text NOT NULL,
+        key     text NOT NULL,
+        payload jsonb NOT NULL,
+        sent_at timestamptz
+      );
+      CREATE INDEX outbox_unsent ON outbox (id) WHERE sent_at IS NULL;
+
+      BEGIN;
+      INSERT INTO orders VALUES (42, 7, 30);
+      INSERT INTO outbox (topic, key, payload)
+      VALUES ('orders', '42', '{"type": "order.created", "orderId": 42}');
+      COMMIT;
+
+      -- the relay, in a loop
+      BEGIN;
+      SELECT id, topic, key, payload FROM outbox
+      WHERE sent_at IS NULL
+      ORDER BY id
+      LIMIT 100
+      FOR UPDATE SKIP LOCKED;
+      -- publish each row to the broker, then:
+      UPDATE outbox SET sent_at = now() WHERE id = ANY($1);
+      COMMIT;
+      ```
+
+      Either both rows commit or neither does. The relay may publish a row twice if it
+      crashes after publishing and before its commit, which is fine: consumers are
+      idempotent anyway. `SKIP LOCKED` lets several relays share the table without blocking,
+      at the cost of strict ordering between them. For strict per-key order, run one relay
+      or have relays own disjoint sets of keys. Change data capture tools that read the
+      write-ahead log are the heavier alternative to a polling relay.
+  - title: The idempotent consumer in SQL
+    body: |-
+      The lesson's fix recorded the message id and applied the effect in one transaction.
+      In Postgres that can be a single statement:
+
+      ```sql
+      CREATE TABLE processed_messages (
+        id text PRIMARY KEY,
+        at timestamptz NOT NULL DEFAULT now()
+      );
+
+      BEGIN;
+      WITH fresh AS (
+        INSERT INTO processed_messages (id) VALUES ('msg-9')
+        ON CONFLICT (id) DO NOTHING
+        RETURNING id
+      )
+      UPDATE accounts SET balance = balance + 25
+      WHERE id = 'acc-1' AND EXISTS (SELECT 1 FROM fresh);
+      COMMIT;
+      ```
+
+      Run twice with the same message id, the first run updated one row and the second
+      updated none, leaving the balance at 25. Two consumers racing on the same message are
+      safe too: the primary key lets only one insert win, and the other waits for it and
+      then finds the id taken.
+
+      The processed table grows for ever unless you prune it. Keep ids for longer than any
+      redelivery can take, such as seven days, and delete older ones in a scheduled job.
+
+      Sometimes the effect is naturally idempotent and needs no table: "set status to
+      shipped" can run twice safely, "add 25 to the balance" can't. An upsert keyed by a
+      business id, such as one row per order, is idempotent too.
+  - title: Poison messages, retries and dead-letter queues
+    body: |-
+      Some messages fail every time: a malformed payload, a reference to a deleted record, a
+      bug. Retrying them for ever blocks the partition behind them in a log, or burns worker
+      time in a queue. This is a **poison message**.
+
+      The usual handling:
+
+      - Retry transient failures, such as timeouts, a few times with backoff.
+      - After a set number of attempts, move the message to a **dead-letter queue** and carry
+        on. SQS does this with a redrive policy after a maximum receive count; with Kafka you
+        write it to a separate topic yourself.
+      - Alert on anything arriving in the dead-letter queue, inspect it, fix the cause, then
+        replay the messages.
+
+      Two numbers tell you a consumer's health. **Consumer lag** is how many messages, or how
+      many seconds, the group is behind the newest one. Growing lag means consumers can't
+      keep up. **Age of oldest message** in a queue means the same thing.
+
+      When lag grows, add consumers, up to the partition count, or make each message
+      cheaper. Choose the partition count with headroom from the start, because adding
+      partitions later changes which partition a key maps to, which can break per-key order
+      during the change. Watch for **hot partitions** too: if one key, such as one very
+      large customer, carries much of the traffic, its partition lags while others idle.
+pitfalls:
+  - "**Two services sharing one work queue when both need every message.** Each message reaches only one of them. Give each reader its own queue fed by a topic, or use a log with a consumer group per reader."
+  - "**Reusing another service's consumer group.** The new consumer resumes from their offsets and steals their partitions. Every reader gets its own group id."
+  - "**Check-then-act idempotency.** Checking whether an id was processed, then acting, lets two consumers both pass. Insert the id under a unique key in the same transaction as the effect."
+  - "**Saving to the database and publishing as two separate steps.** A crash between them loses or invents events. Use an outbox."
+  - "**Retrying poison messages for ever.** One bad message blocks a partition. Cap retries and move failures to a dead-letter queue with an alert."
+  - "**Keying by something random when order matters.** Events for one cart spread over partitions and arrive out of order. Key by the entity whose order matters."
+interview:
+  - question: When would you pick Kafka over a queue such as SQS or RabbitMQ?
+    answer: >-
+      When several independent systems need the same stream of events, in order, and may
+      need to replay it. Kafka keeps messages for a retention period, each consumer group
+      tracks its own offset, and a new consumer can start from the beginning, so search,
+      analytics and billing can all read "order placed" without the producer knowing about
+      them. For jobs that must happen once, such as sending an email, a queue is simpler:
+      per-message acknowledgement, per-message retries, dead-letter handling built in and,
+      with SQS, nothing to operate. The cost of Kafka is operational weight and
+      partition planning, so I'd only take it on for real event streams.
+  - question: How do you guarantee a payment event is processed exactly once?
+    answer: >-
+      You can't guarantee delivery exactly once across a network, so I make the effect
+      happen once. The broker delivers at least once: a crash, timeout or rebalance between
+      processing and committing redelivers the message. The consumer inserts the message id
+      into a processed table with a unique key in the same database transaction as the
+      credit. A duplicate hits the unique key and the credit is skipped, even if two
+      consumers race. On the producer side I use an outbox, so the event commits with the
+      payment row and can't be lost. Kafka's exactly-once only covers Kafka-to-Kafka
+      pipelines, so it doesn't remove the need for this.
+  - question: How do you keep events for one order in order, while still processing in parallel?
+    answer: >-
+      Key every event by the order id, so all events for one order land in the same
+      partition, where order is guaranteed, and parallelism comes from having many
+      partitions. A consumer group spreads partitions over consumers, so with 24 partitions
+      up to 24 consumers work at once, each handling its orders in sequence. Within a
+      consumer I must not process one partition's messages concurrently, or I'd reorder them.
+      I'd choose the partition count with headroom, because adding partitions later remaps
+      keys. If one key is very hot, its partition becomes the bottleneck, and I'd look at
+      splitting that entity's work.
+  - question: Your consumer lag keeps growing. What do you check?
+    answer: >-
+      Whether the consumers are too slow, too few, or stuck on something. First, is lag
+      growing on every partition or one? One partition points at a hot key or a poison
+      message being retried; all partitions point at throughput. For throughput I check
+      processing time per message: a slow downstream call, such as a database without an
+      index, is the usual cause, and batching writes helps. Then I add consumers, up to the
+      partition count. For a poison message, cap retries and send it to a dead-letter topic.
+      Meanwhile I'd check whether the lag breaks a freshness requirement, since that decides
+      how urgently to act.

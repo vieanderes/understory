@@ -1,0 +1,199 @@
+summary: >-
+  An API is a promise to code you don't control. Web pages update on the next deploy, but
+  phone apps, partner integrations and scripts written years ago keep calling the shape they
+  were built against. Changing an API safely means telling compatible changes from breaking
+  ones, and making every break slow, visible and optional.
+
+
+  The rules are short. Adding optional fields and new endpoints is compatible, as long as
+  clients ignore what they don't know. Removing, renaming or retyping a field breaks old
+  readers; making a request field required breaks old writers. Renames happen through
+  **expand, then contract**: add the new shape beside the old, move the clients, and remove
+  the old shape only when nothing uses it. Versions are for the breaks you can't avoid.
+
+
+  The lesson also compares API styles by who shapes the response. These notes add the
+  asymmetry between strict servers and tolerant clients in code, expand and contract applied
+  to the database underneath, how to announce a deprecation, versioning strategies used by
+  large APIs, and the real trade-offs between REST, RPC, GraphQL and gRPC.
+remember:
+  - A change is compatible when every existing client keeps working without an update.
+  - Adding an optional field is safe; removing, renaming or changing the type of a field breaks readers, and a new required request field breaks writers.
+  - Rename with expand, then contract, removing the old field only once logs show nothing reads it.
+  - Servers are strict about requests they receive, and clients are tolerant of responses, ignoring unknown fields and handling unknown enum values.
+  - Version only a break you can't avoid, keep the old version running, and announce its end with dates.
+  - A version chosen by a request header needs `Vary` naming that header, or caches serve one version to clients of another.
+  - Every observable behaviour will be depended on by someone, including field order, error wording and timing.
+  - GraphQL lets the client choose the fields, so the server must limit query depth and cost and batch lookups to avoid N+1 queries.
+sections:
+  - title: Strict on the way in, tolerant on the way out
+    body: |-
+      The two directions need opposite rules. When your server reads a request, an unknown
+      field is probably a typo, `nte` for `note`, and silently dropping it hides a bug. When
+      a client reads a response, an unknown field is the server growing, and failing on it
+      makes every addition a breaking change.
+
+      ```ts
+      import { z } from 'zod';
+
+      // Server, reading a request: strict, so a misspelt field is an error.
+      const CreateOrder = z.strictObject({
+        items: z.array(z.object({ sku: z.string(), quantity: z.number().int().positive() })),
+        note: z.string().max(500).optional(),
+      });
+
+      // Client, reading a response: tolerant, so the server can grow.
+      const Order = z.object({
+        id: z.number(),
+        total: z.number().int(),
+        status: z.enum(['pending', 'paid', 'shipped', 'unknown']).catch('unknown'),
+      });
+
+      console.log(CreateOrder.safeParse({ items: [], nte: 'hi' }).success); // false
+      console.log(Order.parse({ id: 42, total: 1250, amount: 1250, status: 'refunded' }));
+      // { id: 42, total: 1250, status: 'unknown' }
+      ```
+
+      In Zod 4, `z.object` drops unknown keys and `z.strictObject` rejects them. The
+      `.catch('unknown')` turns a status the client has never heard of into a value its
+      interface can display, instead of an exception on the order screen. This pattern is
+      called a **tolerant reader**: read only the fields you need and survive everything
+      else.
+
+      Enums are where most breaks hide. Adding a value to a response enum is compatible in
+      theory and breaks every client with an exhaustive `switch` that throws. Document that
+      enums can grow, and write clients that expect it.
+  - title: Expand and contract, all the way down to the database
+    body: |-
+      A field rename usually touches the database too, and the same pattern applies there,
+      because old and new versions of your own code run side by side during a deploy. Each
+      step below is one release, and each is safe to roll back.
+
+      ```sql
+      -- 1. Expand: add the new column, nullable, so the change is instant.
+      alter table orders add column amount integer;
+
+      -- 2. Code writes both columns from now on. Backfill the old rows.
+      update orders set amount = total where amount is null;
+
+      -- 3. Once every row has it, enforce it.
+      alter table orders alter column amount set not null;
+
+      -- 4. Contract, in a later release, when no code reads total.
+      alter table orders drop column total;
+      ```
+
+      In between sit the application steps: write both, switch reads to `amount`, stop
+      writing `total`. The API follows the same rhythm: respond with both `total` and
+      `amount`, log which clients still read `total`, and remove it when the log is quiet.
+
+      On large tables, run the backfill in batches of a few thousand rows so it doesn't hold
+      locks or bloat the write-ahead log in one huge transaction. Adding `not null` to a big
+      table scans it to check every row; one approach is to add a `check (amount is not
+      null) not valid` constraint, `validate` it separately, then set `not null`, which
+      PostgreSQL can then do without a second full scan. The migrations lesson covers this in
+      depth.
+  - title: Versioning and deprecation in practice
+    body: |-
+      There are three common places for a version.
+
+      - **The path**, `/v2/orders`. Visible, simple to route and to cache, and testable with
+        `curl`. The cost is that a new major version tends to copy every endpoint.
+      - **A header**, such as `Api-Version: 2`. Keeps URLs stable; needs `Vary: Api-Version` on
+        responses so caches keep versions apart.
+      - **Dated versions**, as Stripe does: each account is pinned to the version current when
+        it started, and a `Stripe-Version` header overrides it per request. The server keeps
+        a chain of small transformations that turn the newest response into each older
+        shape, so old clients never notice new releases.
+
+      Whatever the scheme, announce the end of an old version in the response itself, as
+      well as by email. The `Sunset` header (RFC 8594) gives the date after which the
+      resource may stop responding, and the `Deprecation` header (RFC 9745) says since when
+      it has been deprecated.
+
+      ```http
+      HTTP/1.1 200 OK
+      Deprecation: @1767225600
+      Sunset: Thu, 31 Dec 2026 23:59:59 GMT
+      Link: <https://api.example/docs/migrate-v2>; rel="deprecation"
+      ```
+
+      Then measure. Log the version and the client identity on every request, and contact
+      the heaviest users of the old version before the date. Removing a version on schedule
+      while a large customer still calls it isn't an API decision any more; it's a business
+      one.
+  - title: REST, RPC, GraphQL and gRPC, honestly compared
+    body: |-
+      Each style trades something real.
+
+      - **REST** models resources with URLs and HTTP methods. Its strength is the web's
+        infrastructure: HTTP caching on `GET`, status codes that monitoring understands,
+        and tools everyone has. The weakness is fixed response shapes, which lead to
+        over-fetching or several round trips for one screen.
+      - **RPC over HTTP**, including **tRPC**, models actions as functions. tRPC shares
+        TypeScript types between client and server without a schema file, which is excellent
+        inside one TypeScript codebase and useless for public clients in other languages.
+      - **GraphQL** gives one endpoint and a typed schema, and the client selects fields
+        across related objects. It removes over-fetching and suits many different clients.
+        The costs move to the server: naive resolvers make one database query per item,
+        the N+1 problem, which batching libraries such as DataLoader fix; arbitrary
+        queries need depth and cost limits; HTTP caching mostly stops working because
+        queries travel as `POST`. Fields are retired with the built-in `@deprecated`
+        directive rather than versions.
+      - **gRPC** uses Protocol Buffers over HTTP/2 between services. It's compact, fast and
+        generates typed clients in many languages. Browsers can't call it directly. Its
+        compatibility rules are strict and useful: never reuse a field number, and mark
+        removed ones `reserved`.
+
+      A common, defensible architecture uses more than one: REST or GraphQL at the public
+      edge, tRPC inside a TypeScript web app, and gRPC or a message queue between internal
+      services.
+pitfalls:
+  - '**Renaming a field in place.** Every existing client loses it at once. Send both names, move the clients, then remove the old one.'
+  - '**Changing a field''s type.** A number that becomes a string doesn''t throw in JavaScript; `+` starts concatenating. Add a new field with the new type instead.'
+  - '**Clients that throw on unknown values.** A new status crashes old apps. Map unknown enum values to a neutral fallback.'
+  - '**Rejecting unknown response fields on the client.** Strict parsing belongs on the server''s input. On the client it turns every addition into a break.'
+  - '**Header versioning without `Vary`.** Caches hand a v1 response to a v2 client. Add `Vary` naming the version header.'
+  - '**Removing an old version without data.** You don''t know who still calls it. Log version and client per request, and announce with `Sunset` before removing.'
+  - '**Adopting GraphQL without cost limits.** One nested query can ask for millions of rows. Limit depth and cost, and batch lookups.'
+interview:
+  - question: How do you rename a field in a public API without breaking clients?
+    answer: >-
+      Expand, migrate, contract. First I add the new field alongside the old one with the
+      same value, so old clients keep working and new ones can switch. Then I update my own
+      clients, document the change, and mark the old field deprecated, with a `Sunset` date
+      if it's going away. I log which clients still read or send the old field. When usage
+      reaches zero, or the announced date passes, I remove it. If the database column is
+      renamed too, the same pattern runs underneath: add, dual-write, backfill, switch reads,
+      drop. The cost is carrying both names for weeks or months, which is cheap compared
+      with breaking apps you can't update.
+  - question: What counts as a breaking change in a JSON API?
+    answer: >-
+      Anything that makes an existing, correctly written client fail. For responses:
+      removing a field, renaming it, changing its type or meaning, or making it nullable
+      when it never was. For requests: adding a required field, tightening validation, or
+      removing an accepted value. Behavioural changes count too, such as different default
+      sorting, pagination size or error codes. Adding optional fields and new endpoints is
+      compatible, assuming tolerant clients. New enum values are the grey area: compatible
+      by contract but often breaking in practice, so I document that enums can grow. In CI I
+      diff the OpenAPI schema between releases to catch breaks mechanically.
+  - question: URL versioning or header versioning?
+    answer: >-
+      Usually the URL for public APIs, because it's explicit and plays well with
+      infrastructure. `/v2/orders` shows up in logs, routes cleanly at a gateway, caches
+      correctly without extra headers and is obvious when debugging with `curl`. Header
+      versioning keeps URLs stable and suits fine-grained versions, but needs `Vary` on
+      every response and is invisible in most tooling. Dated versions with per-account
+      pinning, as Stripe does, give the smoothest experience for clients, at the price of
+      maintaining transformations for every old version on the server. Whatever I pick, the
+      bigger win is avoiding the need for versions through additive changes.
+  - question: When would you choose GraphQL over REST?
+    answer: >-
+      When many different clients need different slices of a connected data graph, and
+      round trips are expensive. A mobile screen that needs a user, their last orders and
+      each order's items is one GraphQL query instead of several REST calls with extra
+      fields. The costs are real: resolvers cause N+1 queries unless batched, arbitrary
+      queries need depth and cost limits, HTTP caching mostly disappears, and errors often
+      arrive with status `200`, so monitoring needs work. For a public API with simple
+      resources, or when HTTP caching matters, REST stays simpler. Inside a single
+      TypeScript app, tRPC gives end-to-end types with less machinery.

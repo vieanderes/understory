@@ -1,0 +1,345 @@
+summary: >-
+  An error is how code says "I can't do what you asked". `throw` stops the current function
+  and unwinds the call stack until some caller has a `try`. Its `catch` gets the thrown value,
+  and `finally` runs on the way out, whatever happened. Used well, that moves a failure from
+  the place it's detected to the one place that knows what to do about it.
+
+
+  Used badly, it hides failures. An empty `catch`, or one that logs and carries on, turns a
+  full disk into a false "Saved". A `catch` that treats every error as the one it expected
+  turns a programming bug into a misleading message. The discipline is simple to state: a
+  `catch` either handles the failure completely or throws it on, ideally wrapped with
+  `cause` so nothing is lost.
+
+
+  The language gives you the pieces. There's `Error` with its built-in subclasses, and
+  `message`, `stack` and `cause`. You can write subclasses for failures callers must tell
+  apart. And there are exact rules for how `finally` interacts with `return`. Knowing those rules, and a few control-flow classics
+  such as `switch` fall-through, is what interviewers probe.
+remember:
+  - A `catch` must either handle the failure fully or throw it on; an empty `catch` or a log followed by success hides the failure from every caller.
+  - '`finally` runs after `try` or `catch` on every exit: a normal end, a `return`, a `throw`, a `break` or a `continue`.'
+  - A `return` inside `finally` overrides the result of `try` and `catch` and discards an error in flight, so never return from `finally`.
+  - Throw `Error` objects, not strings, because only errors carry `name`, `message`, `stack` and `cause`, and any value at all can be thrown.
+  - Catch only the error types you understand, test them with `instanceof` or a `code`, and rethrow the rest.
+  - 'When you wrap an error, pass the original as `new Error("message", { cause: error })` so its type and stack survive.'
+  - '`try` and `catch` only see errors thrown synchronously inside them, or rejections you `await` inside them; a throw in a timer callback escapes.'
+  - A `switch` case without `break` or `return` falls through into the next case, and cases match with `===`.
+sections:
+  - title: 'The exact rules of try, catch and finally'
+    body: |-
+      `finally` runs whenever control leaves the `try` statement, however it leaves. That
+      includes `break` and `continue` in a loop.
+
+      ```js
+      for (const id of [1, 2, 3]) {
+        try {
+          if (id === 2) continue;
+          if (id === 3) break;
+          console.log("process", id);
+        } finally {
+          console.log("cleanup", id);
+        }
+      }
+      // process 1, cleanup 1, cleanup 2, cleanup 3
+      ```
+
+      A `return` in `try` works out its value first, then runs `finally`, then hands the
+      value back. Changing a variable in `finally` can't change a value that was already
+      worked out.
+
+      ```js
+      function snapshot() {
+        let status = "open";
+        try {
+          return status; // the value is fixed here
+        } finally {
+          status = "closed"; // too late to change what is returned
+        }
+      }
+      console.log(snapshot()); // open
+      ```
+
+      If `finally` itself completes abruptly, with a `return` or a `throw`, that replaces
+      whatever was happening. A `return` in `finally` can therefore swallow an error.
+
+      ```js
+      function overrides() {
+        try {
+          return "from try";
+        } finally {
+          return "from finally";
+        }
+      }
+      console.log(overrides()); // from finally
+
+      function swallows() {
+        try {
+          throw new Error("payment failed");
+        } finally {
+          return "all good"; // the error is thrown away
+        }
+      }
+      console.log(swallows()); // all good
+      ```
+
+      ESLint's `no-unsafe-finally` rule flags control flow in `finally` for this reason. Keep
+      `finally` for cleanup: hide the spinner, close the file, release the lock.
+
+      A `throw` inside `catch` also runs `finally` first, then the new error leaves. The
+      original error is lost unless you attach it as `cause`. Since ES2019 you can write
+      `catch { ... }` without a binding, but you can't rethrow or log a value you never named,
+      so it's only for failures you truly expect and fully handle, like a feature check.
+  - title: Error objects, subclasses and cause
+    body: |-
+      Every error has a `name` and a `message`. Engines also add `stack`, the chain of calls
+      at the moment the error was created. It isn't in the standard yet, but every browser
+      and Node provide it. ES2022 added `cause`, set through the second argument.
+
+      The built-in subclasses tell you what went wrong: `TypeError` for using a value the
+      wrong way, `RangeError` for a number out of bounds, `SyntaxError` from `JSON.parse`,
+      `ReferenceError` for an unknown name. `AggregateError` holds several errors in its
+      `errors` array, and `Promise.any` throws one when every promise rejects.
+
+      For failures your callers must tell apart, define your own subclasses:
+
+      ```js
+      class AppError extends Error {
+        constructor(message, options) {
+          super(message, options);
+          this.name = this.constructor.name;
+        }
+      }
+      class NotFoundError extends AppError {
+        constructor(resource, id, options) {
+          super(`${resource} ${id} not found`, options);
+          this.resource = resource;
+          this.id = id;
+        }
+      }
+
+      function findBooking(id) {
+        try {
+          throw new TypeError("row is undefined"); // pretend the database lookup failed
+        } catch (error) {
+          throw new NotFoundError("Booking", id, { cause: error });
+        }
+      }
+
+      try {
+        findBooking(42);
+      } catch (error) {
+        console.log(error instanceof NotFoundError, error instanceof AppError); // true true
+        console.log(error.name, "|", error.message); // NotFoundError | Booking 42 not found
+        console.log(error.cause.name, "|", error.cause.message); // TypeError | row is undefined
+        console.log(String(error)); // NotFoundError: Booking 42 not found
+      }
+      ```
+
+      Setting `name` matters: logs and `String(error)` use it, and without it every subclass
+      prints as `Error`. Passing `options` on to `super` is what sets `cause`.
+
+      `instanceof` has one weakness: an error from another realm, such as an iframe, fails
+      the check because it was built from a different `Error` class. A string `code`
+      property, as Node uses with `ENOENT`, survives realms and serialisation. Many code
+      bases use both: a class for handlers inside the process, a `code` for anything that
+      crosses a boundary, such as an API response.
+  - title: When the thrown value isn't an Error
+    body: |-
+      `throw` accepts any value: a string, a number, `null`, a plain object. Libraries do it,
+      old code does it, and a promise can reject with anything. So a `catch` can't assume it
+      received an `Error`. A thrown string has no `message` and no `stack`, which means no
+      record of where it came from.
+
+      A small helper normalises whatever arrived, keeping the original as `cause`:
+
+      ```js
+      function toError(thrown) {
+        return thrown instanceof Error ? thrown : new Error(String(thrown), { cause: thrown });
+      }
+      for (const thrown of ["timeout", 404, null, { code: "E1" }, new RangeError("r")]) {
+        console.log(toError(thrown).message);
+      }
+      // timeout, 404, null, [object Object], r
+      ```
+
+      TypeScript makes this explicit. Under `--strict`, the `catch` variable is typed
+      `unknown`, not `any`, so you must narrow it before reading `message`.
+
+      ```ts
+      function parseOrNull(text: string): unknown {
+        try {
+          return JSON.parse(text);
+        } catch (error) {
+          // error is unknown here: error.message would not compile
+          if (error instanceof SyntaxError) return null;
+          throw error;
+        }
+      }
+      ```
+
+      The fix at the source is a rule: only ever throw `Error` objects, and reject promises
+      with them too. ESLint's `no-throw-literal` rule, and `prefer-promise-reject-errors` for
+      promises, enforce it.
+  - title: Errors that try can't see
+    body: |-
+      `try` only covers code that runs synchronously inside it. A callback scheduled for
+      later runs on a fresh call stack, long after the `try` has finished.
+
+      ```js
+      function saveLater() {
+        setTimeout(() => {
+          throw new Error("disk full");
+        }, 0);
+      }
+      try {
+        saveLater();
+        console.log("save scheduled");
+      } catch (error) {
+        console.log("caught", error.message); // never runs
+      }
+      // Logs "save scheduled", then Node crashes with the uncaught "disk full" error
+      ```
+
+      Promises have the same trap in a subtler form. Inside an `async` function, `try` catches
+      a rejection only if you `await` it inside the `try`. Returning the promise without
+      `await` lets it leave before it rejects.
+
+      ```js
+      async function save() {
+        throw new Error("disk full");
+      }
+      async function withoutAwait() {
+        try {
+          return save(); // the promise leaves before it rejects
+        } catch {
+          return "handled";
+        }
+      }
+      async function withAwait() {
+        try {
+          return await save();
+        } catch {
+          return "handled";
+        }
+      }
+      withAwait().then(console.log); // handled
+      withoutAwait().then(console.log, (e) => console.log("escaped:", e.message)); // escaped: disk full
+      ```
+
+      A rejection nobody handles is an unhandled rejection. Since Node 15, Node treats one as
+      fatal and exits the process by default. Browsers report it in the console and fire an
+      `unhandledrejection` event. Put the `try` inside the callback, or `await` every promise
+      inside the `try`.
+  - title: switch, fall-through and its alternatives
+    body: |-
+      A `switch` compares its value with each `case` using `===`, then runs from the first
+      match down until a `break`, a `return` or the end. Forgetting `break` is the classic bug.
+
+      ```js
+      function shippingDays(method) {
+        let days;
+        switch (method) {
+          case "express":
+            days = 1;
+          case "standard":
+            days = 3;
+            break;
+          default:
+            days = 7;
+        }
+        return days;
+      }
+      console.log(shippingDays("express")); // 3, it fell through into "standard"
+
+      function isWeekend(day) {
+        switch (day) {
+          case "sat":
+          case "sun": // stacked cases share one body on purpose
+            return true;
+          default:
+            return false;
+        }
+      }
+      console.log(isWeekend("sun"), isWeekend("mon")); // true false
+      ```
+
+      Because matching is strict, `switch (1)` never matches `case "1"`. A whole `switch` is
+      one block, so `let note` in two cases is a `SyntaxError`, "Identifier 'note' has already
+      been declared". Wrap each case body in braces to give it its own scope.
+
+      `default` can sit anywhere; it runs only when no case matches. `switch (true)` with
+      conditions as cases works, but an `if` and `else if` chain says the same thing more
+      plainly. For a pure mapping from a key to a value, an object lookup is shorter and
+      can't fall through:
+
+      ```js
+      const labels = { paid: "Ready to ship", refunded: "Money returned" };
+      console.log(labels["paid"] ?? "Unknown", labels["lost"] ?? "Unknown"); // Ready to ship Unknown
+      ```
+
+      With a plain object, a key like `"toString"` finds an inherited method. Use a `Map`, or
+      `Object.hasOwn`, when the keys come from users. ESLint's `no-fallthrough` rule flags a
+      missing `break` unless a comment says the fall-through is deliberate. In TypeScript, a
+      `switch` over a union with a `never` check in `default` makes the compiler catch a
+      missing case.
+pitfalls:
+  - "**Swallowing an error in an empty `catch`.** The code after it reports success, and nobody learns the save failed. Handle it fully, for example by showing a message and returning a failure result, or rethrow it."
+  - "**Catching everything as the error you expected.** A `catch` around `JSON.parse(reply).answer.trim()` blames broken JSON for a `TypeError` from a missing field. Test `instanceof SyntaxError` and rethrow the rest."
+  - "**Returning from `finally`.** It overrides the value from `try` and silently discards any error on its way out. Keep `finally` for cleanup, with no `return`, `break` or `throw`."
+  - "**Throwing strings.** `throw \"not found\"` gives the handler no `message`, no `stack` and nothing to test with `instanceof`. Throw `new Error(...)` or a subclass."
+  - "**Wrapping an error without `cause`.** `throw new Error(\"save failed\")` inside a `catch` replaces the original type and stack, which were the useful part. Pass `{ cause: error }`."
+  - "**Wrapping a callback or an un-awaited promise in `try`.** The `try` finishes before the failure happens, so nothing is caught. Put the `try` inside the callback, or `await` inside the `try`."
+interview:
+  - question: What does this return? `function f() { try { return "try"; } finally { return "finally"; } }`
+    answer: >-
+      It returns "finally". A `return` in `try` evaluates its value, then `finally` runs
+      before the function exits. If `finally` completes abruptly, with its own `return` or
+      a `throw`, that completion replaces the pending one. The dangerous version is when
+      `try` throws: a `return` in `finally` discards the error, and the caller sees a normal
+      result. The reverse also matters: if `try` returns a variable and `finally` then
+      changes that variable, the returned value doesn't change, because it was evaluated
+      first. That's why `finally` should only do cleanup, such as releasing a lock or hiding a
+      spinner, and why ESLint's `no-unsafe-finally` rule exists.
+  - question: How do you design custom errors in JavaScript?
+    answer: >-
+      I extend `Error` with a small hierarchy, set `name`, and pass options through to
+      `super` so `cause` works. For example a base `AppError`, then `NotFoundError` and
+      `ValidationError` with the data a handler needs, like the resource and id. Handlers can
+      then use `instanceof` to deal with the kinds they understand and rethrow the rest. When
+      I catch a low-level error and raise a domain one, I attach the original as `cause`,
+      so the logs keep both the readable message and the original stack. For errors that
+      cross a boundary, such as an API response or a worker message, I add a stable string
+      `code`, because `instanceof` doesn't survive serialisation or a different realm.
+  - question: What happens if you throw a string instead of an `Error`?
+    answer: >-
+      It works, because `throw` accepts any value, but the handler gets much less. A string
+      has no `message`, so `error.message` is `undefined`. It has no `stack`, so you lose
+      where it came from, and it fails every `instanceof` check, so typed handling breaks.
+      That's why the defensive pattern in a `catch` is to normalise: if the value isn't an
+      `Error`, wrap it in `new Error(String(value), { cause: value })`. TypeScript's strict
+      mode types the catch variable as `unknown` for exactly this reason. At the source, I
+      throw only `Error` objects and enforce it with `no-throw-literal` and
+      `prefer-promise-reject-errors`.
+  - question: When should a function throw, and when should it return an error value?
+    answer: >-
+      I throw for failures the caller can't reasonably handle at that point, and return a
+      result for outcomes that are part of normal business. A declined card is a normal
+      checkout outcome, so returning `{ status: "declined", reason }` makes callers handle
+      it, and the shape documents it. A timed-out gateway or a bug is exceptional, so I
+      throw. It unwinds to a boundary, such as a request handler or an error boundary,
+      which logs it once and shows a generic message. The trade-off: thrown
+      errors are invisible in function signatures, so they're often forgotten, while result
+      objects add a check at every call site. Mixing the two deliberately, as the lesson's
+      `settleOrder` does, gives both clarity and safety.
+  - question: What's the danger in a `switch` statement, and what would you use instead?
+    answer: >-
+      Fall-through: once a case matches, execution continues into the following cases until
+      a `break` or `return`. Forgetting one silently runs the next case's code. Stacking
+      empty cases on purpose is fine and common, but anything else should be flagged, which
+      ESLint's `no-fallthrough` does. There are two smaller traps. Cases compare with
+      `===`, so a string never matches a number. And the whole `switch` is one scope, so the
+      same `let` in two cases is a syntax error unless each case has braces. For a mapping
+      from key to value I prefer an object or a `Map`. For branching on a TypeScript union,
+      a `switch` that returns in every case plus a `never` check in `default` gives
+      compile-time exhaustiveness.

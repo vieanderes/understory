@@ -1,0 +1,278 @@
+summary: >-
+  A command-line tool is a program other programs can drive. It takes arguments, reads files
+  or standard input, writes results to standard output, writes problems to standard error,
+  and ends with an **exit code** that says whether it worked. Shells, Makefiles, cron and CI
+  all speak that contract, and none of them read your printed messages.
+
+
+  The lesson builds the core with `sys.argv` and a testable `main(argv)`. These notes add the
+  pieces a real tool needs: `argparse` for flags and help, the split between stdout and
+  stderr, exit code conventions, tests for the whole command, and shipping it as a named
+  command in a uv project.
+
+
+  Reach for a small CLI whenever a job runs more than twice or runs in CI: an eval gate that
+  fails a build when the pass rate drops, a data check before a deploy, a report from a log
+  file. If a person runs it once, a notebook or a throwaway script is fine.
+remember:
+  - Exit code 0 means success and anything else means failure, and CI fails a step on any non-zero code.
+  - Data goes to stdout and messages go to stderr, so a pipe or redirect carries only the results.
+  - Keep the work in `main(argv) -> int` and call `sys.exit(main())` only under the guard, so tests can call `main` with a list and check what it returns.
+  - '`argparse` parses flags, converts types, writes `--help`, and on bad input prints usage to stderr and exits with code 2.'
+  - '`parse_args(None)` reads `sys.argv[1:]`, so pass an explicit list in tests and nothing in production.'
+  - '`sys.exit("message")` prints the message to stderr and exits with 1, and an uncaught exception also exits with 1.'
+  - Separate the pure logic from the input and output, so most tests need no files, no terminal and no process.
+sections:
+  - title: From `sys.argv` to argparse
+    body: |-
+      `sys.argv` works for one argument. Once you want a flag such as `--min-rate 0.8`,
+      optional arguments, type conversion and a `--help` page, `argparse` from the standard
+      library does it for you. Here is the report tool grown up: it reads a file or standard
+      input, and fails when the pass rate drops below a threshold.
+
+      ```python
+      import argparse
+      import json
+      import sys
+      from pathlib import Path
+      from typing import TypedDict
+
+
+      class Result(TypedDict):
+          id: str
+          category: str
+          passed: bool
+
+
+      def pass_rate(results: list[Result]) -> float:
+          if not results:
+              return 0.0
+          return sum(r["passed"] for r in results) / len(results)
+
+
+      def build_parser() -> argparse.ArgumentParser:
+          parser = argparse.ArgumentParser(prog="report", description="Summarise eval results.")
+          parser.add_argument("file", help="a JSON file of results, or - to read stdin")
+          parser.add_argument("--min-rate", type=float, default=0.0, help="fail below this pass rate")
+          return parser
+
+
+      def load(name: str) -> list[Result]:
+          text = sys.stdin.read() if name == "-" else Path(name).read_text()
+          data: list[Result] = json.loads(text)
+          return data
+
+
+      def main(argv: list[str] | None = None) -> int:
+          args = build_parser().parse_args(argv)  # None means sys.argv[1:]
+          try:
+              results = load(args.file)
+          except (OSError, json.JSONDecodeError) as err:
+              print(f"report: cannot read {args.file}: {err}", file=sys.stderr)
+              return 2
+          rate = pass_rate(results)
+          print(f"{rate:.0%} of {len(results)} passed")
+          if rate < args.min_rate:
+              print(f"report: below the minimum of {args.min_rate:.0%}", file=sys.stderr)
+              return 1
+          return 0
+
+
+      if __name__ == "__main__":
+          sys.exit(main())
+      ```
+
+      Note one change from the lesson. `parse_args` expects the arguments without the
+      program name, so `main` here takes `sys.argv[1:]`, and `None` tells argparse to read it
+      itself. `--min-rate` becomes `args.min_rate`, already a `float`. A bad value never
+      reaches your code:
+
+      ```bash
+      $ python3 report.py results.json --min-rate lots
+      usage: report [-h] [--min-rate MIN_RATE] file
+      report: error: argument --min-rate: invalid float value: 'lots'
+      $ echo $?
+      2
+      ```
+
+      argparse does this by raising `SystemExit(2)`, and `--help` raises `SystemExit(0)`.
+      Two libraries you'll meet in other codebases are click and typer, which is built on
+      click and reads type hints to define arguments. Both are third-party. argparse is
+      enough for most internal tools and adds no dependency.
+  - title: Standard streams and exit codes
+    body: |-
+      Every process starts with three open streams: **stdin** (0), **stdout** (1) and
+      **stderr** (2). `print` writes to stdout. Keeping diagnostics on stderr means the
+      person at the terminal sees both, while a pipe or a redirect gets only the data:
+
+      ```bash
+      $ python3 report.py results.json --min-rate 0.9 > summary.txt
+      report: below the minimum of 90%
+      $ cat summary.txt
+      67% of 3 passed
+      $ cat results.json | python3 report.py -
+      67% of 3 passed
+      ```
+
+      The exit code is a number from 0 to 255 that the shell stores in `$?`. Zero means
+      success. There's no universal table for the rest, but some conventions are worth
+      following:
+
+      - **1** for a general failure, or "the check ran and failed".
+      - **2** for bad usage or input the tool couldn't read, as argparse, `grep` and many
+        Unix tools do.
+      - **130** when the user pressed Ctrl-C, which is 128 plus the signal number of
+        SIGINT. Python produces it for an uncaught `KeyboardInterrupt`.
+
+      Using 1 for "pass rate too low" and 2 for "couldn't read the file" lets a CI script
+      tell a quality regression from a broken pipeline. Document your codes in `--help` or
+      the README.
+
+      `sys.exit` accepts more than numbers. `sys.exit(None)` exits with 0. `sys.exit("No such
+      file")` prints the text to stderr and exits with 1. `sys.exit(True)` exits with 1,
+      because `True` is the integer 1. An uncaught exception prints the traceback and exits
+      with 1. Codes wrap at 256 on Linux and macOS, so `sys.exit(256)` exits with 0: keep
+      them small.
+
+      Shells chain on exit codes: `python3 report.py results.json --min-rate 0.8 && deploy`
+      only deploys on 0. CI runners do the same with each step.
+  - title: Testing the whole command
+    body: |-
+      Because `main` takes a list and returns an int, pytest can test the command end to end
+      in-process. Its built-in fixtures do the rest: `tmp_path` gives a fresh folder,
+      `capsys` captures stdout and stderr separately, and `monkeypatch` swaps
+      `sys.stdin`.
+
+      ```python
+      import io
+      import json
+      from pathlib import Path
+
+      import pytest
+
+      from report import main
+
+      RESULTS = [
+          {"id": "t1", "category": "refunds", "passed": True},
+          {"id": "t2", "category": "refunds", "passed": False},
+      ]
+
+
+      def test_prints_the_rate_and_exits_0(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+          file = tmp_path / "results.json"
+          file.write_text(json.dumps(RESULTS))
+          assert main([str(file)]) == 0
+          assert capsys.readouterr().out == "50% of 2 passed\n"
+
+
+      def test_below_the_minimum_exits_1(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+          file = tmp_path / "results.json"
+          file.write_text(json.dumps(RESULTS))
+          assert main([str(file), "--min-rate", "0.8"]) == 1
+          assert "below the minimum" in capsys.readouterr().err
+
+
+      def test_reads_stdin(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+          monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(RESULTS)))
+          assert main(["-"]) == 0
+          assert capsys.readouterr().out == "50% of 2 passed\n"
+
+
+      def test_missing_argument_exits_2() -> None:
+          with pytest.raises(SystemExit) as exit_info:
+              main([])
+          assert exit_info.value.code == 2
+      ```
+
+      Save it as `test_report.py` next to `report.py` and run `uv run pytest`. The four tests
+      take a few hundredths of a second, because no process starts.
+
+      Notice the layers. `pass_rate` is pure: a list in, a number out, testable with no files
+      at all, so most edge cases (empty input, all passing, ties) belong there. `load` does
+      the reading. `main` only wires them to arguments, streams and exit codes, so it needs a
+      handful of tests, not dozens. Keep `sys.exit` out of the lower layers: a function that
+      exits the process can't be reused by other code. Raise an exception there, and let
+      `main` turn it into a message and a code.
+  - title: Shipping it as a command
+    body: |-
+      In a uv project, a script can become a named command. Declare an entry point in
+      `pyproject.toml`, pointing at a function:
+
+      ```text
+      [project.scripts]
+      report = "report_tool.cli:main"
+      ```
+
+      This needs a packaged project, such as one made with `uv init --package`, with the code
+      in `src/report_tool/cli.py`. After `uv sync`, `uv run report results.json` works, and
+      so does `.venv/bin/report`. The generated wrapper is a few lines of Python that import
+      your function and call `sys.exit(main())`. That's why `main` should take no required
+      arguments and return an int: the wrapper passes none and uses the return value as the
+      exit code.
+
+      To install the command for yourself, outside any project, `uv tool install .` from the
+      project folder puts it on your `PATH` in an environment of its own, the way `pnpm add
+      -g` does for Node tools.
+
+      With ruff and mypy in the dev group (`uv add --dev ruff mypy`), CI turns the tool into
+      one gate:
+
+      ```yaml
+      - run: uv sync --locked
+      - run: uv run ruff check
+      - run: uv run mypy --strict src
+      - run: uv run report results.json --min-rate 0.85
+      ```
+
+      If the pass rate falls below 85%, the last step exits with 1 and the build turns red.
+      No one has to read the log to notice.
+pitfalls:
+  - '**Returning 0 after an error.** The message prints, but CI only reads the exit code and reports success. Return non-zero for every failure path, and test each code.'
+  - '**Printing errors to stdout.** They end up inside the data when output is piped or redirected. Print them with `file=sys.stderr`.'
+  - '**Reading `sys.argv` inside `main`.** Tests then have to patch global state. Take `argv` as a parameter, and let `None` mean the real command line.'
+  - '**Calling `sys.exit` deep in helper functions.** It kills the process from code that other code might reuse, and tests must catch `SystemExit`. Raise an exception and convert it in `main`.'
+  - '**Catching `Exception` and carrying on.** A broad `except` turns real bugs into a quiet success. Catch the errors you expect, such as `OSError` and `json.JSONDecodeError`, and let the rest crash with a traceback and code 1.'
+  - '**Parsing arguments at import time.** A module-level `parse_args()` runs when a test imports the file and reads pytest''s own arguments. Parse inside `main`.'
+  - '**Mixing up `sys.argv` and `parse_args`.** `sys.argv[0]` is the script, and argparse wants the list without it. Pass `sys.argv[1:]`, or nothing.'
+interview:
+  - question: How would you structure a Python CLI so you can test it well?
+    answer: >-
+      As three layers: pure functions for the logic, a thin layer for input and output, and
+      a `main(argv) -> int` that wires them together. The pure layer, such as computing a
+      pass rate from a list, takes most of the tests and needs no files. `main` takes the
+      argument list as a parameter, defaulting to the real command line, and returns an
+      exit code instead of calling `sys.exit`. Only the `__main__` guard, or the entry point
+      wrapper, turns that into `sys.exit(main())`. Then pytest can call `main(["file.json",
+      "--min-rate", "0.8"])`, capture stdout and stderr with `capsys`, and assert on the
+      return value, all in-process and fast. I'd still keep one test that runs the real
+      command in a subprocess, to catch packaging mistakes.
+  - question: Why do exit codes matter, and which ones would you use?
+    answer: >-
+      Because they're the only part of a program's result that shells and CI read. `&&`,
+      `set -e`, Makefiles and every CI runner decide pass or fail from the exit code, so a
+      tool that prints an error and exits with 0 makes a broken build look green. Zero means
+      success. I'd use 1 for "ran and found a problem", such as a pass rate under the
+      threshold, and 2 for bad usage or unreadable input, which matches argparse and `grep`.
+      That split lets a pipeline tell a quality regression from a broken setup. Python adds
+      its own: an uncaught exception exits with 1, and Ctrl-C gives 130. I'd document the
+      codes in the help text, and test each one.
+  - question: What's the difference between stdout and stderr, and why does it matter?
+    answer: >-
+      stdout is for the program's results and stderr is for messages about the run. Both
+      show on a terminal, so the difference only appears once output is redirected. `tool >
+      out.json` or `tool | jq` captures stdout only, so errors and progress written to
+      stderr stay visible to the person and never corrupt the data. If a tool prints "file
+      not found" to stdout, the next program in the pipe tries to parse that sentence. In
+      Python, `print(..., file=sys.stderr)` or the `logging` module, which writes to stderr
+      by default, keeps them apart. One detail: stdout is block-buffered when it's a pipe,
+      while stderr is written line by line, so their order can shift. Don't rely on it.
+  - question: When would you use argparse instead of reading `sys.argv` directly?
+    answer: >-
+      As soon as there's more than one positional argument or any flag. Reading
+      `sys.argv[1]` is fine for a single file name. Beyond that, argparse converts types,
+      handles optional flags and defaults, rejects bad input with a usage line and exit code
+      2, and writes `--help` from the argument definitions, so the documentation can't drift
+      from the code. It's in the standard library, so the tool gains no dependency. For a
+      larger tool with subcommands and rich output, click or typer are popular third-party
+      choices, and typer defines arguments from type hints. The trade-off is a dependency
+      and another API to learn, so for internal scripts I start with argparse.

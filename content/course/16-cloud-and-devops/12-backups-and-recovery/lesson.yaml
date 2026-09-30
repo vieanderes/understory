@@ -1,0 +1,300 @@
+id: cloud.backups
+title: Backups and recovery
+objective: Set up point-in-time recovery, see why a replica is not a backup, and test a restore.
+level: advanced
+minutes: 10
+concepts: [cloud.pitr, cloud.replicas-and-backups, cloud.restore-testing]
+prerequisites: [db.storage-and-pooling, scale.cron]
+opening:
+  text: >-
+    You'll be able to get yesterday's data back after today's mistake, to the minute. And
+    you'll know it works, because you'll have done it before you needed to.
+
+steps:
+  - type: prose
+    id: what-backups-are
+    body: >-
+      Your database runs on one server, the **primary**. Two things protect its data, and they
+      protect against different failures.
+
+
+      A **replica** is a second server that copies every change from the primary as it
+      happens. A **backup** is a copy from an earlier moment, kept somewhere else. Getting data
+      back from a backup is a **restore**.
+
+  - type: predict-output
+    id: predict-replica-copies-delete
+    concept: cloud.replicas-and-backups
+    difficulty: 1
+    language: bash
+    code: |
+      primary$ psql -c "DELETE FROM bookings WHERE guest LIKE 'guest%'"
+      DELETE 5
+
+      # a third of a second later, on the replica
+      replica$ psql -Atc "SELECT count(*) FROM bookings WHERE guest LIKE 'guest%'"
+    question: The delete was a mistake. How many of those five bookings does the replica still have?
+    choices:
+      - text: '`5`, the replica is a spare copy'
+        feedback: >-
+          A spare copy of *now*. It copies every change, and a delete is a change like any
+          other.
+      - text: '`0`'
+        correct: true
+        feedback: >-
+          Right. We ran it. The replica did its job and deleted them too.
+      - text: '`5`, until someone syncs it'
+        feedback: >-
+          Nobody has to. The replica receives each change at once. Ours lagged by 26 ms.
+
+  - type: prose
+    id: replica-is-not-backup
+    body: >-
+      A replica saves you from a dead machine. It can't save you from a bad `DELETE`, a buggy
+      migration or an attacker. It repeats them faithfully.
+
+
+      The simplest backup is `pg_dump`, which writes a whole database to one file. Run it
+      nightly, and a mistake at 16:30 loses everything since 02:00. The most data you can
+      afford to lose is your **recovery point objective**, or RPO.
+
+  - type: prose
+    id: name-pitr
+    body: >-
+      To shrink that gap, keep the database's own diary. PostgreSQL writes every change to its
+      **write-ahead log**, the WAL, before it touches the tables.
+
+
+      Archive those files as they fill. A base backup is a copy of the whole data folder,
+      taken with `pg_basebackup`. Add the WAL since, and you can replay to any moment. That's **point-in-time
+      recovery**, PITR. Managed databases do this archiving for you.
+
+  - type: predict-output
+    id: predict-restore-point
+    concept: cloud.pitr
+    difficulty: 2
+    language: bash
+    code: |
+      $ pg_basebackup -D /base/backup           # the base backup
+      $ psql -c "INSERT INTO bookings ..."      # new bookings arrive
+      $ psql -Atc "SELECT now()"
+      2026-09-18 17:50:48+00
+      $ psql -c "DELETE FROM bookings"          # the mistake
+      DELETE 1200
+
+      # restore /base/backup, replaying WAL up to 17:50:48
+    question: What does the restored database hold?
+    choices:
+      - text: Every booking up to 17:50:48, new ones too
+        correct: true
+        feedback: >-
+          Right. Replay stopped two seconds before the delete committed.
+      - text: Only the bookings the base backup held
+        feedback: >-
+          That's where the restore starts. Then it replays the archived WAL, which holds the
+          new bookings.
+      - text: No bookings, the delete is in the WAL too
+        feedback: >-
+          It is. But replay stopped at 17:50:48, and the delete committed at 17:50:50.
+
+  - type: prose
+    id: name-restore-testing
+    body: >-
+      A backup you've never restored is a hope. Files go missing, archives have gaps, and
+      the person who knew the steps has left. So **test the restore** on a schedule.
+
+
+      `createdb` makes an empty database and `dropdb` removes one. `pg_restore` loads a
+      `pg_dump` file. `time` in front of a command prints how long it took. That time is your real
+      **recovery time objective**, RTO.
+
+  - type: parsons
+    id: order-restore-test
+    concept: cloud.restore-testing
+    difficulty: 2
+    language: bash
+    prompt: >-
+      Write this week's restore test for last night's dump. Load it into a scratch database,
+      check the rows, time it, and clean up. One line doesn't belong.
+    blocks:
+      - id: create-scratch
+        code: createdb scratch
+      - id: timed-restore
+        code: time pg_restore -d scratch bookings-2026-09-24.dump
+      - id: count-rows
+        code: psql -d scratch -Atc "SELECT count(*) FROM bookings"
+      - id: drop-scratch
+        code: dropdb scratch
+    distractors:
+      - id: restore-over-live
+        code: pg_restore -d bookings bookings-2026-09-24.dump
+        feedback: >-
+          That loads last night's rows into the live database. A test never touches
+          production. It uses a scratch copy.
+
+  - type: ai-review
+    id: review-backup-on-same-disk
+    concept: cloud.replicas-and-backups
+    difficulty: 4
+    language: bash
+    request: Back up the bookings database every night.
+    flawClass: edge-case
+    code: |
+      #!/bin/bash
+      # runs every night at 02:00; $(date +%F) gives today, like 2026-09-24
+      FILE=/var/lib/postgresql/backups/bookings-$(date +%F).dump
+      pg_dump -Fc bookings > "$FILE"
+    prompt: >-
+      An assistant wrote this. A new file appeared each morning, and a test restore on the same
+      server worked. Then the server's disk failed. Tap the line at fault.
+    lines: [3]
+    reasons:
+      - text: '`-Fc` makes a file that can''t be restored'
+        feedback: >-
+          `-Fc` is the custom format, which `pg_restore` reads. We restored one. The format is
+          fine.
+      - text: The backups sit on the same disk as the database
+        correct: true
+        feedback: >-
+          Yes. One failure took both. Copy each backup to another machine, or another provider.
+      - text: It should run every hour, not nightly
+        feedback: >-
+          More copies wouldn't have helped. Every one of them was on the disk that died.
+    fix: |
+      pg_dump -Fc bookings > "$FILE"
+      # scp copies a file to another machine over SSH
+      scp "$FILE" backup@vault.example:/backups/
+
+  - type: code-challenge
+    id: write-recovery-point
+    concept: cloud.restore-testing
+    difficulty: 4
+    language: ts
+    prompt: >-
+      Write `recoveryPoint(backupTimes, walArchivedTo, failureAt)`. All are minutes on one
+      clock. Return `{ restoreTo, lostMinutes }`, or `null` if no base backup was taken at or
+      before the failure.
+
+
+      Start from the newest such backup. If the WAL archive reaches past it, you can restore
+      to where the archive ends, but never past the failure. `lostMinutes` is the gap up to
+      the failure.
+
+
+      So `recoveryPoint([120], 985, 990)` is `{ restoreTo: 985, lostMinutes: 5 }`.
+    hints:
+      - Find the base first. It's the largest backup time that isn't after the failure.
+      - WAL that ends before the base adds nothing. WAL that runs past the failure is cut off there.
+      - 'Start with `let base = -1;` and a loop that keeps the best backup time so far.'
+
+  - type: explain-back
+    id: explain-replicas-cant-rewind
+    concept: cloud.replicas-and-backups
+    difficulty: 4
+    prompt: >-
+      A team runs two replicas and no backups. An engineer runs a `DELETE` with no `WHERE` on
+      the primary. Why can't the replicas save them?
+    rubric:
+      - A replica applies every change from the primary within moments, and the delete is one of those changes.
+      - So all three servers hold the same damaged data, and none holds an earlier moment.
+      - Only a backup, such as a base backup plus archived WAL, can restore the state before the mistake.
+    modelAnswer: >-
+      A replica's job is to match the primary as closely as it can. The delete travelled down
+      the same stream as every other change, and both replicas applied it within a second.
+      Now there are three identical copies of the damage. Replicas guard against losing a
+      machine, not against a bad command. Going back needs a copy from before: a base backup,
+      plus archived WAL to replay up to the minute before the delete. Without those, the data
+      is gone.
+
+recap:
+  - Keep replicas for a dead machine and backups for a mistake, because a replica copies the mistake.
+  - Archive the WAL beside regular base backups, so you can restore to any moment.
+  - Restore on a schedule, off the server, and measure the time taken and the data lost.
+
+recall:
+  - id: card-replica-vs-backup
+    concept: cloud.replicas-and-backups
+    front: Why isn't a replica a backup?
+    back: >-
+      It copies every change at once, including a mistaken delete. Only a backup holds an
+      earlier moment to go back to.
+  - id: card-pitr
+    concept: cloud.pitr
+    front: What two things does point-in-time recovery need?
+    back: >-
+      A base backup of the data directory, and the archived write-ahead log since. Replaying
+      the log stops at the moment you choose.
+  - id: card-rpo-rto
+    concept: cloud.restore-testing
+    front: What do RPO and RTO measure?
+    back: >-
+      RPO is how much recent data you can afford to lose. RTO is how long you can afford the
+      restore to take.
+  - id: card-restore-test
+    concept: cloud.restore-testing
+    front: How do you know a backup works?
+    back: >-
+      Restore it on a schedule to a scratch server, check the data, and record the time
+      taken. An untested backup proves nothing.
+
+references:
+  - kind: docs
+    title: 25.3. Continuous Archiving and Point-in-Time Recovery (PITR)
+    authors: The PostgreSQL Global Development Group
+    venue: PostgreSQL 17 Documentation
+    url: https://www.postgresql.org/docs/17/continuous-archiving.html
+    note: '`archive_command`, base backups, `restore_command` and recovery targets, step by step.'
+    primary: true
+    verified: true
+  - kind: docs
+    title: pg_basebackup
+    authors: The PostgreSQL Global Development Group
+    venue: PostgreSQL 17 Documentation
+    url: https://www.postgresql.org/docs/17/app-pgbasebackup.html
+    note: Taking a base backup of a running server, and the `-R` flag that sets up a replica.
+    verified: true
+  - kind: docs
+    title: pg_dump
+    authors: The PostgreSQL Global Development Group
+    venue: PostgreSQL 17 Documentation
+    url: https://www.postgresql.org/docs/17/app-pgdump.html
+    note: The simple case, a logical dump of one database, and the custom format `-Fc`.
+    verified: true
+  - kind: docs
+    title: 26.4. Hot Standby
+    authors: The PostgreSQL Global Development Group
+    venue: PostgreSQL 17 Documentation
+    url: https://www.postgresql.org/docs/17/hot-standby.html
+    note: What a streaming replica is, and why it applies every change the primary makes.
+    verified: true
+
+deepDive: >-
+  This all ran on PostgreSQL 17.11 in Docker. The primary started with `archive_mode=on` and
+  an `archive_command` that copied WAL files to a volume. After the base backup at 1,000 rows
+  we added 200, noted `now()`, and deleted all 1,200. We forced the last WAL file out with
+  `pg_switch_wal()`.
+
+
+  On the primary, the two settings that matter are `archive_mode = on` and an
+  `archive_command` such as `'cp %p /wal/%f'`, where `%p` is the WAL file's path and `%f`
+  its name. In real life `/wal` is storage on another machine. The restore was a new
+  container on a copy of the base backup, with an empty `pg_wal` and a `recovery.signal`
+  file. It set `restore_command = 'cp /wal/%f %p'` and `recovery_target_time =
+  '2026-09-18 17:50:48+00'`. Its log read
+  "starting point-in-time recovery", then "recovery stopping before commit of transaction
+  741". It counted 1,200 rows about one second after starting. A real database is bigger.
+  Restore time grows with the base backup's size and the WAL to replay, which is why you
+  measure it.
+
+
+  The replica was built with `pg_basebackup -R`, which writes `standby.signal` and the
+  connection settings. It showed a `replay_lag` of 26 ms, and had replayed the delete a third
+  of a second later. A deliberately delayed replica, with `recovery_min_apply_delay`, gives a
+  short window to stop a mistake. It doesn't replace a backup.
+
+
+  The restore test in the parsons step ran on PostgreSQL 17.11 too. A custom-format dump
+  (`pg_dump -Fc`) of 5,000 bookings loaded into a scratch database in 0.36 s of real time,
+  and the count came back as 5000. A dump is fine for a small database or a copy for a
+  laptop. Managed databases do base backups and WAL archiving for you. The restore
+  test is still yours to run.

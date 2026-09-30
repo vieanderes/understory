@@ -1,0 +1,348 @@
+summary: >-
+  Idiomatic TypeScript uses the type system to make wrong code hard to write, not to decorate
+  right code. You annotate the edges, where other code or outside data meets yours, and let
+  inference fill in the middle. You model states as discriminated unions so impossible
+  combinations can't be built. You keep precise types with `satisfies` and `as const`, brand
+  values that share a primitive but not a meaning, and treat everything from outside the
+  program as `unknown` until it has been checked.
+
+
+  The theme underneath is trust. A type is a claim about a value at run time, and TypeScript
+  checks it only as far as you let it. `any`, `as` and a non-null `!` each tell the compiler
+  to stop checking, so professionals keep them rare, local and behind a real check. Strict
+  compiler options close the remaining gaps, such as an array read that might be
+  `undefined`.
+
+
+  These notes cover the narrowing toolbox and parsing at the boundary, exhaustive unions in
+  practice, `as const` and why many teams avoid `enum`, the utility types that derive one
+  type from another, type-only imports, and the strict options worth turning on.
+remember:
+  - '`any` switches type checking off in both directions, while `unknown` accepts anything but must be narrowed before use.'
+  - A cast with `as` is a promise, not a check, so outside data must be validated at run time before it gets a type.
+  - A discriminated union shares a literal tag such as `kind`, and checking the tag narrows the value to one member.
+  - Assigning the leftover value to `never` in a switch turns a forgotten case into a compile error.
+  - '`satisfies` checks a value against a type but keeps the inferred type, while an annotation replaces it with the wider one.'
+  - '`as const` makes literals readonly and exact, so an array of names can produce a union type with `typeof NAMES[number]`.'
+  - '`noUncheckedIndexedAccess` adds `undefined` to every index read, because an array or record may not hold that key.'
+  - Derive types from one source with `Pick`, `Omit`, `Partial`, `ReturnType` and `Awaited` instead of copying fields by hand.
+sections:
+  - title: The narrowing toolbox, and parsing at the boundary
+    body: |-
+      **Narrowing** is how TypeScript refines a wide type inside a branch. Each check below
+      is understood by the compiler:
+
+      - `typeof x === "string"` for primitives, `Array.isArray(x)` for arrays.
+      - `x instanceof Date` for class instances.
+      - `"email" in x` to learn a property exists.
+      - `x === null`, or a truthiness check, to remove `null` and `undefined`.
+      - `x.kind === "card"` on a discriminated union.
+
+      When a check is used in several places, wrap it in a **type guard**, a function whose
+      return type is `value is T`, or an **assertion function**, whose return type is
+      `asserts value is T` and which throws instead of returning `false`.
+
+      ```ts
+      type Booking = { id: string; guests: number };
+
+      function isBooking(value: unknown): value is Booking {
+        return (
+          typeof value === "object" && value !== null &&
+          "id" in value && typeof value.id === "string" &&
+          "guests" in value && typeof value.guests === "number"
+        );
+      }
+
+      function assertIsBooking(value: unknown): asserts value is Booking {
+        if (!isBooking(value)) throw new Error("Not a booking");
+      }
+
+      const raw: unknown = JSON.parse('{"id":"b_1","guests":2}');
+      assertIsBooking(raw);
+      console.log(raw.id.toUpperCase()); // B_1, and raw is a Booking from here on
+      ```
+
+      The compiler trusts a guard's body completely. If `isBooking` forgets a check, the lie
+      spreads everywhere it's used, so guards need their own tests.
+
+      Hand-written guards get long fast. In production, parse outside data with a schema
+      library such as Zod, which checks the value and produces the type from one definition:
+
+      ```ts
+      import { z } from "zod";
+
+      const BookingSchema = z.object({
+        id: z.string().startsWith("b_"),
+        guests: z.number().int().min(1).max(12),
+        notes: z.string().optional(),
+      });
+      type Booking = z.infer<typeof BookingSchema>;
+
+      const result = BookingSchema.safeParse({ id: "b_2", guests: 40 });
+      if (!result.success) console.log(result.error.issues[0]?.path); // ["guests"]
+      ```
+
+      Put the parse at every edge: request bodies, API responses, `localStorage`, environment
+      variables, messages from a queue, and the JSON an AI model returns. Inside the edge,
+      the types can be trusted because a check really happened.
+  - title: Unions in practice, and exhaustiveness
+    body: |-
+      Discriminated unions shine wherever something has a fixed set of shapes: request state,
+      payment methods, and especially the actions of a reducer. The tag has to be a literal
+      type, such as `"added"`, for narrowing to work.
+
+      ```ts
+      type Item = { id: string; price: number; qty: number };
+
+      type CartAction =
+        | { type: "added"; item: Item }
+        | { type: "removed"; id: string }
+        | { type: "quantityChanged"; id: string; qty: number }
+        | { type: "cleared" };
+
+      function cartReducer(items: Item[], action: CartAction): Item[] {
+        switch (action.type) {
+          case "added":
+            return [...items, action.item];
+          case "removed":
+            return items.filter((item) => item.id !== action.id);
+          case "quantityChanged":
+            return items.map((item) =>
+              item.id === action.id ? { ...item, qty: action.qty } : item,
+            );
+          default:
+            action satisfies never;
+            throw new Error(`Unhandled action: ${JSON.stringify(action)}`);
+        }
+      }
+      ```
+
+      The `"cleared"` case is missing, so `tsc --strict` reports: `Type '{ type: "cleared"; }'
+      does not satisfy the expected type 'never'.` The error names the exact member you
+      forgot. `action satisfies never` does the same job as the lesson's
+      `const unreachable: never = payment`, without a variable. Keep the `throw`: types
+      vanish at run time, and data from a server or an old saved state can still arrive
+      with a tag your code has never seen.
+
+      The same thinking applies to state. Instead of `isLoading`, `error` and `data` as three
+      separate fields that allow eight combinations, write one union:
+
+      ```ts
+      type RemoteData<T> =
+        | { status: "idle" }
+        | { status: "loading" }
+        | { status: "failed"; error: string }
+        | { status: "done"; data: T };
+      ```
+
+      Only four states exist, and code that reads `data` must first prove the status is
+      `"done"`.
+  - title: as const, literal unions, and why teams avoid enum
+    body: |-
+      `as const` tells TypeScript to infer the narrowest type: literals instead of `string`,
+      readonly arrays and properties. That lets one runtime array be the single source of a
+      type, and of the check that validates it.
+
+      ```ts
+      export const ROLES = ["guest", "member", "admin"] as const;
+      export type Role = (typeof ROLES)[number]; // "guest" | "member" | "admin"
+
+      export function isRole(value: string): value is Role {
+        return (ROLES as readonly string[]).includes(value);
+      }
+
+      const STATUS = { Pending: "pending", Paid: "paid" } as const;
+      type Status = (typeof STATUS)[keyof typeof STATUS]; // "pending" | "paid"
+      ```
+
+      That object gives you `STATUS.Paid` at call sites, like an enum, while the values stay
+      plain strings. Many teams prefer it, or a bare union, to `enum`, for four reasons:
+
+      - An `enum` is not only a type. It emits a JavaScript object, so it isn't erased like
+        the rest of TypeScript.
+      - Node 24 runs `.ts` files by stripping types, and it refuses enums:
+        `ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX: TypeScript enum is not supported in strip-only
+        mode`. The `erasableSyntaxOnly` compiler option reports enums at compile time for the
+        same reason.
+      - Numeric enums are loose. A literal `7` is rejected where a `Status` is expected, but
+        a variable of type `number` is accepted, and `Status[7]` is `undefined` at run time.
+      - A string enum value can't be passed as a plain string literal. `setStatus("paid")`
+        fails if the parameter is an enum, which is awkward for data from JSON.
+
+      Unions of string literals avoid all four, work with `satisfies` and `switch`
+      exhaustiveness, and appear in error messages as the actual values.
+  - title: Deriving types, and type-only imports
+    body: |-
+      A professional codebase defines each shape once and derives the rest, so a new field
+      appears everywhere it should. The built-in **utility types** cover most needs:
+
+      ```ts
+      type Book = { id: string; title: string; author: string; isbn: string; createdAt: Date };
+
+      type NewBook = Omit<Book, "id" | "createdAt">;          // what a form submits
+      type BookPatch = Partial<Pick<Book, "title" | "author">>; // what an edit may change
+      type Catalogue = Readonly<Record<string, Book>>;
+
+      declare function fetchBook(id: string): Promise<Book>;
+      type Fetched = Awaited<ReturnType<typeof fetchBook>>;   // Book
+      type FetchArgs = Parameters<typeof fetchBook>;          // [id: string]
+      ```
+
+      With these, `updateBook("b_1", { isbn: "x" })` fails to compile, because `isbn` isn't in
+      `BookPatch`. Others worth knowing: `Required`, `NonNullable`, and `Extract` and
+      `Exclude`, which filter the members of a union.
+
+      Brands can be made reusable in the same spirit. A `unique symbol` key can't clash with a
+      real property, and `declare` means nothing is emitted:
+
+      ```ts
+      declare const brand: unique symbol;
+      type Brand<T, Name extends string> = T & { readonly [brand]: Name };
+
+      type Pence = Brand<number, "Pence">;
+      function toPence(pounds: number): Pence {
+        if (!Number.isFinite(pounds)) throw new Error(`Not a price: ${pounds}`);
+        return Math.round(pounds * 100) as Pence;
+      }
+      ```
+
+      A plain `499` no longer fits where `Pence` is expected, so pounds and pence can't be
+      mixed by accident. Arithmetic on a `Pence` gives back a plain `number`, which is the
+      honest answer: the result needs checking again.
+
+      **Type-only imports** say that an import disappears at run time: `import type { Book }`
+      or `import { type Book, loadBook }`. With `verbatimModuleSyntax` on, TypeScript
+      requires them. Without the keyword, an import of a type fails with error TS1484 at
+      compile time. When Node runs the file by stripping types, the same missing keyword
+      fails at run time instead: `does not provide an export named 'Book'`.
+  - title: The strict options worth turning on
+    body: |-
+      `strict: true` is the baseline. It turns on a family of checks, including
+      `strictNullChecks`, `noImplicitAny` and `strictFunctionTypes`. A few important checks
+      sit outside that family and have to be enabled by name.
+
+      **`noUncheckedIndexedAccess`** makes every index read include `undefined`, because a
+      record might not hold the key and an array might be shorter than you think:
+
+      ```ts
+      const prices: Record<string, number> = { tea: 3 };
+      const scores = [90, 72];
+
+      const coffee = prices["coffee"];
+      coffee.toFixed(2); // error TS18048: 'coffee' is possibly 'undefined'.
+      const third = scores[2];
+      third.toFixed(0);  // error TS18048: 'third' is possibly 'undefined'.
+
+      for (const score of scores) score.toFixed(0); // fine, the loop only sees real items
+      const tea = prices["tea"] ?? 0;               // fine, the fallback removes undefined
+      ```
+
+      Under `strict` alone, both errors compile, and both crash at run time. The cost is a
+      check or a `??` at each index read, which is usually a real question you had skipped.
+
+      **`exactOptionalPropertyTypes`** separates "the key is absent" from "the key is
+      `undefined`". With it, `{ name: "Ana", nickname: undefined }` isn't a valid value for
+      `{ name: string; nickname?: string }`. That matters when absent and `undefined` mean
+      different things, as in a patch that clears a field.
+
+      Others worth turning on: `noImplicitOverride`, which requires `override` on methods
+      that replace a parent's; `noFallthroughCasesInSwitch`; `verbatimModuleSyntax`, for
+      predictable imports; and `erasableSyntaxOnly`, if the code will run through type
+      stripping. On an existing codebase, enable one option at a time and fix the errors in
+      their own commits.
+pitfalls:
+  - "**Casting outside data with `as`.** It compiles and checks nothing, so a `role: \"admin\"` sails through. Take the value as `unknown` and parse it with a guard or a schema."
+  - "**Using `any` to silence an error.** It spreads: everything that touches it becomes unchecked too. Use `unknown` and narrow, or fix the type that caused the error."
+  - "**The non-null assertion `!` as a habit.** `user!.email` crashes the same way the error warned about. Handle the missing case, or restructure so it can't be missing."
+  - "**Optional fields for states.** `{ isLoading?: boolean; error?: string; data?: T }` allows loading with an error and data at once. Use a discriminated union on a `status` tag."
+  - "**Annotating a config object.** `const themes: Record<string, Theme>` widens the keys to `string`, so typos compile. Use `satisfies Record<string, Theme>`."
+  - "**Trusting a type guard without testing it.** The compiler believes `value is T` whatever the body does. Test guards with bad input, or generate them from a schema."
+  - "**Dropping the runtime `throw` from an exhaustive switch.** Types don't exist at run time, and old or foreign data can hold a tag you've never seen. Keep the `never` check and the `throw`."
+  - "**Copying a type by hand.** A second `BookForm` type drifts from `Book` when a field changes. Derive it with `Pick`, `Omit` or `Partial`."
+interview:
+  - question: What's the difference between `any` and `unknown`, and when would you use each?
+    answer: >-
+      Both accept any value, but `any` turns checking off while `unknown` forces a check
+      before use. With `any`, you can call any method and pass the value anywhere, and it
+      silently infects whatever it touches. With `unknown`, TypeScript refuses property
+      access until you narrow, with `typeof`, `in`, a type guard or a schema parse. So I type
+      everything from outside the program as `unknown`: `JSON.parse` results, request
+      bodies, API responses, `catch` variables. I'd accept `any` only at a small, commented
+      boundary, such as an untyped third-party library, and wrap it immediately in a typed
+      function. The trade-off is a few lines of narrowing, which is the check the code
+      needed anyway.
+  - question: How do you make sure data coming from an API actually matches your TypeScript types?
+    answer: >-
+      I validate it at run time where it enters, because types are erased and a cast checks
+      nothing. In practice I define a schema with a library such as Zod, derive the type with
+      `z.infer`, and call `safeParse` on every response or request body. On failure I return
+      a clear error, or log and degrade, rather than letting a malformed object travel deep
+      into the app. For a small shape a hand-written type guard works, but it needs tests,
+      because the compiler trusts its body. The payoff is that everything past the boundary
+      can be trusted. The cost is a little run-time work and a dependency, which is cheap
+      compared with debugging `undefined` far from where the bad data came in.
+  - question: What's a discriminated union, and why would you use one?
+    answer: >-
+      It's a union of object types that share a literal tag field, such as `status` or
+      `kind`, so checking the tag tells TypeScript exactly which member you have. I use it
+      to make illegal states unrepresentable. Request state as `idle`, `loading`, `failed`
+      with an `error`, or `done` with `data`, instead of three optional fields that allow
+      eight combinations. Reducer actions and payment methods are other classic cases. In a
+      `switch` on the tag, each branch can read its own fields without `?`, and assigning the
+      leftover to `never` makes a forgotten case a compile error. I keep a runtime `throw` in
+      that default too, since data from outside can still hold an unknown tag. The trade-off
+      is a little more ceremony than a flat object.
+  - question: When do you use `satisfies`, a type annotation, or `as`?
+    answer: >-
+      An annotation declares what a value is and widens it to that type. `satisfies` checks a
+      value against a type while keeping its precise inferred type. `as` overrides the
+      compiler without checking. I annotate function parameters and exported return types,
+      the edges of my code. I use `satisfies` for config objects and lookup tables: with
+      `satisfies Record<string, Theme>`, each value is checked but the keys stay
+      `"light" | "dark"`, so a typo in a theme name fails to compile. I use `as` almost
+      never: only after a real runtime check, as in a branded-type constructor, or for
+      `as const`, which is a different thing that narrows. An unexplained `as` in review
+      is a question I always ask.
+  - question: Would you use enums in a new TypeScript codebase?
+    answer: >-
+      Usually not: I'd use a union of string literals, or an `as const` object when I want
+      named constants. Enums are one of the few TypeScript features that emit runtime code,
+      so they don't fit tools that only strip types. Node 24 runs TypeScript that way and
+      refuses enums outright, and the `erasableSyntaxOnly` option flags them for the same
+      reason. Numeric enums are also loose: any `number` variable is accepted as an enum
+      value. String literal unions give the same autocompletion and exhaustiveness checks,
+      read clearly in error messages, and accept plain strings from JSON. If a codebase
+      already uses enums consistently, I wouldn't rewrite them for style alone; the cost of
+      churn would outweigh the gain.
+  - question: Which compiler options would you add beyond `strict`, and why?
+    answer: >-
+      `noUncheckedIndexedAccess` first. It adds `undefined` to every array index and record
+      lookup, which catches the classic crash of reading `items[0]` from an empty list or a
+      key that isn't there. `strict` alone lets those compile. Next,
+      `exactOptionalPropertyTypes`, which separates a missing key from one set to
+      `undefined`, useful for patch objects. Then `noImplicitOverride` and
+      `noFallthroughCasesInSwitch` for safer classes and switches, and
+      `verbatimModuleSyntax` so type-only imports are explicit and erased predictably. The
+      trade-off is noise: `noUncheckedIndexedAccess` adds checks after loops over indices, so
+      I'd prefer `for...of` and turn options on one at a time in existing code.
+terms:
+  - term: Illegal states
+    say: Validate the object before you use it.
+    means: Model data as a discriminated union, so impossible combinations, such as a cancelled order
+      with a delivery date, can't be built at all.
+  - term: "`satisfies`"
+    say: Another way to write a type annotation.
+    means: "`satisfies` checks a value against a type but keeps the value's own, narrower inferred type.
+      An annotation replaces it with the wider declared one."
+  - term: Non-null assertion (`!`)
+    say: It checks the value isn't null.
+    means: It tells the compiler to assume the value isn't `null` or `undefined`. It checks nothing and
+      emits no code.
+  - term: "`noUncheckedIndexedAccess`"
+    say: "`strict` already covers that."
+    means: "`strict` still types `arr[i]` as the element type. This option adds `undefined` to every
+      index read, because the key may not exist."
+  - term: "`enum`"
+    say: The TypeScript way to list options.
+    means: An enum emits run-time code and behaves unlike the rest of the type system. Many teams use an
+      `as const` array or object with a literal union instead.

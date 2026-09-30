@@ -1,0 +1,256 @@
+summary: >-
+  A classifier gives you a probability; a threshold turns it into an action. Two thresholds
+  make three bands: above the high one the system acts on its own, between them a person
+  decides, and below the low one it refuses or asks for more. Where the lines sit is a
+  business decision written as a number: how much a wrong automatic action costs against a
+  minute of someone's time.
+
+
+  Thresholds are chosen from labelled data, not picked by feel. You score a set of past
+  cases whose right answer is known, then read off precision and recall at each candidate
+  cut-off. Raising the bar makes automatic actions right more often and sends more work to
+  people. Reversible, cheap actions get a low bar; irreversible ones get a high bar or none.
+
+
+  All of this assumes the scores mean what they say. A **calibrated** 0.9 is right nine
+  times in ten, and many models are overconfident. So you check calibration with a bucket
+  table, fix it if needed, and choose the thresholds again whenever the model, the prompt or
+  the traffic changes.
+remember:
+  - A threshold is only valid for the model and data it was chosen on, so choose it again after every model or prompt change.
+  - Choose thresholds from labelled cases by the cost of each error, not by a round number that feels safe.
+  - Raising the high threshold usually raises precision and lowers recall, sending more cases to people.
+  - Precision can rise and fall as the threshold drops, so check every candidate instead of stopping at the first failure.
+  - A calibrated score of 0.9 is right about 90% of the time, which you check by comparing each bucket's mean score with its hit rate.
+  - Temperature scaling fixes overconfidence by dividing the logits by one number fitted on held-out data, without changing which label wins.
+  - A precision measured on a handful of cases is a wide guess, so label more cases where the decision is expensive.
+  - The human band needs a queue with an owner and a time limit, or it becomes the place tickets go to die.
+sections:
+  - title: Choosing both thresholds by expected cost
+    body: |-
+      The lesson fixed a precision target and found the lowest threshold that met it. A more
+      general method puts a price on every outcome and picks the pair of thresholds with the
+      lowest total cost on labelled data. The prices don't need to be exact; the ratio
+      between them does the work.
+
+      ```python
+      SCORES = [0.98, 0.97, 0.95, 0.93, 0.92, 0.91, 0.88, 0.85, 0.82, 0.78,
+                0.74, 0.71, 0.66, 0.62, 0.55, 0.48, 0.35, 0.22, 0.15, 0.05]
+      LABELS = [1, 1, 1, 1, 0, 1, 1, 0, 1, 1, 0, 1, 0, 1, 0, 0, 0, 0, 1, 0]
+
+      WRONG_REFUND = 40.0   # money paid out that shouldn't have been
+      REVIEW = 2.0          # a few minutes of an agent's time
+      MISSED_REFUND = 10.0  # an unhappy customer who had to ask twice
+
+
+      def total_cost(high: float, low: float) -> float:
+          cost = 0.0
+          for s, is_refund in zip(SCORES, LABELS):
+              if s >= high:
+                  cost += 0 if is_refund else WRONG_REFUND   # automated
+              elif s >= low:
+                  cost += REVIEW                             # a person decides, correctly
+              else:
+                  cost += MISSED_REFUND if is_refund else 0  # asked to explain more
+          return cost
+
+
+      candidates = sorted(set(SCORES) | {1.01})
+      best = min(
+          ((total_cost(h, l), h, l) for h in candidates for l in candidates if l <= h),
+          key=lambda item: item[0],
+      )
+      print("cost", best[0], "high", best[1], "low", best[2])  # cost 30.0 high 0.93 low 0.15
+      print("automate everything:", total_cost(0.0, 0.0))     # 360.0
+      print("review everything:", total_cost(1.01, 0.0))      # 40.0
+      ```
+
+      The two baselines are worth printing every time. If the best pair barely beats
+      "review everything", automation isn't paying for its risk yet. Change the prices and
+      the answer moves: make a wrong refund cost 400 and the high threshold rises; make
+      reviews expensive and the middle band shrinks. Add a capacity limit too, because a
+      middle band that sends 5,000 tickets a day to a team of three isn't a plan.
+  - title: Reading a calibration table
+    body: |-
+      A reliability table groups labelled cases by score and compares each bucket's average
+      score with how often it was right. With only 20 cases, five buckets keep a few cases in
+      each.
+
+      ```python
+      SCORES = [0.98, 0.97, 0.95, 0.93, 0.92, 0.91, 0.88, 0.85, 0.82, 0.78,
+                0.74, 0.71, 0.66, 0.62, 0.55, 0.48, 0.35, 0.22, 0.15, 0.05]
+      LABELS = [1, 1, 1, 1, 0, 1, 1, 0, 1, 1, 0, 1, 0, 1, 0, 0, 0, 0, 1, 0]
+
+
+      def reliability(scores: list[float], labels: list[int], bins: int = 5):
+          rows = []
+          for b in range(bins):
+              members = [(s, y) for s, y in zip(scores, labels) if min(int(s * bins), bins - 1) == b]
+              if members:
+                  mean_score = sum(s for s, _ in members) / len(members)
+                  hit_rate = sum(y for _, y in members) / len(members)
+                  rows.append((b / bins, (b + 1) / bins, len(members), mean_score, hit_rate))
+          return rows
+
+
+      def ece(rows, n: int) -> float:
+          return sum(count / n * abs(mean - hits) for _, _, count, mean, hits in rows)
+
+
+      rows = reliability(SCORES, LABELS)
+      for low, high, count, mean, hits in rows:
+          print(f"{low:.1f}-{high:.1f}  n={count:2}  mean score {mean:.3f}  hit rate {hits:.3f}")
+      print("ECE", round(ece(rows, len(SCORES)), 3))
+      # 0.0-0.2  n= 2  mean score 0.100  hit rate 0.500
+      # 0.2-0.4  n= 2  mean score 0.285  hit rate 0.000
+      # 0.4-0.6  n= 2  mean score 0.515  hit rate 0.000
+      # 0.6-0.8  n= 5  mean score 0.702  hit rate 0.600
+      # 0.8-1.0  n= 9  mean score 0.912  hit rate 0.778
+      # ECE 0.206
+      ```
+
+      Read the top bucket first, because that's where automation happens: the model says
+      0.91 on average and is right 78% of the time, so it's overconfident exactly where it
+      matters. **Expected calibration error** is the gap in each bucket weighted by its
+      share of cases. It's one number for a dashboard, but the table shows where the gap is.
+      The two-case buckets at the bottom are noise; the next section says how much.
+  - title: Temperature scaling, the standard fix
+    body: |-
+      If the scores are overconfident but rank cases well, you can fix the numbers without
+      retraining. Convert each probability back to a **logit**, the raw score before the
+      final squashing, divide by a temperature `T`, and squash again. `T` above 1 softens
+      confidence, below 1 sharpens it. Fit `T` by minimising the negative log-likelihood on
+      labelled data.
+
+      ```python
+      import math
+
+      SCORES = [0.98, 0.97, 0.95, 0.93, 0.92, 0.91, 0.88, 0.85, 0.82, 0.78,
+                0.74, 0.71, 0.66, 0.62, 0.55, 0.48, 0.35, 0.22, 0.15, 0.05]
+      LABELS = [1, 1, 1, 1, 0, 1, 1, 0, 1, 1, 0, 1, 0, 1, 0, 0, 0, 0, 1, 0]
+
+
+      def logit(p: float) -> float:
+          return math.log(p / (1 - p))
+
+
+      def scaled(p: float, t: float) -> float:
+          return 1 / (1 + math.exp(-logit(p) / t))
+
+
+      def nll(scores: list[float], labels: list[int], t: float) -> float:
+          total = 0.0
+          for p, y in zip(scores, labels):
+              q = scaled(p, t)
+              total -= math.log(q) if y else math.log(1 - q)
+          return total / len(scores)
+
+
+      temps = [round(0.5 + 0.05 * i, 2) for i in range(71)]  # 0.5 to 4.0
+      best_t = min(temps, key=lambda t: nll(SCORES, LABELS, t))
+      print("T =", best_t)  # T = 1.85
+      print("NLL before", round(nll(SCORES, LABELS, 1.0), 3), "after", round(nll(SCORES, LABELS, best_t), 3))
+      # NLL before 0.63 after 0.579
+      for p in (0.98, 0.9, 0.5, 0.1):
+          print(p, "->", round(scaled(p, best_t), 3))
+      # 0.98 -> 0.891, 0.9 -> 0.766, 0.5 -> 0.5, 0.1 -> 0.234
+      ```
+
+      Scores keep their order, so which label wins is unchanged, but a raw 0.9 now reads
+      0.77. This example fits on the same 20 cases only to show the mechanics. In production,
+      fit `T` on a held-out calibration set and check the table on a separate test set. After
+      calibration, choose the thresholds again, because every score has moved.
+  - title: How sure is a precision measured on six cases?
+    body: |-
+      "Five of six automatic refunds were right" sounds like 83% precision. With six cases,
+      the true rate could be far lower. A **confidence interval** says how far. The Wilson
+      interval behaves well for small counts and rates near 0 or 1.
+
+      ```python
+      import math
+
+
+      def wilson(hits: int, n: int, z: float = 1.96) -> tuple[float, float]:
+          p = hits / n
+          centre = (p + z * z / (2 * n)) / (1 + z * z / n)
+          half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / (1 + z * z / n)
+          return centre - half, centre + half
+
+
+      for hits, n in [(5, 6), (50, 60), (500, 600)]:
+          low, high = wilson(hits, n)
+          print(f"{hits}/{n}: precision {hits / n:.2f}, 95% interval {low:.2f} to {high:.2f}")
+      # 5/6: precision 0.83, 95% interval 0.44 to 0.97
+      # 50/60: precision 0.83, 95% interval 0.72 to 0.91
+      # 500/600: precision 0.83, 95% interval 0.80 to 0.86
+      ```
+
+      Same point estimate, very different certainty. Two practical rules follow. Label more
+      cases near the threshold, where the decision is made, rather than more clear-cut cases far
+      from it. And set the threshold so the lower end of the interval, not the point
+      estimate, clears your target when a mistake is expensive.
+  - title: Operating thresholds in production
+    body: |-
+      A threshold is a setting, so treat it like one: store it in configuration next to the
+      model version it belongs to, review changes, and record which threshold made each
+      decision. Then an audit can replay why a refund went through.
+
+      Launch in **shadow mode** first. The classifier scores live traffic and logs what it
+      would have done, while people keep deciding. Comparing the two gives you labelled
+      production data and a precision estimate before any money moves.
+
+      After launch, watch the band shares. If the share of automatic actions jumps from 40%
+      to 70% overnight with no product change, the scores have shifted: a new model version,
+      a prompt edit, or new kinds of traffic. Sample the automatic band for human review
+      every week, since that is the only place where errors reach customers unseen.
+
+      Thresholds can differ per label and per action. A spam filter that hides a message can
+      act at 0.95; a refund at 0.9 up to a small amount and never above it; an account
+      deletion perhaps never automatically. The model is the same; the cost of a mistake
+      differs.
+pitfalls:
+  - '**Keeping the old threshold after a model upgrade.** The new model''s 0.9 may be right 75% of the time. Rebuild the calibration table and choose thresholds again before shipping.'
+  - '**Stopping at the first threshold that fails.** Precision is not monotonic as the threshold falls, so a scan that stops early misses lower thresholds that pass. Check every distinct score.'
+  - '**Calibrating on the test set.** Fitting the temperature and measuring it on the same cases flatters the result. Split labelled data into a calibration set and a test set.'
+  - '**Trusting a precision from a handful of cases.** Five of six is compatible with a true rate below 50%. Report the interval, and label more cases near the threshold.'
+  - '**A human band with no capacity.** Sending thousands of tickets a day to a small team turns "review" into a backlog. Size the middle band to the team, with an owner and a time limit.'
+  - '**Bucketing a score of exactly 1.0 out of range.** `int(p * 10)` gives 10 for 1.0. Clamp with `min(int(p * bins), bins - 1)`.'
+interview:
+  - question: How do you choose the confidence threshold for an automatic action?
+    answer: >-
+      From labelled data and the cost of each kind of error, never by picking a round number.
+      I'd score a few hundred past cases with known outcomes, then compute precision and
+      recall, or better, total cost, at every candidate threshold: a wrong automatic action
+      costs money or trust, a review costs a few minutes, a refusal costs customer effort. I
+      pick the pair of thresholds with the lowest cost that the review team can handle, and
+      compare it with "review everything" to check automation pays. Irreversible actions get
+      a higher bar or stay manual. The trade-off is labelling effort, and the thresholds must
+      be redone whenever the model changes.
+  - question: What does calibration mean, and how would you check it?
+    answer: >-
+      A classifier is calibrated when its scores match reality: cases it scores 0.9 are right
+      about 90% of the time. I'd check it with a reliability table on held-out labelled data:
+      bucket the scores, then compare each bucket's mean score with its hit rate, and track
+      expected calibration error as a single dashboard number. Modern neural networks are
+      often overconfident, and the gap matters most in the top bucket, where automation
+      happens. If it's off, temperature scaling fitted on a separate calibration set usually
+      fixes it without changing rankings. Calibration drifts with model versions and traffic,
+      so I'd recheck it on every change and periodically on fresh labels.
+  - question: A new model version scores higher across the board. Can we keep the same thresholds?
+    answer: >-
+      No. A threshold only means something for the score distribution it was chosen on. If
+      the new model is more overconfident, its 0.9 might be right far less often, and more
+      wrong actions would go through automatically with nothing looking different. Before
+      shipping, I'd rebuild the calibration table on the same labelled set, choose the
+      thresholds again, and run the new version in shadow mode to compare its decisions with
+      the old one's. The threshold should be versioned with the model in configuration, so
+      rolling back the model rolls back its threshold too.
+  - question: Why have a middle band at all instead of one threshold?
+    answer: >-
+      Because between "sure enough to act" and "sure it's wrong" there's a range where a
+      person decides better and more cheaply than either automatic outcome. One threshold
+      forces every uncertain case into acting or refusing, so you trade wrong actions against
+      missed ones with nothing in between. A middle band sends only the uncertain cases to
+      people, which keeps precision high on automatic actions while keeping recall. The cost
+      is human time, so the band's width is set by the review team's capacity, and it needs a
+      queue with an owner and a time limit.

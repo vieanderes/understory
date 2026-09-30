@@ -1,0 +1,309 @@
+summary: >-
+  A route handler is an HTTP endpoint that lives in the same Next.js project as your pages.
+  You create a `route.ts` file inside `app`, export one function per HTTP method, and each
+  function takes a Web `Request` and returns a Web `Response`. The folders above the file
+  make the URL, exactly as they do for pages.
+
+
+  It exists for callers that aren't your own React tree: a phone app, a partner's server, a
+  payment provider's webhook, a feed reader asking for `rss.xml`, or a Client Component that
+  needs JSON. Your own pages don't need it. A Server Component reads data straight from its
+  source, and a Server Action handles your own forms. Calling your own route handler from a
+  Server Component only adds an HTTP round trip, and at build time there's no server
+  listening, so a prerender that does it fails.
+
+
+  The chapter's other file, `proxy.ts`, runs before any route is rendered. It can redirect,
+  rewrite, set headers or answer by itself, on the paths its matcher lists. It's a first
+  filter, fast and coarse. It is never the only authorisation check, because the check that
+  counts has to sit next to the data.
+remember:
+  - A route handler is a public HTTP endpoint, so it authenticates, authorises and validates inside every function, whatever else sits in front of it.
+  - '`route.ts` exports functions named after HTTP methods; a method it doesn''t export gets `405`, and `OPTIONS` is answered for you with an `Allow` header.'
+  - A body that isn't valid JSON makes `request.json()` throw, so catch it and answer `400`, or the caller's mistake becomes your `500`.
+  - Route handlers aren't cached by default; with Cache Components a `GET` is prerendered only if it reads no request or uncached data, and `'use cache'` goes in a helper, not the handler.
+  - The second argument's `params` is a promise, so `const { id } = await params`.
+  - A `route.ts` and a `page.tsx` can't share a folder, because each takes over every HTTP method for its URL.
+  - '`proxy.ts` runs before routes render, on the paths its matcher lists; without a matcher it runs on every request, static files included.'
+  - Server Components read data directly and Server Actions change it; reach for a route handler when something outside your React tree calls you.
+sections:
+  - title: Which tool answers which caller
+    body: |-
+      Next.js gives you three ways to run server code, and they aren't interchangeable. The
+      question to ask is **who is calling**.
+
+      - Your own page needs data to render: read it in a **Server Component**, straight from
+        the database or API. No endpoint at all.
+      - Your own form or button changes data: use a **Server Action**. Next.js wires the POST,
+        and the response can carry the fresh page in the same round trip.
+      - Something else calls you, with a URL and a method it chooses: a mobile app, a
+        webhook, a partner, a feed reader, or a Client Component fetching JSON. That's a
+        **route handler**.
+
+      The docs are blunt about the common mix-up: fetch data in Server Components from its
+      source, not through your own route handlers. On a page rendered on demand, the detour
+      costs an extra HTTP round trip inside your own server. On a page prerendered at build
+      time, it fails, because no server is listening while `next build` runs.
+
+      Route handlers also shine as a small **backend for your frontend**. One handler can
+      call two internal services, merge and trim their answers, and hand the browser only
+      what it needs. The internal URLs and keys stay on the server. The docs add a limit
+      worth saying in an interview: this layer is publicly reachable and handles any HTTP
+      request, but it isn't a full backend replacement. Long jobs, queues and heavy
+      background work belong in a real service.
+  - title: A handler shaped for production
+    body: |-
+      The lesson's handler catches bad JSON. A real one does four jobs in a fixed order:
+      who's asking, what they sent, the change, and a response that shows only what the
+      caller needs. This one lets signed-in readers review a book in a library catalogue.
+
+      ```ts
+      // app/api/books/[id]/reviews/route.ts
+      type Ctx = { params: Promise<{ id: string }> };
+
+      export async function GET(request: Request, { params }: Ctx) {
+        const { id } = await params;
+        const limit = Number(new URL(request.url).searchParams.get('limit') ?? '20');
+        if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+          return Response.json({ error: 'limit must be 1 to 100' }, { status: 400 });
+        }
+        const page = await listReviews(id, limit);
+        return Response.json(page.map(({ id, stars, text }) => ({ id, stars, text })));
+      }
+
+      export async function POST(request: Request, { params }: Ctx) {
+        const session = await getSession(request);
+        if (!session) return Response.json({ error: 'Sign in first' }, { status: 401 });
+
+        const { id: bookId } = await params;
+        let body: unknown;
+        try {
+          body = await request.json();
+        } catch {
+          return Response.json({ error: 'Send JSON' }, { status: 400 });
+        }
+        const { stars, text } = (body ?? {}) as Record<string, unknown>;
+        if (!Number.isInteger(stars) || (stars as number) < 1 || (stars as number) > 5) {
+          return Response.json({ error: 'stars must be 1 to 5' }, { status: 422 });
+        }
+        if (typeof text !== 'string' || text.trim() === '' || text.length > 2000) {
+          return Response.json({ error: 'Write 1 to 2000 characters' }, { status: 422 });
+        }
+
+        const review = await saveReview({ bookId, userId: session.userId, stars: stars as number, text: text.trim() });
+        return Response.json(
+          { id: review.id, stars: review.stars, text: review.text },
+          { status: 201, headers: { Location: `/api/books/${bookId}/reviews/${review.id}` } },
+        );
+      }
+      ```
+
+      We ran it with stand-in `getSession`, `listReviews` and `saveReview` functions and real
+      `Request` objects. No token gave `401`, a form body gave `400`, nine stars gave `422`,
+      and a good review gave `201` with a `Location` header. The user id comes from the
+      session, never from the body. The response maps fields out explicitly, so a column
+      added to the table later doesn't leak.
+
+      Three details from the docs matter here. A body can be read only once, so call
+      `request.clone()` first if two readers need it. `GET` and `HEAD` carry no body. And an
+      error message sent to the client should never include internals such as a stack or a
+      SQL error: log those, and send a short, safe message.
+  - title: Caching a GET, before and after Cache Components
+    body: |-
+      By default a route handler runs on every request. Only `GET` can be cached; `POST`,
+      `PUT`, `PATCH` and `DELETE` never are, even in a file whose `GET` is.
+
+      Without Cache Components, you opt a `GET` in with a route option such as
+      `export const dynamic = 'force-static'`, or `export const revalidate = 60`. With
+      `cacheComponents: true`, those options are removed. A `GET` then follows the same model
+      as a page. It's prerendered at build time if it reads nothing uncached or
+      request-specific. Touching `request.url`, `request.headers`, `cookies()`, a database or
+      `Math.random()` stops the prerender, and the handler runs per request.
+
+      To cache data you'd otherwise query each time, move it into a helper marked
+      `'use cache'`. The directive can't go on the `GET` export itself.
+
+      ```ts
+      // app/api/books/route.ts, with cacheComponents: true
+      import { cacheLife, cacheTag } from 'next/cache';
+
+      async function getBooks() {
+        'use cache';
+        cacheLife('hours');
+        cacheTag('books');
+        return db.query('SELECT id, title FROM books ORDER BY title');
+      }
+
+      export async function GET() {
+        return Response.json(await getBooks());
+      }
+      ```
+
+      The tag lets something else refresh it. A **webhook** handler from a content system is
+      the classic pair: verify the caller, then call `revalidateTag('books', 'max')`, which
+      serves the old list once more while it refreshes behind the scenes. If the data must be
+      gone at once, pass `{ expire: 0 }` instead. `updateTag` isn't an option here: it only
+      works inside Server Actions, and calling it in a route handler throws.
+  - title: A webhook endpoint that can't be forged
+    body: |-
+      Webhooks are the job route handlers exist for, and they're where interviewers probe
+      security. The provider signs each request with a shared secret. You check the
+      signature over the **exact bytes** it signed, so read the body with `request.text()`,
+      not `request.json()`.
+
+      ```ts
+      // app/api/webhooks/catalogue/route.ts
+      import { createHmac, timingSafeEqual } from 'node:crypto';
+      import { revalidateTag } from 'next/cache';
+
+      export async function POST(request: Request) {
+        const raw = await request.text();
+        const sent = request.headers.get('x-signature') ?? '';
+        const expected = createHmac('sha256', process.env.CATALOGUE_WEBHOOK_SECRET!)
+          .update(raw)
+          .digest('hex');
+        const ok =
+          sent.length === expected.length && timingSafeEqual(Buffer.from(sent), Buffer.from(expected));
+        if (!ok) return new Response(null, { status: 401 });
+
+        const event = JSON.parse(raw) as { type: string; bookId: string };
+        if (event.type === 'book.updated') {
+          revalidateTag(`book-${event.bookId}`, 'max');
+          revalidateTag('books', 'max');
+        }
+        return new Response(null, { status: 204 });
+      }
+      ```
+
+      `timingSafeEqual` compares in constant time, so an attacker can't learn the signature
+      one character at a time from response times. It throws on buffers of different
+      lengths, which is why the length check comes first. The header name and the hex
+      encoding vary by provider; follow their documentation.
+
+      Providers retry when you're slow or fail, so the same event can arrive twice. A
+      revalidation is harmless to repeat. A handler that charges, emails or inserts should
+      record the event id and skip one it has already seen. Answer quickly with a `2xx`, and
+      push slow work to a queue.
+  - title: Proxy, precisely
+    body: |-
+      Next.js 16 renamed `middleware.ts` to `proxy.ts`, and the function to `proxy`. The
+      behaviour didn't change. A codemod, `npx @next/codemod@canary middleware-to-proxy .`,
+      does the rename. The new name says what it is: a layer in front of the app, run before
+      routes render, and a tool of last resort.
+
+      ```ts
+      // proxy.ts
+      import { NextResponse } from 'next/server';
+      import type { NextRequest } from 'next/server';
+
+      export function proxy(request: NextRequest) {
+        if (!request.cookies.has('session')) {
+          const signIn = new URL('/sign-in', request.url);
+          signIn.searchParams.set('next', request.nextUrl.pathname);
+          return NextResponse.redirect(signIn);
+        }
+        const headers = new Headers(request.headers);
+        headers.set('x-pathname', request.nextUrl.pathname);
+        return NextResponse.next({ request: { headers } });
+      }
+
+      export const config = { matcher: ['/account/:path*', '/orders/:path*'] };
+      ```
+
+      The cookie check is **optimistic**: a missing cookie means a visitor can't be signed in,
+      so the proxy skips a wasted render. It says nothing about whether the cookie is valid.
+      `NextResponse.next({ request: { headers } })` passes a header to your app;
+      `NextResponse.next({ headers })` would send it to the browser instead.
+
+      The sharp edges, all from the reference:
+
+      - Matchers must be constants, start with `/`, and are anchored to the start of the path.
+      - Without a matcher, the proxy runs for `_next/static`, images and `public` files too,
+        so a redirect can block your own CSS. Exclude them with a negative lookahead.
+      - Server Actions aren't separate routes. They're POSTs to the page that uses them, so
+        a matcher that skips a path skips its actions too.
+      - It runs in the Node.js runtime, and setting a `runtime` option in it throws.
+      - It's not for slow data fetching, and `fetch` cache options have no effect in it.
+      - For a fixed redirect, `redirects` in `next.config.ts` is simpler.
+pitfalls:
+  - >-
+    **Letting `request.json()` throw.** A form body or an empty body throws a `SyntaxError`,
+    and uncaught it becomes a `500` that blames you. Wrap the parse, answer `400`, then
+    validate each field.
+  - >-
+    **Trusting the proxy to protect data.** Matchers change, and a moved handler or action
+    silently leaves its coverage. Check the session and ownership inside each handler and
+    Server Action as well.
+  - >-
+    **A matcher that also catches static files.** A sign-in redirect on every path redirects
+    requests for CSS and scripts, and the sign-in page arrives unstyled. Scope the matcher,
+    or exclude `_next/static`, `_next/image` and metadata files.
+  - >-
+    **Fetching your own route handler from a Server Component.** It adds an HTTP round trip,
+    and it breaks the build for prerendered pages. Import the data function and call it
+    directly.
+  - >-
+    **Returning the database row.** A later column such as an email or an internal flag then
+    ships to every caller. Build the response object field by field.
+  - >-
+    **Reading the body twice.** The second `request.text()` or `request.json()` throws. Call
+    `request.clone()` before the first read if you need two.
+  - >-
+    **Using `updateTag` in a route handler.** It throws, because it only works in Server
+    Actions. Use `revalidateTag(tag, 'max')`, or `{ expire: 0 }` to drop the data at once.
+  - >-
+    **Carrying old caching habits into Cache Components.** `export const dynamic =
+    'force-static'` is removed when `cacheComponents` is on. Put the read in a helper marked
+    `'use cache'` with a `cacheLife`.
+interview:
+  - question: When do you use a route handler instead of a Server Action or a Server Component?
+    answer: >-
+      I pick by caller. If my own page needs data, a Server Component reads it straight from
+      the source. If my own form changes data, a Server Action handles it, and the response
+      can carry the refreshed page in one round trip. A route handler is for callers outside
+      my React tree: a mobile app, a webhook, a partner, an RSS reader, or a Client Component
+      that wants JSON. It gets a URL and methods I control and returns any content type. What
+      I avoid is a Server Component fetching my own route handler: it adds a network hop, and
+      a prerender fails because no server runs during the build. The trade-off is that a
+      route handler is a public contract, so I version it and validate it like any API.
+  - question: How do you secure a route handler? Isn't the proxy enough?
+    answer: >-
+      Every handler checks its own caller, because it's a public endpoint and anyone can send
+      the request. First authentication, from a session or a verified token. Then
+      authorisation, usually by putting the owner in the query so another user's row isn't
+      found. Then input validation, with a `400` for malformed bodies and `422` for bad
+      values, and a response built from chosen fields. The proxy is a useful optimistic
+      filter, for example redirecting visitors with no session cookie. But it only covers
+      paths its matcher lists, and a refactor can move a handler outside it with no error. I
+      also add rate limits on expensive endpoints, in code and at the host.
+  - question: Are route handlers cached in Next.js 16? How would you cache a GET?
+    answer: >-
+      No, they run on every request by default, and only `GET` can be cached at all. With
+      Cache Components enabled, a `GET` follows the page model: it's prerendered at build
+      time if it touches no request data and nothing uncached. Reading `request.url`,
+      headers, cookies or a database makes it run per request. To cache the expensive part, I
+      move the query into a helper with `'use cache'`, a `cacheLife` such as `'hours'` and a
+      `cacheTag`, and the handler calls that helper. Without Cache Components, the older
+      route option `dynamic = 'force-static'` or `revalidate` does it. The trade-off is
+      freshness, so I tag the data and revalidate on writes.
+  - question: Walk me through a webhook endpoint that refreshes cached pages when content changes.
+    answer: >-
+      It's a `POST` route handler that verifies, acts and answers fast. I read the raw body
+      with `request.text()`, because the provider's signature covers those exact bytes. I
+      compute an HMAC with the shared secret and compare it using `timingSafeEqual`,
+      returning `401` on a mismatch. Then I parse the event and call
+      `revalidateTag('book-42', 'max')`, which serves the old page once more while it
+      refreshes, or `{ expire: 0 }` if stale content is unacceptable. `updateTag` isn't
+      available there, since it's Server Actions only. Providers retry, so any
+      non-idempotent side effect records the event id first. I return `204` quickly and push
+      slow work to a queue.
+  - question: What is `proxy.ts`, and why did Next.js rename middleware?
+    answer: >-
+      It's one file at the project root whose function runs before routes render. It can
+      redirect, rewrite, change request or response headers, or answer directly, on the
+      paths its matcher lists. Next.js 16 renamed it because "middleware" suggested Express
+      middleware, a chain you put business logic in. "Proxy" says it's a network layer in
+      front of the app, one the team calls a last resort. I use it for coarse routing: locale
+      rewrites, A/B rewrites, optimistic sign-in redirects, security headers. I keep slow
+      data fetching and real authorisation out of it, and I scope the matcher so it skips
+      static assets.

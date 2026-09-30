@@ -1,0 +1,221 @@
+summary: >-
+  User files, photos, documents, video, don't belong on your server's disk or in your
+  database. The disk vanishes on redeploy and isn't shared between servers; the database is
+  built for small values and gets slow and expensive with large ones. They go to **object
+  storage** such as Amazon S3 or one of the many services that copy its API: flat keys in a
+  bucket, each object written and replaced whole, stored durably and cheaply.
+
+
+  Uploads are also one of the most dangerous inputs a web app accepts. The declared type and
+  file name are claims by the sender. A "photo" can be HTML that runs on your origin, a file
+  can be large enough to exhaust memory, and a key built from the sender's file name can
+  overwrite someone else's file. The lesson's defences are a size cap with `413`, a type
+  check on the first bytes with `415`, keys you generate, and serving with a type you set,
+  `nosniff` and `attachment`.
+
+
+  These notes cover what happens at scale: direct uploads with signed URLs so large files
+  never pass through your server, reading a body with a byte cap, what first-byte checks
+  can't catch and why re-encoding can, and how to serve private files through short-lived
+  links or a CDN.
+remember:
+  - Store files in object storage under keys your server generates, and keep only the key and metadata in the database.
+  - The declared `type` and file name come from the sender, so check the real type from the file's first bytes.
+  - Cap the size before reading the whole body, and answer `413 Content Too Large` when it's over.
+  - Serve uploads with the type you checked, `X-Content-Type-Options` set to `nosniff`, and `Content-Disposition` set to `attachment` unless you mean to display them.
+  - A signed URL grants one operation on one key until an expiry, and the server checks the user before signing it.
+  - Direct uploads to storage spare your server the bytes, but the server must still confirm the object before trusting it.
+  - Re-encoding images strips hidden metadata such as GPS location and removes content that only looked like an image.
+  - Serve user files from a separate domain, so anything that does run can't read your site's cookies.
+sections:
+  - title: Direct uploads with signed URLs, step by step
+    body: |-
+      Sending a 2 GB video through your API ties up memory, bandwidth and a request slot for
+      minutes. With a signed URL, the browser sends the bytes straight to storage and your
+      server only handles small JSON requests.
+
+      ```text
+      1. Browser  -> API      POST /uploads {kind: "video", size: 2000000000}
+      2. API      checks the user, picks key uploads/pending/7f3a.mp4,
+                  records a pending upload, signs a PUT for that key, 10 minutes
+      3. Browser  -> Storage  PUT <signed URL> with the bytes
+      4. Browser  -> API      POST /uploads/7f3a/complete
+      5. API      reads the object's size and first bytes from storage,
+                  moves or copies it to its final key, marks it ready
+      ```
+
+      Step 5 is the one people skip. The browser can upload anything to that URL, or nothing,
+      so the server checks the object before any other user sees it. Uploads that never
+      complete leave orphans; a storage lifecycle rule that deletes objects under
+      `uploads/pending/` after a day cleans them up. With S3, a presigned POST form can carry
+      a policy with a `content-length-range` condition, so storage itself refuses oversized
+      files.
+
+      A signed URL is a key, an expiry and a signature over both, made with a secret only
+      the server holds. S3 uses its own scheme, Signature Version 4, through the SDK's
+      presigner, and caps expiry at seven days. The idea fits in a few lines:
+
+      ```ts
+      import { createHmac, timingSafeEqual } from 'node:crypto';
+
+      const SECRET = process.env.SIGNING_SECRET ?? 'dev-only-secret';
+
+      const sign = (method: string, key: string, expires: number) =>
+        createHmac('sha256', SECRET).update(`${method}\n${key}\n${expires}`).digest('hex');
+
+      export function signedUrl(method: 'GET' | 'PUT', key: string, ttlSeconds: number, now = Date.now()) {
+        const expires = Math.floor(now / 1000) + ttlSeconds;
+        const url = new URL(`https://files.example/${key}`);
+        url.searchParams.set('expires', String(expires));
+        url.searchParams.set('signature', sign(method, key, expires));
+        return url.toString();
+      }
+
+      export function checkSignedUrl(method: string, raw: string, now = Date.now()): string | null {
+        const url = new URL(raw);
+        const key = url.pathname.slice(1);
+        const expires = Number(url.searchParams.get('expires'));
+        const given = Buffer.from(url.searchParams.get('signature') ?? '', 'hex');
+        const expected = Buffer.from(sign(method, key, expires), 'hex');
+        if (given.length !== expected.length || !timingSafeEqual(given, expected)) return null;
+        if (Math.floor(now / 1000) > expires) return null;
+        return key;
+      }
+      ```
+
+      A URL signed for `PUT` fails as a `GET`, fails with the key edited, and fails after its
+      expiry, because the method, key and expiry are all inside the signature.
+  - title: Reading a body with a byte cap
+    body: |-
+      `await request.formData()` and `await request.arrayBuffer()` read the whole body into
+      memory before you can check anything. A `Content-Length` header helps, but the sender
+      writes it, and a chunked request may not have one. The dependable cap counts bytes as
+      they arrive and stops at the limit.
+
+      ```ts
+      export async function readCapped(request: Request, maxBytes: number): Promise<Uint8Array | null> {
+        const declared = Number(request.headers.get('content-length') ?? 0);
+        if (declared > maxBytes) return null;
+        if (!request.body) return new Uint8Array();
+        const chunks: Uint8Array[] = [];
+        let total = 0;
+        for await (const chunk of request.body) {
+          total += chunk.byteLength;
+          if (total > maxBytes) return null; // leaving the loop cancels the stream
+          chunks.push(chunk);
+        }
+        const out = new Uint8Array(total);
+        let offset = 0;
+        for (const c of chunks) {
+          out.set(c, offset);
+          offset += c.byteLength;
+        }
+        return out;
+      }
+      ```
+
+      Tested with a 10-byte body, a 3 MB body with an honest length and a 5 MB stream with no
+      length, against a 2 MB cap: the first returns its bytes, the other two return `null`,
+      which the handler turns into `413`. Frameworks and proxies usually have a body size
+      setting too; set it, so an oversized request is refused before your code runs at all.
+  - title: What a first-bytes check misses
+    body: |-
+      Checking the signature bytes stops the common attack: a script renamed to `.png`. A few
+      signatures worth knowing:
+
+      ```text
+      PNG    137 80 78 71 13 10 26 10
+      JPEG   255 216 255
+      GIF    "GIF87a" or "GIF89a"
+      WebP   "RIFF" at 0, "WEBP" at 8
+      PDF    "%PDF-"
+      ```
+
+      It doesn't prove the rest of the file is harmless. A **polyglot** file starts like a
+      valid image and carries other content later, which some programs will read. An image
+      can be tiny on disk yet decode to an enormous pixel grid, a **decompression bomb** that
+      exhausts memory when you open it. And some formats are dangerous by design: SVG is XML
+      and can contain script, so treat SVG uploads as documents, not images, or refuse them.
+
+      Re-encoding answers most of this. Decode the image with an image library, check its
+      width and height against a limit before decoding fully, and write a fresh PNG, JPEG or
+      WebP. Only pixels survive the round trip, so polyglot tails, embedded scripts and
+      metadata disappear. That includes EXIF data, which on phone photos often holds the GPS
+      location where the photo was taken, a privacy leak on a public profile. Run the work in
+      a background job with a time and memory limit, since image decoders have had serious
+      security bugs.
+  - title: Serving files back
+    body: |-
+      Private files, such as invoices or chat attachments, stay in a private bucket. When a
+      user asks for one, the server checks they may see it and answers with a redirect to a
+      signed `GET` URL valid for a few minutes. The authorisation check happens on every
+      request; the bytes still come from storage.
+
+      Public files, such as avatars, go through a CDN. Name them by content, for example the
+      SHA-256 of the bytes, and a new upload gets a new key. The old URL never changes
+      meaning, so it can be cached for ever:
+
+      ```http
+      HTTP/1.1 200 OK
+      Content-Type: image/webp
+      Cache-Control: public, max-age=31536000, immutable
+      X-Content-Type-Options: nosniff
+      ```
+
+      Serve user content from a different domain from your app, not a subdomain that shares
+      cookies. If something slips past every check and runs as a page, it runs on an origin
+      that holds none of your users' sessions.
+
+      For downloads, `Content-Disposition: attachment; filename="invoice.pdf"` sets the saved
+      name. Build that name yourself from safe characters; a sender-supplied name with quotes
+      or line breaks can break the header.
+pitfalls:
+  - '**Using the sender''s file name as the key.** `../`, collisions and overwrites of other users'' files all follow. Generate the key, and store the original name as metadata if you need it.'
+  - '**Trusting `file.type`.** It comes from the sender, often from the extension. Check the first bytes, and better still, re-encode.'
+  - '**Reading the whole upload before checking its size.** One huge request fills memory. Check `Content-Length`, count bytes as they stream, and set the framework''s body limit.'
+  - '**Echoing the uploader''s content type when serving.** `nosniff` only stops guessing; it obeys a declared `text/html`. Send the type you checked.'
+  - '**Trusting a direct upload without checking it.** The browser can PUT anything to a signed URL. Inspect the object before marking it ready.'
+  - '**Long-lived signed URLs.** A link valid for a week can be shared or leaked. Sign for minutes and re-sign on demand.'
+  - '**Keeping EXIF metadata.** Phone photos can reveal where they were taken. Strip it by re-encoding.'
+interview:
+  - question: Design profile photo uploads for a large app.
+    answer: >-
+      Direct upload to object storage with a signed URL, then server-side checks and
+      re-encoding. The client asks the API for an upload; the API checks the user, picks a
+      key under a pending prefix and returns a short-lived signed `PUT` or presigned `POST`
+      with a size limit. The browser uploads straight to storage, then tells the API. A
+      background job reads the object, checks the first bytes and pixel dimensions,
+      re-encodes to WebP at a few sizes, strips EXIF, writes to content-addressed keys and
+      updates the user's row. A CDN serves them with long cache lifetimes from a separate
+      domain. A lifecycle rule deletes pending uploads after a day. The trade-off is more
+      moving parts than posting to the API, which only pays off once files are large or
+      numerous.
+  - question: Why use signed URLs instead of proxying files through your API?
+    answer: >-
+      Because they keep large byte streams off your servers while keeping authorisation on
+      them. The server still decides who may upload or download what, and encodes that
+      decision as a URL for one key, one method and a short expiry, signed with a secret.
+      Storage verifies the signature and does the heavy lifting of bandwidth and durability.
+      Your API servers stay small and fast. The costs are that a signed URL is a bearer token,
+      anyone holding it can use it until it expires, so expiries should be minutes, and that
+      you lose per-request control once it's issued: you can't revoke one early without
+      rotating the signing key.
+  - question: How do you make user-uploaded files safe to serve?
+    answer: >-
+      Assume every upload is hostile and put several layers between it and your users. Cap
+      the size before reading, check the real type from the bytes and allow only the formats
+      you need, and re-encode images so only pixels survive. Store under generated keys in a
+      private bucket. When serving, set the content type yourself, add `nosniff`, use
+      `attachment` for anything you don't intend to display, and serve from a separate
+      domain so script can't reach your cookies. For documents, add malware scanning. The
+      trade-off is cost and latency in the pipeline, which is why the checks run in a
+      background job while the user sees a "processing" state.
+  - question: Why not store files in PostgreSQL as bytea?
+    answer: >-
+      For small files at low volume it works, but it scales badly. Every file read goes
+      through the database's connections, memory and network, competing with queries that
+      need them. Backups and replicas grow with every upload, so restores get slow. You also
+      lose what object storage gives for free: CDN integration, signed URLs, lifecycle rules
+      and very cheap storage. The usual design keeps bytes in object storage and a row in
+      PostgreSQL with the key, size, type, owner and status. The trade-off is consistency: a
+      row and an object can drift apart, so you need cleanup for orphans in both directions.

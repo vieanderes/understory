@@ -1,0 +1,289 @@
+id: scale.concurrency-vs-parallelism
+title: Many things at once
+objective: Tell waiting work from computing work, and picture the copies of a server that run at once.
+level: essential
+minutes: 10
+concepts: [scale.concurrency, scale.parallelism, scale.cpu-and-io-bound, scale.server-copies]
+prerequisites: [js.promises, backend.first-endpoint, cs.os-and-networks]
+opening:
+  text: >-
+    You'll know what really happens when a thousand people use your app at once. And you'll
+    know which slow code more hardware can fix, a picture this whole chapter builds on.
+
+steps:
+  - type: prose
+    id: one-thread-many-requests
+    body: |-
+      Your Node server runs your JavaScript on one **thread**: a worker that does one thing
+      at a time. Yet it serves many requests at once. How?
+
+      ```js
+      async function showProfile(request) {
+        const user = await db.findUser(request.userId); // waits 95 ms
+        return renderProfile(user);                     // computes 5 ms
+      }
+      ```
+
+      Most of a request is waiting: for the database, for a model API.
+
+  - type: multiple-choice
+    id: pick-what-the-thread-does
+    concept: scale.concurrency
+    difficulty: 1
+    question: While this request waits 95 ms for the database, what does the thread do?
+    choices:
+      - text: Runs code for other requests
+        correct: true
+        feedback: >-
+          Right. `await` hands the thread back, and the next request's code runs.
+      - text: Sits idle until the reply comes
+        feedback: >-
+          That's how it would look without `await`. Waiting frees the thread for other work.
+      - text: Starts a second thread for this request
+        feedback: >-
+          Node doesn't start a thread per request. One thread takes turns between them.
+
+  - type: prose
+    id: name-concurrency
+    body: >-
+      That's **concurrency**: several tasks in progress over the same period, taking turns
+      on one thread. You used it with `Promise.all`: three calls started together, and their
+      waits overlapped.
+
+
+      Concurrency overlaps waiting. It can't overlap computing. One thread still computes one
+      thing at a time.
+
+  - type: prose
+    id: name-parallelism
+    body: >-
+      To overlap computing, you need **parallelism**: work running at the same instant on
+      separate cores. A **core** is one processor inside the chip, and each can run its own
+      thread. Laptops often have eight or more.
+
+
+      Work that mostly waits on a network or a disk is **I/O-bound**, from input and output.
+      Work that mostly computes is **CPU-bound**.
+
+  - type: code-challenge
+    id: write-overlaps
+    concept: scale.cpu-and-io-bound
+    difficulty: 2
+    language: js
+    starter: starter.js
+    solution: solution.js
+    tests: tests.js
+    editable: '10-11'
+    prompt: >-
+      Don't take our word for it: measure it. Write `overlaps(task, now)`. Time one run of
+      the async `task`, reading the clock with `now()`. Then time three at once with
+      `timeThree`.
+
+
+      Return `true` when three at once took less than twice one run. The tests pass a task
+      that waits and a task that computes.
+    hints:
+      - Read the clock with `now()`, `await task()`, then read it again. The difference is one run.
+      - '`timeThree(task, now)` already returns how long three runs took together. Await it.'
+      - 'Finish with `return three < one * 2;`'
+
+  - type: multiple-choice
+    id: pick-what-overlaps
+    concept: scale.cpu-and-io-bound
+    difficulty: 2
+    question: Which of these gets faster with `Promise.all`?
+    choices:
+      - text: Asking a model API to summarise 20 documents
+        correct: true
+        feedback: >-
+          Right. Each call is mostly waiting for the model, so the waits overlap.
+      - text: Resizing 20 photos in plain JavaScript
+        feedback: >-
+          Resizing is pixel maths on your thread. Twenty resizes still run one after another.
+      - text: Counting words in 20 books already in memory
+        feedback: >-
+          The books are loaded, so nothing waits. Counting is computing, and one thread does it all.
+
+  - type: ai-review
+    id: review-promise-all-cpu
+    concept: scale.parallelism
+    difficulty: 3
+    language: js
+    request: Making thumbnails for 500 uploads one by one is slow. Do them in parallel.
+    flawClass: performance
+    code: |
+      // pure JavaScript pixel maths, about 40 ms per photo
+      function makeThumbnail(pixels) {
+        return shrink(pixels, 200);
+      }
+
+      export async function makeThumbnails(photos) {
+        return Promise.all(photos.map(async (pixels) => makeThumbnail(pixels)));
+      }
+    prompt: >-
+      A coding assistant wrote this. Every thumbnail is correct. With 500 photos it's no
+      faster, and the server stops answering anyone else meanwhile. Tap the line at fault.
+    lines: [7]
+    reasons:
+      - text: Shrinking pixels is computing, and one thread does it all
+        correct: true
+        feedback: >-
+          Yes. It's concurrent, not parallel. Computing only overlaps on other threads.
+      - text: '`Promise.all` fails if one photo is empty'
+        feedback: >-
+          Nothing here rejects on an empty photo. Look at what kind of work is being overlapped.
+      - text: '`async` should be removed from the arrow function'
+        feedback: >-
+          Removing it changes nothing. With or without it, the maths runs on one thread.
+    fix: |
+      // Computing needs other threads. Lesson 3 moves work like this to worker threads.
+      export async function makeThumbnails(photos) {
+        return runOnWorkers(photos, makeThumbnail);
+      }
+
+  - type: prose
+    id: copies-of-a-server
+    body: >-
+      One copy of your server runs your code on one thread. So a busy app runs several
+      **copies**, often one per core or machine. A **load balancer** sits in front
+      and hands each request to one copy.
+
+
+      Each copy has its own memory, and they all share one database. So two copies can touch
+      the same row at the same instant. That's where this chapter's bugs come from.
+
+  - type: bug-hunt
+    id: hunt-counter-per-copy
+    concept: scale.server-copies
+    difficulty: 2
+    language: js
+    code: |
+      let signUpsToday = 0;
+
+      export async function signUp(request) {
+        await db.insertUser(await request.json());
+        signUpsToday = signUpsToday + 1;
+        return Response.json({ ok: true });
+      }
+
+      export function stats() {
+        return Response.json({ signUpsToday });
+      }
+    prompt: >-
+      The app runs as four copies. The admin page shows about a quarter of the real
+      sign-ups, and a different number on each refresh. Tap the line at fault.
+    lines: [1]
+    reasons:
+      - text: Each copy keeps its own `signUpsToday`
+        correct: true
+        feedback: >-
+          Yes. Each copy counts only the requests it served. Count in the shared database instead.
+      - text: The count is increased before the insert finishes
+        feedback: >-
+          The `await` means the insert finished first. The count is right for that one copy.
+      - text: '`stats` should be an async function'
+        feedback: >-
+          It returns straight away, so `async` changes nothing. The number is only one copy's view.
+    fix: |
+      export async function stats() {
+        const { rows } = await db.query(
+          "SELECT count(*) FROM users WHERE created_at >= current_date",
+        );
+        return Response.json({ signUpsToday: rows[0].count });
+      }
+
+  - type: explain-back
+    id: explain-more-copies
+    concept: scale.server-copies
+    difficulty: 3
+    prompt: >-
+      At peak, your API is slow. A teammate wants to double the number of server copies.
+      When would that help, and when not?
+    rubric:
+      - More copies help when each copy is busy computing, since the work spreads over more cores.
+      - They don't help when requests are slow because they wait on something shared, such as the database.
+      - Each copy has its own memory, so anything they must agree on has to live in the shared store.
+    modelAnswer: >-
+      It depends on where the time goes. If each copy is busy computing, say building
+      reports, more copies spread that work over more cores, and it helps. If requests are
+      slow because they wait on the database, more copies send it more queries at once. That
+      may make it worse. I'd measure first. And any state that lives in a copy's memory,
+      like a counter, would now be split across more copies.
+
+recap:
+  - Tell I/O-bound work, which overlaps on one thread, from CPU-bound work, which needs more cores.
+  - Measure whether a task overlaps, instead of guessing.
+  - Keep what every copy of a server must agree on in a shared store, not in memory.
+
+recall:
+  - id: card-concurrency
+    concept: scale.concurrency
+    front: What is concurrency, and what kind of work does it speed up?
+    back: >-
+      Several tasks in progress over the same period, taking turns on one thread. It speeds
+      up work that's mostly waiting.
+  - id: card-parallelism
+    concept: scale.parallelism
+    front: Why doesn't `Promise.all` speed up three CPU-heavy functions?
+    back: >-
+      One thread still runs them one after another. Computing only overlaps on separate
+      cores, which is parallelism.
+  - id: card-io-or-cpu
+    concept: scale.cpu-and-io-bound
+    front: What makes work I/O-bound rather than CPU-bound?
+    back: >-
+      It spends most of its time waiting on a network, a disk or a database, not computing.
+  - id: card-copies-memory
+    concept: scale.server-copies
+    front: Your server runs as four copies. Why can't a variable hold the number of logged-in users?
+    back: >-
+      Each copy has its own memory, so each variable only sees that copy's requests. Keep it
+      in a shared store.
+
+references:
+  - kind: talk
+    title: Concurrency is not parallelism
+    authors: Rob Pike
+    year: 2013
+    venue: The Go Blog
+    url: https://go.dev/blog/waza-talk
+    note: Concurrency as a way to structure a program, and parallelism as a way to run it.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Don't Block the Event Loop (or the Worker Pool)
+    authors: Node.js contributors
+    venue: Node.js documentation
+    url: https://nodejs.org/en/learn/asynchronous-work/dont-block-the-event-loop
+    note: Why Node serves many clients on one thread, and why computing on it delays them all.
+    primary: true
+    verified: true
+  - kind: essay
+    title: 'The Twelve-Factor App: VI. Processes'
+    authors: Adam Wiggins
+    year: 2011
+    venue: 12factor.net
+    url: https://12factor.net/processes
+    note: Run the app as stateless processes, and keep anything that must persist in a backing store.
+    verified: true
+
+deepDive: >-
+  We ran the challenge's tasks in Node 24. Three 30 ms waits took about 31 ms together.
+  Three 30 ms computations took about 91 ms. Your numbers will differ a little, and the
+  ratio won't.
+
+
+  How much can more cores help? Only the part of a job that can be split gets faster. If a
+  fifth of a job must run in order, no number of cores makes it more than five times
+  faster. That ceiling is Amdahl's law, and it's why the database that every copy shares so
+  often ends up as the limit.
+
+
+  Node isn't strictly one thread. It keeps a small pool of helper threads for some file,
+  DNS and crypto work, and lesson 3 adds your own. Your JavaScript still runs on one thread
+  per copy unless you ask for more.
+
+
+  Platforms name copies differently: instances, replicas, pods, dynos. Serverless platforms
+  start copies for you as traffic grows, so the same rule applies there. The cloud chapter
+  covers keeping servers stateless in depth.

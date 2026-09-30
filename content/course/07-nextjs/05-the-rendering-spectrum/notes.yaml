@@ -1,0 +1,307 @@
+summary: >-
+  Every page answers one question: when is its HTML made? Once at build time and shared by
+  everyone (static). Once, then remade every so often or when data changes (revalidated, also
+  called incremental static regeneration or ISR). For each request (dynamic). Or in the
+  browser after the JavaScript runs (client rendering). Most real apps use all four, page by
+  page and sometimes part by part.
+
+
+  Next.js decides for you, and the rule is simple to state: a page is prerendered unless
+  something in it can only be known at request time. Reading `searchParams`, cookies or
+  headers, or calling `connection()`, makes it dynamic. A plain `fetch` with nothing
+  request-specific around it runs once during the build, and its answer is frozen into the
+  HTML. The dev server hides all of this because it renders every page on every request.
+
+
+  The skill the lesson builds is reading the build output and choosing on purpose. Static is
+  fastest and cheapest, and wrong the moment data changes. Dynamic is always fresh, and
+  costs a server render per visit. Revalidation sits between them, and its exact behaviour,
+  serving a stale page while it rebuilds in the background, is what interviews probe.
+remember:
+  - >-
+    A page is static unless it reads something from the request, such as `searchParams`,
+    `cookies()`, `headers()` or `connection()`; then it's dynamic.
+  - >-
+    Without Cache Components, a `fetch` with no cache option that runs before any
+    request-time API is fetched once during `next build` and frozen into the page.
+  - >-
+    `next dev` renders every page on demand and never caches it, so only `next build` shows
+    what's static (`○`) and what's dynamic (`ƒ`).
+  - >-
+    `export const revalidate = 60` means stale-while-revalidate: after 60 seconds, the next
+    visitor still gets the old page and triggers a rebuild in the background.
+  - >-
+    If a background regeneration throws, the last good page keeps being served and the next
+    request tries again.
+  - >-
+    `generateStaticParams` prerenders known values of a dynamic segment; with
+    `dynamicParams` true, other values render on first visit and are then cached.
+  - >-
+    `revalidatePath` and `revalidateTag` in a Server Action or Route Handler mark cached
+    pages or data stale as soon as the data changes, instead of waiting for a timer.
+sections:
+  - title: How the build decides
+    body: |-
+      During `next build`, Next.js renders each route and watches what it touches. In the
+      model a new app starts with, without Cache Components, the rules are:
+
+      - Code that reads a **request-time API** (`cookies()`, `headers()`, the
+        `searchParams` prop, `connection()`) can't run before a request exists, so the route
+        becomes dynamic.
+      - A `fetch` with no `cache` option that runs before any request-time API is fetched
+        once at build time, and its result is part of the saved page. A fetch discovered
+        after a request-time API runs on every request.
+      - Segment options override the heuristics. `export const dynamic = 'force-dynamic'`
+        renders per request; `'force-static'` prerenders and makes `cookies()` and
+        `headers()` return empty values; `'error'` fails the build if anything dynamic
+        appears, which is a good guard on pages that must stay static.
+
+      The rules apply per route, across its layouts and page. That's the trap with root
+      layouts: one `cookies()` call there, to read a theme, makes every page in the app
+      dynamic. Read such values as low in the tree as possible, or in a Client Component.
+
+      The build prints its decisions:
+
+      ```text
+      Route (app)
+      ┌ ○ /
+      ├ ○ /about
+      ├ ● /products/[id]
+      ├ ƒ /search
+      └ ƒ /account
+      ```
+
+      `○` is static, `ƒ` is dynamic, and `●` marks a dynamic segment prerendered through
+      `generateStaticParams`. Reading this table after every significant change is the
+      cheapest way to catch a page that became dynamic, or frozen, by accident.
+  - title: What `revalidate` does, step by step
+    body: |-
+      Time-based revalidation is often described as "rebuild every 60 seconds". It isn't a
+      timer. Nothing happens until someone visits.
+
+      ```text
+      build        page rendered, saved                        cache: fresh
+      0 to 60 s    every visitor gets the saved page           HIT
+      61 s         next visitor gets the saved page anyway     STALE
+                   a new version renders in the background
+      after that   visitors get the new page                   HIT
+      ```
+
+      The labels are real: the `x-nextjs-cache` response header reports `HIT`, `STALE`,
+      `MISS` or `REVALIDATED`, which is how you check the behaviour on a deployed site with
+      `curl -I`. Two details matter for correctness. If the background render throws, for
+      example because the API is down, Next.js keeps serving the last good page and retries
+      on the next request, so an outage doesn't blank your page. And the value must be a
+      literal the compiler can read: `revalidate = 600` works, `revalidate = 60 * 10` doesn't.
+
+      When a route has several values, from its layouts, its page and individual
+      `fetch(url, { next: { revalidate } })` calls, the lowest one sets how often the whole
+      route regenerates. `revalidate = 0` forces the route dynamic.
+
+      Timers suit data that drifts, like a league table. Data that changes on an event, such
+      as a price edit, is better served by **on-demand revalidation**. Tag the fetch, then
+      call `revalidateTag` where the change happens:
+
+      ```ts
+      'use server';
+
+      import { revalidateTag } from 'next/cache';
+
+      export async function updatePrice(id: string, pence: number) {
+        // check the caller may edit prices before this point
+        await fetch(`https://api.shop.example/products/${id}`, {
+          method: 'PATCH',
+          body: JSON.stringify({ pence }),
+        });
+        revalidateTag(`product-${id}`, 'max');
+      }
+      ```
+
+      With the `'max'` profile, the tagged data is marked stale and the next visit gets the
+      old page while the new one renders. The revalidation is triggered by that visit, not
+      by the call.
+  - title: Prerendering pages for dynamic segments
+    body: |-
+      A route like `/products/[id]` is dynamic by default, because the build can't guess the
+      ids. `generateStaticParams` gives it the list, and together with `revalidate` it's the
+      standard pattern for a catalogue:
+
+      ```tsx
+      import { notFound } from 'next/navigation';
+
+      type Product = { id: string; name: string; pence: number };
+
+      export const revalidate = 3600; // regenerate each product page at most once an hour
+      export const dynamicParams = true; // unknown ids render on first visit, then are cached
+
+      async function getProduct(id: string): Promise<Product | null> {
+        const response = await fetch(`https://api.shop.example/products/${id}`, {
+          next: { tags: ['products', `product-${id}`] },
+        });
+        if (response.status === 404) return null;
+        if (!response.ok) throw new Error(`Product ${id}: ${response.status}`);
+        return response.json();
+      }
+
+      export async function generateStaticParams() {
+        const response = await fetch('https://api.shop.example/products?top=100');
+        const top: Product[] = await response.json();
+        return top.map((product) => ({ id: product.id }));
+      }
+
+      export default async function ProductPage({ params }: { params: Promise<{ id: string }> }) {
+        const { id } = await params;
+        const product = await getProduct(id);
+        if (!product) notFound();
+        return (
+          <main>
+            <h1>{product.name}</h1>
+            <p>£{(product.pence / 100).toFixed(2)}</p>
+          </main>
+        );
+      }
+      ```
+
+      The build prerenders the 100 best sellers, keeping build time bounded. A visit to any
+      other product renders it on demand and caches it. `dynamicParams = false` would make
+      unlisted ids a 404 instead, which suits a closed set like the pages of a manual.
+      Returning an empty array prerenders nothing at build time and every page on first
+      visit; returning nothing at all makes the route dynamic, so always return an array.
+
+      During revalidation `generateStaticParams` isn't called again. A product added after
+      the build is picked up by `dynamicParams`, not by the list. `fetch` calls are memoised
+      across `generateStaticParams`, layouts and pages, so asking for the same URL in both
+      costs one request.
+  - title: Cache Components, the finer-grained model
+    body: |-
+      Everything above treats the route as the unit: one `cookies()` call and the whole page
+      is dynamic. Next.js 16 adds an opt-in model, enabled with `cacheComponents: true` in
+      `next.config.ts`, where the unit is the component.
+
+      ```tsx
+      import { Suspense } from 'react';
+      import { cookies } from 'next/headers';
+      import { cacheLife, cacheTag } from 'next/cache';
+
+      async function Menu() {
+        'use cache';
+        cacheLife('hours');
+        cacheTag('menu');
+        const response = await fetch('https://api.canteen.example/menu');
+        const dishes: { id: string; name: string }[] = await response.json();
+        return <ul>{dishes.map((d) => <li key={d.id}>{d.name}</li>)}</ul>;
+      }
+
+      async function Greeting() {
+        const name = (await cookies()).get('name')?.value ?? 'there';
+        return <p>Hello, {name}</p>;
+      }
+
+      export default function CanteenPage() {
+        return (
+          <main>
+            <h1>Today's menu</h1>
+            <Menu />
+            <Suspense fallback={<p>Loading your greeting</p>}>
+              <Greeting />
+            </Suspense>
+          </main>
+        );
+      }
+      ```
+
+      Here the heading and the cached menu become the **static shell**, prerendered and
+      served at once. The greeting reads cookies, so it streams in per request behind its
+      boundary. Uncached request-time work outside a Suspense boundary is reported as a
+      blocking route, so the model pushes you to decide, component by component, what's
+      cached and what streams. In this model `fetch` isn't cached by default,
+      `dynamicParams` isn't available, and `generateStaticParams` must return at least one
+      entry. The caching lesson later in the course uses it in depth.
+  - title: Choosing a point on the spectrum
+    body: |-
+      Ask two questions about each piece of data: does it differ per visitor or per query,
+      and how stale may it be?
+
+      - Same for everyone, changes with a deploy: an about page, docs. **Static.**
+      - Same for everyone, changes during the day: a catalogue, a news list. **Static with
+        revalidation**, on a timer if it drifts, on demand if you know when it changes.
+      - Differs per request: search results, a basket, an account page, train departures.
+        **Dynamic**, and stream the slow parts.
+      - Changes after load, in response to the person: a live filter, a like count that
+        updates as they click. **Client rendering** inside an otherwise server-rendered
+        page.
+
+      The costs run the other way. Static pages are served from a cache or a CDN and cost
+      almost nothing per visit. Dynamic pages cost a server render every time and are only
+      as fast as their slowest uncached call. Client rendering costs JavaScript and leaves
+      the content out of the first HTML, which matters for crawlers and link previews.
+
+      A strong answer in a design discussion names the staleness budget explicitly: "prices
+      can be a minute old on the listing, never on the checkout". That sentence decides the
+      rendering mode of both pages.
+pitfalls:
+  - >-
+    **Trusting `npm run dev` for freshness.** Dev renders every page on every visit. Run
+    `npm run build` and read `○` and `ƒ` before shipping a page with live data.
+  - >-
+    **Treating `revalidate` as a timer.** Regeneration happens on a visit after the window,
+    and that visitor still gets the stale page. For data that must be current, render per
+    request.
+  - >-
+    **Writing `revalidate = 60 * 10`.** The value must be a literal the compiler can read.
+    Write `600`.
+  - >-
+    **Reading cookies in the root layout.** It makes every route dynamic. Read them in the
+    page or component that needs them.
+  - >-
+    **Forgetting `generateStaticParams` on a dynamic segment.** Every product page renders
+    per request and none is prefetched fully. Return the known ids, even a subset.
+  - >-
+    **Calling `revalidateTag` with one argument.** The single-argument form is deprecated
+    in Next.js 16. Pass a profile, usually `'max'`.
+  - >-
+    **Making a page dynamic to fix staleness that revalidation would solve.** Per-request
+    rendering costs a server render every visit. Use `revalidate` or on-demand revalidation
+    when a short delay is acceptable.
+interview:
+  - question: How does Next.js decide whether a page is static or dynamic?
+    answer: >-
+      It prerenders by default and falls back to per-request rendering when the route reads
+      something only a request has. During the build it renders each route; if a layout or
+      page reads `cookies()`, `headers()`, `searchParams` or calls `connection()`, the route
+      becomes dynamic. A plain `fetch` before any of those runs at build time and is frozen
+      into the HTML, which is the classic stale-in-production bug. Segment config can force
+      either way, and `dynamic = 'error'` guards a page that must stay static. I always read
+      the route table the build prints. With Cache Components enabled the unit becomes the
+      component: cached parts join a static shell and request-time parts stream behind
+      Suspense.
+  - question: Explain what happens with `export const revalidate = 60` on a busy page.
+    answer: >-
+      It's stale-while-revalidate, not a timer. For 60 seconds after generation every
+      request is a cache hit. The first request after that still gets the old page, marked
+      `STALE` in the `x-nextjs-cache` header, and triggers a regeneration in the background.
+      Once that succeeds, later requests get the new page. If regeneration throws, the last
+      good version keeps being served and the next request retries, so an upstream outage
+      doesn't blank the page. The lowest `revalidate` across the route's segments and
+      fetches wins. The trade-off is bounded staleness, so for data that changes on known
+      events I tag it and call `revalidateTag` from the action that changes it.
+  - question: A page shows the same data all day in production but is fresh locally. How do you debug it?
+    answer: >-
+      I first check the build output. If the route is marked static, the build prerendered
+      it: a `fetch` ran at build time and the HTML was saved, while `next dev` renders every
+      request, which hid it. Then I decide on the staleness the data allows. If minutes are
+      fine, `export const revalidate` with a literal number keeps it static and cheap. If
+      the data changes on an event, I tag the fetch and call `revalidateTag` in the action
+      or webhook handler. If it must be current for every visitor, like departures, I make
+      the page dynamic with `await connection()` and stream slow parts. I verify on the
+      deployment with the `x-nextjs-cache` header.
+  - question: How would you render a catalogue of fifty thousand products?
+    answer: >-
+      As static pages with incremental regeneration, not per-request rendering. I'd use
+      `generateStaticParams` to prerender the few hundred most visited products, which keeps
+      build time bounded, and leave `dynamicParams` true so any other product renders on its
+      first visit and is cached afterwards. A `revalidate` window catches drift, and the
+      admin action that edits a product calls `revalidateTag` for that product's tag, so an
+      edit shows up on the next visit. Anything per visitor, like stock in the visitor's
+      region or the basket count, streams in separately or renders in a Client Component.
+      The trade-off is a first visit to an unbuilt product paying a render, once.

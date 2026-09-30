@@ -1,0 +1,193 @@
+summary: >-
+  A server is a computer that runs your code for other people: always on, always online,
+  reachable at a public address. The cloud is renting those computers by the hour, in a
+  region you choose. Deploying is the four moves that get your code onto one and answering:
+  build it, copy it there, start it, and point an address at it.
+
+
+  Most first deploys fail on two lines that never mattered on a laptop. An app that listens
+  on `127.0.0.1` answers only its own machine, and an app that ignores `PORT` listens on a
+  door the platform isn't using. Both look like "the server is down" while the process runs
+  happily.
+
+
+  These notes add what sits around those two lines: what an address and a port really are,
+  why distance to the database matters more than distance to the user, how config reaches
+  an app from the environment, and what a platform does to your process when it starts and
+  stops it. That last part, the stop signal, decides whether a deploy drops requests.
+remember:
+  - A server bound to `127.0.0.1` accepts connections only from its own machine; bind to `0.0.0.0` (or leave the host out in Node) to accept outside callers.
+  - A hosting platform chooses the port and passes it in `PORT`, so read it from the environment and keep a default only for your laptop.
+  - Put the app in the same region as its database first, because an app makes many database round trips for each user request.
+  - Config and secrets come from the environment, are checked once at start-up, and make the app exit with a clear message when something is missing.
+  - Platforms stop a process with `SIGTERM` and kill it a few seconds later, so handle `SIGTERM` by finishing requests in flight and then exiting.
+  - A region is a group of data centres in one area, split into zones that fail separately, so one building's outage doesn't take the region down.
+  - Deploying is build, copy, start and point an address, and every tool in this chapter automates one of those moves.
+sections:
+  - title: Addresses, interfaces and what "listening" means
+    body: |-
+      A machine has several network interfaces, each with an address. The loopback
+      interface, `127.0.0.1`, exists only inside the machine. A server also has a private
+      address on its provider's network and often a public one. When a program listens, it
+      asks the kernel for connections arriving at one address and one port.
+
+      - `127.0.0.1` (or `::1` in IPv6): only programs on this machine.
+      - `0.0.0.0` (or `::`): every interface, so outside callers too.
+      - A specific address, such as the private one: only traffic arriving there.
+
+      Node's `server.listen()` with no host listens on `::` when IPv6 is available, and on
+      `0.0.0.0` otherwise. On most systems `::` also accepts IPv4. That's why leaving the
+      host out works in a container, and setting `hostname: "127.0.0.1"` breaks it.
+
+      A port is a number from 1 to 65535 that picks one program on that address. Ports
+      below 1024 are privileged on Linux: a normal user can't listen on them. That's one
+      reason apps listen on 3000 or 8080, and a reverse proxy on 80 and 443 passes traffic
+      in. Lesson 7 builds that proxy.
+
+      Binding to `127.0.0.1` isn't always wrong. It's the right choice for something that
+      only a local proxy should reach, such as an app behind nginx on the same server, or an
+      admin port. The mistake is using it by accident where the caller lives elsewhere, and
+      a container counts as elsewhere.
+  - title: Choosing a region, with the round trips counted
+    body: |-
+      Users feel the time for each request. A request usually makes several database
+      queries one after another, and each query crosses the network twice. So the distance
+      between the app and the database is paid many times, while the distance to the user is
+      paid once.
+
+      ```text
+      user in Berlin -> API in Frankfurt      one round trip, about 15 ms
+      API in Frankfurt -> DB in Frankfurt     under 1 ms per query
+      API in Sydney -> DB in Frankfurt        about 250 ms per query
+      ```
+
+      With five queries per request, the Sydney API adds over a second, whatever the user's
+      distance. Put the app beside its data first, then put both near most users.
+
+      Three more things decide a region. **Law and contracts**: data about people in the EU
+      often has to stay in the EU, so the region is chosen for you. **Price**: the same
+      server costs different amounts in different regions. **Services**: newer products,
+      such as some AI models, launch in a few regions first.
+
+      Inside a region, **availability zones** are separate buildings with their own power and
+      network, close enough for fast links. Running two copies of an app in two zones
+      survives a building failing. Running in two regions survives a whole region failing,
+      and costs far more work, because the database has to be copied across the distance.
+      Most products start in one region with more than one zone.
+  - title: Config from the environment, checked at start-up
+    body: |-
+      The same build runs on your laptop, in CI, in staging and in production. What
+      differs is config: the port, the database address, the keys. Reading these from
+      environment variables keeps one build for everywhere and keeps secrets out of Git.
+
+      Check everything once, when the process starts. An app that starts without its
+      database URL fails later on the first request, with a confusing error, after the
+      platform has already marked it healthy.
+
+      ```ts
+      type Config = { port: number; databaseUrl: string; modelKey: string };
+
+      function loadConfig(env: Record<string, string | undefined>): Config {
+        const missing = ["DATABASE_URL", "MODEL_KEY"].filter((name) => !env[name]);
+        if (missing.length > 0) {
+          throw new Error(`Missing environment variables: ${missing.join(", ")}`);
+        }
+        const port = Number(env.PORT ?? 3000);
+        if (!Number.isInteger(port) || port < 1 || port > 65535) {
+          throw new Error(`PORT must be a whole number from 1 to 65535, got "${env.PORT}"`);
+        }
+        return { port, databaseUrl: env.DATABASE_URL!, modelKey: env.MODEL_KEY! };
+      }
+
+      const config = loadConfig(process.env);
+      ```
+
+      Called with only `PORT` set, it throws `Missing environment variables: DATABASE_URL,
+      MODEL_KEY`, and the deploy fails at once, where you can see it. Pass `process.env`
+      into the function rather than reading it inside, so a test can hand it any
+      environment.
+
+      The platform sets the values. On a plain server that's a file readable only by the
+      app's user, as lesson 2 shows. On managed platforms it's a settings page or a secret
+      store. Never log the whole config object: it holds the keys.
+  - title: How a platform starts and stops your app
+    body: |-
+      A deploy replaces a running process with a new one. Platforms stop the old one the
+      same way a Linux service manager or `docker stop` does: they send the signal
+      `SIGTERM`, wait a grace period, then send `SIGKILL`, which ends the process at once.
+      Docker's default wait is 10 seconds.
+
+      Without a handler, Node exits immediately on `SIGTERM`, and any request halfway
+      through is cut off. With one, it can stop taking new connections and finish the rest.
+
+      ```ts
+      import { createServer } from "node:http";
+
+      const server = createServer((req, res) => {
+        setTimeout(() => res.end("done\n"), 2000); // a slow request in flight
+      });
+      server.listen(Number(process.env.PORT ?? 3000));
+
+      process.on("SIGTERM", () => {
+        server.close(() => process.exit(0));
+        setTimeout(() => process.exit(1), 10_000).unref();
+      });
+      ```
+
+      Sending `SIGTERM` while a request was in flight, the client still got `done`, and then
+      the process exited. `server.close()` stops accepting connections and calls back once
+      the open ones finish. Since Node 19 it also closes idle keep-alive connections. The
+      second timer is a backstop, so a stuck request can't hold the process forever, and
+      `unref()` stops that timer from keeping the process alive by itself.
+
+      Starting matters too. A platform usually waits for a health check to pass before it
+      sends traffic to the new process. Lesson 6 writes an honest one, and lesson 9 uses both
+      halves to release without dropping a request.
+pitfalls:
+  - '**Binding to `127.0.0.1` in a container.** It works when you test inside the container and fails from outside. Leave the host out or use `0.0.0.0`.'
+  - '**Hard-coding the port.** The platform routes to the port in `PORT`, and the app waits on another. Read `PORT`, with a fallback for local runs.'
+  - '**Putting the API near users and the database far away.** Every query pays the long trip, several times per request. Keep app and database in one region.'
+  - '**Validating config lazily.** A missing variable surfaces on the first real request, after the deploy looked healthy. Check every variable at start-up and exit with a clear message.'
+  - '**Ignoring `SIGTERM`.** Each deploy cuts off requests in flight, or waits for the kill timeout. Handle it: close the server, then exit.'
+  - '**Committing a `.env` file or a key in code.** It then lives in Git history and on every machine with a copy. Keep secrets in the platform''s environment and rotate any that leaked.'
+interview:
+  - question: Your app works locally, but after deploying, every request times out or is refused. How do you debug it?
+    answer: >-
+      I'd follow the request inward and find the first hop that fails. First, is the process
+      running and what did it log at start-up? Then, what is it listening on: `ss -ltnp` on
+      the server shows the address and port. If it says `127.0.0.1:3000`, outside callers
+      can't reach it, so bind to `0.0.0.0`. If it's on 3000 while the platform routes to
+      `PORT`, read `PORT`. Next I'd `curl` it from the server itself, then from outside,
+      which separates the app from firewalls, security groups and DNS. The trade-off in
+      debugging order is cheap checks first: logs and listening sockets take seconds and
+      explain most first-deploy failures.
+  - question: How do you choose which cloud region to run an application in?
+    answer: >-
+      Next to its database first, then near most of its users, within whatever legal limits
+      apply. The app makes several sequential queries per request, so app-to-database
+      distance is paid many times, and user distance once. Data-residency rules can decide
+      it outright: personal data about EU users often has to stay in the EU. After that,
+      price and whether the services I need exist there. Inside the region I'd spread copies
+      across availability zones, which survives a building failing cheaply. Going
+      multi-region is a much bigger step, because the database has to be replicated across
+      long distances, so I'd only do it for a real latency or availability requirement.
+  - question: Why should configuration come from environment variables, and what are the limits of that approach?
+    answer: >-
+      Because one build should run everywhere, with only config differing, and secrets
+      shouldn't live in the code. Environment variables are supported by every platform,
+      language and container runtime, and they keep keys out of Git and out of images. I
+      validate them once at start-up so a missing value fails the deploy loudly instead of
+      the first request. The limits: they're flat strings, so structured config needs
+      parsing, and anything that can read the process environment, such as a crash reporter
+      that dumps it, can leak them. For sensitive keys a secret store with rotation and audit
+      logs is better, often injecting values into the environment at start.
+  - question: What happens to in-flight requests when you deploy a new version, and how do you avoid dropping them?
+    answer: >-
+      The platform sends `SIGTERM` to the old process, waits a grace period, then kills it,
+      so any request without a handler is cut off. The fix is on both sides. In the app, I
+      handle `SIGTERM` by closing the server, which stops new connections and lets current
+      requests finish, with a backstop timer shorter than the platform's grace period. In
+      the platform, new instances only take traffic once their health check passes, and old
+      ones are removed from the load balancer before they get the signal. Long-running work,
+      such as a slow model call, shouldn't live in a request at all; it belongs in a queue
+      that survives restarts.

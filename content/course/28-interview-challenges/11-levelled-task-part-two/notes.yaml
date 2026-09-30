@@ -1,0 +1,224 @@
+summary: >-
+  Levels 3 and 4 of the in-memory database test whether a design can grow. Level 3 adds time:
+  every call carries a timestamp, and a value can have a time to live. Level 4 adds backup and
+  restore, which forces you to think about what "the same data" means once values expire.
+  Throughout, every level 1 and 2 test must keep passing.
+
+
+  Two ideas carry both levels. First, **the store never reads a clock**. The caller passes the
+  time, the entry stores an absolute `expiresAt`, and liveness is one comparison. That makes
+  expiry exact at the boundary tick and trivially testable. Second, **decide liveness in one
+  place**. A single helper that returns a record's live fields serves get, delete, the scans
+  and backup, so the rule cannot drift between methods.
+
+
+  A backup must save what each field has left, not when it would have expired. Restoring
+  later then gives each field a fresh expiry, the restore time plus its remaining ttl.
+  Getting this wrong brings data back already expired, which is exactly the case a hidden
+  test checks.
+remember:
+  - >-
+    Pass time into every call and store `expiresAt = timestamp + ttl`, with `Infinity` for no ttl,
+    so liveness is one comparison.
+  - >-
+    "Expires at timestamp plus ttl" means gone at that moment: the live check is a strict
+    `timestamp < expiresAt`.
+  - >-
+    Decide liveness in one helper that every read uses, so get, delete, scans and backup cannot
+    disagree.
+  - >-
+    Checking expiry at read time is lazy expiry: no timers and no sweeps, at the cost of expired
+    entries staying in memory until something removes them.
+  - >-
+    A backup saves each live field's remaining ttl; a restore sets `expiresAt` to the restore
+    time plus that remainder.
+  - >-
+    Change a signature first with no new behaviour, run every earlier test, then add the
+    behaviour in small tested steps.
+  - >-
+    Setting a field again replaces its value and its expiry, so a later set without a ttl makes
+    it permanent.
+sections:
+  - title: Lazy expiry and when to clean up
+    body: |-
+      The solution in this lesson never deletes an expired field when it expires. It ignores
+      it on every read. That is **lazy expiry**, and it has three good properties: no timers,
+      no background work, and exact answers at every timestamp, because the decision is made
+      at the moment of the read with the time the caller supplied.
+
+      The cost is memory. A field set with a ttl of 1 and never read again stays in the map
+      forever. In an interview store that is fine, and worth saying aloud. In a long-running
+      system you add some form of eager cleanup:
+
+      - **Clean on touch.** When a read finds an expired entry, delete it there and then.
+        Cheap, and it keeps hot records tidy.
+      - **Periodic sampling.** Every so often, check a sample of entries with a ttl and delete
+        the expired ones. Redis combines this with expiry on access.
+      - **An expiry queue.** A min-heap ordered by `expiresAt` lets you pop everything due up
+        to the current time. Precise, but every set with a ttl now costs O(log n).
+
+      In the levelled task, "clean on touch" is the only one worth adding, and only if a test
+      depends on memory or on a count of stored records. Otherwise lazy is correct and
+      shortest. Watch one subtlety if you do delete on read: a scan that deletes while
+      iterating the same map is safe in JavaScript, since deleting entries during iteration of
+      a `Map` is allowed, but it is clearer to collect the live fields first.
+  - title: Boundary rules to confirm before coding
+    body: |-
+      Time-based levels hide their tests at the edges. Settle each of these from the statement,
+      or ask:
+
+      - **The expiry moment.** Live while `timestamp < expiresAt`, gone at `expiresAt`. A ttl of
+        0 therefore means the value is never visible.
+      - **Re-setting a field.** A new set replaces the value and the expiry. A later set with no
+        ttl makes a field permanent again.
+      - **Delete of an expired field** returns `false`, since from the caller's point of view
+        the field is not there.
+      - **Counting in backups.** "Records with at least one live field", not "records in the
+        map".
+      - **Which backup a restore uses.** The latest made at or before the given timestamp.
+        With none, the statement says what happens; if it does not, leave the data unchanged
+        and say so.
+      - **Timestamps only increase.** It is usually guaranteed. It lets you append backups in
+        order and search them, and it means you never need to handle a read from the past
+        unless a level asks for one.
+
+      Each rule is one line of code and one test. Writing the test first, with the exact tick
+      from the statement, catches the `<=` slip before the hidden tests do.
+  - title: If a level asks for values in the past
+    body: |-
+      Some variants ask "what was this field at time t?". Overwriting entries cannot answer
+      that. Keep every version of a field in time order instead, and binary search for the
+      last version written at or before t. Because timestamps only increase, appending keeps
+      the list sorted for free.
+
+      ```ts
+      // If a level asks "what was the value at time t?", keep every version of a field in time
+      // order and binary search it. Timestamps only increase, so appending keeps the order.
+      interface Version {
+        at: number; // when this version was written
+        value: string | null; // null records a delete
+        expiresAt: number;
+      }
+
+      class FieldHistory {
+        #versions: Version[] = [];
+
+        write(at: number, value: string | null, ttl?: number): void {
+          this.#versions.push({ at, value, expiresAt: ttl === undefined ? Infinity : at + ttl });
+        }
+
+        // The last version written at or before t, if it was still live at t.
+        valueAt(t: number): string | null {
+          let lo = 0;
+          let hi = this.#versions.length - 1;
+          let found = -1;
+          while (lo <= hi) {
+            const mid = (lo + hi) >> 1;
+            if (this.#versions[mid].at <= t) {
+              found = mid;
+              lo = mid + 1;
+            } else {
+              hi = mid - 1;
+            }
+          }
+          if (found === -1) return null;
+          const version = this.#versions[found];
+          return t < version.expiresAt ? version.value : null;
+        }
+      }
+
+      const price = new FieldHistory();
+      price.write(10, '4.50');
+      price.write(20, '4.80', 5);
+      price.write(30, null);
+      console.log(price.valueAt(5), price.valueAt(15), price.valueAt(24), price.valueAt(25), price.valueAt(31));
+      // null 4.50 4.80 null null
+      ```
+
+      A delete is recorded as a version with a `null` value, so a read after it correctly
+      finds nothing. A version that has expired returns `null` even though an older version
+      existed: the older value was overwritten, not restored. Each write is O(1) and each
+      historical read is O(log v) for v versions of that field. The memory grows with every
+      write, which is the trade-off to name.
+  - title: Backups, their cost and a cheaper design
+    body: |-
+      The straightforward backup copies every live field: O(total fields) time and memory per
+      backup, and restore is O(fields in the backup). For the task's sizes that is right, and
+      the copy has one property you must keep: later writes must not leak into it. Copy the
+      values into new maps and new objects, never store references to the live maps.
+
+      If an interviewer asks how this scales to a large store with frequent backups, there are
+      two classic answers:
+
+      - **Copy on write.** Records are treated as immutable. A write creates a new record map
+        and swaps it in, so a backup only needs to copy the outer map of references, O(number of
+        records), and unchanged records are shared between the live store and every backup.
+      - **A log plus snapshots.** Record every change with its timestamp, take a full snapshot
+        occasionally, and restore by loading the nearest snapshot and replaying the log. This
+        is how databases recover to a point in time.
+
+      Both trade simpler writes for cheaper backups. Naming them, and saying the full copy is
+      correct for the task, is the senior answer.
+pitfalls:
+  - >-
+    **Reading the clock inside the store.** Tests then cannot choose the time, and the boundary
+    tick becomes untestable. Take the timestamp as an argument.
+  - >-
+    **Storing the ttl instead of the expiry time.** A ttl means nothing without its start. Store
+    `timestamp + ttl` when the value is set.
+  - >-
+    **`<=` at the expiry check.** It keeps a value alive for one extra tick, which is the exact
+    tick hidden tests probe. Use `<`.
+  - >-
+    **Checking expiry in some reads but not others.** Scans then list fields that `get` says are
+    gone. Put the rule in one helper and use it everywhere.
+  - >-
+    **Saving `expiresAt` in a backup.** A later restore brings fields back already expired. Save
+    the remaining ttl and add it to the restore time.
+  - >-
+    **Backups that share objects with the live store.** Later writes then change the backup.
+    Copy values into new maps and objects.
+interview:
+  - question: >-
+      Why does your store take the timestamp as an argument instead of reading the clock?
+    answer: >-
+      Because it makes time an input like any other, which makes the logic exact and testable.
+      A test can set a value at tick 10 with a ttl of 5 and read at 14 and 15 to check the
+      boundary, without sleeping or faking globals. It also removes a whole class of flaky
+      behaviour, since two reads in one operation see the same time. In production the same
+      idea appears as an injected clock: the service takes a `now()` function, and the real
+      one is passed at the edge. The trade-off is that callers must supply the time, which is
+      a small cost for deterministic behaviour.
+  - question: >-
+      What are the trade-offs between lazy and eager expiry?
+    answer: >-
+      Lazy expiry checks the expiry time when a value is read and ignores it if it has passed.
+      It needs no timers or background work and is exact at every read, but expired values
+      use memory until something removes them. Eager expiry removes values when they expire,
+      through timers, a periodic sweep or a queue ordered by expiry. It keeps memory tight but
+      adds work on every write or in the background, and timers are awkward to test. Real
+      caches often combine them: remove on access, plus a periodic sample to catch values
+      nobody reads. For an interview store, lazy is correct and shortest, and I would say
+      where I would add cleanup.
+  - question: >-
+      Why does your backup save the remaining ttl rather than the expiry time?
+    answer: >-
+      Because a restore happens at a different time from the backup, and the statement wants
+      each field to keep the lifetime it had left. If a field had 8 ticks left at a backup at
+      tick 18 and is restored at tick 50, it should live until 58. Saving the absolute expiry,
+      tick 26, would bring it back already expired. So the backup stores `expiresAt - timestamp`
+      for each live field, with `Infinity` for no ttl, and the restore sets `expiresAt` to the
+      restore time plus that value. I would confirm the intended semantics with the statement,
+      since a different product might want absolute expiry.
+  - question: >-
+      Level 4 changes behaviour your earlier levels rely on. How do you make that change
+      without breaking them?
+    answer: >-
+      In two separate steps. First I change the shape with no new behaviour, for example
+      threading a timestamp through every method or adding a field to the entry object with a
+      neutral default such as `Infinity`. Then I run every earlier test; if they pass, the
+      plumbing is right. Only then do I add the new behaviour, one rule at a time, running the
+      whole suite after each. If a test fails, the cause is in the few lines I changed last. I
+      also keep the old method signatures working if the statement says both old and new calls
+      exist. The principle is Fowler's refactoring discipline: small steps, tests green between
+      them.

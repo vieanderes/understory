@@ -1,0 +1,350 @@
+summary: >-
+  JavaScript runs your code on one thread, one piece at a time. The **event loop** is the
+  scheduler around it: it takes a task from a queue, runs it to completion, empties the
+  microtask queue, and, in a browser, sometimes renders a frame. Then it takes the next task.
+  Everything asynchronous, from timers to clicks to network responses, is a callback waiting
+  in one of those queues.
+
+
+  Two consequences drive most real bugs. First, nothing interrupts running code: a slow
+  function blocks clicks, timers and painting until it returns, so the page freezes. Second,
+  the queues have priorities. Promise callbacks and the code after `await` are microtasks, and
+  they all run before the next task and before any paint, however short the timer you set.
+
+
+  You use this model to predict the order of logs, to understand why a spinner never
+  appears, to split heavy work so the page stays responsive, and to choose between
+  `setTimeout`, `queueMicrotask`, `requestAnimationFrame` and, in Node, `process.nextTick`
+  and `setImmediate`. It's also one of the most common interview topics in JavaScript.
+remember:
+  - "The loop runs one task to completion, then every microtask until the queue is empty, then maybe renders, then takes the next task."
+  - "Promise callbacks and the code after `await` are microtasks, while timers, events and I/O callbacks are tasks."
+  - "`setTimeout(fn, 0)` means \"as a new task, no sooner than now\", so it always runs after the current code and its microtasks."
+  - An async function runs synchronously up to its first `await`, and only the rest is queued.
+  - "A microtask that queues another microtask keeps the loop in the same checkpoint, so endless microtasks freeze the page as surely as a `while` loop."
+  - "`requestAnimationFrame` callbacks run right before the browser recalculates styles and paints, which makes them the place for visual updates."
+  - Keep tasks short by splitting work into chunks that yield with a timer, or move CPU-heavy work to a Web Worker.
+  - "In Node, `process.nextTick` callbacks run before promise callbacks in CommonJS, but an ES module's top level is itself inside a promise job, so there promise callbacks run first."
+sections:
+  - title: One turn of the loop
+    body: |-
+      Picture three parts. The **call stack** holds the functions running right now. The
+      **task queues** hold callbacks waiting for their turn: a timer that expired, a click, a
+      network response, the initial script itself. The **microtask queue** holds promise
+      reactions and anything passed to `queueMicrotask`.
+
+      One turn goes like this:
+
+      1. Take the oldest runnable task and run it until the stack is empty.
+      2. Run microtasks until the microtask queue is empty, including any queued along the way.
+      3. In a browser, if it's time for a frame, run the rendering steps.
+      4. Repeat.
+
+      That's enough to solve the classic ordering puzzle. Run in Node 24:
+
+      ```js
+      console.log("1 script start");
+
+      setTimeout(() => console.log("2 timeout"), 0);
+
+      Promise.resolve()
+        .then(() => console.log("3 then A"))
+        .then(() => console.log("4 then B"));
+
+      queueMicrotask(() => console.log("5 queueMicrotask"));
+
+      (async () => {
+        console.log("6 async body");
+        await null;
+        console.log("7 after await");
+      })();
+
+      console.log("8 script end");
+
+      // 1 script start
+      // 6 async body
+      // 8 script end
+      // 3 then A
+      // 5 queueMicrotask
+      // 7 after await
+      // 4 then B
+      // 2 timeout
+      ```
+
+      The synchronous lines go first, including the async function's body up to its
+      `await`. Then the microtasks run in the order they were queued: `then A`, the
+      `queueMicrotask` callback, the rest of the async function. `then B` only joins the queue
+      once `then A` has run, so it goes last among them. The timer is a task and waits for
+      the next turn, even at 0 ms.
+
+      Microtasks queued by a task run before the *next* task, not at the end of the whole
+      queue:
+
+      ```js
+      setTimeout(() => {
+        console.log("timeout 1");
+        Promise.resolve().then(() => console.log("microtask from timeout 1"));
+      }, 0);
+      setTimeout(() => console.log("timeout 2"), 0);
+
+      // timeout 1
+      // microtask from timeout 1
+      // timeout 2
+      ```
+  - title: Where await fits in the order
+    body: |-
+      `await` splits an async function in two. Everything before it runs as part of the
+      caller's task. When it hits `await`, the function returns a pending promise to its
+      caller, and the rest is scheduled as a microtask once the awaited value settles. Even
+      `await` on a plain value or an already fulfilled promise pauses: the rest of the
+      function still waits for the current synchronous code to finish.
+
+      This is the version of the puzzle interviewers like best:
+
+      ```js
+      async function a1() {
+        console.log("a1 start");
+        await a2();
+        console.log("a1 end");
+      }
+      async function a2() {
+        console.log("a2");
+      }
+      console.log("script start");
+      setTimeout(() => console.log("setTimeout"), 0);
+      a1();
+      new Promise((resolve) => {
+        console.log("promise executor");
+        resolve();
+      }).then(() => console.log("then 1"));
+      console.log("script end");
+
+      // script start
+      // a1 start
+      // a2
+      // promise executor
+      // script end
+      // a1 end
+      // then 1
+      // setTimeout
+      ```
+
+      Walk it through aloud. `a1` starts synchronously and calls `a2`, which logs straight
+      away and returns a fulfilled promise. `await` then suspends `a1`, queueing its
+      continuation. The promise executor runs synchronously, as executors always do, and its
+      `then` callback is queued after `a1`'s continuation. After `script end`, the two
+      microtasks run in queue order. The timer comes last.
+
+      The precise number of microtask turns an `await` costs has changed across engine and
+      specification versions, especially when awaiting a promise returned from another async
+      function. Don't build logic on tick counting. If order matters, make it explicit with
+      `await` or a chain.
+  - title: Rendering and requestAnimationFrame
+    body: |-
+      Between tasks, the browser gets a **rendering opportunity**, typically once per display
+      refresh (about every 16.7 ms at 60 Hz). It may skip one if nothing changed, and it
+      pauses rendering in background tabs. When it does render, the order is: run
+      `requestAnimationFrame` callbacks, recalculate styles, lay out, then paint.
+
+      So DOM changes are cheap to make and only become pixels at the next render. That's why
+      showing a spinner and hiding it again in the same task shows nothing, and why a
+      microtask doesn't help either: microtasks run before the render step.
+
+      `requestAnimationFrame(callback)` is the right hook for anything visual. The callback
+      gets a timestamp, runs once, and must re-register itself for the next frame. Driving an
+      animation from the timestamp keeps its speed right on 60 Hz and 120 Hz screens alike.
+
+      ```js
+      // Browser only. Move a box 200 px over one second, one step per frame.
+      const box = document.querySelector("#box");
+      let start;
+      function step(timestamp) {
+        start ??= timestamp;
+        const progress = Math.min((timestamp - start) / 1000, 1);
+        box.style.transform = `translateX(${progress * 200}px)`;
+        if (progress < 1) requestAnimationFrame(step);
+      }
+      requestAnimationFrame(step);
+      ```
+
+      Two traps sit here. Reading a layout value such as `offsetHeight` right after changing
+      styles forces the browser to lay out immediately, in the middle of your task. Doing
+      that in a loop, write then read then write, is called **layout thrashing**: batch the
+      reads first, then the writes. And `setTimeout(fn, 16)` is a poor animation clock: it
+      drifts, doesn't line up with frames, and keeps firing in situations where
+      `requestAnimationFrame` would pause.
+  - title: Starving the loop, and how to stay responsive
+    body: |-
+      A task that runs for a long time delays everything queued behind it. Browsers treat a
+      task over 50 ms as a **long task**, and it's what makes a page feel sluggish to taps. A
+      timer can't cut in; it fires late instead:
+
+      ```js
+      const start = Date.now();
+      setTimeout(() => {
+        console.log("timer late by about", Math.round((Date.now() - start) / 100) * 100, "ms");
+      }, 0);
+      while (Date.now() - start < 500) {}
+      console.log("busy loop done");
+
+      // busy loop done
+      // timer late by about 500 ms
+      ```
+
+      Microtasks can starve the loop too. Each one queued during the checkpoint joins the same
+      checkpoint, so timers, input and painting all wait:
+
+      ```js
+      let rounds = 0;
+      setTimeout(() => console.log("timer ran after", rounds, "microtasks"), 0);
+      function spin() {
+        rounds++;
+        if (rounds < 1_000_000) queueMicrotask(spin);
+      }
+      queueMicrotask(spin);
+
+      // timer ran after 1000000 microtasks
+      ```
+
+      The fixes, in order of effort. Split work into chunks and yield with a timer between
+      them; a time budget adapts better than a fixed chunk size:
+
+      ```js
+      const yieldToLoop = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+      async function processWithBudget(items, handle, budgetMs = 10) {
+        let deadline = performance.now() + budgetMs;
+        for (const item of items) {
+          handle(item);
+          if (performance.now() > deadline) {
+            await yieldToLoop();
+            deadline = performance.now() + budgetMs;
+          }
+        }
+      }
+      ```
+
+      Chromium-based browsers also offer `scheduler.yield()`, which resumes your work ahead
+      of other queued tasks; check support before relying on it. For work that's CPU-bound
+      from start to end, such as parsing a large file or resizing images, move it to a **Web
+      Worker**: a separate thread with its own loop that talks to the page by messages and
+      never blocks it.
+  - title: "Node's loop: nextTick, setImmediate and module type"
+    body: |-
+      Node has no rendering step, but it has more queues. Its loop runs in phases: expired
+      timers, then waiting for and running I/O callbacks (the poll phase), then
+      `setImmediate` callbacks (the check phase), then close callbacks. Between callbacks,
+      Node drains two microtask-like queues: the `process.nextTick` queue and the promise
+      microtask queue.
+
+      The ordering of those two depends on where the code runs, and the difference shows up
+      in real output. The same file, run as CommonJS and as an ES module in Node 24:
+
+      ```js
+      Promise.resolve().then(() => console.log("then"));
+      process.nextTick(() => console.log("nextTick"));
+      queueMicrotask(() => console.log("queueMicrotask"));
+      console.log("sync");
+
+      // Saved as order.js (CommonJS):  sync, nextTick, then, queueMicrotask
+      // Saved as order.mjs (ES module): sync, then, queueMicrotask, nextTick
+      ```
+
+      In CommonJS, the nextTick queue is drained before promise callbacks. An ES module's top
+      level already runs inside a promise job, so the promise microtasks queued there drain
+      first, and nextTick runs after. Inside ordinary callbacks later on, nextTick goes first
+      in both.
+
+      `setTimeout(fn, 0)` versus `setImmediate(fn)` from the main module is **not
+      deterministic**: Node's documentation says it depends on process performance, although
+      one run may look stable. Inside an I/O callback, `setImmediate` always runs first,
+      because the check phase comes straight after the poll phase:
+
+      ```js
+      const fs = require("node:fs");
+      fs.readFile(__filename, () => {
+        setTimeout(() => console.log("timeout"), 0);
+        setImmediate(() => console.log("immediate"));
+      });
+
+      // immediate
+      // timeout
+      ```
+
+      Prefer `queueMicrotask` or promises for "after this code, before anything else", and
+      `setImmediate` for "after pending I/O". A recursive `process.nextTick` starves I/O the
+      same way endless microtasks do.
+pitfalls:
+  - "**Expecting `setTimeout(fn, 0)` to run immediately.** It queues a task that waits for the current code, all microtasks and possibly a render. Use `queueMicrotask` if you need \"right after this code\", and remember timers are a minimum delay, never a promise of exact timing."
+  - "**Using a promise callback to let the page paint.** Microtasks run before rendering, so `Promise.resolve().then(work)` still blocks the paint. Start the work in a later task, such as `requestAnimationFrame(() => setTimeout(work, 0))`."
+  - "**Heavy work in an event handler.** One 800 ms handler freezes input for 800 ms. Split it into chunks that yield, show progress between them, or move it to a Web Worker."
+  - "**Recursive microtasks or `process.nextTick`.** Each one queued joins the current checkpoint, so timers, I/O and painting never get a turn. Recurse through `setTimeout` or `setImmediate` instead."
+  - "**Relying on exact microtask tick counts.** How many turns an `await` takes has changed between engine versions. Make order explicit with `await` or chaining rather than clever timing."
+  - "**Animating with `setInterval`.** It drifts, ignores the display's refresh rate and runs out of step with painting. Use `requestAnimationFrame` and compute positions from its timestamp."
+interview:
+  - question: 'What does this print, and why? `setTimeout(() => log("timeout"), 0); Promise.resolve().then(() => log("promise")); log("sync");`'
+    answer: >-
+      It prints `sync`, then `promise`, then `timeout`. The whole script is one task, so the
+      synchronous log runs first. `then` queues a microtask and `setTimeout` queues a task.
+      When the script's task ends, the loop drains the microtask queue completely, so
+      `promise` logs. Only then does it take the next task, the timer. The 0 ms delay doesn't
+      change that; it means "as a new task, no earlier than now". The same rule tells you
+      that code after an `await` behaves like the `then` callback, and that if the promise
+      callback queued another microtask, that one would also run before the timer.
+  - question: What's the difference between a task and a microtask?
+    answer: >-
+      Tasks are the units the event loop picks one at a time: running a script, a click
+      handler, a timer callback, a network callback. Microtasks are smaller follow-ups:
+      promise reactions, code after `await`, `queueMicrotask`, and MutationObserver
+      callbacks. After each task, and after each callback when the stack empties, the loop
+      runs every microtask, including ones queued in the process, before rendering or taking
+      another task. That gives promise code low latency and consistent state, since nothing
+      else can run in between. The trade-off is starvation: a chain of microtasks that keeps
+      queueing more blocks input, timers and painting completely.
+  - question: A heavy calculation freezes the page. How do you fix it?
+    answer: >-
+      First I confirm it's CPU work on the main thread, using the Performance panel, which
+      flags long tasks over 50 ms. Then there are three options. If the work can be split,
+      I process it in chunks and yield between them with a timer, ideally on a time budget
+      of a few milliseconds, so input and painting get a turn; that keeps it simple and
+      works everywhere. If it's CPU-bound and self-contained, I move it to a Web Worker,
+      which runs on another thread and posts the result back, at the cost of copying data
+      across. And often the best fix is doing less: memoising, virtualising a long list, or
+      moving the work to the server. Promises alone don't help, because they don't create
+      threads.
+  - question: Compare `process.nextTick`, `queueMicrotask`, `setImmediate` and `setTimeout(fn, 0)` in Node.
+    answer: >-
+      `process.nextTick` and `queueMicrotask` both run before the loop moves on; the other
+      two run in later loop phases. Within a normal callback, the nextTick queue is drained
+      before promise microtasks. There's one wrinkle: at the top level of an ES module, the
+      module itself runs in a promise job, so promise callbacks run before nextTick there.
+      `setImmediate` runs in the check phase, after I/O polling, and `setTimeout(fn, 0)` runs
+      in the timers phase with a minimum delay of 1 ms. From the main module their relative
+      order isn't guaranteed; inside an I/O callback, `setImmediate` always wins. My default
+      is `queueMicrotask` for standard code, and I avoid recursive nextTick, which starves
+      I/O.
+terms:
+  - term: Event loop
+    say: JavaScript runs async code in the background.
+    means: One thread runs one task to completion, then every microtask, then in a browser maybe a
+      render, then the next task. Async work waits as callbacks in those queues.
+  - term: Microtask
+    say: A smaller, quicker task.
+    means: A promise callback or the code after an `await`. The microtask queue is emptied completely
+      after each task, before the next task and before any paint.
+  - term: "`setTimeout(fn, 0)`"
+    say: It runs the function immediately.
+    means: It queues a new task, no sooner than now. It always runs after the current code and every
+      microtask that code queued.
+  - term: "`await`"
+    say: The whole async function runs later.
+    means: An async function runs synchronously up to its first `await`, and only the rest is queued as
+      a microtask.
+  - term: Blocking the loop
+    say: Async code can't freeze the page.
+    means: Nothing interrupts running code, so a long task or an endless chain of microtasks blocks
+      clicks, timers and painting. Split the work into chunks or move it to a Web Worker.
+  - term: "`requestAnimationFrame`"
+    say: A timer set to 16 milliseconds.
+    means: A callback that runs right before the browser's next style and paint step, at whatever rate
+      the display refreshes. It's the place for visual updates.

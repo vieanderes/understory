@@ -1,0 +1,236 @@
+summary: >-
+  A release swaps the code that serves live traffic. Done naively, there's a moment when
+  nothing is listening, and every request in that moment fails. A zero-downtime release
+  removes the moment by ordering the steps: start the new version, wait until it's
+  healthy, move traffic, and only then stop the old one.
+
+
+  Three things make that order hold up in production. The old version must finish the
+  requests it already has before it exits, which is called draining. The database must
+  suit both versions at once, because they overlap during the switch and again after a
+  rollback. And every build must keep its own name, so going back is a redeploy of a known
+  image rather than a rebuild under pressure.
+
+
+  These notes cover graceful shutdown in Node, how the release strategies compare, a
+  column rename carried out safely across releases, and when a rollback stops being
+  possible.
+remember:
+  - "A zero-downtime release runs in a fixed order: start the new version, wait for its health check, switch traffic, then stop the old one."
+  - Draining means an instance stops receiving new requests, finishes the ones in flight, and only then exits.
+  - On `SIGTERM`, fail readiness first, wait long enough for the balancer to notice, then close the server with a hard deadline shorter than the platform's kill timeout.
+  - Old and new code run against one database during a release, so every migration must work with both versions.
+  - A rename or a drop ships as expand, migrate the code, then contract in a later release, never in one step.
+  - A rollback is a redeploy of the last good image by its commit tag, and it only works while the schema still suits the old code.
+  - Blue-green switches everyone at once and rolls back instantly, at the cost of double capacity; rolling needs little spare capacity but mixes versions for longer.
+  - Deploy and release are different moments; a feature flag lets you ship code switched off and turn it on without a deploy.
+sections:
+  - title: Draining, the other half of a release
+    body: |-
+      Starting the new version first closes the gap at the front. The old version's exit can
+      still drop requests: `docker stop` sends `SIGTERM`, and a process that ignores it is
+      killed ten seconds later, mid-request. A process that exits at once is worse. Handle
+      the signal.
+
+      ```js
+      import http from 'node:http';
+
+      let draining = false;
+
+      const server = http.createServer(async (req, res) => {
+        if (req.url === '/ready') {
+          res.statusCode = draining ? 503 : 200;
+          return res.end();
+        }
+        await new Promise((r) => setTimeout(r, 2000)); // a slow request
+        res.end('booked\n');
+      });
+
+      server.listen(8080);
+
+      process.on('SIGTERM', () => {
+        draining = true; // readiness fails, the balancer stops sending
+        setTimeout(() => {
+          server.close(() => process.exit(0)); // wait for requests in flight
+          setTimeout(() => process.exit(1), 20_000).unref(); // never hang for ever
+        }, 5_000); // give the balancer time to notice
+      });
+      ```
+
+      Run on Node 24: a two-second request that started before the signal still answered
+      `booked`, `/ready` returned `503` straight after the signal, and the process exited
+      with code 0 once the delay and the request were done.
+
+      The five-second pause matters. The balancer only learns an instance is draining at its
+      next health check, so new requests keep arriving for up to one check interval. Closing
+      the listener at once turns those into connection errors. `server.close()` stops
+      accepting connections and calls back when open requests finish. Since Node 19 it also
+      closes idle keep-alive connections, which used to hold the process open.
+
+      Two platform details make or break this. The shutdown must fit inside the kill
+      timeout: raise it with `docker stop --time 30` or `stop_grace_period: 30s` in Compose.
+      And the signal has to reach Node. `CMD ["node", "server.js"]` makes Node the process
+      that receives it. The shell form, `CMD node server.js`, runs under `/bin/sh`, which
+      doesn't pass `SIGTERM` on.
+  - title: Recreate, rolling or blue-green
+    body: |-
+      Each strategy trades spare capacity, speed of rollback and how long two versions run
+      side by side.
+
+      - **Recreate.** Stop everything, start the new version. Simple and never mixes
+        versions, and there's downtime. Fine for a batch worker or an internal tool at 3
+        a.m.
+      - **Rolling.** Replace instances a few at a time, each health-gated. Needs one or two
+        spare instances, not a whole copy. Old and new serve users side by side for the
+        whole rollout, and a rollback is another rolling deploy, so it takes as long as the
+        release did. Kubernetes calls the knobs `maxSurge`, how many extra instances may
+        start, and `maxUnavailable`, how many may be missing.
+      - **Blue-green.** Start a full second copy, test it privately, switch all traffic at
+        once. Versions overlap only for the moment of the switch, and rollback is flipping
+        back, in seconds, while blue still runs. The cost is double capacity during the
+        release, and every user meets the new version at the same moment, bugs included.
+      - **Canary.** Send a small share of traffic to the new version, watch its error rate,
+        then widen. The progressive delivery lesson covers it.
+
+      Whatever the strategy, shared resources don't switch. The database, the queue and the
+      cache serve both colours. A new version that writes a message format the old workers
+      can't read breaks the rollback as surely as a dropped column does. Treat message and
+      cache formats like schemas: readers learn the new shape before any writer produces it.
+
+      For a small service on one or two servers, blue-green behind Caddy or nginx is the
+      most forgiving choice: the proxy reload is graceful, and the old copy is your rollback.
+  - title: A column rename across three releases
+    body: |-
+      The lesson did the first half of expand and contract. Here is the whole of it,
+      renaming `customers.name` to `full_name` while old and new code both write. It ran on
+      PostgreSQL 17.
+
+      Release A, expand. Add the column, and keep both columns in step with a trigger, so
+      whichever version writes, the other still reads the right value.
+
+      ```sql
+      SET lock_timeout = '2s';
+      ALTER TABLE customers ADD COLUMN full_name text;
+
+      CREATE FUNCTION customers_sync_names() RETURNS trigger AS $$
+      BEGIN
+        IF TG_OP = 'INSERT' THEN
+          NEW.full_name := coalesce(NEW.full_name, NEW.name);
+          NEW.name := coalesce(NEW.name, NEW.full_name);
+        ELSIF NEW.name IS DISTINCT FROM OLD.name THEN
+          NEW.full_name := NEW.name;       -- old code changed the name
+        ELSIF NEW.full_name IS DISTINCT FROM OLD.full_name THEN
+          NEW.name := NEW.full_name;       -- new code changed the name
+        END IF;
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql;
+
+      CREATE TRIGGER customers_sync_names
+        BEFORE INSERT OR UPDATE ON customers
+        FOR EACH ROW EXECUTE FUNCTION customers_sync_names();
+
+      -- backfill in batches; repeat until it updates 0 rows
+      UPDATE customers SET full_name = name
+      WHERE id IN (SELECT id FROM customers WHERE full_name IS NULL LIMIT 5000);
+      ```
+
+      Inserts through the old column and the new, and updates through each, all came out
+      with both columns equal. Then make the new column required without a long lock:
+
+      ```sql
+      ALTER TABLE customers
+        ADD CONSTRAINT full_name_present CHECK (full_name IS NOT NULL) NOT VALID;
+      ALTER TABLE customers VALIDATE CONSTRAINT full_name_present;
+      ALTER TABLE customers ALTER COLUMN full_name SET NOT NULL;
+      ALTER TABLE customers DROP CONSTRAINT full_name_present;
+      ```
+
+      `VALIDATE` scans the table without blocking writes, and `SET NOT NULL` then uses the
+      valid check to skip its own scan.
+
+      Release B deploys code that reads and writes only `full_name`. Release C, once you're
+      sure you won't roll back to A's code, contracts: drop the trigger, the function and
+      `name`.
+
+      `lock_timeout` guards every step. `ALTER TABLE` waits for an exclusive lock, and while
+      it waits, every query behind it queues too. Failing after two seconds and retrying is
+      better than stalling the whole app.
+  - title: Roll back, roll forward, or neither
+    body: |-
+      Rolling back is the default response to a bad release because it's fast and needs no
+      diagnosis. It isn't always available, so know the cases before you need them.
+
+      **The schema moved on.** If the release dropped or renamed something the old code
+      reads, the old image fails on start or on first query. Expand and contract prevents
+      this by keeping every contract step a release behind.
+
+      **The data moved on.** The new version may have written rows the old one can't read,
+      such as a new status value that the old code's validation rejects. Restoring the
+      database to fix that loses every booking since, so the choice becomes a fix forward.
+
+      **The world moved on.** Emails sent, payments captured and messages published to other
+      systems don't un-happen when the code does. A rollback stops further harm; it doesn't
+      undo effects. Idempotent handlers and an outbox make the retry after a fix safe.
+
+      **Roll forward** means shipping a fix as a new release. It's right when the fix is
+      small and certain, or when going back is unsafe for one of the reasons above. It's
+      slower under pressure, since it needs a diagnosis, a review and a full pipeline run.
+
+      A **feature flag** removes much of this. The new code ships switched off, the deploy
+      changes nothing users see, and the release is a flag change that takes effect in
+      seconds and reverts as fast. Deploys become routine, and the risky moment moves
+      to a switch you control per user or per percentage.
+
+      Automate the obvious case. If the smoke test after the switch fails, or the error rate
+      of the new version passes a threshold in the first few minutes, switch back without
+      waiting for a person.
+pitfalls:
+  - "**Stopping the old version before the new one is healthy.** That's the gap from the lesson, and it returns whenever a script is reordered for speed. Health-gate every switch."
+  - "**Exiting immediately on `SIGTERM`.** Requests in flight are cut off. Fail readiness, wait for the balancer to notice, then close and let open requests finish."
+  - "**Shell-form `CMD` in the Dockerfile.** `/bin/sh` receives the signal and Node never hears it, so the container is killed after the timeout. Use the exec form."
+  - "**Renaming or dropping in the same release as the code change.** The old version, still serving during the switch and after a rollback, asks for a column that's gone. Expand, migrate the code, contract later."
+  - "**Backfilling a large table in one `UPDATE`.** It holds row locks for a long time and bloats the table. Update in batches, and set `lock_timeout` on schema changes."
+  - "**Tagging every build `latest`.** The last good image loses its name, and rollback turns into a rebuild. Tag by commit and keep old tags."
+  - "**Assuming rollback undoes side effects.** Sent emails and captured payments stay done. Plan compensations, and make handlers idempotent so the corrected release can retry safely."
+interview:
+  - question: How would you deploy a database column rename with zero downtime?
+    answer: >-
+      In at least three releases, using expand and contract, because old and new code run at
+      the same time. First, add the new column, keep both in sync with a trigger or dual
+      writes, and backfill in batches. If it must be `NOT NULL`, add a `NOT VALID` check,
+      validate it, then set `NOT NULL`, which avoids a long exclusive lock. Second, deploy
+      code that reads and writes only the new column. Third, once rollback to the old code
+      is off the table, drop the trigger and the old column. Every schema step uses a short
+      `lock_timeout`. The cost is several deploys and a period with duplicate data, in
+      exchange for never breaking the version still running.
+  - question: What does graceful shutdown mean for a web server in a container, and how do you implement it?
+    answer: >-
+      It means finishing the requests you've accepted and taking no new ones before you
+      exit. The platform sends `SIGTERM`, then kills after a grace period. On the signal, I
+      flip readiness to failing so the balancer stops routing to me, wait about one health
+      check interval, then call `server.close()` and exit when in-flight requests finish.
+      A hard deadline below the grace period stops a stuck request from hanging the
+      shutdown. The Dockerfile uses exec-form `CMD` so Node receives the signal. Background
+      work, such as a queue consumer, stops taking new jobs and finishes or returns the
+      current one. Without this, every deploy drops a handful of requests.
+  - question: Blue-green or rolling deploy, how do you choose?
+    answer: >-
+      Blue-green when fast rollback and a clean switch matter more than spare capacity;
+      rolling when capacity is the constraint. Blue-green runs two full environments, lets
+      me test green privately, and switches everyone at once, so rollback is flipping back
+      in seconds. It doubles resources during the release and exposes all users to a bug
+      at the same moment. Rolling replaces instances in batches with little extra capacity,
+      but versions coexist for the whole rollout and rollback is another rollout. In both,
+      the database is shared, so migrations must be backward compatible either way. If I
+      need to limit blast radius, I'd add a canary step in front of either.
+  - question: A release has gone out and error rates are climbing. Do you roll back or fix forward?
+    answer: >-
+      Roll back by default, because it's fast and needs no diagnosis, as long as rollback is
+      safe. I check two things first: did the release run a migration the old code can't
+      live with, and has it written data the old code can't read? If either is true,
+      rollback could make things worse, so I'd mitigate another way, such as turning off
+      the feature flag, and fix forward. If neither is true, I redeploy the previous image
+      or switch back to blue, confirm the errors fall, and then investigate calmly. Fixing
+      forward under pressure risks a second bad release, which is why the default favours
+      going back.

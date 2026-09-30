@@ -1,0 +1,1375 @@
+summary: >-
+  The reference storefront is a Next.js 16 app with three routes: a product list at `/`, a page per product at `/products/[slug]` and a checkout at `/checkout`. Server Components load the products through one server-only module, so the catalogue never becomes client state. The list and each product page are prerendered and regenerated at most every five minutes with `export const revalidate = 300`, and `generateStaticParams` prebuilds every known product. Interactivity lives in a few small Client Components. The basket is a pure reducer behind a small external store, saved to `localStorage` and read with `useSyncExternalStore`, so every route shares it and a reload keeps it. Colour roles in design tokens feed Tailwind and a component library: a `Button` with closed variants and a `Field` that wires labels, hints and errors. The checkout uses a React form action, validates in a pure function, keeps what people typed, moves focus to the first wrong field and announces results in live regions. Every animation is opt-in behind `prefers-reduced-motion: no-preference`. We built the app with `next build`, ran 22 unit and component tests, and drove the flow in Chromium with axe at phone and desktop widths, light and dark, with and without reduced motion: zero violations and no console errors.
+remember:
+  - >-
+    Products are server data: Server Components load them through one `server-only` module, and no client component keeps a copy in state.
+  - >-
+    The list and product pages are static with `export const revalidate = 300`; `generateStaticParams` prebuilds known slugs and new ones render on their first visit.
+  - >-
+    The data layer throws on a failed request instead of returning an empty list, because a throw during revalidation keeps the last good page.
+  - >-
+    Each value lives in the smallest home that serves it: quantity in its component, basket in a persisted store, answers in the form, outcome in `useActionState`.
+  - >-
+    The basket is read with `useSyncExternalStore` and an empty server snapshot, so the server HTML and the hydrating render agree.
+  - >-
+    `'use client'` marks only the leaves that need the browser, so product lists and details arrive as HTML with no component JavaScript.
+  - >-
+    Components read colour roles, never palette values, and each variant is a member of a closed union mapped to full class names.
+  - >-
+    Every field has a visible label and its error in words, linked by `aria-describedby` and flagged by `aria-invalid`, and a failed submit focuses the first wrong field.
+  - >-
+    Live regions exist before their text changes, so screen readers are already listening when a message arrives.
+  - >-
+    Motion is opt-in: it is written inside `prefers-reduced-motion: no-preference`, so someone who asked for less never gets it.
+sections:
+  - title: '1. The map, and where each piece of state lives'
+    body: |-
+      Start with a map, because the brief's hardest line is "keep each piece of state where it
+      belongs".
+
+      ```text
+      app/layout.tsx                every page       header, basket link, skip link
+      app/page.tsx                  /                product list, static, revalidate 300
+      app/products/[slug]/page.tsx  /products/:slug  one product, static per slug
+      app/checkout/page.tsx         /checkout        basket and form, static shell
+      app/not-found.tsx, error.tsx  404 and crashes
+      lib/products.ts               server only      fetches and checks products
+      lib/cart.ts, cart-store.ts    browser          basket reducer and store
+      lib/checkout.ts               both             reads and validates the form
+      components/ui/                both             Button, ButtonLink, Field, RadioGroup
+      ```
+
+      Then give every value one home, with the React chapter's questions: can it be derived, who
+      needs it, and must it survive a reload?
+
+      - **The catalogue** stays on the server. Client code receives only the fields it needs, as
+        props.
+      - **The chosen quantity** is `useState` inside `AddToCart`. Nothing else needs it until Add.
+      - **The basket** is needed by three routes and must survive a reload. Context over
+        `useReducer` in the root layout would share it across navigations, but a reload would
+        empty it. So it lives in a store outside React, saved to `localStorage`.
+      - **Counts and totals** are derived during render, never stored.
+      - **The checkout answers** live in the inputs. The action reads them from `FormData`.
+      - **The checkout outcome** is whatever the action returns, kept by `useActionState`.
+
+      Nothing is in the URL yet. The first candidate is a category filter, because a filtered list
+      is something people share.
+  - title: '2. The product type and the server-only data layer'
+    body: |-
+      Prices are whole pence, so sums stay exact.
+
+      ```ts
+      // lib/types.ts
+      export type Product = {
+        slug: string;
+        name: string;
+        description: string;
+        /** Whole pence, so sums never meet floating-point rounding. */
+        price: number;
+        image: string;
+        imageAlt: string;
+        inStock: boolean;
+      };
+      ```
+
+      ```ts
+      // lib/products.ts
+      import 'server-only';
+      import type { Product } from './types';
+
+      function apiUrl(path: string): string {
+        const base = process.env.PRODUCTS_API_URL;
+        if (!base) throw new Error('PRODUCTS_API_URL is not set');
+        return `${base}${path}`;
+      }
+
+      function isProduct(value: unknown): value is Product {
+        if (typeof value !== 'object' || value === null) return false;
+        const p = value as Record<string, unknown>;
+        return (
+          typeof p.slug === 'string' &&
+          typeof p.name === 'string' &&
+          typeof p.description === 'string' &&
+          Number.isInteger(p.price) &&
+          typeof p.image === 'string' &&
+          typeof p.imageAlt === 'string' &&
+          typeof p.inStock === 'boolean'
+        );
+      }
+
+      export async function getProducts(): Promise<Product[]> {
+        const response = await fetch(apiUrl('/products'));
+        // Throw, never return []: during revalidation a throw keeps the last good page.
+        if (!response.ok) throw new Error(`Products request failed with ${response.status}`);
+        const data: unknown = await response.json();
+        if (!Array.isArray(data)) throw new Error('Products response is not a list');
+        return data.filter(isProduct);
+      }
+
+      export async function getProduct(slug: string): Promise<Product | null> {
+        const response = await fetch(apiUrl(`/products/${encodeURIComponent(slug)}`));
+        if (response.status === 404) return null;
+        if (!response.ok) throw new Error(`Product request failed with ${response.status}`);
+        const data: unknown = await response.json();
+        return isProduct(data) ? data : null;
+      }
+      ```
+
+      **`import 'server-only'`** stops the build if a Client Component ever imports this file.
+      `PRODUCTS_API_URL` has no `NEXT_PUBLIC_` prefix, so it never reaches a bundle.
+
+      **The response is `unknown` until checked.** `isProduct` narrows each item, so a renamed API
+      field shows up as a missing product rather than `undefined` on a page.
+
+      **A failed request throws.** The Next.js ISR guide says that if an error is thrown while
+      revalidating, the last page that generated without error keeps being served, and the next
+      request retries. Returning `[]` would be saved as the new page, and the shop would show no
+      products for five minutes.
+
+      **A missing product is `null`**, which the page turns into a 404. Only real failures reach
+      the error boundary.
+
+      No cache wrapper is needed for the product page and its metadata to share a request: the
+      docs say identical `fetch` calls are memoised during one server render, across
+      `generateMetadata`, `generateStaticParams`, layouts and pages.
+  - title: '3. The product list, rendered on the server'
+    body: |-
+      The list page is an async Server Component: no `'use client'`, no effect, no spinner. The
+      HTML arrives with the products in it.
+
+      ```tsx
+      // app/page.tsx
+      import { ProductCard } from '@/components/product-card';
+      import { getProducts } from '@/lib/products';
+
+      export const revalidate = 300;
+
+      export default async function ProductListPage() {
+        const products = await getProducts();
+
+        return (
+          <>
+            <h1 className="text-2xl font-bold">All products</h1>
+            <ul className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+              {products.map((product) => (
+                <li key={product.slug}>
+                  <ProductCard product={product} />
+                </li>
+              ))}
+            </ul>
+          </>
+        );
+      }
+      ```
+
+      ```tsx
+      // components/product-card.tsx
+      import Image from 'next/image';
+      import Link from 'next/link';
+      import { formatPrice } from '@/lib/format';
+      import type { Product } from '@/lib/types';
+
+      export function ProductCard({ product }: { product: Product }) {
+        return (
+          <article className="group grid gap-2 rounded-md bg-raised p-3">
+            <div className="overflow-hidden rounded-md">
+              {/* Empty alt: the heading below already names the product. */}
+              <Image
+                src={product.image}
+                alt=""
+                width={600}
+                height={600}
+                className="aspect-square object-cover motion-safe:transition-transform motion-safe:group-hover:scale-105"
+              />
+            </div>
+            <h2 className="text-lg font-bold">
+              <Link
+                href={`/products/${product.slug}`}
+                className="underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus"
+              >
+                {product.name}
+              </Link>
+            </h2>
+            <p>{formatPrice(product.price)}</p>
+            {!product.inStock && <p className="font-medium text-muted">Out of stock</p>}
+          </article>
+        );
+      }
+      ```
+
+      Read it as a screen reader user meets it. The products are a list, so its length is
+      announced. Each card's heading holds the link, so heading navigation jumps between products
+      and each link is named by its product, not "View". The image has `alt=""` because the
+      heading below already names the product; on the product page, where the picture is the
+      content, it gets a real description. Out of stock is said in words, not only by greying.
+      The key is the stable slug, so a reordered API response moves cards instead of rebuilding
+      them.
+  - title: '4. Static product pages with revalidation'
+    body: |-
+      A product page must be fast for everyone and correct within minutes of a price change.
+
+      ```tsx
+      // app/products/[slug]/page.tsx
+      import type { Metadata } from 'next';
+      import Image from 'next/image';
+      import { notFound } from 'next/navigation';
+      import { AddToCart } from '@/components/add-to-cart';
+      import { ButtonLink } from '@/components/ui/button';
+      import { formatPrice } from '@/lib/format';
+      import { getProduct, getProducts } from '@/lib/products';
+
+      export const revalidate = 300;
+
+      export async function generateStaticParams() {
+        const products = await getProducts();
+        return products.map((product) => ({ slug: product.slug }));
+      }
+
+      export async function generateMetadata({ params }: PageProps<'/products/[slug]'>): Promise<Metadata> {
+        const { slug } = await params;
+        const product = await getProduct(slug);
+        if (!product) return { title: 'Product not found' };
+        return {
+          title: product.name,
+          description: product.description,
+          openGraph: { images: [product.image] },
+        };
+      }
+
+      export default async function ProductPage({ params }: PageProps<'/products/[slug]'>) {
+        const { slug } = await params;
+        const product = await getProduct(slug);
+        if (!product) notFound();
+
+        return (
+          <article className="grid gap-4 md:grid-cols-2">
+            <Image
+              src={product.image}
+              alt={product.imageAlt}
+              width={800}
+              height={800}
+              loading="eager"
+              className="aspect-square rounded-md object-cover"
+            />
+            <div className="grid content-start justify-items-start gap-3">
+              <h1 className="text-2xl font-bold">{product.name}</h1>
+              <p className="text-lg">{formatPrice(product.price)}</p>
+              <p>{product.description}</p>
+              {product.inStock ? (
+                <AddToCart slug={product.slug} name={product.name} price={product.price} />
+              ) : (
+                <p className="font-medium">Out of stock</p>
+              )}
+              <ButtonLink href="/checkout" variant="plain">
+                Go to checkout
+              </ButtonLink>
+            </div>
+          </article>
+        );
+      }
+      ```
+
+      The real `next build` output of the reference app:
+
+      ```text
+      Route (app)                  Revalidate  Expire
+      ┌ ○ /                                5m      1y
+      ├ ○ /_not-found
+      ├ ○ /checkout
+      └   /products/[slug]
+        ├ ● /products/canvas-tote          5m      1y
+        ├ ● /products/enamel-mug           5m      1y
+        └ ● /products/wool-socks           5m      1y
+
+      ○  (Static)  prerendered as static content
+      ●  (SSG)     prerendered as static HTML (uses generateStaticParams)
+      ```
+
+      The ISR guide describes the life of each page. Requests get the saved page. Once 300 seconds
+      have passed, the next request still gets the stale page and triggers a regeneration in the
+      background; when it succeeds, later requests get the new one. A product added after the
+      build renders on its first visit and is saved, because `dynamicParams` defaults to `true`.
+      An unknown slug makes `getProduct` return `null`, and `notFound()` answers with a 404, which
+      we checked with `curl` against `next start`.
+
+      `generateMetadata` gives each page a title, which the layout's template turns into "Canvas
+      tote | The Shop", and a share image. Only three serialisable values cross into
+      `AddToCart`, which keeps the page payload small. The main image uses `loading="eager"`:
+      Next.js 16 deprecated `priority`, and its docs suggest `loading="eager"` or
+      `fetchPriority="high"` in most cases.
+
+      Five minutes is a product decision: shorter means more regenerations, longer means slower
+      price updates. Invalidating the moment a price changes needs `revalidatePath` in a Server
+      Action or Route Handler, chapter 29's topic. In `next dev` pages always render on demand, so
+      check revalidation on a production build.
+  - title: '5. Design tokens: palette, roles and Tailwind'
+    body: |-
+      Tokens come first, because every component reads them. The palette says what a colour is;
+      roles say what it's for. Components use roles only.
+
+      ```css
+      /* app/globals.css */
+      @import "tailwindcss";
+
+      /* Palette: what each colour is. Only the roles below may use these. */
+      :root {
+        --stone-50: #f7f5f0;
+        --white: #ffffff;
+        --grey-500: #6b6f80;
+        --grey-600: #4f5366;
+        --ink-900: #1b1d2e;
+        --night-900: #16181f;
+        --night-800: #232635;
+        --mist-300: #b4b7c5;
+        --paper-100: #f2f0ea;
+        --teal-300: #5eead4;
+        --teal-200: #99f6e4;
+        --teal-700: #0f766e;
+        --teal-800: #115e59;
+        --red-300: #fca5a5;
+        --red-200: #fecaca;
+        --red-700: #b91c1c;
+        --red-800: #991b1b;
+        --blue-700: #1d4ed8;
+        --blue-300: #93c5fd;
+      }
+
+      /* Roles: what each colour is for. Components read these, through Tailwind. */
+      :root {
+        --surface: var(--stone-50);
+        --raised: var(--white);
+        --ink: var(--ink-900);
+        --muted: var(--grey-600);
+        --edge: var(--grey-500);
+        --accent: var(--teal-700);
+        --accent-strong: var(--teal-800);
+        --on-accent: var(--white);
+        --danger: var(--red-700);
+        --danger-strong: var(--red-800);
+        --focus: var(--blue-700);
+        color-scheme: light;
+      }
+
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --surface: var(--night-900);
+          --raised: var(--night-800);
+          --ink: var(--paper-100);
+          --muted: var(--mist-300);
+          --edge: var(--mist-300);
+          --accent: var(--teal-300);
+          --accent-strong: var(--teal-200);
+          --on-accent: var(--night-900);
+          --danger: var(--red-300);
+          --danger-strong: var(--red-200);
+          --focus: var(--blue-300);
+          color-scheme: dark;
+        }
+      }
+
+      /* inline: utilities use var(--surface) directly, so a theme switch reaches them. */
+      @theme inline {
+        --color-*: initial;
+        --color-surface: var(--surface);
+        --color-raised: var(--raised);
+        --color-ink: var(--ink);
+        --color-muted: var(--muted);
+        --color-edge: var(--edge);
+        --color-accent: var(--accent);
+        --color-accent-strong: var(--accent-strong);
+        --color-on-accent: var(--on-accent);
+        --color-danger: var(--danger);
+        --color-danger-strong: var(--danger-strong);
+        --color-focus: var(--focus);
+      }
+
+      body {
+        background-color: var(--surface);
+        color: var(--ink);
+        font-family: system-ui, sans-serif;
+      }
+
+      /* Motion is opt-in: it exists only for people who have not asked for less. */
+      @media (prefers-reduced-motion: no-preference) {
+        .bump {
+          animation: bump 300ms ease-out;
+        }
+      }
+
+      @keyframes bump {
+        from { transform: scale(1.3); }
+        to { transform: scale(1); }
+      }
+      ```
+
+      **`@theme inline`** makes theming reach Tailwind. The built CSS contains
+      `.bg-accent{background-color:var(--accent)}`, so when the dark query gives `--accent` a new
+      value, every `bg-accent` follows. `--color-*: initial` removes Tailwind's default colours, so
+      an off-system `bg-blue-500` generates nothing and shows up in review. The dark theme
+      redefines roles and touches no component.
+
+      We measured the role pairs with the WCAG formula:
+
+      ```text
+      light  ink on surface         15.28   text needs 4.5
+      light  on-accent on accent     5.47   primary button
+      light  danger on raised        6.47   error text
+      light  edge on surface         4.58   input borders need 3
+      light  focus on surface        6.15   focus ring needs 3
+      dark   on-accent on accent    11.98
+      dark   danger on raised        7.90
+      dark   focus on surface        9.83
+      ```
+
+      All 28 pairs pass in both themes. Input borders use `--edge`, not a pale line, because a
+      control's edge needs 3 to 1.
+  - title: '6. The component library: Button and ButtonLink'
+    body: |-
+      Each component is built on the native element, so focus, roles and keys come free.
+
+      ```tsx
+      // components/ui/button.tsx
+      import Link from 'next/link';
+      import type { ComponentProps } from 'react';
+
+      export type ButtonVariant = 'primary' | 'plain' | 'danger';
+      export type ButtonSize = 'md' | 'sm';
+
+      const base =
+        'inline-flex items-center justify-center gap-1 rounded-md border-2 font-medium ' +
+        'focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus ' +
+        'aria-disabled:cursor-not-allowed aria-disabled:opacity-70';
+
+      // Full class names, written out, so Tailwind's scanner finds every one.
+      const variants: Record<ButtonVariant, string> = {
+        primary: 'border-transparent bg-accent text-on-accent hover:bg-accent-strong',
+        plain: 'border-edge bg-raised text-ink hover:border-ink',
+        danger: 'border-transparent bg-danger text-on-accent hover:bg-danger-strong',
+      };
+
+      const sizes: Record<ButtonSize, string> = {
+        md: 'min-h-11 px-4 text-base',
+        sm: 'min-h-9 px-3 text-sm',
+      };
+
+      export function buttonClasses(variant: ButtonVariant = 'primary', size: ButtonSize = 'md'): string {
+        return `${base} ${variants[variant]} ${sizes[size]}`;
+      }
+
+      type Look = { variant?: ButtonVariant; size?: ButtonSize };
+
+      export type ButtonProps = Omit<ComponentProps<'button'>, 'className'> & Look;
+
+      /** An action. Defaults to type="button", so it never submits a form by accident. */
+      export function Button({ variant = 'primary', size = 'md', type = 'button', ...rest }: ButtonProps) {
+        return <button type={type} className={buttonClasses(variant, size)} {...rest} />;
+      }
+
+      export type ButtonLinkProps = Omit<ComponentProps<typeof Link>, 'className'> & Look;
+
+      /** Somewhere to go, dressed as a button. Still a real link underneath. */
+      export function ButtonLink({ variant = 'plain', size = 'md', ...rest }: ButtonLinkProps) {
+        return <Link className={buttonClasses(variant, size)} {...rest} />;
+      }
+      ```
+
+      **Variants are a closed union.** `Record<ButtonVariant, string>` makes the compiler demand
+      classes for every variant, and `variant="secondary"` is a type error.
+
+      **Class names are written out whole**, because Tailwind finds classes by scanning text. A
+      name built at run time, like `` `bg-${variant}` ``, never gets a rule.
+
+      **No `className` prop.** A caller can't add `p-2` to a button that has `px-4` and get
+      whichever rule the generated CSS lists later. Layout belongs to a wrapper. The cost: a
+      one-off look needs a new variant, reviewed once.
+
+      **`type` defaults to `"button"`**, because a plain button inside a form submits it. The
+      submit button asks for `type="submit"`.
+
+      **Action or destination.** `Button` does something; `ButtonLink` goes somewhere and renders
+      a real link, announced as one and openable in a new tab.
+
+      **`aria-disabled` over `disabled`.** A disabled button leaves the Tab order, and a focused one
+      that turns disabled can lose focus. `aria-disabled` keeps it reachable while the handler
+      refuses the click.
+
+      Controls are at least 44 pixels tall. WCAG 2.2 AA asks for 24 by 24; 44 suits a thumb. The
+      file has no `'use client'` and no hooks, so Server and Client Components can both render
+      it.
+  - title: '7. Fields that explain themselves'
+    body: |-
+      Every rule from the forms lesson is solved once, here, so no screen can forget a label.
+
+      ```tsx
+      // components/ui/field.tsx
+      import { useId, type ComponentProps } from 'react';
+
+      type FieldProps = Omit<
+        ComponentProps<'input'>,
+        'id' | 'name' | 'className' | 'required' | 'aria-invalid' | 'aria-describedby'
+      > & {
+        name: string;
+        label: string;
+        hint?: string;
+        error?: string;
+        optional?: boolean;
+      };
+
+      export function Field({ name, label, hint, error, optional = false, ...input }: FieldProps) {
+        const id = useId();
+        const hintId = `${id}-hint`;
+        const errorId = `${id}-error`;
+        const describedBy = [hint && hintId, error && errorId].filter(Boolean).join(' ') || undefined;
+
+        return (
+          <div className="grid gap-1">
+            <label htmlFor={id} className="font-medium">
+              {label}
+              {optional && <span className="font-normal text-muted"> (optional)</span>}
+            </label>
+            {hint && (
+              <p id={hintId} className="text-sm text-muted">
+                {hint}
+              </p>
+            )}
+            {error && (
+              <p id={errorId} className="text-sm font-medium text-danger">
+                {error}
+              </p>
+            )}
+            <input
+              id={id}
+              name={name}
+              required={!optional}
+              aria-invalid={error ? true : undefined}
+              aria-describedby={describedBy}
+              className="min-h-11 rounded-md border-2 border-edge bg-raised px-2 text-ink aria-invalid:border-danger focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus"
+              {...input}
+            />
+          </div>
+        );
+      }
+
+      type Option = { value: string; label: string };
+
+      type RadioGroupProps = {
+        name: string;
+        legend: string;
+        options: readonly Option[];
+        defaultValue?: string;
+        error?: string;
+      };
+
+      export function RadioGroup({ name, legend, options, defaultValue, error }: RadioGroupProps) {
+        const errorId = useId();
+        return (
+          <fieldset className="grid gap-1" aria-describedby={error ? errorId : undefined}>
+            <legend className="font-medium">{legend}</legend>
+            {error && (
+              <p id={errorId} className="text-sm font-medium text-danger">
+                {error}
+              </p>
+            )}
+            {options.map((option) => (
+              <label key={option.value} className="flex min-h-11 items-center gap-2">
+                <input
+                  type="radio"
+                  name={name}
+                  value={option.value}
+                  defaultChecked={option.value === defaultValue}
+                  required
+                  className="size-5 accent-accent"
+                />
+                {option.label}
+              </label>
+            ))}
+          </fieldset>
+        );
+      }
+      ```
+
+      `useId` gives ids that match between the server HTML and the browser, and never collide
+      between two forms. `aria-describedby` lists the hint, then the error, only when each exists,
+      so a screen reader reads the label, the states, then "We send your receipt here. Enter an
+      email address like name@example.com". `aria-invalid` appears only while there is an error.
+
+      Optional fields say "(optional)" in the label; everything else is required, and the
+      `required` attribute comes from the same prop, so the visible and the semantic can't
+      disagree. `Omit` stops callers setting the ARIA attributes by hand. The error sits above the
+      input, because a phone keyboard covers what is below the focused field.
+
+      The delivery choices are one question, so a `fieldset` and `legend` make "Delivery speed"
+      part of each radio's announcement. Callers pass `autoComplete` values such as `email` and
+      `postal-code`, so the browser can fill the form, which helps people with motor or memory
+      difficulties most.
+  - title: '8. The basket as a pure reducer'
+    body: |-
+      Four changes with edges (merge a repeat add, cap quantities, drop a line set to zero) make a
+      reducer.
+
+      ```ts
+      // lib/cart.ts
+      import type { Product } from './types';
+
+      export const MAX_QUANTITY = 10;
+
+      export type CartLine = { slug: string; name: string; price: number; quantity: number };
+      export type CartState = { lines: CartLine[] };
+
+      export type CartAction =
+        | { type: 'add'; product: Pick<Product, 'slug' | 'name' | 'price'>; quantity: number }
+        | { type: 'setQuantity'; slug: string; quantity: number }
+        | { type: 'remove'; slug: string }
+        | { type: 'clear' };
+
+      export const emptyCart: CartState = { lines: [] };
+
+      function clamp(quantity: number): number {
+        if (!Number.isFinite(quantity)) return 1;
+        return Math.min(MAX_QUANTITY, Math.max(1, Math.floor(quantity)));
+      }
+
+      export function cartReducer(state: CartState, action: CartAction): CartState {
+        switch (action.type) {
+          case 'add': {
+            const { slug, name, price } = action.product;
+            const existing = state.lines.find((line) => line.slug === slug);
+            if (existing) {
+              return {
+                lines: state.lines.map((line) =>
+                  line.slug === slug ? { ...line, quantity: clamp(line.quantity + action.quantity) } : line,
+                ),
+              };
+            }
+            return { lines: [...state.lines, { slug, name, price, quantity: clamp(action.quantity) }] };
+          }
+          case 'setQuantity':
+            if (action.quantity < 1) {
+              return { lines: state.lines.filter((line) => line.slug !== action.slug) };
+            }
+            return {
+              lines: state.lines.map((line) =>
+                line.slug === action.slug ? { ...line, quantity: clamp(action.quantity) } : line,
+              ),
+            };
+          case 'remove':
+            return { lines: state.lines.filter((line) => line.slug !== action.slug) };
+          case 'clear':
+            return emptyCart;
+        }
+      }
+
+      export function cartCount(cart: CartState): number {
+        return cart.lines.reduce((count, line) => count + line.quantity, 0);
+      }
+
+      export function cartTotal(cart: CartState): number {
+        return cart.lines.reduce((sum, line) => sum + line.price * line.quantity, 0);
+      }
+      ```
+
+      Every branch returns new objects, so the store and React see changes by identity. `clamp`
+      turns `NaN` into 1, because a quantity arrives through `Number(event.target.value)`. `add`
+      copies three fields by name instead of spreading the product: structural typing would accept
+      a whole `Product`, and the description would end up in storage.
+
+      Each line keeps the price from when it was added. That's fine for browsing, but the server
+      step that takes the order must price every line again from the catalogue. `cartCount` and
+      `cartTotal` are selectors called during render, so no stored count can drift.
+  - title: '9. One basket for every page: an external store'
+    body: |-
+      The reducer needs a home that three routes share and a reload keeps.
+
+      ```ts
+      // lib/cart-store.ts
+      import { useSyncExternalStore } from 'react';
+      import { cartReducer, emptyCart, type CartAction, type CartLine, type CartState } from './cart';
+
+      const STORAGE_KEY = 'cart:v1';
+      const listeners = new Set<() => void>();
+      let current: CartState | null = null;
+
+      function isLine(value: unknown): value is CartLine {
+        if (typeof value !== 'object' || value === null) return false;
+        const line = value as Record<string, unknown>;
+        return (
+          typeof line.slug === 'string' &&
+          typeof line.name === 'string' &&
+          Number.isInteger(line.price) &&
+          Number.isInteger(line.quantity)
+        );
+      }
+
+      function load(): CartState {
+        try {
+          const raw = window.localStorage.getItem(STORAGE_KEY);
+          if (!raw) return emptyCart;
+          const parsed: unknown = JSON.parse(raw);
+          if (typeof parsed === 'object' && parsed !== null && 'lines' in parsed && Array.isArray(parsed.lines)) {
+            return { lines: parsed.lines.filter(isLine) };
+          }
+        } catch {
+          // Storage blocked or the JSON is corrupt: start with an empty basket.
+        }
+        return emptyCart;
+      }
+
+      // The same object until something changes, or useSyncExternalStore renders forever.
+      export function readCart(): CartState {
+        current ??= load();
+        return current;
+      }
+
+      function getServerSnapshot(): CartState {
+        return emptyCart;
+      }
+
+      function notify(): void {
+        for (const listener of listeners) listener();
+      }
+
+      function onStorage(event: StorageEvent): void {
+        if (event.key !== null && event.key !== STORAGE_KEY) return;
+        current = null; // Another tab changed the basket: read it again on the next snapshot.
+        notify();
+      }
+
+      function subscribe(listener: () => void): () => void {
+        listeners.add(listener);
+        if (listeners.size === 1) window.addEventListener('storage', onStorage);
+        return () => {
+          listeners.delete(listener);
+          if (listeners.size === 0) window.removeEventListener('storage', onStorage);
+        };
+      }
+
+      export function dispatchCart(action: CartAction): CartState {
+        current = cartReducer(readCart(), action);
+        try {
+          window.localStorage.setItem(STORAGE_KEY, JSON.stringify(current));
+        } catch {
+          // Quota full or storage blocked: the basket still works for this visit.
+        }
+        notify();
+        return current;
+      }
+
+      export function useCart(): CartState {
+        return useSyncExternalStore(subscribe, readCart, getServerSnapshot);
+      }
+
+      const subscribeToNothing = () => () => {};
+
+      /** False on the server and during hydration, true once the browser has taken over. */
+      export function useHydrated(): boolean {
+        return useSyncExternalStore(subscribeToNothing, () => true, () => false);
+      }
+      ```
+
+      **The snapshot is stable.** `useSyncExternalStore` compares snapshots by identity. Parsing
+      `localStorage` on every `getSnapshot` call would return a new object each time and render
+      forever, so parsing happens once, lazily, and `dispatchCart` swaps the object.
+
+      **The server snapshot is empty.** Client Components also render on the server, where there
+      is no storage. React uses the third argument during hydration, so the HTML and the first
+      client render agree, then reads the real snapshot and renders again. No hydration mismatch.
+
+      **`useHydrated` keeps the page honest.** An empty basket is right for hydration but wrong for
+      the person, so the header hides its count and the checkout says "Loading your basket" until
+      the browser has taken over.
+
+      **Tabs stay in step** through the `storage` event, which fires in the other tabs when one
+      writes. **Storage can fail** in private modes or on a full quota, so reads and writes are
+      wrapped. And no visitor's basket can leak on the server: it only ever calls
+      `getServerSnapshot`, and `dispatchCart` runs only in handlers and actions.
+
+      ```tsx
+      // components/cart-link.tsx
+      'use client';
+
+      import Link from 'next/link';
+      import { cartCount } from '@/lib/cart';
+      import { useCart, useHydrated } from '@/lib/cart-store';
+
+      export function CartLink() {
+        const count = cartCount(useCart());
+        const hydrated = useHydrated();
+
+        return (
+          <Link
+            href="/checkout"
+            className="inline-flex min-h-11 items-center gap-1 rounded-md px-2 font-medium focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus"
+          >
+            Basket
+            {hydrated && (
+              <>
+                {/* A new key restarts the bump animation each time the count changes. */}
+                <span key={count} className="bump rounded-md bg-accent px-1 text-on-accent">
+                  {count}
+                </span>
+                <span className="sr-only">{count === 1 ? 'item' : 'items'}</span>
+              </>
+            )}
+          </Link>
+        );
+      }
+      ```
+
+      ```tsx
+      // components/add-to-cart.tsx
+      'use client';
+
+      import { useId, useState } from 'react';
+      import { MAX_QUANTITY } from '@/lib/cart';
+      import { dispatchCart } from '@/lib/cart-store';
+      import type { Product } from '@/lib/types';
+      import { Button } from './ui/button';
+
+      type AddToCartProps = Pick<Product, 'slug' | 'name' | 'price'>;
+
+      export function AddToCart({ slug, name, price }: AddToCartProps) {
+        const quantityId = useId();
+        const [quantity, setQuantity] = useState(1);
+        const [message, setMessage] = useState('');
+
+        function add() {
+          const cart = dispatchCart({ type: 'add', product: { slug, name, price }, quantity });
+          const inBasket = cart.lines.find((line) => line.slug === slug)?.quantity ?? 0;
+          setMessage(`Added. You have ${inBasket} in your basket.`);
+        }
+
+        return (
+          <div className="grid justify-items-start gap-2">
+            <label htmlFor={quantityId} className="font-medium">
+              Quantity
+            </label>
+            <select
+              id={quantityId}
+              value={quantity}
+              onChange={(event) => setQuantity(Number(event.target.value))}
+              className="min-h-11 rounded-md border-2 border-edge bg-raised px-2 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus"
+            >
+              {Array.from({ length: MAX_QUANTITY }, (_, i) => i + 1).map((n) => (
+                <option key={n} value={n}>
+                  {n}
+                </option>
+              ))}
+            </select>
+            <Button onClick={add}>Add to basket</Button>
+            {/* Always in the DOM, so screen readers are already watching it when the text arrives. */}
+            <p role="status" className="min-h-6 text-sm">
+              {message}
+            </p>
+          </div>
+        );
+      }
+      ```
+
+      The status paragraph is always rendered, because a live region that appears together with
+      its text is often missed. The message includes the new basket quantity, so a second Add
+      changes the text and is announced again. The badge's `key` changes with the count, which
+      remounts it and restarts its animation.
+  - title: '10. Validating the checkout in a pure function'
+    body: |-
+      Rules change more often than forms, so they live in a module with no React.
+
+      ```ts
+      // lib/checkout.ts
+      export const DELIVERY_OPTIONS = [
+        { value: 'standard', label: 'Standard, 3 to 5 working days, free' },
+        { value: 'express', label: 'Express, next working day, £4.95' },
+      ] as const;
+
+      export const CHECKOUT_FIELDS = ['name', 'email', 'phone', 'address', 'town', 'postcode', 'delivery'] as const;
+
+      export type CheckoutField = (typeof CHECKOUT_FIELDS)[number];
+      export type CheckoutValues = Record<CheckoutField, string>;
+      export type CheckoutErrors = Partial<Record<CheckoutField, string>>;
+
+      const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      const POSTCODE = /^[A-Z]{1,2}\d[A-Z\d]? ?\d[A-Z]{2}$/i;
+
+      export function readCheckout(formData: FormData): CheckoutValues {
+        const read = (name: CheckoutField) => {
+          const value = formData.get(name);
+          return typeof value === 'string' ? value.trim() : '';
+        };
+        return {
+          name: read('name'),
+          email: read('email'),
+          phone: read('phone'),
+          address: read('address'),
+          town: read('town'),
+          postcode: read('postcode'),
+          delivery: read('delivery'),
+        };
+      }
+
+      // Each message says what to do, not only what is wrong.
+      export function validateCheckout(values: CheckoutValues): CheckoutErrors {
+        const errors: CheckoutErrors = {};
+        if (!values.name) errors.name = 'Enter your full name';
+        if (!values.email) errors.email = 'Enter your email address';
+        else if (!EMAIL.test(values.email)) errors.email = 'Enter an email address like name@example.com';
+        if (!values.address) errors.address = 'Enter the first line of your address';
+        if (!values.town) errors.town = 'Enter your town or city';
+        if (!values.postcode) errors.postcode = 'Enter your postcode';
+        else if (!POSTCODE.test(values.postcode)) errors.postcode = 'Enter a full postcode, like SW1A 1AA';
+        if (!DELIVERY_OPTIONS.some((option) => option.value === values.delivery)) {
+          errors.delivery = 'Choose a delivery speed';
+        }
+        return errors;
+      }
+
+      export function firstError(errors: CheckoutErrors): CheckoutField | undefined {
+        return CHECKOUT_FIELDS.find((field) => errors[field] !== undefined);
+      }
+      ```
+
+      `CHECKOUT_FIELDS` follows the form's order, so `firstError` finds the first wrong field on
+      screen. Each message says what to do, with an example where a format matters. The patterns
+      are loose on purpose: the only proof of an email address is a message that arrives, and a
+      strict pattern rejects real ones. `readCheckout` trims values and turns missing fields into
+      empty strings. The delivery check looks redundant beside a default radio, but form data can
+      hold anything, and once submission moves to a Server Action the same function guards the
+      server.
+  - title: '11. The checkout form: an action, focus and live regions'
+    body: |-
+      The largest file, and the one to get right.
+
+      ```tsx
+      // components/checkout-form.tsx
+      'use client';
+
+      import { useActionState, useEffect, useRef } from 'react';
+      import { useFormStatus } from 'react-dom';
+      import {
+        DELIVERY_OPTIONS,
+        firstError,
+        readCheckout,
+        validateCheckout,
+        type CheckoutErrors,
+        type CheckoutValues,
+      } from '@/lib/checkout';
+      import { dispatchCart, readCart, useCart, useHydrated } from '@/lib/cart-store';
+      import { prefersReducedMotion } from '@/lib/motion';
+      import { placeOrder } from '@/lib/orders';
+      import { Button, ButtonLink } from './ui/button';
+      import { Field, RadioGroup } from './ui/field';
+
+      export type CheckoutState =
+        | { status: 'editing' }
+        | { status: 'invalid'; values: CheckoutValues; errors: CheckoutErrors }
+        | { status: 'failed'; values: CheckoutValues; message: string }
+        | { status: 'placed'; reference: string };
+
+      export async function checkout(_previous: CheckoutState, formData: FormData): Promise<CheckoutState> {
+        const values = readCheckout(formData);
+        const errors = validateCheckout(values);
+        if (firstError(errors)) return { status: 'invalid', values, errors };
+
+        const { lines } = readCart();
+        if (lines.length === 0) return { status: 'failed', values, message: 'Your basket is empty.' };
+
+        try {
+          const { reference } = await placeOrder({ customer: values, lines });
+          dispatchCart({ type: 'clear' });
+          return { status: 'placed', reference };
+        } catch {
+          return { status: 'failed', values, message: "We couldn't place your order and nothing was charged. Try again." };
+        }
+      }
+
+      function SubmitButton() {
+        const { pending } = useFormStatus();
+        return (
+          <Button
+            type="submit"
+            aria-disabled={pending}
+            onClick={(event) => {
+              if (pending) event.preventDefault();
+            }}
+          >
+            {pending ? 'Placing order' : 'Place order'}
+          </Button>
+        );
+      }
+
+      export function CheckoutForm() {
+        const hydrated = useHydrated();
+        const cart = useCart();
+        const [state, formAction] = useActionState(checkout, { status: 'editing' });
+        const formRef = useRef<HTMLFormElement>(null);
+        const confirmationRef = useRef<HTMLHeadingElement>(null);
+
+        // Focus follows the outcome: the first wrong field, or the confirmation.
+        useEffect(() => {
+          if (state.status === 'placed') {
+            confirmationRef.current?.focus();
+            return;
+          }
+          if (state.status !== 'invalid' || !formRef.current) return;
+          const name = firstError(state.errors);
+          if (!name) return;
+          const control = formRef.current.elements.namedItem(name);
+          const target = control instanceof RadioNodeList ? control[0] : control;
+          if (target instanceof HTMLElement) {
+            target.scrollIntoView({ behavior: prefersReducedMotion() ? 'auto' : 'smooth', block: 'center' });
+            target.focus({ preventScroll: true });
+          }
+        }, [state]);
+
+        if (state.status === 'placed') {
+          return (
+            <section className="grid justify-items-start gap-2">
+              <h2 ref={confirmationRef} tabIndex={-1} className="text-lg font-bold">
+                Order placed
+              </h2>
+              <p>
+                Your reference is <strong>{state.reference}</strong>. We have emailed you a receipt.
+              </p>
+              <ButtonLink href="/">Keep shopping</ButtonLink>
+            </section>
+          );
+        }
+
+        if (!hydrated) return <p>Loading your basket</p>;
+        if (cart.lines.length === 0) return <ButtonLink href="/">Browse products</ButtonLink>;
+
+        const values = state.status === 'invalid' || state.status === 'failed' ? state.values : undefined;
+        const errors = state.status === 'invalid' ? state.errors : {};
+        const problems = Object.keys(errors).length;
+
+        return (
+          <form ref={formRef} action={formAction} noValidate className="grid max-w-md gap-3">
+            <h2 className="text-lg font-bold">Delivery details</h2>
+            <p role="status" className="font-medium">
+              {problems > 0 ? `${problems} ${problems === 1 ? 'answer needs' : 'answers need'} changing.` : ''}
+            </p>
+            {state.status === 'failed' && (
+              <p role="alert" className="font-medium text-danger">
+                {state.message}
+              </p>
+            )}
+            <Field label="Full name" name="name" autoComplete="name" defaultValue={values?.name} error={errors.name} />
+            <Field
+              label="Email"
+              name="email"
+              type="email"
+              autoComplete="email"
+              hint="We send your receipt here."
+              defaultValue={values?.email}
+              error={errors.email}
+            />
+            <Field
+              label="Phone"
+              name="phone"
+              type="tel"
+              autoComplete="tel"
+              optional
+              hint="Only if the courier can't find you."
+              defaultValue={values?.phone}
+            />
+            <Field
+              label="Address line 1"
+              name="address"
+              autoComplete="address-line1"
+              defaultValue={values?.address}
+              error={errors.address}
+            />
+            <Field
+              label="Town or city"
+              name="town"
+              autoComplete="address-level2"
+              defaultValue={values?.town}
+              error={errors.town}
+            />
+            <Field
+              label="Postcode"
+              name="postcode"
+              autoComplete="postal-code"
+              defaultValue={values?.postcode}
+              error={errors.postcode}
+            />
+            <RadioGroup
+              name="delivery"
+              legend="Delivery speed"
+              options={DELIVERY_OPTIONS}
+              defaultValue={values?.delivery || 'standard'}
+              error={errors.delivery}
+            />
+            <SubmitButton />
+          </form>
+        );
+      }
+      ```
+
+      **`noValidate`.** Otherwise the browser checks `required` first, one bubble at a time, in
+      wording the shop doesn't control. With it, every message comes from `validateCheckout`,
+      and `required` still announces "required".
+
+      **Keeping what people typed.** After a form action completes, React resets the form's
+      uncontrolled fields, which would wipe a failed attempt. So the action returns the
+      submitted `values`, and each field's `defaultValue` comes from them: the reset restores the
+      person's answers. We confirmed it in Chromium and in the component test.
+
+      **Focus follows the outcome.** Each submit returns a new state object, so the effect runs
+      every time. On errors it focuses the first wrong field (a radio group comes back from
+      `namedItem` as a `RadioNodeList`), after scrolling it to the centre, smoothly or not
+      depending on the motion setting. On success it focuses the confirmation heading, which has
+      `tabIndex={-1}` so a script can focus it without adding a Tab stop.
+
+      **Two kinds of announcement.** The problem count sits in a `role="status"` that is always
+      present, read politely after the focused field. A failed order is `role="alert"`, read at
+      once, and says nothing was charged.
+
+      **The pending button** is its own component, because `useFormStatus` reads the form it sits
+      inside. It sets `aria-disabled`, refuses clicks and says "Placing order".
+
+      `placeOrder` is a stand-in, because chapters 6 to 8 teach no server code for changing data.
+      A form's `action` also accepts a server function, so swapping in chapter 29's Server Action
+      barely changes this component.
+  - title: '12. Reduced-motion paths'
+    body: |-
+      Three things move, and all three follow one rule: **motion is opt-in**, written for
+      `prefers-reduced-motion: no-preference`.
+
+      - **CSS keyframes.** The badge bump in `globals.css` exists only inside that query. In the
+        browser run its computed `animation-name` was `bump` normally and `none` under reduce.
+      - **Tailwind utilities.** The card zoom uses `motion-safe:`. The built CSS nests those rules
+        inside `@media (prefers-reduced-motion:no-preference)`, and the scale also inside
+        `@media (hover:hover)`, so touch screens never get a zoom stuck after a tap.
+      - **JavaScript.** CSS can't reach `scrollIntoView`, so the checkout effect asks at the moment
+        it scrolls, and uses `behavior: 'auto'` when the answer is yes. It runs in an effect, so it
+        never runs on the server.
+
+      ```ts
+      // lib/motion.ts
+      export function prefersReducedMotion(): boolean {
+        return window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      }
+      ```
+
+      Opt-in beats opt-out. An opt-out sheet adds motion everywhere and removes it under `reduce`,
+      so every forgotten override hurts exactly the people who asked. With opt-in, a forgotten
+      query means a missing animation, which harms nobody. Reduced motion still keeps feedback:
+      the badge changes, the status speaks, the page scrolls. Only the travel goes.
+  - title: '13. The layout and the error page'
+    body: |-
+      ```tsx
+      // app/layout.tsx
+      import type { Metadata } from 'next';
+      import Link from 'next/link';
+      import type { ReactNode } from 'react';
+      import { CartLink } from '@/components/cart-link';
+      import './globals.css';
+
+      export const metadata: Metadata = {
+        metadataBase: new URL(process.env.SITE_URL ?? 'http://localhost:3000'),
+        title: { template: '%s | The Shop', default: 'The Shop' },
+        description: 'Bags, mugs and socks, delivered.',
+      };
+
+      export default function RootLayout({ children }: { children: ReactNode }) {
+        return (
+          <html lang="en-GB">
+            <body className="min-h-screen">
+              <a
+                href="#main"
+                className="sr-only focus:not-sr-only focus:absolute focus:left-2 focus:top-2 focus:rounded-md focus:bg-raised focus:p-2"
+              >
+                Skip to content
+              </a>
+              <header className="flex items-center justify-between gap-2 border-b-2 border-edge px-4 py-2">
+                <Link href="/" className="min-h-11 content-center font-bold">
+                  The Shop
+                </Link>
+                <nav aria-label="Main">
+                  <CartLink />
+                </nav>
+              </header>
+              <main id="main" className="mx-auto grid max-w-5xl gap-4 px-4 py-6">
+                {children}
+              </main>
+            </body>
+          </html>
+        );
+      }
+      ```
+
+      `lang="en-GB"` sets the screen reader's voice. The skip link is the first Tab stop, as the
+      browser run confirmed, and is hidden until focused. The basket link sits in a labelled
+      `nav`, so it's a landmark. `metadataBase` turns relative share images into full URLs;
+      without it the build warns and uses `http://localhost:3000`.
+
+      ```tsx
+      // app/error.tsx
+      'use client';
+
+      import { Button } from '@/components/ui/button';
+
+      export default function ErrorPage({ retry }: { error: Error & { digest?: string }; retry: () => void }) {
+        return (
+          <>
+            <h1 className="text-2xl font-bold">The shop didn't load</h1>
+            <p>Our product list is not answering right now.</p>
+            <div>
+              <Button onClick={() => retry()}>Try again</Button>
+            </div>
+          </>
+        );
+      }
+      ```
+
+      An error boundary must be a Client Component. In Next.js 16.3 it receives `retry`, which
+      re-fetches and re-renders the segment; the docs prefer it to `reset`. Errors from Server
+      Components arrive as a generic message with a `digest` for the logs, and the page shows a way
+      forward rather than details. `app/not-found.tsx` is a heading, a sentence and a
+      `ButtonLink` home. There is no `loading.tsx`: static pages are ready before any request.
+  - title: '14. Tests: pure logic, components and a browser run'
+    body: |-
+      Pure functions get unit tests with Vitest: the reducer (merge, no mutation, the cap, a line
+      set to zero, `NaN`, only three product fields kept, count and total) and the validator
+      (valid form, messages in order, bad email and postcode, postcodes in any case, unknown
+      delivery). `Button` and `Field` render through `renderToStaticMarkup`, and the tests assert
+      exact attributes: `type="button"`, `aria-describedby` with the hint and error ids, no
+      `aria-invalid` on a clean optional field. The store tests show an empty server render
+      whatever storage holds, persistence on dispatch, a `storage` event from another tab, and
+      recovery from corrupt JSON.
+
+      The component test drives the checkout by role and label, so it fails when the
+      accessibility contract breaks:
+
+      ```tsx
+      // tests/checkout-form.test.tsx
+      import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+      import { cleanup, render, screen, waitFor } from '@testing-library/react';
+      import userEvent from '@testing-library/user-event';
+      import type { ReactNode } from 'react';
+
+      vi.mock('next/link', () => ({
+        default: ({ href, children, ...rest }: { href: string; children: ReactNode }) => (
+          <a href={href} {...rest}>
+            {children}
+          </a>
+        ),
+      }));
+
+      beforeEach(() => {
+        window.localStorage.setItem(
+          'cart:v1',
+          JSON.stringify({ lines: [{ slug: 'canvas-tote', name: 'Canvas tote', price: 1800, quantity: 2 }] }),
+        );
+        window.matchMedia = vi.fn().mockReturnValue({ matches: true });
+        Element.prototype.scrollIntoView = vi.fn();
+        vi.resetModules();
+      });
+
+      afterEach(() => {
+        cleanup();
+        window.localStorage.clear();
+      });
+
+      describe('CheckoutForm', () => {
+        it('keeps typed answers, announces the count and focuses the first wrong field', async () => {
+          const { CheckoutForm } = await import('@/components/checkout-form');
+          const user = userEvent.setup();
+          render(<CheckoutForm />);
+
+          await user.type(screen.getByLabelText('Email'), 'sam@example.com');
+          await user.click(screen.getByRole('button', { name: 'Place order' }));
+
+          const name = await screen.findByRole('textbox', { name: 'Full name' });
+          await waitFor(() => expect(name).toHaveFocus());
+          expect(name).toHaveAttribute('aria-invalid', 'true');
+          expect(name).toHaveAccessibleDescription('Enter your full name');
+          expect(screen.getByLabelText('Email')).toHaveValue('sam@example.com');
+          expect(screen.getByRole('status')).toHaveTextContent('4 answers need changing.');
+          expect(Element.prototype.scrollIntoView).toHaveBeenCalledWith({ behavior: 'auto', block: 'center' });
+        });
+
+        it('places the order, clears the basket and moves focus to the confirmation', async () => {
+          const { CheckoutForm } = await import('@/components/checkout-form');
+          const { readCart } = await import('@/lib/cart-store');
+          const user = userEvent.setup();
+          render(<CheckoutForm />);
+
+          await user.type(screen.getByLabelText('Full name'), 'Sam Lee');
+          await user.type(screen.getByLabelText('Email'), 'sam@example.com');
+          await user.type(screen.getByLabelText('Address line 1'), '1 High Street');
+          await user.type(screen.getByLabelText('Town or city'), 'Leeds');
+          await user.type(screen.getByLabelText('Postcode'), 'LS1 4AP');
+          await user.click(screen.getByRole('radio', { name: /Express/ }));
+          await user.click(screen.getByRole('button', { name: 'Place order' }));
+
+          expect(await screen.findByRole('button', { name: 'Placing order' })).toHaveAttribute('aria-disabled', 'true');
+          const heading = await screen.findByRole('heading', { name: 'Order placed' }, { timeout: 2000 });
+          await waitFor(() => expect(heading).toHaveFocus());
+          expect(readCart().lines).toEqual([]);
+          expect(window.localStorage.getItem('cart:v1')).toBe('{"lines":[]}');
+        });
+      });
+      ```
+
+      `vi.resetModules()` gives each test a fresh store, since the store is module state.
+
+      Last, a Playwright script ran against `next start`: open the list, add two totes, check the
+      status and the badge, submit an incomplete checkout, check focus and the kept email, place
+      the order, press Tab on the home page. It ran axe with the WCAG 2.2 AA tags on three pages.
+      Eight runs, at 390 and 1440 pixels, light and dark, with and without reduced motion: zero
+      violations and no console errors, so no hydration warnings.
+  - title: '15. Decisions and trade-offs'
+    body: |-
+      - **External store over context.** Context shares state across navigations but not a
+        reload. The store costs about 90 lines and a hydration guard. A server-rendered basket
+        would need a cookie or a database, which is server work.
+      - **Timed revalidation over dynamic pages.** Everyone gets a prebuilt page; prices can lag by
+        five minutes. Flash sales would add on-demand revalidation, not dynamic rendering.
+      - **Uncontrolled inputs over controlled ones.** No state per keystroke. Live validation while
+        typing would need more; validating on submit also stops an email being called wrong
+        before it's finished.
+      - **Focus the first error over a summary.** Fastest for seven fields. A long form would put a
+        linked error summary at the top and focus that instead.
+      - **A closed Button API.** No class clashes and no one-off colours, at the cost of adding a
+        variant for a genuinely new look.
+      - **System theme over a toggle.** No state and no flash. A toggle needs a stored preference
+        applied before first paint.
+      - **A client stand-in for orders.** It keeps the capstone inside chapters 6 to 8. The real
+        version prices orders on the server.
+checklist:
+  - >-
+    `next build` lists `/` and each product page as prerendered with a 5 minute revalidate, the product pages from `generateStaticParams`.
+  - >-
+    Products are fetched only in files that import `server-only`, and the API address has no `NEXT_PUBLIC_` prefix.
+  - >-
+    A failed products request throws, and an unknown slug returns a 404 with a link home.
+  - >-
+    `'use client'` appears only on the basket link, add-to-basket, basket summary, checkout form and error page.
+  - >-
+    No component copies products or props into state; counts and totals are computed during render.
+  - >-
+    The basket reducer never mutates, and its tests cover add, merge, cap, remove and clear.
+  - >-
+    The basket survives a reload, follows changes from another tab and causes no hydration warning.
+  - >-
+    No hex value or palette name appears outside `globals.css`; components use role classes.
+  - >-
+    Each Button variant belongs to a union mapped with `Record`, with class names written out whole.
+  - >-
+    Actions are buttons and destinations are links; no `div` or `span` has a click handler.
+  - >-
+    Every field has a visible label, optional fields say "(optional)", and inputs carry `autocomplete` values.
+  - >-
+    Errors are words linked with `aria-describedby`, and `aria-invalid="true"` is present only while an error shows.
+  - >-
+    A failed submit keeps every answer and focuses the first wrong field.
+  - >-
+    Status messages sit in live regions present before their text changes; a failed order uses `role="alert"`.
+  - >-
+    Every animation is inside `prefers-reduced-motion: no-preference` or uses `motion-safe:`, and scrolling is instant under reduce.
+  - >-
+    Text passes 4.5 to 1, and borders and focus rings pass 3 to 1, in light and dark.
+  - >-
+    Tab reaches a skip link first, then every control, with a visible focus ring.
+  - >-
+    axe reports no violations on the list, a product page and the checkout with errors, at phone and desktop widths.

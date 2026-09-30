@@ -1,0 +1,325 @@
+summary: >-
+  In a client-rendered app, data loading is a relay: the HTML arrives empty, the JavaScript
+  runs, an effect fires a request, and only then does content appear. A Server Component
+  removes the relay. It's an `async` function that awaits its data during render, on a
+  machine close to the database, with the secrets it needs. The HTML leaves the server with
+  the data already in it.
+
+
+  That power brings a new failure mode: the page now waits for its slowest await. Two tools
+  answer it. Start independent requests together so they overlap, and wrap slow parts in
+  `<Suspense>` so the rest of the page streams first while the slow part follows in the
+  same response.
+
+
+  The other half of the lesson is trust. Server code can read every environment variable,
+  and none of it ships. A variable named `NEXT_PUBLIC_` is copied into the browser bundle at
+  build time, where every visitor can read it. Props passed to Client Components are sent to
+  the browser too. Keeping secrets safe means knowing exactly which values cross.
+remember:
+  - >-
+    A Server Component can be `async` and await data during render, so the HTML arrives
+    filled in and no API key or query reaches the browser.
+  - >-
+    Awaits in a row run one after another; start independent requests first and
+    `await Promise.all`, so the wait is the slowest request, not the sum.
+  - >-
+    `<Suspense>` lets the page send its shell and fallback at once and stream the slow part
+    later in the same response; `loading.tsx` does the same for a whole page.
+  - >-
+    Once streaming starts the status code is already sent, so a `notFound()` after that
+    gives a 200 with a noindex tag, not a 404.
+  - >-
+    `NEXT_PUBLIC_` values are inlined into the JavaScript at build time, so they're public
+    and frozen until the next build.
+  - >-
+    Identical `fetch` calls in one render are memoised, and `React.cache` does the same for
+    database calls, so each component can ask for the data it needs.
+  - >-
+    A pending promise can be passed from a Server Component to a Client Component and read
+    with `use` inside a Suspense boundary.
+sections:
+  - title: Waterfalls, and how to avoid them
+    body: |-
+      A **waterfall** is a chain of requests where each one waits for the last, even though
+      it didn't need to. Awaits in a row create one:
+
+      ```tsx
+      const harbour = await getHarbour(name); // 300 ms
+      const warnings = await getWarnings(name); // another 300 ms, after the first
+      ```
+
+      When neither needs the other's answer, start both, then wait once. The request
+      begins when the function is called, not when it's awaited.
+
+      ```tsx
+      import { Suspense } from 'react';
+
+      type Harbour = { name: string; tideHeight: number };
+      type Warning = { id: string; text: string };
+
+      async function getHarbour(name: string): Promise<Harbour> {
+        const response = await fetch(`https://api.tides.example/harbours/${name}`);
+        if (!response.ok) throw new Error(`Harbour ${name}: ${response.status}`);
+        return response.json();
+      }
+
+      async function getWarnings(name: string): Promise<Warning[]> {
+        const response = await fetch(`https://api.tides.example/warnings?harbour=${name}`);
+        if (!response.ok) throw new Error(`Warnings ${name}: ${response.status}`);
+        return response.json();
+      }
+
+      async function Forecast({ name }: { name: string }) {
+        const response = await fetch(`https://api.tides.example/forecast?harbour=${name}`);
+        const days: { day: string; high: number }[] = await response.json();
+        return (
+          <ul>
+            {days.map((d) => (
+              <li key={d.day}>
+                {d.day}: {d.high} m
+              </li>
+            ))}
+          </ul>
+        );
+      }
+
+      export default async function HarbourPage({ params }: { params: Promise<{ name: string }> }) {
+        const { name } = await params;
+        // Both requests start now; the page waits for the slower one, not the sum.
+        const [harbour, warnings] = await Promise.all([getHarbour(name), getWarnings(name)]);
+        return (
+          <main>
+            <h1>{harbour.name}</h1>
+            <p>High tide: {harbour.tideHeight} m</p>
+            <ul>
+              {warnings.map((w) => (
+                <li key={w.id}>{w.text}</li>
+              ))}
+            </ul>
+            <Suspense fallback={<p>Loading the week ahead</p>}>
+              <Forecast name={name} />
+            </Suspense>
+          </main>
+        );
+      }
+      ```
+
+      Three levels of waiting are on show. The harbour and warnings are needed for the first
+      paint, so they're awaited together. The forecast isn't, so it lives in its own async
+      component behind a boundary and streams in. And layouts and pages of one route
+      already render in parallel, so a layout's fetch doesn't delay the page's.
+
+      `Promise.all` rejects as soon as one request fails, which here sends the page to its
+      `error.tsx`. When a failed request should degrade rather than break the page, use
+      `Promise.allSettled` and render what succeeded.
+  - title: What streaming sends down the wire
+    body: |-
+      Streaming uses chunked transfer: the server sends HTML as it becomes ready instead of
+      building the whole document first. React cuts the chunks at `<Suspense>` boundaries.
+      We rendered the lesson's campsite page with React's streaming renderer and a
+      300-millisecond review fetch. The output is trimmed:
+
+      ```text
+      --- +8ms
+      <main><h1>Lakeside campsite</h1><!--$?--><template id="B:0"></template>
+      <p>Loading reviews</p><!--/$--></main>...
+      --- +320ms
+      <div hidden id="S:0"><p>2 reviews</p></div><script>...swap B:0 for S:0...</script>
+      ```
+
+      The first chunk is the **static shell**: everything that doesn't wait, plus each
+      boundary's fallback, marked with a placeholder. When the data resolves, React sends
+      the finished HTML hidden, with a tiny inline script that swaps it in. The swap runs
+      before the page's JavaScript bundle has even loaded. Next.js also streams the RSC
+      payload for each chunk so React can hydrate it later.
+
+      Two consequences matter in production. First, the status code and headers go out with
+      the first chunk, so they can't change later. A `notFound()` or `redirect()` inside a
+      streamed part can't produce a real 404 or 301; Next.js injects a noindex tag or does a
+      client-side redirect instead. Put existence checks before anything suspends. Second,
+      anything that buffers the response defeats streaming: an Nginx proxy with buffering on,
+      some CDNs, compression that waits to fill a block. The docs suggest the
+      `X-Accel-Buffering: no` header for Nginx. Next.js also detects HTML-limited bots and
+      sends them the fully rendered page, so metadata lands in the `<head>`.
+  - title: One request per render, even when many components ask
+    body: |-
+      Server Components invite you to fetch data where it's used instead of drilling it down
+      as props. That only works if repeated calls are cheap. Next.js memoises identical
+      `fetch` requests within one render, so three components fetching the same URL cause
+      one request.
+
+      A database client isn't `fetch`, so wrap the function in React's `cache`:
+
+      ```ts
+      import { cache } from 'react';
+
+      type Customer = { id: string; name: string };
+      const customers = new Map<string, Customer>([['c1', { id: 'c1', name: 'Ada' }]]);
+
+      export const getCustomer = cache(async (id: string) => {
+        // Imagine a database query here; it runs once per id per request.
+        return customers.get(id) ?? null;
+      });
+      ```
+
+      The header, the page and the metadata can all call `getCustomer('c1')` and share one
+      result. Two facts keep this safe. The memo is scoped to a single request, so one
+      visitor never sees another's data, and it's not a cache between requests; that's the
+      job of the caching tools in a later lesson. And the arguments are compared by
+      identity, so pass primitives like an id, not a fresh object each call.
+
+      Memoisation also enables **preloading**: call `void getCustomer(id)` early in a page,
+      before another slow await, and the component that needs the customer later reuses the
+      request already in flight.
+  - title: Streaming data into a Client Component with `use`
+    body: |-
+      Sometimes the data is needed by an interactive component: a sortable review list, a
+      chart with a tooltip. Fetching it in an effect would bring back the relay. Instead,
+      start the request on the server, don't await it, and pass the promise as a prop.
+      Promises are serialisable, so the value streams to the browser when it resolves.
+
+      ```tsx
+      // app/products/[id]/reviews.tsx
+      'use client';
+
+      import { use } from 'react';
+
+      type Review = { id: string; stars: number; text: string };
+
+      export function Reviews({ reviews }: { reviews: Promise<Review[]> }) {
+        const list = use(reviews);
+        return (
+          <ul>
+            {list.map((r) => (
+              <li key={r.id}>
+                {r.stars} stars: {r.text}
+              </li>
+            ))}
+          </ul>
+        );
+      }
+      ```
+
+      ```tsx
+      // app/products/[id]/page.tsx
+      import { Suspense } from 'react';
+      import { Reviews } from './reviews';
+
+      type Review = { id: string; stars: number; text: string };
+
+      async function getReviews(productId: string): Promise<Review[]> {
+        const response = await fetch(`https://api.shop.example/products/${productId}/reviews`);
+        return response.json();
+      }
+
+      export default async function ProductPage({ params }: { params: Promise<{ id: string }> }) {
+        const { id } = await params;
+        const reviews = getReviews(id); // not awaited: the promise itself is the prop
+        return (
+          <main>
+            <h1>Product {id}</h1>
+            <Suspense fallback={<p>Loading reviews</p>}>
+              <Reviews reviews={reviews} />
+            </Suspense>
+          </main>
+        );
+      }
+      ```
+
+      `use` suspends while the promise is pending, so the nearest boundary shows its
+      fallback. The request started on the server before any client code ran, so there's no
+      second trip. Fetch in the browser only when the data depends on something only the
+      browser knows, such as what someone is typing.
+  - title: Environment variables, precisely
+    body: |-
+      Next.js looks a variable up in order and stops at the first match: the real
+      `process.env`, then `.env.$(NODE_ENV).local`, `.env.local`, `.env.$(NODE_ENV)` and
+      `.env`. So a value set by the host beats every file. When `NODE_ENV` is `test`,
+      `.env.local` is skipped, so tests behave the same for everyone.
+
+      On the server, `process.env.WEATHER_KEY` is a normal lookup. For the browser, Next.js
+      does something more surprising with public variables: at `next build` it replaces
+      every `process.env.NEXT_PUBLIC_…` reference in client code with the literal value.
+
+      ```ts
+      // written
+      const id = process.env.NEXT_PUBLIC_ANALYTICS_ID;
+      // what ships, if the build ran with NEXT_PUBLIC_ANALYTICS_ID=abc123
+      const id = 'abc123';
+      ```
+
+      Three consequences follow. Public values are frozen at build time: one Docker image
+      promoted from staging to production keeps staging's public values. A dynamic lookup
+      such as `process.env[name]` isn't replaced, so it doesn't work in the browser. And a
+      public secret is in a file every visitor downloads, as the lesson showed.
+
+      A secret can also escape without the prefix. A Server Component that passes the key
+      as a prop, or a Client Component that renders it during its server render, puts it in
+      the HTML or the RSC payload. Keep secrets inside server-only modules, and mark those
+      modules with `import 'server-only'`.
+pitfalls:
+  - >-
+    **Awaiting independent requests one by one.** Each await adds its full delay. Start them
+    together and `await Promise.all`, or stream the slow one behind `<Suspense>`.
+  - >-
+    **Fetching in an effect what the server could load.** The page ships empty, and bots and
+    link previews see only the loading state. Await it in a Server Component, or pass a
+    promise to `use`.
+  - >-
+    **Giving a secret the `NEXT_PUBLIC_` prefix to make an error go away.** The value is
+    inlined into the bundle. Move the call to server code and keep the plain name.
+  - >-
+    **Expecting a changed `NEXT_PUBLIC_` value to apply without a rebuild.** It was
+    replaced at build time. Rebuild, or serve the value from the server at runtime.
+  - >-
+    **Awaiting slow data in a layout.** `loading.tsx` wraps the page, not the layout beside
+    it, so navigation blocks. Move the read into the page or wrap it in its own
+    `<Suspense>`.
+  - >-
+    **Reading JSON before checking `response.ok`.** An error page parses badly or renders
+    nonsense. Check the status first and throw or render a message.
+  - >-
+    **Calling `notFound()` after streaming has started.** The response is already a 200.
+    Check that the record exists before the first suspended component.
+interview:
+  - question: Why load data in a Server Component rather than in a `useEffect`?
+    answer: >-
+      Because it removes a round trip and keeps secrets on the server. With an effect, the
+      browser gets an empty page, downloads JavaScript, hydrates, then requests the data, so
+      content arrives last and crawlers see a spinner. A Server Component awaits the data
+      during render, close to the database, and the HTML arrives filled in. The API key and
+      the query never reach the browser, and no fetch code ships. The trade-off is that the
+      page waits for its awaits, so I run independent requests in parallel and stream slow
+      sections with Suspense. I still fetch on the client for data driven by user input,
+      such as search-as-you-type.
+  - question: What is streaming in Next.js, and what does it change for status codes and SEO?
+    answer: >-
+      Streaming sends the page in chunks: the shell and Suspense fallbacks go first, and
+      each boundary's HTML follows when its data resolves, with an inline script that swaps
+      it in. Users see content sooner and slow sections don't block fast ones. The catch is
+      HTTP: headers and the status go out with the first chunk, so a `notFound()` inside a
+      streamed section can't become a 404; Next.js adds a noindex meta tag, and a redirect
+      becomes client-side. So I do existence checks before anything suspends. For SEO,
+      Next.js serves HTML-limited bots the fully rendered page. In production I also check
+      nothing buffers the response, such as an Nginx proxy.
+  - question: How do you avoid request waterfalls in server-rendered React?
+    answer: >-
+      First I separate dependent from independent requests. Dependent ones must be
+      sequential, like loading an artist before their playlists, so I make the first one
+      fast or cache it. Independent ones start together and meet in `Promise.all`, or
+      `Promise.allSettled` if one failing shouldn't break the page. Anything not needed for
+      the first paint moves into its own async component behind a Suspense boundary so it
+      streams. For data several components need, I rely on fetch memoisation or wrap
+      database calls in `React.cache`, which also lets me preload by calling the function
+      early without awaiting. Layouts and pages already render in parallel.
+  - question: How do environment variables reach the browser in Next.js, and what can go wrong?
+    answer: >-
+      Only variables prefixed `NEXT_PUBLIC_` reach client code, and they're inlined as
+      literal values during `next build`. That has two consequences people miss. Anything
+      with the prefix is public, because it sits in a downloadable bundle, so a paid API key
+      must never have it. And the values are frozen per build: one image deployed to staging
+      and production keeps whatever the build saw, and a dynamic lookup like
+      `process.env[name]` isn't inlined at all. Unprefixed secrets stay server-side, but can
+      still leak if passed as props or rendered during a Client Component's server render.
+      I keep secret access in modules marked `server-only`.

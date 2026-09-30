@@ -1,0 +1,263 @@
+summary: >-
+  Types describe your own code. They say nothing true about data that comes from outside:
+  a server's reply, a form, a file, `localStorage`, an environment variable or an AI model's
+  output. That edge is **the boundary**. Because types are erased, the only thing that can
+  check outside data is code that runs.
+
+
+  TypeScript makes the gap hard to see. `JSON.parse` and `response.json()` return `any`,
+  which switches checking off, so `const order: Order = JSON.parse(body)` compiles whatever
+  the body holds. An `as` cast does the same thing more visibly. The fix is a habit: give
+  outside data the type `unknown`, which forces a check before use, and turn it into a typed
+  value with a **parser** that either returns the value or reports a failure.
+
+
+  Writing parsers by hand is fine for a few fields. For real APIs, a schema library such as
+  Zod, which this repository uses, writes the parser and the type from one description. Parse
+  once, at the edge. Behind that line, every function can trust its types again.
+remember:
+  - Types are erased, so only code that runs can check data from outside your program.
+  - '`JSON.parse`, `response.json()` and many older APIs return `any`, which accepts any annotation without evidence.'
+  - '`any` switches checking off in both directions and spreads to everything it touches, while `unknown` accepts every value and allows nothing until you narrow it.'
+  - '`never` is the opposite end: no value has it, it fits everywhere, and nothing but `never` fits into it.'
+  - An `as` cast checks nothing and emits no code, so a wrong claim fails later, somewhere else.
+  - A parser takes `unknown` and returns either a typed value or a failure, so the check and the type can't drift apart.
+  - In Zod 4, `z.infer<typeof Schema>` gives the type, `safeParse` returns `{ success, data }` or `{ success, error }`, and `parse` throws a `ZodError`.
+  - Parse once where data enters, then pass typed values inward instead of re-checking everywhere.
+sections:
+  - title: any, unknown and never, the top and the bottom
+    body: |-
+      Think of types as sets of values. `unknown` is the **top type**: every value belongs to
+      it, so anything can be assigned to it. `never` is the **bottom type**: the empty set,
+      so it can be assigned to anything, and nothing but `never` can be assigned to it. `any`
+      is outside the system: it's assignable to and from everything, and every operation on
+      it is allowed.
+
+      That last part is why `any` is contagious:
+
+      ```ts
+      const fromAny: any = JSON.parse('{"total":"45.00"}');
+      const total = fromAny.total; // any
+      const withDelivery: number = total + 5; // no error, any spreads
+      console.log(withDelivery); // 45.005
+
+      const fromUnknown: unknown = JSON.parse('{"total":"45.00"}');
+      fromUnknown.total;
+      // 'fromUnknown' is of type 'unknown'.
+      ```
+
+      `withDelivery` is typed `number` and holds the string `"45.005"`. No error appears
+      anywhere, and every function that receives it inherits the lie.
+
+      `any` sneaks in from a few predictable places: `JSON.parse`, `response.json()`, untyped
+      libraries and parameters you forgot to annotate when `noImplicitAny` is off. Catch
+      variables used to be one; under `strict`, `catch (error)` gives `unknown`, because
+      JavaScript can throw any value, not only an `Error`:
+
+      ```ts
+      try {
+        JSON.parse("{not json");
+      } catch (error) {
+        if (error instanceof SyntaxError) console.log(error.name); // SyntaxError
+      }
+      ```
+
+      In a codebase, ban `any` with lint rules such as typescript-eslint's `no-explicit-any`
+      and the `no-unsafe-*` family, which also flag values that arrive as `any` from
+      libraries. Use `unknown` for "I don't know yet" and `never` for "this can't happen".
+  - title: What as allows, and when it's acceptable
+    body: |-
+      `as` is not unlimited. The checker refuses a cast between types that don't overlap at
+      all:
+
+      ```ts
+      const text = "45.00";
+      const n = text as number;
+      // Conversion of type 'string' to type 'number' may be a mistake because neither type
+      // sufficiently overlaps with the other. If this was intentional, convert the
+      // expression to 'unknown' first.
+      const forced = text as unknown as number; // compiles, and forced is still a string
+      ```
+
+      The double cast through `unknown` gets past any check, which is why reviewers treat it
+      as a warning sign. A cast from `{}` is as dangerous: `const p = {} as Price`
+      compiles, and `p.amount.toFixed(2)` throws at run time.
+
+      The postfix `!`, as in `document.querySelector("#total")!`, is the same kind of claim:
+      it removes `null` and `undefined` without checking.
+
+      Legitimate uses are narrow and local:
+
+      - Inside a small constructor function right after a runtime check, such as creating a
+        branded id.
+      - Where you know more than the checker can prove and the knowledge is local, such as
+        an element that your own markup always renders.
+      - In tests, to build a deliberately broken value, as the lesson's test file does with
+        `as unknown as Subscription`.
+
+      Two alternatives replace most casts. An annotation, `const p: Price = { ... }`, checks
+      the value instead of trusting it. And `satisfies Price` checks a value against a type
+      while keeping its precise inferred type. Neither can create a type the value doesn't
+      have, which is the point.
+  - title: Parsing at the boundary with Zod 4
+    body: |-
+      Zod describes a shape once and gives you both a runtime parser and the static type.
+      This repository uses Zod 4:
+
+      ```ts
+      import { z } from "zod";
+
+      const PriceSchema = z.object({
+        amountPence: z.number().int().nonnegative(),
+        currency: z.enum(["GBP", "EUR"]),
+      });
+      type Price = z.infer<typeof PriceSchema>;
+      // { amountPence: number; currency: "GBP" | "EUR" }
+
+      const good = PriceSchema.safeParse(JSON.parse('{"amountPence":4500,"currency":"GBP","note":"x"}'));
+      if (good.success) {
+        const price: Price = good.data;
+        console.log(price); // { amountPence: 4500, currency: 'GBP' }
+      }
+
+      const bad = PriceSchema.safeParse({ amountPence: "4500", currency: "USD" });
+      if (!bad.success) {
+        console.log(bad.error.issues.map((issue) => `${issue.path.join(".")}: ${issue.code}`));
+        // [ 'amountPence: invalid_type', 'currency: invalid_value' ]
+      }
+      ```
+
+      Four behaviours to know. `safeParse` returns a discriminated union on `success`, so you
+      narrow it like any other union. `parse` returns the data or throws a `ZodError`, which
+      suits code where a bad shape is a bug. `z.object` **strips** unknown keys, so `note`
+      vanished above; `z.strictObject` rejects them instead. And `z.prettifyError(error)`
+      turns the issues into readable lines for logs.
+
+      Some inputs are always strings, such as query strings, form fields and environment
+      variables. `z.coerce.number()` converts before checking, so
+      `z.object({ page: z.coerce.number().int().min(1) }).parse({ page: "3" })` gives
+      `{ page: 3 }`. Use coercion only for those inputs. On JSON, a string where a number
+      belongs usually signals a real bug upstream.
+
+      The main win is a **single source of truth**. The type is derived from the schema, so
+      they can't drift apart. The costs are a dependency, some bundle size in the browser,
+      and a small parsing cost on every request.
+  - title: Designing the boundary
+    body: |-
+      Boundaries are everywhere data crosses into your program: HTTP responses and request
+      bodies, form data, URL parameters, `localStorage`, environment variables, files,
+      messages from another window, database rows from a schema you don't control, and
+      output from an AI model, even one asked for JSON. Each gets one parser.
+
+      A small helper keeps that discipline for HTTP:
+
+      ```ts
+      import { z } from "zod";
+
+      const Booking = z.discriminatedUnion("status", [
+        z.object({ status: z.literal("held"), expiresAt: z.iso.datetime() }),
+        z.object({ status: z.literal("confirmed"), reference: z.string().min(1) }),
+      ]);
+      type Booking = z.infer<typeof Booking>;
+
+      async function getJson<T>(url: string, schema: z.ZodType<T>): Promise<T> {
+        const response = await fetch(url);
+        if (!response.ok) throw new Error(`HTTP ${response.status} from ${url}`);
+        const body: unknown = await response.json();
+        return schema.parse(body); // throws a ZodError if the shape is wrong
+      }
+
+      function describe(b: Booking): string {
+        return b.status === "held" ? `held until ${b.expiresAt}` : `confirmed ${b.reference}`;
+      }
+
+      const reply = encodeURIComponent('{"status":"confirmed","reference":"BK-9"}');
+      const booking = await getJson(`data:application/json,${reply}`, Booking);
+      console.log(describe(booking)); // confirmed BK-9
+      ```
+
+      The `data:` URL stands in for a real server, so the example runs in Node 24 as an ES
+      module. Note the order: check `response.ok` first, since an error page is not a
+      booking. Then take the body as `unknown`, then parse.
+
+      Decide what failure means at each boundary. For your own backend, a bad shape is a bug:
+      throw, log the issues and alert. For user input, return the failure so the form can
+      show it. For an AI model's reply, a failure is expected now and then: retry, or fall
+      back. That is the case for a result type over exceptions.
+
+      Once parsed, don't re-validate deeper in the code. Functions behind the boundary take
+      `Booking`, not `unknown`, and trust it. If a value can be invalid in ways a type can't
+      express, such as a checked email, keep that knowledge in the type with a brand.
+pitfalls:
+  - "**Annotating `JSON.parse` and calling it typed.** `const order: Order = JSON.parse(body)` is a cast in disguise, because `any` accepts any annotation. Assign to `unknown` and parse."
+  - "**Fixing a type error with `as unknown as T`.** The double cast silences the checker completely. If you need it outside a test, the value needs a runtime check instead."
+  - "**Parsing the body before checking the status.** A 404 or 500 page is not your data, and its error will be confusing. Check `response.ok` first, then parse the body."
+  - "**Validating without keeping the result.** A function that returns `true` or `false` leaves the value untyped, so the next function has to trust it again. Return the parsed, typed value."
+  - "**Checking the same data again and again inside the app.** Scattered checks drift and slow the code. Parse once at the edge and pass typed values inward."
+  - "**Using `z.coerce` on JSON.** Coercion turns `\"4500\"` into `4500` and hides a real bug in the sender. Coerce only inputs that are always strings, such as query parameters and environment variables."
+interview:
+  - question: What's the difference between `any`, `unknown` and `never`?
+    answer: >-
+      `unknown` is the safe top type, `never` is the bottom type, and `any` opts out of the
+      type system. Every value is assignable to `unknown`, but you can't do anything with
+      it until you narrow it with `typeof`, `in`, `instanceof` or a parser. `never` has no
+      values; it's the return type of a function that always throws and the leftover type
+      after exhaustive narrowing. `any` is assignable both to and from every type and
+      allows every operation, so errors disappear and the `any` spreads to everything
+      derived from it. I use `unknown` for untrusted input and for catch variables, and
+      `never` for exhaustiveness. I treat `any` as a lint error except when migrating
+      JavaScript, where it's a temporary bridge.
+  - question: How do you type the response of an API call safely?
+    answer: >-
+      I don't trust the response's type; I parse it. `response.json()` returns
+      `Promise<any>`, so annotating the result or casting it with `as` compiles no matter
+      what the server sends. First I check `response.ok`, so an error page isn't treated as
+      data. Then I take the body as `unknown` and run it through a schema, typically Zod:
+      `Schema.parse(body)` returns a typed value or throws, and `safeParse` returns a result
+      I can branch on. The type comes from `z.infer`, so the schema and type can't drift.
+      After that point, the rest of the app uses the typed value without further checks.
+      The costs are a dependency and a little runtime work, which is cheap next to a
+      malformed payload crashing deep inside the UI.
+  - question: When is it acceptable to use `as`?
+    answer: >-
+      Rarely, and only where the claim is local and backed by something. `as` checks
+      nothing and emits no code, so a wrong assertion becomes a runtime error somewhere
+      else. Acceptable cases: a small constructor that validates a string and then casts it
+      to a branded type, test fixtures that deliberately build invalid data, and DOM or
+      library spots where I know more than the types express. Unacceptable: casting parsed
+      JSON, casting to get past an error I don't understand, and `as unknown as T` in
+      application code. Most casts can become an annotation, which checks the value, or
+      `satisfies`, which checks and keeps the precise type. When I review code, every
+      `as` needs a reason, ideally in a comment.
+  - question: What does "parse, don't validate" mean in TypeScript?
+    answer: >-
+      It means a check should return a more precise value, not a boolean. A validator like
+      `isValid(input): boolean` answers yes or no and leaves `input` as `unknown`, so later
+      code has to trust or re-check it, and the check and the type can drift apart. A
+      parser, `parsePrice(input: unknown): PriceResult`, returns either a typed `Price` or a
+      failure. The type now carries the proof: any function taking `Price` knows it was
+      checked. In practice I parse at every boundary with a schema library, keep a result
+      type where failure is expected, and use brands for properties a plain type can't
+      express, such as a checked email. The cost is some upfront modelling, which pays off
+      because invalid data can't travel far.
+terms:
+  - term: Boundary
+    say: The API layer.
+    means: "Anywhere data enters from outside your program: a server reply, a form, a file,
+      `localStorage`, an environment variable, a model's output."
+  - term: Type erasure
+    say: TypeScript checks types while the code runs.
+    means: Types are removed when the code compiles, so no annotation can check data at run time. Only
+      code that runs can.
+  - term: "`unknown`"
+    say: The same as `any`.
+    means: Both accept every value. `any` then allows everything and switches checking off; `unknown`
+      allows nothing until you narrow it.
+  - term: "`as` cast"
+    say: It converts the value to that type.
+    means: It changes only the type the checker sees. It checks nothing and emits no code, so a wrong
+      claim fails later, somewhere else.
+  - term: Parse, don't validate
+    say: Check that the data is valid.
+    means: A parser takes `unknown` and returns either a typed value or a failure, so the check and the
+      type can't drift apart. Parse once where data enters, then pass typed values inward.

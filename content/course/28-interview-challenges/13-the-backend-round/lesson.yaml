@@ -1,0 +1,318 @@
+id: interview.backend-round
+title: The backend round
+objective: Write a request handler that validates input, paginates with a cursor, returns one error format and honours an idempotency key.
+level: advanced
+minutes: 10
+concepts: [interview.handler-shape, interview.idempotency-keys]
+prerequisites: [backend.api-design, backend.validation, scale.idempotency]
+opening:
+  text: >-
+    You'll write the handler a backend round asks for: validated input, cursor pages, one
+    error format and safe retries. Each piece is small, and graders check all four.
+
+steps:
+  - type: prose
+    id: handler-shape
+    body: |-
+      What you need: HTTP basics. A **handler** takes a request (method, path, headers,
+      body) and returns a response: a status and a body. The codes here: 400 bad input, 404
+      unknown path, 405 wrong method, and 422 well formed but unprocessable.
+
+      Graders look for one shape. Check the input first, run plain logic on clean data, and
+      send every failure out in one format.
+
+  - type: predict-output
+    id: predict-string-guests
+    concept: interview.handler-shape
+    difficulty: 1
+    language: js
+    code: |
+      function handle(req) {
+        if (req.method !== 'POST') return { status: 405 };
+        const { room, guests } = req.body ?? {};
+        if (typeof room !== 'string') return { status: 400 };
+        if (!Number.isInteger(guests) || guests < 1) return { status: 400 };
+        return { status: 201 };
+      }
+      console.log(handle({ method: 'POST', body: { room: 'Oak', guests: '2' } }).status);
+    question: A form sent the guests as text. What does this log?
+    choices:
+      - text: '`400`'
+        correct: true
+        feedback: >-
+          Yes. `'2'` is a string, so `Number.isInteger` says no. Validation caught it.
+      - text: '`201`'
+        feedback: >-
+          `'2'` looks like a number to us. To `Number.isInteger` it's text, so the check fails.
+      - text: '`405`'
+        feedback: >-
+          The method is `POST`, so the first check passes. It's the guests that fail.
+
+  - type: prose
+    id: problem-details
+    body: |-
+      That one format has a standard: **problem details**, from RFC 9457. The body has
+      `type`, `title`, `status` and `detail`, and the response says
+      `content-type: application/problem+json`.
+
+      ```json
+      { "type": "about:blank", "title": "Invalid request",
+        "status": 400, "detail": "guests must be 1 to 20." }
+      ```
+
+      Clients learn one shape and can read every error.
+
+  - type: ai-review
+    id: review-private-error
+    concept: interview.handler-shape
+    difficulty: 2
+    language: js
+    request: Reject a booking with too many guests. Use the API's problem details format.
+    flawClass: logic
+    code: |
+      function reject(detail) {
+        return {
+          status: 400,
+          headers: { 'content-type': 'application/problem+json' },
+          body: { error: true, message: detail },
+        };
+      }
+    prompt: >-
+      An assistant wrote this helper. Its test only checked the status. The client's error
+      banner shows nothing. Tap the line at fault.
+    lines: [5]
+    reasons:
+      - text: The body isn't problem details
+        correct: true
+        feedback: >-
+          Yes. The header promises `type`, `title`, `status` and `detail`. This body is a private shape.
+      - text: The status belongs in the body only
+        feedback: >-
+          The status goes on the response. Problem details repeats it in the body too.
+      - text: The content type should be `application/json`
+        feedback: >-
+          `application/problem+json` is the right type. The body is what doesn't match it.
+    fix: |
+      body: { type: 'about:blank', title: 'Invalid request', status: 400, detail },
+
+  - type: parsons
+    id: order-create-handler
+    concept: interview.handler-shape
+    difficulty: 2
+    prompt: >-
+      Put the create handler's body in order. `invalidBooking` returns the first problem or
+      `null`, `problem` builds a problem details response, and `json` any other response.
+    language: js
+    blocks:
+      - id: read-key
+        code: "const key = req.headers['idempotency-key'];"
+        subgoal: Replay a retry
+      - id: replay
+        code: 'if (key && store.responses.has(key)) return store.responses.get(key);'
+      - id: validate
+        code: 'const detail = invalidBooking(req.body);'
+        subgoal: Check the input first
+      - id: reject
+        code: "if (detail) return problem(400, 'Invalid request', detail);"
+      - id: add
+        code: 'const booking = addBooking(store, req.body);'
+        subgoal: Do the work
+      - id: build
+        code: 'const res = json(201, booking);'
+      - id: remember
+        code: 'if (key) store.responses.set(key, res);'
+        subgoal: Remember and answer
+      - id: answer
+        code: 'return res;'
+    distractors:
+      - id: remember-request
+        code: 'if (key) store.responses.set(key, req.body);'
+        feedback: >-
+          A retry needs the answer it missed, with the new booking's id. Store the response.
+
+  - type: prose
+    id: idempotency-keys
+    body: >-
+      You met idempotency in the scale module. In this round it becomes a header. The
+      client sends `Idempotency-Key` with a unique value, and resends the same one when it
+      retries.
+
+
+      The server stores its first response under that key. A retry gets the stored response
+      back and nothing runs twice. That's an **idempotency key**. The same key with a
+      different body is a client bug: answer 422.
+
+  - type: ai-review
+    id: review-key-race
+    concept: interview.idempotency-keys
+    difficulty: 4
+    language: js
+    request: Make booking creation safe to retry with an Idempotency-Key header.
+    flawClass: race
+    code: |
+      async function createBooking(req, store) {
+        const key = req.headers['idempotency-key'];
+        if (store.responses.has(key)) return store.responses.get(key);
+        const booking = await store.db.insert(req.body);
+        const res = { status: 201, body: booking };
+        store.responses.set(key, res);
+        return res;
+      }
+    prompt: >-
+      An assistant wrote this. Its test sent a retry after the first call finished, and it
+      passed. Two retries sent together create two bookings. Tap the line at fault.
+    lines: [4, 6]
+    reasons:
+      - text: The key is saved only after the await
+        correct: true
+        feedback: >-
+          Yes. Both calls pass the check during the insert. Store a pending promise before awaiting.
+      - text: The key should be read from the body
+        feedback: >-
+          A header is the usual place, and the IETF draft defines one. The timing is the problem.
+      - text: '`has` then `get` is two lookups'
+        feedback: >-
+          Two lookups with no `await` between them can't interleave. The gap is at the insert.
+    fix: |
+      const pending = store.db.insert(req.body).then((booking) => ({ status: 201, body: booking }));
+      store.responses.set(key, pending);
+      return pending;
+
+  - type: prose
+    id: cursor-pages
+    body: |-
+      Lists come in pages. With a **cursor**, the client sends `after`, the id of the last
+      item it has. The server returns the next items and `nextCursor`. That's the id to send
+      next time, or `null` when nothing is left.
+
+      Unlike page numbers, a cursor doesn't skip or repeat items when rows are added
+      meanwhile. Check `limit` and `after` too: query values arrive as strings.
+
+  - type: code-challenge
+    id: write-bookings-handler
+    concept: interview.handler-shape
+    difficulty: 4
+    language: ts
+    prompt: >-
+      Finish `createHandler(store)` for `/bookings`. It returns an async handler.
+
+
+      `POST` checks the body: `room` is a non-empty string, `date` is `YYYY-MM-DD`, and
+      `guests` is a whole number from 1 to 20. It stores `{ id, room, date, guests }` and
+      answers 201. A known `idempotency-key` header returns its stored response instead.
+
+
+      `GET` returns `{ items, nextCursor }`. `limit` is 1 to 100, default 10. `after` is a
+      cursor. Every failure is a problem: 400, 404 or 405.
+    hints:
+      - Route first on `req.path`, then on `req.method`. Anything else is a 404 or a 405.
+      - The query values are strings. Check them with a pattern before turning them into numbers.
+      - 'Take the bookings with `id > after`. `nextCursor` is the last item''s id, when more remain.'
+
+  - type: explain-back
+    id: explain-store-response
+    concept: interview.idempotency-keys
+    difficulty: 4
+    prompt: >-
+      Why store the whole first response under the key, rather than a note that the key was
+      seen?
+    rubric:
+      - A retry happens because the client never got the first response.
+      - With only a "seen" flag, the server can skip the work but has nothing to answer with.
+      - Returning the stored response gives the client the same status and booking id it missed.
+    modelAnswer: >-
+      The client retries because the first reply was lost. A note of the key would stop a
+      second booking. But the server would have no booking id to send back. Storing
+      the full response lets the retry get exactly what the first call would have returned.
+
+recap:
+  - Shape a handler as validate, act, respond, with one error format.
+  - Page a list with a cursor and check every query value.
+  - Store the first response under an idempotency key.
+recall:
+  - id: card-handler-order
+    concept: interview.handler-shape
+    front: In what order does a create handler do its work?
+    back: >-
+      Replay a known idempotency key, validate the body, do the work, then store and return
+      the response.
+  - id: card-problem-details
+    concept: interview.handler-shape
+    front: Which members does a problem details body have, and what is its media type?
+    back: >-
+      `type`, `title`, `status` and `detail`, sent as `application/problem+json`.
+  - id: card-key-stored
+    concept: interview.idempotency-keys
+    front: What does the server store under an idempotency key?
+    back: >-
+      The first response, status and body, so a retry gets exactly that back.
+  - id: card-key-race
+    concept: interview.idempotency-keys
+    front: How do two simultaneous retries both slip past an idempotency check?
+    back: >-
+      Both check the key while the first insert is still awaiting. Store a pending marker or
+      promise before any `await`.
+
+references:
+  - kind: rfc
+    title: 'RFC 9457: Problem Details for HTTP APIs'
+    authors: M. Nottingham, E. Wilde, S. Dalal
+    year: 2023
+    venue: IETF
+    url: https://www.rfc-editor.org/rfc/rfc9457
+    note: The error format. It obsoletes RFC 7807.
+    primary: true
+    verified: true
+  - kind: spec
+    title: The Idempotency-Key HTTP Header Field
+    authors: J. Jena, S. Dalal
+    year: 2025
+    venue: IETF HTTPAPI working group, Internet-Draft (expired)
+    url: https://datatracker.ietf.org/doc/draft-ietf-httpapi-idempotency-key-header/
+    note: The header, a published expiry policy for keys, 422 for a reused key with a different body and 409 while the first is in flight.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Idempotent requests
+    authors: Stripe
+    venue: Stripe API reference
+    url: https://docs.stripe.com/api/idempotent_requests
+    note: A widely copied design. It stores the first result, including 500 errors, and may prune a key once it's 24 hours old.
+    verified: true
+
+deepDive: |-
+  **How the round runs.** Usually 45 to 60 minutes: build one resource, then the
+  interviewer adds retries, paging or a second client. They score validation, one error
+  format, tests for the failure paths and how you explain trade-offs. If an assistant is
+  allowed, let it write the validation boilerplate and write the idempotency logic yourself.
+
+  **With `Request` and `Response`.** Fetch-style runtimes include Node 18 and later, Deno, Bun and
+  Next.js route handlers. There the handler reads `await req.json()` inside a `try`, since a
+  malformed body throws. It reads `new URL(req.url).searchParams` for the query and
+  `req.headers.get('idempotency-key')` for the key. It answers with
+  `Response.json(body, { status })`. The shape of the logic doesn't change. That's why
+  interviewers like a thin adapter where requests come in, and plain functions inside.
+
+
+  **Validation.** In a real service you'd use a schema library such as zod, covered in the
+  validation lesson. In a round, ask whether a library is allowed. If not, write one
+  `invalidBooking` that returns the first problem, and say you'd collect all of them for a
+  form.
+
+
+  **Cursors.** The id works as a cursor here because ids only grow. For a list sorted by
+  something else, the cursor must hold the sort value and the id, to break ties. Encode it
+  as base64 so clients treat it as opaque and don't build their own. The API design lesson
+  has the offset trap this avoids.
+
+
+  **Idempotency in production.** Keys are scoped to the caller, so two clients can't collide.
+  They expire after a window, often 24 hours. The stored record keeps a hash of the request
+  body. That's how a reused key with a different body is spotted and refused with 422. A
+  request still in flight gets 409. With a database, the key goes in a table with a unique
+  constraint, written in the same transaction as the booking.
+
+
+  **Where interviewers push next.** Rate limiting as middleware, from the system design
+  module. Auth on the route. And "what if two people book the last room", which needs a
+  unique constraint or a conditional update, from the locking lesson.

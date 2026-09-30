@@ -1,0 +1,277 @@
+id: db.transactions
+title: Transactions
+objective: "Group writes with `BEGIN` and `COMMIT` so they all happen or none do, and never leave a transaction open."
+level: essential
+minutes: 10
+concepts: [db.transactions, db.acid, db.atomicity]
+prerequisites: [db.reading-explain]
+opening:
+  text: >-
+    You'll make a money transfer that can never half-happen, even if the server dies midway.
+    You'll also catch a transfer bug that passes every test and still loses money.
+
+steps:
+  - type: prose
+    id: what-a-transaction-is
+    body: >-
+      A transfer is two writes: take £20 from Ana, give £20 to Ben. If the server crashes
+      between them, £20 vanishes.
+
+
+      A **transaction** wraps statements so they count as one. `BEGIN` opens it. `COMMIT` makes
+      every change permanent at once. `ROLLBACK` throws every change away. If anything fails
+      before `COMMIT`, Postgres undoes the lot.
+
+  - type: sql
+    id: watch-rollback
+    prompt: >-
+      Run it. Inside the transaction, Ana's balance has dropped. After `ROLLBACK`, it's as if
+      nothing happened.
+    setup: &accounts |
+      CREATE TABLE accounts (
+        id integer PRIMARY KEY,
+        owner text NOT NULL,
+        balance_pence integer NOT NULL CHECK (balance_pence >= 0)
+      );
+      INSERT INTO accounts VALUES (1, 'Ana', 5000), (2, 'Ben', 1000);
+    starter: |
+      BEGIN;
+      UPDATE accounts SET balance_pence = balance_pence - 2000 WHERE id = 1;
+      SELECT * FROM accounts;
+      ROLLBACK;
+      SELECT * FROM accounts;
+    showSchema: true
+
+  - type: predict-output
+    id: predict-failed-transfer
+    concept: db.atomicity
+    difficulty: 2
+    language: sql
+    code: |
+      BEGIN;
+      UPDATE accounts SET balance_pence = balance_pence + 9000 WHERE id = 2;  -- Ben
+      UPDATE accounts SET balance_pence = balance_pence - 9000 WHERE id = 1;  -- Ana
+      -- ERROR: new row for relation "accounts" violates check constraint "accounts_balance_pence_check"
+      COMMIT;
+    question: Ana can't afford it, so the second update fails. What happens to Ben's balance?
+    choices:
+      - text: It's back where it started
+        correct: true
+        feedback: >-
+          Right. A failed transaction commits nothing, so Ben's credit is undone too.
+      - text: He keeps the extra £90
+        feedback: >-
+          That's what happens without `BEGIN`. Inside a transaction, one failure undoes every
+          change.
+      - text: It stays locked until someone fixes it
+        feedback: >-
+          Postgres refuses further statements until the transaction ends, then drops every
+          change.
+
+  - type: prose
+    id: a-transaction-left-open
+    body: >-
+      A transaction holds locks on the rows it changed until it ends. Forget the `COMMIT`, and
+      your changes sit invisible to everyone else. Anyone updating those rows waits, and waits.
+
+
+      In code this hides in an early `return` or a thrown error between `BEGIN` and `COMMIT`.
+      Database dashboards list such connections as `idle in transaction`. Always end what you
+      begin.
+
+  - type: sql
+    id: fix-left-open
+    concept: db.transactions
+    difficulty: 2
+    prompt: >-
+      This transfer looks done, but its transaction never ends. The check after your SQL shows
+      `transaction_finished`. Fix it so the transfer really happens.
+    setup: *accounts
+    starter: |
+      BEGIN;
+      UPDATE accounts SET balance_pence = balance_pence - 2000 WHERE id = 1;
+      UPDATE accounts SET balance_pence = balance_pence + 2000 WHERE id = 2;
+      SELECT * FROM accounts;
+    solution: |
+      BEGIN;
+      UPDATE accounts SET balance_pence = balance_pence - 2000 WHERE id = 1;
+      UPDATE accounts SET balance_pence = balance_pence + 2000 WHERE id = 2;
+      COMMIT;
+      SELECT * FROM accounts;
+    checks:
+      query: >-
+        SELECT id, owner, balance_pence, now() = statement_timestamp() AS transaction_finished
+        FROM accounts ORDER BY id
+    showSchema: true
+    hints:
+      - Every `BEGIN` needs an ending.
+      - One word makes the changes permanent. It goes after the second `UPDATE`.
+
+  - type: prose
+    id: acid
+    body: >-
+      Databases promise four things about transactions, called **ACID**:
+
+
+      - **Atomicity**: all of it happens, or none of it.
+
+      - **Consistency**: every constraint holds after it.
+
+      - **Isolation**: transactions running at once don't trip over each other, up to a point.
+
+      - **Durability**: once `COMMIT` returns, a crash won't lose it.
+
+
+      "Up to a point" matters. The next two lessons are about that point.
+
+  - type: ai-review
+    id: review-pool-transaction
+    concept: db.transactions
+    difficulty: 4
+    language: js
+    request: Write a transfer between two accounts, inside a transaction.
+    flawClass: race
+    code: |
+      async function transfer(fromId, toId, pence) {
+        await pool.query("BEGIN");
+        await pool.query("UPDATE accounts SET balance_pence = balance_pence - $1 WHERE id = $2", [pence, fromId]);
+        await pool.query("UPDATE accounts SET balance_pence = balance_pence + $1 WHERE id = $2", [pence, toId]);
+        await pool.query("COMMIT");
+      }
+    prompt: >-
+      An assistant wrote this. Tests pass on a quiet laptop. Under load, half-finished transfers
+      appear. `pool.query` borrows any free connection for each call. Tap the first line at
+      fault.
+    lines: [2]
+    reasons:
+      - text: '`BEGIN` may run on a different connection from the updates'
+        correct: true
+        feedback: >-
+          Right. A transaction lives on one connection. Borrow one client and use it throughout.
+      - text: The two updates are in the wrong order
+        feedback: >-
+          Inside a working transaction, order wouldn't matter. Here there's no shared transaction.
+      - text: '`$1` can''t be used twice in one statement'
+        feedback: >-
+          Each statement has its own `$1` and `$2`. The values bind correctly.
+    fix: |
+      async function transfer(fromId, toId, pence) {
+        const client = await pool.connect();
+        try {
+          await client.query("BEGIN");
+          await client.query("UPDATE accounts SET balance_pence = balance_pence - $1 WHERE id = $2", [pence, fromId]);
+          await client.query("UPDATE accounts SET balance_pence = balance_pence + $1 WHERE id = $2", [pence, toId]);
+          await client.query("COMMIT");
+        } catch (error) {
+          await client.query("ROLLBACK");
+          throw error;
+        } finally {
+          client.release();
+        }
+      }
+
+  - type: multiple-choice
+    id: pick-atomicity-limit
+    concept: db.atomicity
+    difficulty: 3
+    question: >-
+      Two buyers each read "1 ticket left" and sell it, each in a committed transaction. Which
+      promise didn't stop them?
+    choices:
+      - text: None failed; atomicity never covered this
+        correct: true
+        feedback: >-
+          Right. Each sale was whole. Stopping two at once needs constraints or locks.
+      - text: Atomicity failed
+        feedback: >-
+          Each transaction did all of its work. Atomicity says nothing about other transactions.
+      - text: Durability failed
+        feedback: >-
+          Both sales were saved as promised. The trouble is that both were allowed.
+
+  - type: explain-back
+    id: explain-why-a-transfer-needs-one
+    concept: db.acid
+    difficulty: 3
+    prompt: >-
+      Explain to a new teammate why a money transfer needs a transaction, and what goes wrong
+      without one.
+    rubric:
+      - A transfer is two writes, and a crash or error can land between them.
+      - Without a transaction, the first write stays and money appears or disappears.
+      - With `BEGIN` and `COMMIT`, both writes happen together or neither does.
+    modelAnswer: >-
+      A transfer is two updates: take from one account, add to the other. If the server crashes
+      or the second update fails in between, the first one stays on its own. Money vanishes or
+      appears from nowhere. Inside `BEGIN` and `COMMIT`, Postgres treats both as one change.
+      Either both are saved, or on any failure, neither is.
+
+recap:
+  - Wrap writes that belong together in `BEGIN` and `COMMIT`.
+  - End every transaction, and run it on one connection from your code.
+  - Know that atomicity means all-or-nothing, not safety from other writers.
+
+recall:
+  - id: card-rollback
+    concept: db.transactions
+    front: What does `ROLLBACK` do?
+    back: It ends the transaction and throws away every change made since `BEGIN`.
+  - id: card-open-transaction
+    concept: db.transactions
+    front: What harm does a transaction left open do?
+    back: >-
+      Its changes stay invisible to others, and its row locks make other writers wait until it
+      ends.
+  - id: card-pool-query
+    concept: db.transactions
+    front: Why can't a transaction use `pool.query` for each statement?
+    back: >-
+      Each call may borrow a different connection, and a transaction lives on one. Use one
+      client from `pool.connect()`.
+  - id: card-acid
+    concept: db.acid
+    front: What do the four letters of ACID stand for?
+    back: Atomicity, consistency, isolation and durability.
+
+references:
+  - kind: docs
+    title: 3.4. Transactions
+    authors: The PostgreSQL Global Development Group
+    venue: PostgreSQL 18 documentation
+    url: https://www.postgresql.org/docs/18/tutorial-transactions.html
+    note: '`BEGIN`, `COMMIT` and `ROLLBACK` with a bank transfer as the example.'
+    primary: true
+    verified: true
+  - kind: docs
+    title: Transactions
+    authors: node-postgres
+    venue: node-postgres documentation
+    url: https://node-postgres.com/features/transactions
+    note: Why a transaction must use one client, not `pool.query`, with the full pattern.
+    primary: true
+    verified: true
+  - kind: docs
+    title: 28.1. Reliability
+    authors: The PostgreSQL Global Development Group
+    venue: PostgreSQL 18 documentation
+    url: https://www.postgresql.org/docs/18/wal-reliability.html
+    note: How a committed transaction survives a crash.
+    verified: true
+
+deepDive: >-
+  Durability comes from the **write-ahead log**. Before `COMMIT` returns, Postgres writes the
+  change to a log on disk. After a crash, it replays the log, so committed work comes back and
+  half-done work doesn't.
+
+
+  Every single statement is a transaction of its own. An `UPDATE` that changes a thousand rows
+  changes all thousand or none. `BEGIN` is for grouping several statements.
+
+
+  After an error inside a transaction, Postgres answers every further statement with `current
+  transaction is aborted, commands ignored until end of transaction block`. Only `ROLLBACK`
+  gets you out.
+
+
+  `SAVEPOINT` marks a spot you can roll back to without losing the whole transaction. Some
+  ORMs use it for nested transactions.

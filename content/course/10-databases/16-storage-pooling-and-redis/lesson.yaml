@@ -1,0 +1,256 @@
+id: db.storage-and-pooling
+title: Scaling a database
+objective: Pool connections, read from replicas, cache with Redis and understand sharding, in the order a growing app needs them.
+level: advanced
+minutes: 10
+concepts: [db.connection-pooling, db.read-replicas, db.redis, db.shard-key]
+prerequisites: [db.row-level-security]
+opening:
+  text: >-
+    You'll know what to do, and in which order, when one database starts to struggle. Most
+    apps need the first two steps and never the last.
+
+steps:
+  - type: prose
+    id: scale-in-order
+    body: >-
+      One Postgres server carries far more than most apps ever ask of it. It also covers
+      full-text search, JSON, and AI embeddings with the `pgvector` extension. So before
+      anything below, fix slow queries and add the missing indexes.
+
+
+      When that's done and it still struggles, grow in this order: pool connections, cache hot
+      reads, add read replicas, and shard only as a last resort.
+
+  - type: prose
+    id: connections-and-pools
+    body: >-
+      Every open connection costs Postgres a process and some memory, and it allows 100 by
+      default. Past that, new ones get `FATAL: sorry, too many clients already`.
+
+
+      A **connection pool** keeps a few connections open and lends one to each query, then takes
+      it back. `pg.Pool` from the querying-from-code lesson is one. With many copies of your
+      app, a pooler such as PgBouncer sits in front. It shares a few connections among them all.
+
+  - type: ai-review
+    id: review-pool-per-request
+    concept: db.connection-pooling
+    difficulty: 3
+    language: js
+    request: Load the signed-in user's profile for the account page.
+    flawClass: performance
+    code: |
+      import pg from "pg";
+
+      export async function loadProfile(userId) {
+        const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
+        const { rows } = await pool.query("SELECT name, email FROM users WHERE id = $1", [userId]);
+        return rows[0];
+      }
+    prompt: >-
+      An assistant wrote this. It works in testing. On launch day, the logs fill with `sorry,
+      too many clients already`. Tap the line at fault.
+    lines: [4]
+    reasons:
+      - text: Every call opens a new pool and never closes it
+        correct: true
+        feedback: >-
+          Right. Create one pool when the server starts, and share it.
+      - text: '`$1` opens a connection of its own'
+        feedback: >-
+          A parameter travels with the query on the same connection. It costs nothing extra.
+      - text: The query should select fewer columns
+        feedback: >-
+          Two columns is fine. The connections pile up however little each query reads.
+    fix: |
+      import pg from "pg";
+
+      const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
+
+      export async function loadProfile(userId) {
+        const { rows } = await pool.query("SELECT name, email FROM users WHERE id = $1", [userId]);
+        return rows[0];
+      }
+
+  - type: prose
+    id: read-replicas
+    body: >-
+      Most apps read far more than they write. A **read replica** is a read-only copy that
+      follows the main database, a fraction of a second behind. Send heavy reads there, and
+      the main one keeps its strength for writes.
+
+
+      That small lag is the catch. Write to the main database, read the replica straight
+      after, and your own change may not be there yet.
+
+  - type: multiple-choice
+    id: pick-replica-lag
+    concept: db.read-replicas
+    difficulty: 2
+    question: >-
+      A user saves a new name. The next page reads from a replica and shows the old one. The
+      fix?
+    choices:
+      - text: Read from the main database right after a write
+        correct: true
+        feedback: >-
+          Right. The replica catches up in a moment, but this read can't wait for it.
+      - text: Save the name twice
+        feedback: >-
+          Both writes go to the main database. The replica still hasn't caught up.
+      - text: Add an index on the name column
+        feedback: >-
+          The read isn't slow; it's early. An index can't show a row the replica hasn't got.
+
+  - type: prose
+    id: caching-with-redis
+    body: >-
+      **Redis** is a store that keeps keys and values in memory, so reads take well under a
+      millisecond. The usual pattern is **cache-aside**: look in Redis first. On a miss, ask
+      Postgres, then save the answer in Redis with an expiry, called a **TTL**.
+
+
+      A cache holds copies, and copies go stale. Delete the key whenever the data changes, and
+      let the TTL catch anything you miss.
+
+  - type: code-challenge
+    id: write-cache-with-ttl
+    concept: db.redis
+    difficulty: 3
+    language: ts
+    prompt: >-
+      Build the expiry part of a cache. Write `cacheSet(cache, key, value, ttlSeconds, now)` and
+      `cacheGet(cache, key, now)`. `cache` is a plain object, and `now` is in seconds.
+
+
+      `cacheSet` stores the value with `expiresAt` set to `now + ttlSeconds`. `cacheGet`
+      returns the value while `now` is before `expiresAt`. At or after it, it deletes the key
+      and returns `null`. A key never set returns `null`.
+
+
+      `delete cache[key]` removes a key from an object.
+    hints:
+      - The expiry is a moment in time, so work it out when you set, and compare when you get.
+      - A missing key and an expired key both return `null`, but only one of them needs deleting.
+      - 'Start `cacheGet` with `const entry = cache[key];` and check for `undefined`.'
+
+  - type: prose
+    id: sharding
+    body: >-
+      When one database can't take the writes, **sharding** splits the rows across several
+      databases. A **shard key**, such as `chat_id`, decides where each row goes. All of chat 7 lives on one shard.
+
+
+      A query that names the key goes to one shard. A query without it must ask every shard
+      and merge the answers. Postgres can split a table this way on one server, called
+      partitioning. Watch it next.
+
+  - type: sql
+    id: watch-the-shard-key
+    prompt: >-
+      `messages` is split into three parts by `chat_id`. Run both plans. With the key, Postgres
+      reads one part. Without it, it reads all three.
+    setup: |
+      CREATE TABLE messages (id integer NOT NULL, chat_id integer NOT NULL, body text NOT NULL)
+        PARTITION BY HASH (chat_id);
+      CREATE TABLE messages_0 PARTITION OF messages FOR VALUES WITH (MODULUS 3, REMAINDER 0);
+      CREATE TABLE messages_1 PARTITION OF messages FOR VALUES WITH (MODULUS 3, REMAINDER 1);
+      CREATE TABLE messages_2 PARTITION OF messages FOR VALUES WITH (MODULUS 3, REMAINDER 2);
+      INSERT INTO messages SELECT n, n % 50, 'Message ' || n FROM generate_series(1, 3000) AS n;
+    starter: |
+      EXPLAIN (COSTS OFF) SELECT * FROM messages WHERE chat_id = 7;
+      EXPLAIN (COSTS OFF) SELECT * FROM messages WHERE body = 'Message 42';
+    showSchema: true
+
+  - type: explain-back
+    id: explain-shard-last
+    concept: db.shard-key
+    difficulty: 4
+    prompt: >-
+      A teammate wants to shard the database before launch, "to be ready for scale". What would
+      you tell them?
+    rubric:
+      - Queries without the shard key must ask every shard, and joins across shards get hard.
+      - Choosing the wrong key is painful to undo, and every feature must respect it.
+      - Indexes, pooling, caching and replicas usually carry an app much further first.
+    modelAnswer: >-
+      Sharding has a lasting cost. Every query should include the shard key, or it has to ask
+      every shard and merge the answers. Joins and totals across shards get hard, and a wrong
+      key is painful to change. Most apps go a very long way on one Postgres with good indexes,
+      a pool, a cache and replicas. I'd shard only when writes truly outgrow one machine.
+
+recap:
+  - Scale in order, starting with queries and indexes, then pools, caches and replicas.
+  - Share one pool per server, and read from the main database right after a write.
+  - Cache with a TTL and delete on write, and shard only when writes outgrow one machine.
+
+recall:
+  - id: card-pool
+    concept: db.connection-pooling
+    front: Why does an app use a connection pool?
+    back: >-
+      Each connection costs the database memory and has a limit. A pool reuses a few open
+      connections for many queries.
+  - id: card-replica-lag
+    concept: db.read-replicas
+    front: Why might a read replica not show a row you wrote a moment ago?
+    back: It follows the main database slightly behind, so a read straight after a write can miss it.
+  - id: card-cache-aside
+    concept: db.redis
+    front: Describe cache-aside in three steps.
+    back: >-
+      Look in the cache. On a miss, read the database. Store the answer in the cache with a TTL.
+  - id: card-shard-key
+    concept: db.shard-key
+    front: What happens to a query that doesn't include the shard key?
+    back: It has to ask every shard and merge the results.
+
+references:
+  - kind: docs
+    title: 26. High Availability, Load Balancing, and Replication
+    authors: The PostgreSQL Global Development Group
+    venue: PostgreSQL 18 documentation
+    url: https://www.postgresql.org/docs/18/high-availability.html
+    note: Replicas, how they follow the main server, and the lag between them.
+    primary: true
+    verified: true
+  - kind: docs
+    title: 5.12. Table Partitioning
+    authors: The PostgreSQL Global Development Group
+    venue: PostgreSQL 18 documentation
+    url: https://www.postgresql.org/docs/18/ddl-partitioning.html
+    note: Hash partitions, and how the planner skips partitions a query can't touch.
+    verified: true
+  - kind: docs
+    title: 19.3. Connections and Authentication
+    authors: The PostgreSQL Global Development Group
+    venue: PostgreSQL 18 documentation
+    url: https://www.postgresql.org/docs/18/runtime-config-connection.html
+    note: '`max_connections` and its default of 100.'
+    verified: true
+  - kind: docs
+    title: EXPIRE
+    authors: Redis
+    venue: Redis documentation
+    url: https://redis.io/docs/latest/commands/expire/
+    note: How a key's time to live works, and when Redis removes an expired key.
+    verified: true
+
+deepDive: >-
+  Serverless functions make pooling urgent. Each running copy is its own tiny server with its
+  own connections, and a busy minute can start hundreds of copies. Hosts put a pooler in
+  front for exactly this, as the cloud chapter shows.
+
+
+  Redis also does atomic counters. `INCR page:42:views` adds one safely however many servers
+  call it at once, and `SET lock:job1 me NX EX 30` claims something only if nobody else has.
+
+
+  Partitioning is useful on its own. Split a huge `events` table by month, and dropping a
+  year of old data is `DROP TABLE events_2024_01`, instant, instead of a slow `DELETE`.
+
+
+  Resharding, moving to more shards later, is where naive schemes hurt. With `hash % 3`, going
+  to four shards moves most rows. Real systems use many small virtual shards or consistent
+  hashing, covered in the system design chapter.

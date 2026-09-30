@@ -1,0 +1,418 @@
+summary: >-
+  FastAPI is a Python web framework that turns typed functions into HTTP endpoints. You
+  write a function, annotate its parameters, and FastAPI works out where each value comes
+  from: the path, the query string, a header or the JSON body. It validates all of it with
+  Pydantic before your code runs, answers bad input with `422`, and builds OpenAPI docs from
+  the same types.
+
+
+  It exists because the typing does three jobs at once. The annotation is the parser, the
+  validator and the documentation, so they can't drift apart. `Depends` adds a small
+  dependency injection system on top: shared steps such as "who is calling" or "open a
+  database session" are written once and requested by type, and tests swap them out.
+
+
+  For AI engineering it is the usual shape of a model service: a thin, typed API between
+  the app and the model. It checks input, enforces who may see what, keeps the API key on
+  the server and streams the reply back. Reach for it when a Python service needs an HTTP
+  API. If the product is already a Next.js app and the model call is a few lines, a route
+  handler there may be enough. A second service is one more thing to run.
+remember:
+  - FastAPI reads each parameter's type and position to decide its source, validates it with Pydantic, and answers `422` before your function runs if it fails.
+  - A plain `def` route runs in a thread pool, while an `async def` route runs on the event loop, so blocking calls inside `async def` stall every request.
+  - '`Depends` runs a dependency once per request, caches the result for every other dependant in that request, and lets tests replace it with `app.dependency_overrides`.'
+  - A dependency with `yield` gives setup before the route and cleanup after it, like a context manager, which suits database sessions.
+  - '`response_model` filters and validates what goes out, so an internal field never leaks even if the function returns it.'
+  - Raise `HTTPException` for an expected failure with a status code, and check ownership in every route that returns someone's data.
+  - A `StreamingResponse` sends its status and headers before the first chunk, so an error mid-stream can no longer change the status code.
+  - Create shared clients once in the `lifespan` function, not per request, so connection pools are reused.
+sections:
+  - title: What happens between the request and your function
+    body: |-
+      FastAPI is built on Starlette, a small toolkit for **ASGI**, the async Python standard
+      for web servers. A server such as Uvicorn accepts connections and calls the app. When
+      you decorate a function, FastAPI inspects its signature once, at start-up, and builds
+      a plan. Path names in `{}` become path parameters and Pydantic models become the body.
+      `Header()`, `Query()` and `Cookie()` name a source explicitly. Other plain types come
+      from the query string.
+
+      On each request the plan runs in order: extract, convert, validate, resolve
+      dependencies, call your function, then validate and serialise the result. The outgoing
+      half matters as much as the incoming one.
+
+      ```python
+      from fastapi import FastAPI, HTTPException, status
+      from fastapi.testclient import TestClient
+      from pydantic import BaseModel, Field
+
+      app = FastAPI()
+
+
+      class BookingIn(BaseModel):
+          room: str
+          nights: int = Field(gt=0, le=30)
+
+
+      class BookingOut(BaseModel):
+          id: int
+          room: str
+          nights: int
+
+
+      BOOKINGS: dict[int, dict] = {}
+
+
+      @app.post("/bookings", status_code=status.HTTP_201_CREATED, response_model=BookingOut)
+      def create_booking(booking: BookingIn):
+          booking_id = len(BOOKINGS) + 1
+          row = {"id": booking_id, **booking.model_dump(), "card_token": "tok_123"}
+          BOOKINGS[booking_id] = row
+          return row  # response_model drops card_token on the way out
+
+
+      @app.get("/bookings/{booking_id}", response_model=BookingOut)
+      def read_booking(booking_id: int):
+          if booking_id not in BOOKINGS:
+              raise HTTPException(status_code=404, detail="Booking not found")
+          return BOOKINGS[booking_id]
+
+
+      client = TestClient(app)
+      created = client.post("/bookings", json={"room": "12B", "nights": 2})
+      print(created.status_code, created.json())  # 201 {'id': 1, 'room': '12B', 'nights': 2}
+      print(client.get("/bookings/9").json())  # {'detail': 'Booking not found'}
+      bad = client.post("/bookings", json={"room": "12B", "nights": 0})
+      print(bad.status_code, bad.json()["detail"][0]["loc"])  # 422 ['body', 'nights']
+      print(client.get("/bookings/abc").status_code)  # 422
+      ```
+
+      Compare it with Express, where `req.body` is whatever arrived and you validate by hand,
+      or a Next.js route handler, where you call `schema.parse(await request.json())`
+      yourself. In FastAPI the signature is the contract, and a path parameter typed `int`
+      rejects `abc` without a line of your code.
+  - title: Dependency injection with Depends
+    body: |-
+      A dependency is any callable FastAPI can call with its own resolved parameters. It can
+      declare headers, query parameters and other dependencies, so they form a graph.
+      FastAPI resolves that graph for each request and **caches each dependency per
+      request**: if two dependants both ask for `get_session`, it runs once and both get the
+      same object.
+
+      A dependency that uses `yield` works like a context manager. The code before `yield`
+      runs first, the route runs at the `yield`, and the `finally` block cleans up afterwards,
+      even when the route raised.
+
+      ```python
+      from typing import Annotated
+
+      from fastapi import Depends, FastAPI, Header, HTTPException
+      from fastapi.testclient import TestClient
+
+      app = FastAPI()
+      events: list[str] = []
+
+
+      class FakeSession:
+          def __init__(self) -> None:
+              events.append("open")
+
+          def close(self) -> None:
+              events.append("close")
+
+
+      def get_session():
+          session = FakeSession()
+          try:
+              yield session  # the route runs here
+          finally:
+              session.close()  # runs after the route, even if it raised
+
+
+      def get_user(
+          session: Annotated[FakeSession, Depends(get_session)],
+          x_api_key: Annotated[str | None, Header()] = None,
+      ) -> str:
+          if x_api_key != "secret":
+              raise HTTPException(status_code=401, detail="Unknown key")
+          return "ana"
+
+
+      @app.get("/todos")
+      def list_todos(
+          user: Annotated[str, Depends(get_user)],
+          session: Annotated[FakeSession, Depends(get_session)],
+      ):
+          return {"user": user}
+
+
+      client = TestClient(app)
+      print(client.get("/todos", headers={"X-API-Key": "secret"}).json())  # {'user': 'ana'}
+      print(events)  # ['open', 'close']: one session, shared by both dependants
+
+      app.dependency_overrides[get_user] = lambda: "test-user"
+      print(client.get("/todos").json())  # {'user': 'test-user'}
+      app.dependency_overrides.clear()
+      print(client.get("/todos").status_code)  # 401
+      ```
+
+      `dependency_overrides` is the testing seam. Map the real dependency to a fake, and
+      every route that uses it gets the fake. You test routes without real keys, databases
+      or model calls, and you clear the map afterwards so tests stay independent. It plays the
+      role that middleware and `req.user` play in Express, but typed and explicit per route.
+  - title: def or async def, and why it matters
+    body: |-
+      FastAPI treats the two kinds of route differently. An `async def` route runs on the
+      event loop, the single thread that serves every request in that process. A plain
+      `def` route is sent to a thread pool, which has 40 threads by default in the AnyIO
+      version FastAPI uses. Dependencies follow the same rule.
+
+      So the rule is about what you call inside. In `async def`, every slow call must be
+      awaited: an async HTTP client, an async database driver, `asyncio.sleep`. One blocking
+      call, such as `time.sleep`, `requests.get` or a synchronous model SDK, stops the loop
+      and every other request waits.
+
+      ```python
+      import asyncio
+      import time
+
+      import httpx
+      from fastapi import FastAPI
+
+      app = FastAPI()
+
+
+      @app.get("/blocking-async")
+      async def blocking_async():
+          time.sleep(0.2)  # blocks the event loop: every other request waits
+          return {"ok": True}
+
+
+      @app.get("/sync")
+      def sync_route():
+          time.sleep(0.2)  # runs in the thread pool, so the loop stays free
+          return {"ok": True}
+
+
+      @app.get("/awaiting")
+      async def awaiting():
+          await asyncio.sleep(0.2)  # hands control back to the loop while it waits
+          return {"ok": True}
+
+
+      async def timed(path: str) -> float:
+          transport = httpx.ASGITransport(app=app)
+          async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+              start = time.perf_counter()
+              await asyncio.gather(*(client.get(path) for _ in range(5)))
+              return time.perf_counter() - start
+
+
+      for path in ["/blocking-async", "/sync", "/awaiting"]:
+          print(path, round(asyncio.run(timed(path)), 1))
+      ```
+
+      Five concurrent requests take about a second on the blocking route, because they run
+      one after another. The other two finish in about 0.2 to 0.3 seconds. For model
+      services, `async def` with the async SDK client is the better default. A model call
+      waits for seconds. The event loop holds thousands of waiting requests cheaply, while
+      the pool caps you at 40 blocked threads.
+  - title: Streaming a model reply, and what can go wrong
+    body: |-
+      `StreamingResponse` takes an iterator or async iterator and sends each item as it is
+      produced. That is how an app shows a model's answer word by word. FastAPI 0.141 also
+      ships Server-Sent Events: set `response_class=EventSourceResponse` and `yield` from the
+      route, and each item goes out as a `data:` line, JSON-encoded.
+
+      ```python
+      import asyncio
+      from collections.abc import AsyncIterator
+
+      from fastapi import FastAPI
+      from fastapi.responses import StreamingResponse
+      from fastapi.sse import EventSourceResponse
+      from fastapi.testclient import TestClient
+
+      app = FastAPI()
+
+
+      async def fake_model(question: str) -> AsyncIterator[str]:
+          for word in ["Your ", "order ", "has ", "shipped."]:
+              await asyncio.sleep(0.01)  # stands in for waiting on the model
+              yield word
+
+
+      @app.get("/answer")
+      async def answer(q: str):
+          return StreamingResponse(fake_model(q), media_type="text/plain")
+
+
+      @app.get("/answer-events", response_class=EventSourceResponse)
+      async def answer_events(q: str):
+          async for piece in fake_model(q):
+              yield {"text": piece}
+
+
+      client = TestClient(app)
+      with client.stream("GET", "/answer", params={"q": "Where is my order?"}) as response:
+          print(response.status_code, response.headers["content-type"])
+          print("".join(response.iter_text()))  # Your order has shipped.
+
+      with client.stream("GET", "/answer-events", params={"q": "Where is my order?"}) as response:
+          print(response.headers["content-type"])  # text/event-stream; charset=utf-8
+          print(response.read().decode().splitlines()[:3])
+          # ['data: {"text": "Your "}', '', 'data: {"text": "order "}']
+      ```
+
+      Three things differ from a normal response. First, the status line and headers go out
+      before the first chunk, as `200`. If the model call fails halfway, you can't turn it
+      into a `500`. Validate and authorise before you start streaming, and send failures
+      in-band, for example as an `error` event the client understands. Second, the
+      generator is the unit of work, so put the model call inside it, not before the
+      `return`. Third, proxies may buffer. Behind nginx or some platforms, a stream arrives
+      all at once unless buffering is turned off for that route.
+  - title: Lifespan and shared clients
+    body: |-
+      Some objects should exist once per process: an HTTP client with a connection pool, a
+      model SDK client, a database engine. Creating one per request throws away the pool and
+      repeats the TLS handshake every time. The `lifespan` function runs once at start-up,
+      up to its `yield`, and once at shutdown, after it.
+
+      ```python
+      from contextlib import asynccontextmanager
+      from typing import Annotated
+
+      import httpx
+      from fastapi import Depends, FastAPI, Request
+      from fastapi.testclient import TestClient
+
+
+      @asynccontextmanager
+      async def lifespan(app: FastAPI):
+          app.state.http = httpx.AsyncClient(timeout=10)  # one pool for the process
+          print("started")
+          yield
+          await app.state.http.aclose()  # runs once at shutdown
+          print("stopped")
+
+
+      app = FastAPI(lifespan=lifespan)
+
+
+      def get_http(request: Request) -> httpx.AsyncClient:
+          return request.app.state.http
+
+
+      @app.get("/health")
+      async def health(http: Annotated[httpx.AsyncClient, Depends(get_http)]):
+          return {"pool_open": not http.is_closed}
+
+
+      with TestClient(app) as client:  # the with block runs the lifespan
+          print(client.get("/health").json())
+      # started
+      # {'pool_open': True}
+      # stopped
+      ```
+
+      Routes reach the shared object through a dependency, never a module global they import
+      directly. That keeps them testable: override `get_http` and the route gets a fake.
+      Note that `TestClient(app)` without `with` does not run the lifespan, so start-up code
+      is skipped. In production, each worker process runs its own lifespan, so four workers
+      mean four pools.
+
+      The older `@app.on_event("startup")` hooks do the same job, but they are deprecated in
+      favour of `lifespan`. One function that sets up and tears down keeps the pair
+      together, the way a `with` block does. Nothing opened at start-up is forgotten at
+      shutdown.
+pitfalls:
+  - '**Blocking inside `async def`.** A synchronous SDK, `requests` or `time.sleep` in an async route freezes the event loop for everyone. Use the async client and `await` it, or make the route a plain `def` so it runs in the thread pool.'
+  - '**Authenticating but not authorising.** `Depends(get_user)` proves who is calling, not what they may read. Check the owner of every record you return, and answer `404` rather than `403` if you don''t want to reveal that it exists.'
+  - '**Returning the database row as it is.** Without `response_model` or a return type, every field goes out, including tokens and internal notes. Declare an output model so only the listed fields leave.'
+  - '**Opening clients per request.** `httpx.AsyncClient()` or a model client inside a route rebuilds the connection pool on every call. Create it once in `lifespan` and hand it out through a dependency.'
+  - '**Expecting a status code after streaming starts.** Once the first chunk is sent the status is fixed. Do validation and permission checks before returning the `StreamingResponse`, and report later failures inside the stream.'
+  - '**Leaking overrides between tests.** `app.dependency_overrides` is a dict on the app, shared by every test. Clear it in a fixture''s teardown, or the next test silently runs against a fake.'
+  - '**Joining the generator before returning.** `"".join(pieces)` or collecting into a list waits for the whole reply, so nothing streams. Pass the generator itself to `StreamingResponse`.'
+interview:
+  - question: How does FastAPI decide where each route parameter comes from, and what happens when it's invalid?
+    answer: >-
+      It inspects the signature at start-up and maps each parameter by name and type. A name
+      in the path template is a path parameter, and a Pydantic model is the JSON body.
+      Markers like `Header()` or `Query()` are explicit. Other simple types come from the
+      query string. On each request it extracts and converts the values, then validates them with
+      Pydantic. If anything fails, it returns `422` with a `detail` list giving the location,
+      such as `["body", "nights"]`, and the message, and the function never runs. Safe
+      conversions are allowed, so `"10"` becomes `10` for an `int`. The trade-off is less
+      control over the error format: to match an existing API's error shape, you add an
+      exception handler for `RequestValidationError`.
+  - question: Explain FastAPI's dependency injection. How would you use it in tests?
+    answer: >-
+      A dependency is a callable declared with `Depends`, which FastAPI resolves per request
+      and injects into the route. Dependencies can have their own parameters and
+      dependencies, so they form a graph. Each is cached within a request, so two dependants
+      share one database session. A dependency with `yield` gives setup and
+      teardown around the route, which is how sessions and transactions are scoped. In tests
+      I set `app.dependency_overrides[get_user] = lambda: fake_user`, or swap the model client
+      for a fake that returns canned text, then call routes with `TestClient`. No
+      monkeypatching of imports is needed. I clear the overrides in fixture teardown. The
+      cost is some indirection: a dependency chain several levels deep is harder to follow
+      than an explicit call.
+  - question: When would you write a route as async def rather than def?
+    answer: >-
+      Use `async def` when everything slow inside it can be awaited, and `def` when it calls
+      blocking libraries. FastAPI runs `async def` routes on the event loop and `def` routes
+      in a thread pool, 40 threads by default. A model service spends most of its time
+      waiting on the provider. With `async def` and the async SDK, one process holds
+      thousands of waiting requests cheaply. The danger is one blocking call inside an async
+      route, such as `requests.get` or a sync SDK, which freezes every request in that
+      worker. If a library has no async version, a plain `def` route is the safe choice, or
+      I wrap the call with `run_in_threadpool`. CPU-heavy work belongs in neither: move it to
+      a process pool or a worker queue.
+  - question: How would you stream an LLM response through a FastAPI endpoint, and what are the pitfalls?
+    answer: >-
+      Return a `StreamingResponse` around an async generator that yields each text delta
+      from the provider's stream. Or use Server-Sent Events with `EventSourceResponse`, so
+      the browser gets structured events. Before streaming I
+      validate input and check permissions, because the `200` and headers go out with the
+      first chunk and can't change later. Errors after that are sent in-band as an error
+      event. I make sure the model call lives inside the generator, check that no proxy
+      buffers the response, and set timeouts on the upstream call. I also handle a client
+      that disconnects: stopping the upstream stream saves tokens. The alternative, waiting
+      for the whole reply, is simpler to test and retry, and fine for short answers or
+      background jobs.
+  - question: How does FastAPI compare with an Express or Next.js route handler?
+    answer: >-
+      All three map a method and path to a function, but FastAPI makes the types the
+      contract. In Express you read `req.body`, validate it yourself, and attach shared state
+      through middleware. In a Next.js route handler you export `GET` or `POST`, parse the
+      request with something like Zod, and return a `Response`. FastAPI derives parsing,
+      validation, output filtering and OpenAPI docs from the annotations. Its `Depends`
+      system replaces much of what middleware does, typed and per route. Next.js
+      wins when the model call belongs to a web app you already deploy. FastAPI wins when the
+      service is Python-first, for example because it uses NumPy or Python-only SDKs, or
+      because several clients share it.
+terms:
+  - term: Dependency injection
+    say: A framework for importing modules.
+    means: Declaring what a route needs, such as a database session or the current user, with
+      `Depends`. FastAPI runs each dependency once per request, and tests swap it with
+      `app.dependency_overrides`.
+  - term: "422"
+    say: The server crashed on bad input.
+    means: "Unprocessable Content: Pydantic validation of the path, query, headers or body
+      failed, and FastAPI answered before your function ran."
+  - term: "`async def` route"
+    say: Always faster than `def`.
+    means: Runs on the event loop, so a blocking call inside it stalls every request. A plain
+      `def` route runs in a thread pool, which suits blocking libraries.
+  - term: "`response_model`"
+    say: Documentation for the response.
+    means: A model that filters and validates what the route returns, so an internal field such
+      as a password hash never leaks even if the function returns it.
+  - term: Lifespan
+    say: Start-up scripts.
+    means: A function that runs setup before the app serves requests and cleanup at shutdown.
+      Shared clients created there reuse their connection pools.
+  - term: "`StreamingResponse`"
+    say: A normal response, sent in parts.
+    means: Sends status and headers before the first chunk, so an error mid-stream can no longer
+      change the status code; it has to be signalled inside the stream.

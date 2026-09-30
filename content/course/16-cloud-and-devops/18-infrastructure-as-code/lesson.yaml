@@ -1,0 +1,341 @@
+id: cloud.infrastructure-as-code
+title: "Infrastructure as code"
+objective: "Declare a server and a DNS record in code, read a plan before applying it, keep state safe, and give each role only the access it needs."
+level: advanced
+minutes: 10
+concepts: [cloud.iac, cloud.plan-and-apply, cloud.iac-state, cloud.least-privilege]
+prerequisites: [cloud.ci-cd, cloud.dns-and-tls]
+opening:
+  text: >-
+    You'll describe servers and DNS records in files, and read what a tool will change
+    before it touches anything. It's how a team rebuilds a whole setup from a pull request.
+
+steps:
+  - type: prose
+    id: why-code-not-clicks
+    body: >-
+      You can make a server by clicking through your cloud provider's web console. It works.
+      Six months later, nobody knows which boxes were ticked. You can't review the change,
+      repeat it for a test copy, or rebuild it after a mistake.
+
+
+      **Infrastructure as code** fixes that. Servers, DNS records and databases are written
+      in files, kept in Git, and created by a tool.
+
+  - type: prose
+    id: first-resource
+    body: |-
+      OpenTofu and Terraform read files like this:
+
+      ```text
+      provider "aws" {
+        region = "eu-west-2"
+      }
+
+      resource "aws_instance" "web" {
+        ami           = "ami-0abcdef1234567890"
+        instance_type = "t3.small"
+      }
+      ```
+
+      A **provider** is a plugin that talks to one cloud. A **resource** is one thing that
+      should exist: here a server, from a disk image (`ami`), in a size (`instance_type`).
+      Other blocks call it `aws_instance.web`, and `aws_instance.web.public_ip` is its address.
+
+  - type: fill-blank
+    id: fill-dns-record
+    concept: cloud.iac
+    difficulty: 1
+    language: text
+    prompt: >-
+      Point `www.example.com` at that server with an A record, the kind from lesson 3. Fill
+      the gaps.
+    template: |
+      {{1}} "aws_route53_record" "www" {
+        zone_id = "Z0123456789ABCDEFGHIJ"
+        name    = "www.example.com"
+        type    = "{{2}}"
+        ttl     = 300
+        records = [{{3}}]
+      }
+    blanks:
+      - key: '1'
+        answer: resource
+      - key: '2'
+        answer: A
+      - key: '3'
+        answer: aws_instance.web.public_ip
+    bank: [resource, provider, A, CNAME, aws_instance.web.public_ip, '"web"']
+
+  - type: prose
+    id: name-plan-and-apply
+    body: |-
+      Nothing changes until you ask twice. `tofu plan` compares the files with what really
+      exists, and prints what it would do:
+
+      ```text
+        # aws_instance.web will be created
+        # aws_route53_record.www will be created
+      Plan: 2 to add, 0 to change, 0 to destroy.
+      ```
+
+      `+` creates, `~` changes in place, `-` destroys, and `-/+` destroys then creates again.
+      `tofu apply` does it. A hand-made change shows up too, and the plan would undo it.
+
+  - type: bug-hunt
+    id: hunt-forced-replacement
+    concept: cloud.plan-and-apply
+    difficulty: 2
+    language: bash
+    code: |
+      $ tofu plan
+        # docker_container.db must be replaced
+      -/+ resource "docker_container" "db" {
+            ~ image = "sha256:33f923b05f64..." -> (known after apply) # forces replacement
+        # docker_image.postgres must be replaced
+      -/+ resource "docker_image" "postgres" {
+            ~ name  = "postgres:16" -> "postgres:17" # forces replacement
+      Plan: 2 to add, 0 to change, 2 to destroy.
+    prompt: >-
+      You changed one line, `postgres:16` to `postgres:17`. The orders database keeps its data
+      inside that container. Tap the line that should stop you applying.
+    lines: [2]
+    reasons:
+      - text: The database container is destroyed and made again
+        correct: true
+        feedback: >-
+          Yes. A new container starts empty. Back up and plan the upgrade first.
+      - text: The image name only changes in place
+        feedback: >-
+          The `-/+` and "forces replacement" say otherwise. The old image is removed and a new one pulled.
+      - text: Two adds and two destroys cancel out
+        feedback: >-
+          Tempting, but the adds are empty replacements. Whatever lived in the destroyed container is gone.
+    fix: |
+      # Don't apply. Put the data in a volume, take a backup,
+      # then upgrade Postgres with a planned dump and restore.
+
+  - type: prose
+    id: name-state
+    body: |-
+      How does the tool know what already exists? It keeps a **state file**: every resource
+      it manages, with its real id and settings. Secrets too, in plain text:
+
+      ```bash
+      $ grep '"result"' terraform.tfstate
+                  "result": "ZepPFGEal0BS<i=ePYU5",
+      ```
+
+      A team keeps state in a remote, encrypted store, with a **lock** so two applies can't
+      run at once.
+
+  - type: ai-review
+    id: review-state-in-git
+    concept: cloud.iac-state
+    difficulty: 3
+    language: bash
+    request: Write a deploy script that applies our infrastructure and keeps the state safe.
+    flawClass: security
+    code: |
+      #!/bin/sh
+      set -e
+      tofu init
+      tofu plan -out=release.plan
+      tofu apply release.plan
+      git add terraform.tfstate
+      git commit -m "Update infrastructure state"
+      git push
+    prompt: >-
+      This runs for a public repository. Every deploy worked, and the state was never lost.
+      Tap the line at fault.
+    lines: [6]
+    reasons:
+      - text: The state, with its secrets, lands in Git
+        correct: true
+        feedback: >-
+          Exactly. Anyone can read the database password in that file.
+      - text: '`apply` should run without a saved plan'
+        feedback: >-
+          Applying a saved plan is the safe habit. It applies exactly what was reviewed.
+      - text: '`set -e` hides failures'
+        feedback: >-
+          It does the opposite. It stops the script at the first failing command.
+    fix: |
+      #!/bin/sh
+      set -e
+      # State lives in a locked, encrypted remote store, never in Git.
+      tofu init
+      tofu plan -out=release.plan
+      tofu apply release.plan
+
+  - type: prose
+    id: name-least-privilege
+    body: >-
+      Who may create and delete all this? Your provider's **IAM**, identity and access
+      management, decides. You give each person, app and pipeline a **role**: the actions it
+      may take, on named resources.
+
+
+      **Least privilege** means only what the job needs. And don't paste long-lived access
+      keys into CI. With OIDC, a pipeline run gets keys that expire within the hour (lesson 8).
+
+  - type: ai-review
+    id: review-star-policy
+    concept: cloud.least-privilege
+    difficulty: 3
+    language: json
+    request: Let the photo resizer read uploaded photos from the photo-uploads bucket.
+    flawClass: security
+    code: |
+      {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Action": "*",
+            "Resource": "*"
+          }
+        ]
+      }
+    prompt: >-
+      The resizer works with this policy, and the pull request is ready. Tap the lines at
+      fault.
+    lines: [6, 7]
+    reasons:
+      - text: The resizer may do anything to any resource
+        correct: true
+        feedback: >-
+          Yes. One bug could delete every bucket. Name one action and one bucket.
+      - text: The version should be today's date
+        feedback: >-
+          A common guess. `2012-10-17` is the version of the policy language, and it's current.
+      - text: '`Allow` should be `Deny`'
+        feedback: >-
+          Then the resizer could read nothing. The problem is how much it allows.
+    fix: |
+      {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Action": "s3:GetObject",
+            "Resource": "arn:aws:s3:::photo-uploads/*"
+          }
+        ]
+      }
+
+  - type: explain-back
+    id: explain-read-the-plan
+    concept: cloud.plan-and-apply
+    difficulty: 4
+    prompt: >-
+      Your team reviews infrastructure changes by reading the code diff. Why should they
+      read the plan too?
+    rubric:
+      - The code diff shows what you asked for, and the plan shows what will actually happen.
+      - A one-line edit can force a replacement, which destroys the old resource and its data.
+      - Changes made by hand outside the code show up only in the plan.
+    modelAnswer: >-
+      The diff says what changed in the files. The plan says what the tool will do to real
+      things. Bumping the Postgres image looked like a one-line tweak, but the plan said
+      destroy and create. That would empty the database. The plan also shows hand-made
+      changes it's about to undo. You only see those surprises in the plan.
+
+recap:
+  - Declare servers and DNS records in files, and let a tool create them.
+  - Read the plan, especially every `-/+` and destroy, before you apply it.
+  - Keep state remote, locked and out of Git, and give every role the least access it needs.
+recall:
+  - id: card-iac
+    concept: cloud.iac
+    front: What is infrastructure as code?
+    back: >-
+      Servers, networks and services declared in versioned files and created by a tool, so
+      changes are reviewed and repeatable.
+  - id: card-forces-replacement
+    concept: cloud.plan-and-apply
+    front: What does `-/+` with `# forces replacement` in a plan mean?
+    back: >-
+      That setting can't change in place, so the resource will be destroyed and created
+      again, with a new id and none of the old data inside it.
+  - id: card-state
+    concept: cloud.iac-state
+    front: Where should a team keep its state file, and why?
+    back: >-
+      In a remote store with locking and encryption. It must be shared, applies must not
+      overlap, and it holds secrets in plain text.
+  - id: card-drift
+    concept: cloud.plan-and-apply
+    front: Someone changes a resource by hand. What happens on the next plan?
+    back: >-
+      The plan shows the difference and proposes changing the resource back to what the
+      code declares.
+  - id: card-least-privilege
+    concept: cloud.least-privilege
+    front: What should a role for a service that reads one bucket allow?
+    back: >-
+      Only the read action, such as `s3:GetObject`, on that one bucket's objects. Never `*`
+      actions on `*` resources.
+
+references:
+  - kind: docs
+    title: State
+    authors: OpenTofu Authors
+    venue: OpenTofu Documentation
+    url: https://opentofu.org/docs/language/state/
+    note: What state records, and why it matters.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Sensitive Data in State
+    authors: OpenTofu Authors
+    venue: OpenTofu Documentation
+    url: https://opentofu.org/docs/language/state/sensitive-data/
+    note: Why state files hold secrets, and how to protect them.
+    verified: true
+  - kind: docs
+    title: 'Backend Type: s3'
+    authors: OpenTofu Authors
+    venue: OpenTofu Documentation
+    url: https://opentofu.org/docs/language/settings/backends/s3/
+    note: Remote state in a bucket, with locking through `use_lockfile`.
+    verified: true
+  - kind: docs
+    title: Security best practices in IAM
+    authors: Amazon Web Services
+    venue: AWS Identity and Access Management User Guide
+    url: https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html
+    note: Least privilege, temporary credentials and roles instead of long-lived keys.
+    primary: true
+    verified: false
+  - kind: docs
+    title: Configuring OpenID Connect in Amazon Web Services
+    authors: GitHub
+    venue: GitHub Docs
+    url: https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/configuring-openid-connect-in-amazon-web-services
+    note: Short-lived cloud credentials for a workflow run, with no stored keys.
+    verified: false
+
+deepDive: >-
+  Every plan here came from OpenTofu 1.12.6 in Docker. The AWS plan for the server, the DNS
+  record and both IAM policies ran with the `aws` provider and fake keys. The settings
+  `skip_credentials_validation`, `skip_requesting_account_id` and `skip_metadata_api_check`
+  let it print `Plan: 4 to add` without an account. It was never applied. The replacement,
+  the state and the hand-made change ran for real with the `kreuzwerker/docker` and
+  `random` providers against a local Docker. Changing `postgres:16` to `postgres:17` gave
+  the `-/+` plan in the lesson. The password from `random_password` sat in
+  `terraform.tfstate` in plain text. After `docker rm -f orders-db` by hand, the next plan
+  said `docker_container.db will be created`.
+
+
+  A hand-made change is called drift. `tofu plan -refresh-only` shows drift without
+  proposing to undo it, so you can decide whether to copy the change into the code instead.
+
+
+  Terraform and OpenTofu share HCL, the language of these files, and most commands.
+  OpenTofu split off in 2023 after Terraform's licence change, and it can also encrypt state
+  and plan files on the client. Pulumi keeps the same idea, desired state, a diff and an
+  apply, with programs in TypeScript or Python. For a shared S3 backend, `use_lockfile =
+  true` now locks with the bucket itself, where older setups needed a DynamoDB table. Run
+  `plan` in CI on every pull request and post it as a comment, so reviewers read the plan,
+  not only the diff.

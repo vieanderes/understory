@@ -1,0 +1,1062 @@
+summary: >-
+  This solution takes the booking API from the servers part and makes it fit to run in public. A threat model comes first, because every later control answers one of its rows. Rate limits live in PostgreSQL as token buckets, and access-control tests ask every endpoint as its owner, a stranger and nobody. A performance budget runs the shipped image in CI. The confirmation email moves into a jobs table, written in the booking's transaction and drained by a worker with `FOR UPDATE SKIP LOCKED`. The code is a modular monolith whose domain sees storage only through ports, enforced by a lint rule, and three ADRs record the expensive choices. One image per commit runs under Compose behind Caddy on one server. A release starts the new colour, waits for health and drains the old one. Dumps and archived WAL leave the machine, and a weekly drill restores and checks them. Everything shown was run: the tests on PostgreSQL 17, the image with Docker, Caddy 2.11, releases under load, and both kinds of restore.
+remember:
+  - 'The threat model comes first, and every control and test in the project traces back to one of its rows.'
+  - 'Access is proved by asking each endpoint as owner, stranger and nobody, expecting `200`, `404` and `401`, and ownership sits in the SQL `WHERE`.'
+  - 'Rate limits count the thing under attack, per account for logins, and the bucket lives in the shared database so every instance sees one count.'
+  - 'A job is written in the same transaction as the booking that needs it, so there is never a booking without its email job or a job without its booking.'
+  - 'The worker''s row lock is its visibility timeout: a crash rolls the transaction back and the job is due again, so every handler is idempotent.'
+  - 'The domain declares ports and imports no framework or driver, and a lint rule fails the build when anyone reaches past a module''s `index.js`.'
+  - 'One image per commit travels from CI to staging to production, and a rollback is a release of an older commit tag.'
+  - 'A release overlaps two versions on one schema, so migrations expand first and contract a release later.'
+  - 'A backup counts only once a scheduled drill has restored it elsewhere, checked the data and timed it against the RTO.'
+sections:
+  - title: '1. The starting point and the targets'
+    body: |-
+      The servers part left a working API: sign-in with a session cookie, rooms, bookings, and a payment webhook handled once per event id. Its heart is one table that refuses double bookings on its own:
+
+      ```sql
+      CREATE TABLE bookings (
+        id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        room_id bigint NOT NULL REFERENCES rooms (id),
+        user_id bigint NOT NULL REFERENCES users (id),
+        during tstzrange NOT NULL,
+        status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'paid', 'cancelled')),
+        created_at timestamptz NOT NULL DEFAULT now(),
+        EXCLUDE USING gist (room_id WITH =, during WITH &&) WHERE (status <> 'cancelled')
+      );
+      ```
+
+      It runs on a laptop and nowhere else. Production adds targets, written down before any code so that each piece of work has a number to hit:
+
+      - **Availability**: 99.5% of requests succeed over 30 days, which allows about 3.6 hours of failure a month.
+      - **Latency**: p95 under 100 ms for reading one booking and under 250 ms for the admin list, measured in CI on the image that ships.
+      - **Releases**: no failed request during a release, and a rollback in under five minutes.
+      - **Data**: RPO of 5 minutes, RTO of 30 minutes, both proved by drills.
+
+      The stack stays small on purpose: TypeScript on Node 24, Hono for routing, `pg` for PostgreSQL 17, Vitest for tests. One server runs Caddy, two colours of the API, one worker and the database, all under Docker Compose. The work goes in the order below, because each step leans on the one before. Security decides what the limits and tests are. Measuring decides what moves to the worker. The worker and the ports shape the modules. The modules are what gets containerised, released and backed up.
+  - title: '2. The threat model'
+    body: |-
+      The model lives in the repository as `docs/threat-model.md` and changes in the same pull request as any new entry point.
+
+      **Assets.** Customers' bookings, which say where a named person will be and when. Account credentials and session ids. The power to cancel or confirm bookings. The admin role. The availability of the service itself.
+
+      **Attackers.** A curious customer who edits ids in the address bar. A bot guessing or stuffing passwords. A bot holding every free slot. A former employee with an old admin session. A malicious dependency.
+
+      **Entry points and trust boundaries.** Browser to Caddy, Caddy to the API, the payment provider's webhook to the API, the API and worker to PostgreSQL, the worker to the email provider, and CI to the server over SSH. Each arrow that points to a more trusted part is a boundary, and each boundary gets a check.
+
+      Walked through STRIDE, the rows that matter, each with its control and the test that proves it:
+
+      - **Spoofing, `POST /auth/login`**: password guessing against one account. Control: a token bucket of 5 attempts per account, refilling one every 3 minutes, plus 20 per client address; scrypt hashes; a fresh session id at every login. Test: the sixth wrong password from six different addresses gets `429`.
+      - **Spoofing, the webhook**: a forged "payment succeeded". Control: the HMAC signature check from the servers part, compared in constant time. Test: the servers part's test, where an unsigned or altered body gets `401` and changes nothing.
+      - **Tampering, `DELETE /bookings/:id`**: cancelling someone else's booking. Control: ownership in the `WHERE`. Test: a stranger gets `404` and the booking is still there afterwards.
+      - **Repudiation, cancellations and admin actions**: "I never cancelled that". Control: one JSON log line per state change, with the user id and request id, kept for a year.
+      - **Information disclosure, `GET /bookings/:id`**: sequential ids invite enumeration. Control: ownership in the `WHERE`, and the same `404` body for "not yours" and "doesn't exist". Test: the stranger's reply equals the reply for a missing id, byte for byte.
+      - **Denial of service, the whole API**: a flood from one address. Control: 60 requests of burst per address, refilling 20 a second, and a 1 MB body cap at Caddy.
+      - **Denial of service, bookings**: one account holding every slot. Control: 10 bookings of burst per account, refilling one a minute.
+      - **Elevation of privilege, `/admin/*`**: a customer calling admin routes. Control: a role check after the session check. Test: a customer gets `403`.
+      - **Elevation of privilege, the supply chain**: an install script in a new dependency. Control: `npm ci --ignore-scripts` in CI and in the image build, and `npm audit` in CI.
+
+      Accepted risks are written down too. A stolen laptop with a live session is bounded by a seven-day session lifetime and a "sign out everywhere" that deletes the user's session rows.
+  - title: '3. Rate limits in the shared database'
+    body: |-
+      Two copies of the API run during every release, and one could scale to three. A count kept in memory would give each copy its own allowance, so the buckets live in PostgreSQL. One statement refills, checks and spends. `INSERT ... ON CONFLICT DO UPDATE` locks the row, so two instances spending from one key queue behind each other instead of both taking the last token. And `now()` is the database's clock, so instances whose clocks drift can't hand out extra tokens.
+
+      ```ts
+      import type { Context, MiddlewareHandler } from 'hono';
+      import type { Pool } from 'pg';
+
+      export type Rule = { capacity: number; perSecond: number };
+      export type Verdict = { allowed: true } | { allowed: false; retryAfterSeconds: number };
+
+      // Refill, check and spend in one statement. The row lock taken by ON CONFLICT
+      // makes two instances queue on the same key, and now() is the database's clock.
+      const TAKE = `
+        INSERT INTO rate_buckets AS b (key, tokens, updated_at)
+        VALUES ($1, $2::float8 - 1, now())
+        ON CONFLICT (key) DO UPDATE
+          SET tokens = LEAST($2::float8,
+                b.tokens + EXTRACT(EPOCH FROM now() - b.updated_at)::float8 * $3::float8) - 1,
+              updated_at = now()
+          WHERE LEAST($2::float8,
+                b.tokens + EXTRACT(EPOCH FROM now() - b.updated_at)::float8 * $3::float8) >= 1
+        RETURNING tokens`;
+
+      const PEEK = `
+        SELECT LEAST($2::float8,
+                 tokens + EXTRACT(EPOCH FROM now() - updated_at)::float8 * $3::float8) AS tokens
+        FROM rate_buckets WHERE key = $1`;
+
+      export async function take(db: Pool, key: string, rule: Rule): Promise<Verdict> {
+        const args = [key, rule.capacity, rule.perSecond];
+        const spent = await db.query(TAKE, args);
+        if (spent.rowCount === 1) return { allowed: true };
+        const peek = await db.query<{ tokens: number }>(PEEK, args);
+        const tokens = peek.rows[0]?.tokens ?? 0;
+        return { allowed: false, retryAfterSeconds: Math.max(1, Math.ceil((1 - tokens) / rule.perSecond)) };
+      }
+
+      // Caddy is the only proxy, and the last entry is the address it saw. Caddy replaces a
+      // client's header, but a proxy that appends leaves client-written entries in front.
+      export function clientIp(forwardedFor: string | undefined): string | null {
+        if (!forwardedFor) return null;
+        const last = forwardedFor.split(',').at(-1)?.trim();
+        return last ? last : null;
+      }
+
+      export function tooMany(c: Context, verdict: { retryAfterSeconds: number }) {
+        c.header('Retry-After', String(verdict.retryAfterSeconds));
+        return c.json({ error: 'Too many requests' }, 429);
+      }
+
+      export function rateLimit(
+        db: Pool,
+        rule: Rule,
+        keyOf: (c: Context) => string | null,
+      ): MiddlewareHandler {
+        return async (c, next) => {
+          const key = keyOf(c);
+          if (key !== null) {
+            const verdict = await take(db, key, rule);
+            if (!verdict.allowed) return tooMany(c, verdict);
+          }
+          await next();
+        };
+      }
+      ```
+
+      When the refill leaves less than one token, the `WHERE` on the update fails, no row comes back, and the request is refused. The second query only runs on a refusal, to work out `Retry-After`, rounded up so the client never returns before a token exists.
+
+      The table is `UNLOGGED`: it skips the WAL, so its constant writes cost less, and PostgreSQL empties it after a crash. For a rate limit that's the right trade. Losing the counts means a few minutes of fresh buckets, not lost data. A nightly job deletes rows untouched for a day.
+
+      The limits, each a capacity and a refill rate:
+
+      ```ts
+      export const LIMITS = {
+        perIp: { capacity: 60, perSecond: 20 },
+        loginPerAccount: { capacity: 5, perSecond: 1 / 180 },
+        loginPerIp: { capacity: 20, perSecond: 1 / 6 },
+        bookingsPerUser: { capacity: 10, perSecond: 1 / 60 },
+      } satisfies Record<string, Rule>;
+
+      ```
+
+      The login route spends from two buckets, `login:account:<email>` and `login:ip:<address>`, and refuses if either is empty. The account key catches one account guessed from a thousand addresses. The address key catches one address trying a common password on many accounts. An unknown email still runs scrypt against a dummy hash, so the reply's timing doesn't reveal which emails have accounts.
+
+      Keeping the limiter in the database also settles fail open against fail closed. If PostgreSQL is down, the API can't serve bookings anyway, so the limiter adds no failure mode of its own. The cost is a write per request. At this scale that is nothing; ADR 2 records when it stops being nothing.
+  - title: '4. Access-control tests'
+    body: |-
+      Owner-only tests pass even when the ownership check is missing, so every endpoint that touches one booking is asked three times. The tests run the real Hono app against a real PostgreSQL through `app.request`, with no server and no mocks in between.
+
+      ```ts
+      import { afterAll, beforeAll, describe, expect, test } from 'vitest';
+      import { buildApp } from '../src/app.js';
+      import { aBooking, db, resetDatabase, signedIn } from './db.js';
+
+      const app = buildApp(db);
+      let owner: Awaited<ReturnType<typeof signedIn>>;
+      let stranger: Awaited<ReturnType<typeof signedIn>>;
+      let bookingId: string;
+
+      beforeAll(async () => {
+        await resetDatabase();
+        owner = await signedIn();
+        stranger = await signedIn();
+        bookingId = await aBooking(owner.id);
+      });
+      afterAll(() => db.end());
+
+      // Every endpoint that touches one booking, asked by its owner, a stranger and nobody.
+      const endpoints = [
+        { method: 'GET', path: () => `/bookings/${bookingId}`, ownerStatus: 200 },
+        { method: 'DELETE', path: () => `/bookings/${bookingId}`, ownerStatus: 204 },
+      ];
+
+      describe.each(endpoints)('$method /bookings/:id', ({ method, path, ownerStatus }) => {
+        test('nobody gets 401', async () => {
+          const res = await app.request(path(), { method });
+          expect(res.status).toBe(401);
+        });
+
+        test('a stranger gets 404, the same as a booking that does not exist', async () => {
+          const res = await app.request(path(), { method, headers: { cookie: stranger.cookie } });
+          expect(res.status).toBe(404);
+          const missing = await app.request('/bookings/999999', { method, headers: { cookie: stranger.cookie } });
+          expect(await res.text()).toBe(await missing.text());
+        });
+
+        test(`the owner gets ${ownerStatus}`, async () => {
+          const res = await app.request(path(), { method, headers: { cookie: owner.cookie } });
+          expect(res.status).toBe(ownerStatus);
+        });
+      });
+
+      describe('GET /admin/bookings', () => {
+        test('nobody gets 401', async () => {
+          expect((await app.request('/admin/bookings')).status).toBe(401);
+        });
+
+        test('a customer gets 403', async () => {
+          const res = await app.request('/admin/bookings', { headers: { cookie: owner.cookie } });
+          expect(res.status).toBe(403);
+        });
+
+        test('an admin gets 200', async () => {
+          const admin = await signedIn('admin');
+          const res = await app.request('/admin/bookings', { headers: { cookie: admin.cookie } });
+          expect(res.status).toBe(200);
+        });
+      });
+
+      test('a stranger cannot cancel, and the booking survives', async () => {
+        const id = await aBooking(owner.id);
+        await app.request(`/bookings/${id}`, { method: 'DELETE', headers: { cookie: stranger.cookie } });
+        const { rows } = await db.query('SELECT status FROM bookings WHERE id = $1', [id]);
+        expect(rows[0].status).toBe('pending');
+      });
+      ```
+
+      The handlers these tests hold in place are short, because the store does the checking:
+
+      ```ts
+      async findForOwner(id, userId) {
+        const { rows } = await db.query<Booking>(
+          `SELECT ${COLUMNS} FROM bookings WHERE id = $1 AND user_id = $2`,
+          [id, userId],
+        );
+        return rows[0] ?? null;
+      },
+      ```
+
+      A foreign row is never found, so the handler can't forget to compare owners: there's nothing to compare. Adding an endpoint means adding a row to `endpoints`, and the review checklist asks for it.
+
+      The rate limits have tests of the same kind, next to these. The sixth wrong password for one account, sent from six different addresses, gets `429` with a positive `Retry-After`. Twenty logins whose `X-Forwarded-For` starts with a different forged address, as a proxy that appends would pass them on, still share one bucket keyed by the last entry. And forty parallel calls to `take` on a bucket of five, each on its own pooled connection, let exactly five through. That last one is the test that would catch a read-then-write limiter.
+
+      All twenty tests in the project pass in about three seconds against PostgreSQL 17.
+  - title: '5. A performance budget in CI'
+    body: |-
+      The budget is a test for speed. It runs the image CI just built, on the same schema, against 5,000 seeded bookings, and fails the build when a route's p95 crosses its line. It warms up first and reports p50 as well, so a regression shows as a shift of the whole curve, not one unlucky request.
+
+      ```ts
+      // Fails CI when a route's p95 goes over its budget. Run against the built image.
+      const base = process.env.BASE_URL ?? 'http://localhost:3000';
+      const cookie = `sid=${process.env.PERF_SESSION ?? 'perf-session'}`;
+
+      const budgets = [
+        { name: 'GET /bookings/:id', path: '/bookings/1', p95Ms: 100 },
+        { name: 'GET /admin/bookings', path: '/admin/bookings', p95Ms: 250 },
+      ];
+      const WARM_UP = 50;
+      const REQUESTS = 500;
+      const CONCURRENCY = 10;
+
+      async function timeOne(path: string): Promise<number> {
+        const started = performance.now();
+        const res = await fetch(base + path, { headers: { cookie } });
+        await res.arrayBuffer(); // the body is part of the wait
+        if (res.status !== 200) throw new Error(`${path} answered ${res.status}`);
+        return performance.now() - started;
+      }
+
+      async function measure(path: string): Promise<number[]> {
+        for (let i = 0; i < WARM_UP; i++) await timeOne(path);
+        const times: number[] = [];
+        let next = 0;
+        const worker = async () => {
+          while (next < REQUESTS) {
+            next++;
+            times.push(await timeOne(path));
+          }
+        };
+        await Promise.all(Array.from({ length: CONCURRENCY }, worker));
+        return times.sort((a, b) => a - b);
+      }
+
+      const percentile = (sorted: number[], p: number) =>
+        sorted[Math.min(sorted.length - 1, Math.ceil((p / 100) * sorted.length) - 1)];
+
+      let failed = false;
+      for (const budget of budgets) {
+        const times = await measure(budget.path);
+        const p50 = percentile(times, 50);
+        const p95 = percentile(times, 95);
+        const over = p95 > budget.p95Ms;
+        failed ||= over;
+        console.log(
+          `${over ? 'OVER' : 'ok  '} ${budget.name}: p50 ${p50.toFixed(1)} ms, p95 ${p95.toFixed(1)} ms, budget ${budget.p95Ms} ms`,
+        );
+      }
+      process.exit(failed ? 1 : 0);
+      ```
+
+      Node 24 runs this file as it is, stripping the types, so CI needs no extra tool. The seed is a plain SQL file: an admin user, a known session id, one room and 5,000 bookings from `generate_series`.
+
+      Setting the numbers is the real work. On an idle laptop the reference build measured p95 9 ms for one booking and 59 ms for the admin list. On the same laptop with a stack of containers busy beside it, the same build measured 87 ms and 164 ms. CI runners are shared machines, closer to the second case. So each budget sits well above the idle numbers, 100 ms and 250 ms, and gets tightened once a few weeks of CI runs show the runner's real spread. That still catches a lost index or an N+1 loop, since those cost ten times, not ten per cent. A budget that fails on noise gets ignored, and then it guards nothing.
+
+      The admin list is the route most likely to regress: it sorts and returns 100 rows. When it slows, the first move is the one from the performance chapter. Time the parts, read the plan with `EXPLAIN ANALYZE`, and fix the biggest part before touching anything else.
+
+      The load runs straight at the container, not through Caddy. Through the proxy, every request would carry the runner's address and meet the per-address limit, and the budget would measure `429`s.
+  - title: '6. Slow work moves to a queue-backed worker'
+    body: |-
+      In the servers part, `POST /bookings` sent the confirmation email before answering. The insert takes a few milliseconds. A call to an email provider's API takes hundreds, and when the provider slows, so does every booking. Worse, a provider outage fails the booking itself, though the booking has nothing to do with email.
+
+      The fix is to answer the booking at once and send the email later. The request writes a job row in the same transaction as the booking. That's the outbox from the architecture chapter: the job exists if and only if the booking does, with no gap where a crash loses one of them.
+
+      ```sql
+      CREATE TABLE jobs (
+        id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        kind text NOT NULL,
+        payload jsonb NOT NULL,
+        idempotency_key text NOT NULL UNIQUE,
+        status text NOT NULL DEFAULT 'waiting' CHECK (status IN ('waiting', 'done', 'dead')),
+        attempts integer NOT NULL DEFAULT 0,
+        max_attempts integer NOT NULL DEFAULT 6,
+        run_at timestamptz NOT NULL DEFAULT now(),
+        last_error text,
+        created_at timestamptz NOT NULL DEFAULT now()
+      );
+      CREATE INDEX jobs_due ON jobs (run_at) WHERE status = 'waiting';
+      ```
+
+      The whole queue and worker:
+
+      ```ts
+      import type { Pool, PoolClient } from 'pg';
+
+      export type Job = { id: string; kind: string; payload: unknown; attempts: number; maxAttempts: number };
+      export type Handler = (job: Job, signal: AbortSignal) => Promise<void>;
+      export type Handlers = Record<string, Handler>;
+
+      // Called inside the caller's transaction, so the job exists only if the booking does.
+      export async function enqueue(
+        tx: PoolClient,
+        kind: string,
+        payload: unknown,
+        idempotencyKey: string,
+      ): Promise<void> {
+        await tx.query(
+          `INSERT INTO jobs (kind, payload, idempotency_key) VALUES ($1, $2, $3)
+           ON CONFLICT (idempotency_key) DO NOTHING`,
+          [kind, JSON.stringify(payload), idempotencyKey],
+        );
+      }
+
+      export function backoffMs(attempt: number, baseMs: number, capMs: number): number {
+        // Full jitter: a random wait up to the exponential ceiling, so retries spread out.
+        return Math.round(Math.random() * Math.min(capMs, baseMs * 2 ** attempt));
+      }
+
+      type Options = { baseMs?: number; capMs?: number; timeoutMs?: number; idleMs?: number };
+
+      // Claims one due job, runs it and records the outcome. Returns false when nothing was due.
+      export async function runOne(db: Pool, handlers: Handlers, options: Options = {}): Promise<boolean> {
+        const { baseMs = 2_000, capMs = 600_000, timeoutMs = 30_000 } = options;
+        const tx = await db.connect();
+        try {
+          await tx.query('BEGIN');
+          // The row lock is the visibility timeout: other workers skip this row, and if this
+          // process dies the connection drops, the transaction rolls back and the job is due again.
+          const { rows } = await tx.query(
+            `SELECT id, kind, payload, attempts, max_attempts AS "maxAttempts"
+             FROM jobs WHERE status = 'waiting' AND run_at <= now()
+             ORDER BY run_at LIMIT 1
+             FOR UPDATE SKIP LOCKED`,
+          );
+          const job = rows[0] as Job | undefined;
+          if (!job) {
+            await tx.query('COMMIT');
+            return false;
+          }
+          try {
+            const handler = handlers[job.kind];
+            if (!handler) throw new Error(`no handler for ${job.kind}`);
+            await handler(job, AbortSignal.timeout(timeoutMs));
+            await tx.query(`UPDATE jobs SET status = 'done', attempts = attempts + 1 WHERE id = $1`, [job.id]);
+          } catch (error) {
+            const attempts = job.attempts + 1;
+            const message = error instanceof Error ? error.message : String(error);
+            if (attempts >= job.maxAttempts) {
+              await tx.query(
+                `UPDATE jobs SET status = 'dead', attempts = $2, last_error = $3 WHERE id = $1`,
+                [job.id, attempts, message],
+              );
+            } else {
+              const delay = backoffMs(attempts, baseMs, capMs);
+              await tx.query(
+                `UPDATE jobs SET attempts = $2, last_error = $3,
+                   run_at = now() + $4 * interval '1 millisecond' WHERE id = $1`,
+                [job.id, attempts, message, delay],
+              );
+            }
+          }
+          await tx.query('COMMIT');
+          return true;
+        } catch (error) {
+          await tx.query('ROLLBACK').catch(() => {});
+          throw error;
+        } finally {
+          tx.release();
+        }
+      }
+
+      export async function runWorker(
+        db: Pool,
+        handlers: Handlers,
+        stop: AbortSignal,
+        options: Options = {},
+      ): Promise<void> {
+        const idleMs = options.idleMs ?? 1_000;
+        while (!stop.aborted) {
+          let worked = false;
+          try {
+            worked = await runOne(db, handlers, options);
+          } catch (error) {
+            console.error(JSON.stringify({ level: 'error', msg: 'worker loop', error: String(error) }));
+          }
+          if (!worked && !stop.aborted) {
+            await new Promise((resolve) => setTimeout(resolve, idleMs));
+          }
+        }
+      }
+      ```
+
+      Each design choice answers a failure. The worker holds the row lock for the whole job, so the lock is the visibility timeout: other workers skip the row, and if the process dies, the connection drops, the transaction rolls back and the job is due again. The ack is the `UPDATE ... 'done'`, committed after the handler, never before. A throw counts an attempt and sets the next `run_at` with full jitter, so a provider outage doesn't bring every job back in the same second. After `max_attempts` the job is parked as `dead` with its last error: the dead-letter queue is a status, and an alert fires when it's above zero. Each handler gets an `AbortSignal` with a deadline, so a hung provider can't hold a lock for ever.
+
+      Holding a transaction open for a job only suits short jobs. An email takes a second. A job of minutes would hold a connection and a lock that long, and would want a lease column with an expiry instead.
+
+      Delivery is at least once, so the handler must be safe to run twice. The email handler looks the booking up again, skips it if it was cancelled meanwhile, and passes `booking-confirmation:<id>` to the provider as an idempotency key, so a repeat after a crash sends one email.
+
+      The bookings adapter calls `enqueue` inside the same transaction as its `INSERT`. An overlapping booking fails the insert with `23P01`, the exclusion violation, the transaction rolls back, and no job is left behind. Four tests hold the properties that matter: three workers share 30 jobs and each runs once; a job that always fails runs three times and ends `dead` with its error; an overlapping booking leaves exactly one job; and a crashed worker's job goes to the next one:
+
+      ```ts
+      test('a worker that dies mid-job leaves the job for another worker', async () => {
+        await db.query(`INSERT INTO jobs (kind, payload, idempotency_key) VALUES ('once', '{}', 'o:1')`);
+        const victim = await db.connect();
+        await victim.query('BEGIN');
+        await victim.query(`SELECT id FROM jobs FOR UPDATE SKIP LOCKED`);
+        expect(await runOne(db, { once: async () => {} })).toBe(false);
+        victim.release(new Error('simulated crash')); // destroys the connection, rolling back
+        expect(await runOne(db, { once: async () => {} })).toBe(true);
+      });
+      ```
+
+      The worker's entry file wires the real email adapter and stops claiming on `SIGTERM`, finishing the job in hand first.
+  - title: '7. Modules behind ports'
+    body: |-
+      The code is grouped by feature, and each feature has one entry file:
+
+      ```text
+      src/
+        bookings/        index.ts  domain.ts  ports.ts  postgres.ts  http.ts
+        notifications/   index.ts  (the EmailSender port and the confirmation handler)
+        platform/        auth.ts  jobs.ts  rate-limit.ts  passwords.ts
+        app.ts           composition root: builds adapters and passes them in
+        main.ts          the API process
+        worker.ts        the worker process
+        migrate.ts       applies new files in migrations/, each with a 5 s lock_timeout
+      ```
+
+      The bookings rules state what they need from storage in their own words, and import nothing:
+
+      ```ts
+      export type Booking = {
+        id: string;
+        roomId: string;
+        userId: string;
+        startsAt: Date;
+        endsAt: Date;
+        status: 'pending' | 'paid' | 'cancelled';
+      };
+
+      export type Draft = Omit<Booking, 'id' | 'status'>;
+
+      // What the bookings rules need from storage, in their own words.
+      export interface BookingStore {
+        // Saves the booking and a confirmation job in one transaction.
+        create(draft: Draft): Promise<{ ok: true; id: string } | { ok: false; reason: 'overlap' }>;
+        findForOwner(id: string, userId: string): Promise<Booking | null>;
+        cancelForOwner(id: string, userId: string): Promise<boolean>;
+        listAll(limit: number): Promise<Booking[]>;
+      }
+      ```
+
+      `createBooking(draft, now, store)` checks the rules that need no database, start before end, not in the past, at most four hours, and then calls `store.create`. The HTTP handler parses the request, calls `createBooking` once and maps the result to a status: `201`, `409` for an overlap, `422` for a rule broken. The Postgres adapter is the one place that knows SQL. The domain's tests hand it an in-memory store and run in milliseconds, with no database, and they also check that a refused booking never reaches storage.
+
+      A folder layout is only a hope until the build enforces it. ESLint does, with the rule from the architecture chapter, written for TypeScript:
+
+      ```js
+      import { defineConfig } from 'eslint/config';
+      import tseslint from 'typescript-eslint';
+
+      const modules = ['bookings', 'notifications'];
+      // Other code may import a module's index.js and nothing deeper.
+      const boundaries = modules.map((name) => ({
+        group: [`**/${name}/*`, `!**/${name}/index.js`],
+        message: `Import from ${name}/index.js only.`,
+      }));
+
+      export default defineConfig(
+        tseslint.configs.recommended,
+        {
+          files: ['src/**/*.ts'],
+          rules: { 'no-restricted-imports': ['error', { patterns: boundaries }] },
+        },
+        {
+          // The rules import no framework, driver or platform code: dependencies point inward.
+          files: ['src/*/domain.ts', 'src/*/ports.ts'],
+          rules: {
+            'no-restricted-imports': ['error', {
+              patterns: [...boundaries, {
+                group: ['pg', 'hono', 'hono/*', '**/platform/*'],
+                message: 'The domain declares a port instead.',
+              }],
+            }],
+          },
+        },
+      );
+      ```
+
+      Tried on purpose, an import of `./bookings/postgres.js` from `app.ts` failed with "Import from bookings/index.js only", and `import pg from 'pg'` in `domain.ts` failed with "The domain declares a port instead". Imports inside a module, such as `./ports.js`, don't match the patterns and stay allowed.
+
+      The ports earn their keep in two places here. The email provider sits behind `EmailSender`, so the worker's tests run without it and a change of provider touches one adapter. And the store's contract, "saves the booking and its job in one transaction", is written on the port, so a future adapter can't quietly drop the outbox.
+  - title: '8. Three decision records'
+    body: |-
+      Each ADR is a short Markdown file in `docs/adr/`, numbered, merged in the pull request that makes the change. Here are the three, with the costs written beside the gains.
+
+      ```text
+      # 1. One deployable: a modular monolith
+      Date: 2026-09-14. Status: accepted.
+
+      Context: two developers, one PostgreSQL database, and a booking and its payment
+      must change in one transaction. Module boundaries are still moving.
+
+      Decision: one codebase and one image, in feature folders with an index.ts each.
+      ESLint's no-restricted-imports fails the build on imports past index.ts, and the
+      domain reaches storage and email only through ports.
+
+      Consequences: calls between modules cost a function call, and bookings and
+      payments share transactions. Everything deploys together, so one broken module
+      blocks a release, and no part scales alone. Revisit if a module needs its own
+      scaling, release cadence or team.
+      ```
+
+      ```text
+      # 2. PostgreSQL as the queue and the rate-limit store
+      Date: 2026-09-16. Status: accepted.
+
+      Context: we need a job queue for emails and a shared store for rate limits. We
+      already run and back up PostgreSQL. Jobs must be created atomically with bookings.
+
+      Decision: a jobs table claimed with FOR UPDATE SKIP LOCKED, written in the booking's
+      transaction. Token buckets in an UNLOGGED table, updated in one statement.
+
+      Consequences: no second system to run, secure and back up. Enqueueing is
+      transactional, which a separate broker can't offer without an outbox relay. The
+      limiter fails exactly when the API does. Costs: every request writes a row, jobs
+      compete with bookings for the same database, and a held row lock per running job
+      limits us to short jobs. Revisit if rate-limit writes pass a few hundred a second,
+      if the jobs table's churn shows up in booking latency, or if jobs need minutes.
+      ```
+
+      ```text
+      # 3. One VPS with Docker Compose and Caddy
+      Date: 2026-09-18. Status: accepted.
+
+      Context: traffic fits one machine several times over, and the team knows Docker.
+      Kubernetes would need someone to run it.
+
+      Decision: one VPS in the region nearest our customers, running Compose: Caddy for
+      TLS and routing, two colours of the API, one worker and PostgreSQL 17 with WAL
+      archiving. CI builds one image per commit and releases it over SSH.
+
+      Consequences: a flat monthly price and full control. Every operations job is ours:
+      OS patches, the firewall, backups and restore drills. The server is a single point
+      of failure, accepted within the 99.5% objective, and recovery from its loss is the
+      restore runbook at a 30-minute RTO. Revisit if availability must pass 99.9%, if one
+      machine can't carry peak load, or if nobody on the team can carry the pager.
+      ```
+
+      The router and the test runner get no ADR: they're cheap to reverse.
+  - title: '9. The container'
+    body: |-
+      One multi-stage image serves the API, the worker and migrations. The first stage installs with the lockfile, builds TypeScript and prunes dev dependencies. The second copies only what runs.
+
+      ```text
+      FROM node:24-slim AS build
+      WORKDIR /app
+      COPY package.json package-lock.json ./
+      RUN npm ci --ignore-scripts
+      COPY tsconfig.json ./
+      COPY src ./src
+      RUN npm run build && npm prune --omit=dev
+
+      FROM node:24-slim
+      ENV NODE_ENV=production
+      WORKDIR /app
+      COPY --from=build /app/package.json ./
+      COPY --from=build /app/node_modules ./node_modules
+      COPY --from=build /app/dist ./dist
+      COPY migrations ./migrations
+      USER node
+      EXPOSE 3000
+      CMD ["node", "dist/main.js"]
+      ```
+
+      ```text
+      node_modules
+      dist
+      .env
+      .git
+      test
+      perf
+      deploy
+      ```
+
+      The package files come before the source, so an edit to one file reuses the cached install. `npm ci --ignore-scripts` means no dependency's install script runs during the build. The final image runs as `node`, not root: `whoami` in it prints `node`. `docker build --check` reports no warnings, and the image is 354 MB, almost all of it `node:24-slim`. There's no secret anywhere in it: `DATABASE_URL` and the email key arrive at run time from the environment. `CMD` uses the exec form, so Node is process 1 and receives `SIGTERM` itself.
+
+      That signal matters, because draining is the app's job:
+
+      ```ts
+      // Drain: fail the health check first, so the proxy stops sending new requests here, while
+      // still serving whatever arrives. Then stop accepting, finish open requests and exit.
+      const DRAIN_MS = Number(process.env.DRAIN_MS ?? 6_000);
+      process.on('SIGTERM', () => {
+        state.draining = true;
+        setTimeout(() => {
+          server.close(() => {
+            db.end().finally(() => process.exit(0));
+          });
+        }, DRAIN_MS);
+        setTimeout(() => process.exit(1), DRAIN_MS + 15_000).unref();
+      });
+      ```
+
+      `/health` answers `503` while draining, and otherwise runs `SELECT 1` against a one-second deadline, so a hung database fails the check instead of hanging it. The pool has an `error` listener, because without one a dropped database connection kills the process. Six seconds of draining covers three of Caddy's two-second health checks. The compose file's `stop_grace_period` of 25 seconds leaves room for that and for slow requests before Docker kills the process.
+  - title: '10. Compose and the reverse proxy'
+    body: |-
+      The server runs one Compose project from `/srv/bookings`. The file holds no secrets: `secrets.env` sits beside it, mode `600`, outside Git. The image tags come from `.env`, which the release script rewrites.
+
+      ```yaml
+      name: bookings
+
+      x-api: &api
+        restart: unless-stopped
+        env_file: secrets.env # DATABASE_URL and keys, mode 600, never in Git
+        environment:
+          PORT: "3000"
+        depends_on:
+          db:
+            condition: service_healthy
+        healthcheck:
+          test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health').then(r => process.exit(r.ok ? 0 : 1), () => process.exit(1))"]
+          interval: 2s
+          timeout: 2s
+          retries: 3
+          start_period: 10s
+        stop_grace_period: 25s
+
+      services:
+        caddy:
+          image: caddy:2
+          restart: unless-stopped
+          ports:
+            - "80:80"
+            - "443:443"
+          volumes:
+            - ./Caddyfile:/etc/caddy/Caddyfile:ro
+            - caddy_data:/data
+            - caddy_config:/config
+
+        api-blue:
+          <<: *api
+          image: ghcr.io/example/booking-api:${BLUE_TAG:?}
+
+        api-green:
+          <<: *api
+          image: ghcr.io/example/booking-api:${GREEN_TAG:?}
+
+        worker:
+          image: ghcr.io/example/booking-api:${WORKER_TAG:?}
+          command: ["node", "dist/worker.js"]
+          restart: unless-stopped
+          env_file: secrets.env
+          depends_on:
+            db:
+              condition: service_healthy
+          stop_grace_period: 40s
+
+        migrate:
+          image: ghcr.io/example/booking-api:${NEW_TAG:-none}
+          command: ["node", "dist/migrate.js"]
+          env_file: secrets.env
+          profiles: ["release"]
+
+        db:
+          image: postgres:17
+          restart: unless-stopped
+          env_file: secrets.env # POSTGRES_PASSWORD
+          command:
+            - postgres
+            - -c
+            - archive_mode=on
+            - -c
+            - archive_command=test ! -f /wal/%f && cp %p /wal/%f
+            - -c
+            - archive_timeout=240
+          volumes:
+            - dbdata:/var/lib/postgresql/data
+            - /srv/wal:/wal
+          healthcheck:
+            test: ["CMD", "pg_isready", "-U", "postgres"]
+            interval: 2s
+            retries: 15
+
+      volumes:
+        dbdata:
+        caddy_data:
+        caddy_config:
+      ```
+
+      Only Caddy publishes ports. The API colours, the worker and PostgreSQL are reachable only by service name on the project's network, so the database is never a way in. Each API colour has a health check, and everything waits for PostgreSQL to be healthy, not only started. `migrate` sits in a profile, so it runs only when asked. PostgreSQL archives every finished WAL segment to `/srv/wal`, and `archive_timeout=240` forces a segment out at least every four minutes on a quiet day. A cron job copies new segments off the server every minute, which makes the five-minute RPO.
+
+      ```text
+      {
+        email ops@example.com
+      }
+
+      bookings.example.com {
+        encode zstd gzip
+        request_body {
+          max_size 1MB
+        }
+        header {
+          Strict-Transport-Security "max-age=31536000; includeSubDomains"
+          X-Content-Type-Options nosniff
+          -Server
+        }
+        reverse_proxy api-blue:3000 api-green:3000 {
+          lb_policy round_robin
+          health_uri /health
+          health_interval 2s
+          lb_try_duration 5s
+        }
+      }
+      ```
+
+      Caddy gets and renews the certificate for `bookings.example.com` by ACME and terminates TLS, so the apps speak plain HTTP on the private network. It lists both colours for good. Its active health check skips any colour that is stopped or draining, and `lb_try_duration` gives a request that can't reach one upstream five seconds to find another. That's what makes the release in section 12 need no config change and no reload. `caddy validate` accepts the file.
+
+      Caddy replaces any `X-Forwarded-For` a client sends and writes the address it saw. The app still reads the last entry, which is right either way, and the rate-limit test with a forged first entry holds it to that.
+  - title: '11. The pipeline'
+    body: |-
+      One workflow tests every push, and on `main` carries the commit through build, the budget, staging and production. `needs` chains the jobs, so a failure anywhere stops everything after it.
+
+      ```yaml
+      name: ci
+      on:
+        push:
+          branches: [main]
+        pull_request:
+
+      permissions:
+        contents: read
+
+      env:
+        IMAGE: ghcr.io/example/booking-api
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          services:
+            postgres:
+              image: postgres:17
+              env:
+                POSTGRES_PASSWORD: test
+              ports:
+                - 5432:5432
+              options: >-
+                --health-cmd "pg_isready -U postgres"
+                --health-interval 2s
+                --health-retries 15
+          env:
+            DATABASE_URL: postgres://postgres:test@localhost:5432/postgres
+          steps:
+            - uses: actions/checkout@v7
+            - uses: actions/setup-node@v7
+              with:
+                node-version: 24
+                cache: npm
+            - run: npm ci --ignore-scripts
+            - run: npm run lint
+            - run: npm run build
+            - run: npm test
+            - run: npm audit --audit-level=high --omit=dev
+
+        build:
+          needs: test
+          if: github.ref == 'refs/heads/main'
+          runs-on: ubuntu-latest
+          permissions:
+            contents: read
+            packages: write
+          steps:
+            - uses: actions/checkout@v7
+            - run: echo "$GITHUB_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+              env:
+                GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            - run: docker build -t "$IMAGE:${{ github.sha }}" .
+            - run: docker push "$IMAGE:${{ github.sha }}"
+
+        performance-budget:
+          needs: build
+          runs-on: ubuntu-latest
+          permissions:
+            contents: read
+            packages: read
+          services:
+            postgres:
+              image: postgres:17
+              env:
+                POSTGRES_PASSWORD: test
+              ports:
+                - 5432:5432
+              options: >-
+                --health-cmd "pg_isready -U postgres"
+                --health-interval 2s
+                --health-retries 15
+          env:
+            DATABASE_URL: postgres://postgres:test@localhost:5432/postgres
+          steps:
+            - uses: actions/checkout@v7
+            - uses: actions/setup-node@v7
+              with:
+                node-version: 24
+            - run: echo "$GITHUB_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+              env:
+                GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            # The same image that will ship, on the same schema, with realistic rows.
+            - run: docker run --rm --network host -e DATABASE_URL "$IMAGE:${{ github.sha }}" node dist/migrate.js
+            - run: docker run --rm --network host -i postgres:17 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 < perf/seed.sql
+            - run: docker run -d --network host -e DATABASE_URL -e PORT=3000 "$IMAGE:${{ github.sha }}"
+            - run: timeout 30 sh -c 'until curl -sf localhost:3000/health; do sleep 1; done'
+            - run: node perf/budget.ts
+
+        deploy-staging:
+          needs: performance-budget
+          runs-on: ubuntu-latest
+          environment: staging
+          steps:
+            - run: |
+                install -m 700 -d ~/.ssh
+                printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+                chmod 600 ~/.ssh/id_ed25519
+                printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+                ssh "deploy@$HOST" "docker pull $IMAGE:${{ github.sha }} && /srv/bookings/release.sh ${{ github.sha }}"
+                curl -sf "https://$HOST/health"
+              env:
+                SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+                KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+                HOST: ${{ vars.DEPLOY_HOST }}
+
+        deploy-production:
+          needs: deploy-staging
+          runs-on: ubuntu-latest
+          environment: production # a required reviewer approves this job
+          steps:
+            - run: |
+                install -m 700 -d ~/.ssh
+                printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+                chmod 600 ~/.ssh/id_ed25519
+                printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+                ssh "deploy@$HOST" "docker pull $IMAGE:${{ github.sha }} && /srv/bookings/release.sh ${{ github.sha }}"
+                curl -sf "https://$HOST/health"
+              env:
+                SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+                KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+                HOST: ${{ vars.DEPLOY_HOST }}
+      ```
+
+      The build job pushes one image tagged with `github.sha`, and every later job uses that exact image, so what passed the budget is what reaches production. The budget job starts a fresh PostgreSQL service, migrates it with the image's own migration script, seeds it, and runs the image on the host network. Production waits for a required reviewer on the `production` environment, which makes this continuous delivery. Keys come from the secret store, and they're passed to the script as environment variables, not pasted into its text. The server logged in to the registry once with a read-only token, so it can pull.
+
+      actionlint 1.7.12 reports nothing but two shellcheck notes, SC2029, saying `$IMAGE` expands on the runner before `ssh` sends the command. Here that's intended.
+  - title: '12. Releasing without downtime'
+    body: |-
+      A release runs on the server as `release.sh <sha>`:
+
+      ```bash
+      #!/usr/bin/env bash
+      # Usage: ./release.sh <commit-sha>   Runs on the server, in /srv/bookings.
+      set -euo pipefail
+      cd "$(dirname "$0")"
+      NEW_TAG="$1"
+      source .env # LIVE, BLUE_TAG, GREEN_TAG, WORKER_TAG
+
+      save_state() {
+        printf 'LIVE=%s\nBLUE_TAG=%s\nGREEN_TAG=%s\nWORKER_TAG=%s\n' \
+          "$LIVE" "$BLUE_TAG" "$GREEN_TAG" "$WORKER_TAG" > .env
+      }
+
+      if [ "$LIVE" = blue ]; then IDLE=green; else IDLE=blue; fi
+
+      # 1. Expand-only migrations: the live version must keep working on the new schema.
+      NEW_TAG="$NEW_TAG" docker compose run --rm migrate
+
+      # 2. Start the idle colour on the new image, next to the live one.
+      if [ "$IDLE" = blue ]; then BLUE_TAG="$NEW_TAG"; else GREEN_TAG="$NEW_TAG"; fi
+      save_state
+      docker compose up -d --no-deps "api-$IDLE"
+
+      # 3. Wait for its health check. If it never passes, stop it: traffic never reached it.
+      for attempt in $(seq 1 30); do
+        status=$(docker inspect --format '{{.State.Health.Status}}' "$(docker compose ps -q "api-$IDLE")")
+        [ "$status" = healthy ] && break
+        if [ "$attempt" = 30 ]; then
+          echo "api-$IDLE never became healthy; api-$LIVE keeps serving" >&2
+          docker compose stop "api-$IDLE"
+          exit 1
+        fi
+        sleep 2
+      done
+      sleep 4 # two of Caddy's health intervals, so it has seen the new colour pass
+
+      # 4. Switch by draining the old colour: SIGTERM makes its /health fail, Caddy stops
+      #    sending it requests, and it exits once its open requests finish.
+      OLD="$LIVE"
+      LIVE="$IDLE"
+      save_state
+      docker compose stop "api-$OLD"
+
+      # 5. Move the worker to the new image. It finishes its current job before exiting.
+      WORKER_TAG="$NEW_TAG"
+      save_state
+      docker compose up -d --no-deps worker
+      echo "released $NEW_TAG on api-$LIVE"
+      ```
+
+      The order is the whole point. The new colour starts next to the live one. Traffic reaches it only after its health check passes and Caddy has seen it pass. The old colour then drains: its health check fails, Caddy stops choosing it, it finishes what it holds and exits. At no moment does nothing answer. If the new colour never becomes healthy, the script stops it and the old one never noticed.
+
+      This was tested, not assumed. A load generator ran eight connections against a booking through Caddy for 80 seconds while two releases ran back to back, blue to green and green to blue. Of 32,964 requests, none failed: 1,659 got `200` and the rest got `429` from the per-address limit, which is the app answering. An earlier version switched by rewriting the Caddyfile and running `caddy reload`. It lost seven requests at the moment of the reload, each "other side closed", when Caddy's old server closed idle keep-alive connections that the client was about to reuse. Browsers retry such a request, but a `POST` from a script would see an error. Keeping both colours in the config and switching by health removed the reload, and the errors with it.
+
+      A rollback is the same script with the previous commit's tag, about 30 seconds on the test stack. It's only safe if the schema still suits the old code, which is why migrations expand and contract. Renaming `rooms.name` to `display_name` takes three releases:
+
+      ```sql
+      -- Release 41, expand: both versions keep working.
+      ALTER TABLE rooms ADD COLUMN display_name text;
+      UPDATE rooms SET display_name = name WHERE display_name IS NULL;
+      -- Code in 41 writes both columns and still reads name.
+
+      -- Release 42: code reads display_name and still writes both.
+
+      -- Release 43, contract, once 41 can no longer come back:
+      ALTER TABLE rooms ALTER COLUMN display_name SET NOT NULL;
+      ALTER TABLE rooms DROP COLUMN name;
+      ```
+
+      The migration runner sets `lock_timeout = '5s'` in each migration's transaction, so a migration that can't get its lock gives up instead of queueing every request behind it. The worker moves to the new image last. Old and new workers can run side by side safely, because `SKIP LOCKED` never lets two of them hold one job.
+  - title: '13. Backups, and a restore you have proven'
+    body: |-
+      A replica would copy a bad `DELETE` within milliseconds, so backups are copies from earlier moments, kept on another machine. There are two kinds, for two jobs. A nightly `pg_dump` in custom format is portable and quick to restore, and it's what the weekly drill uses. A weekly base backup plus the archived WAL allows point-in-time recovery to any moment, and that's what meets the five-minute RPO.
+
+      ```bash
+      #!/usr/bin/env bash
+      # Nightly at 02:00 UTC on the production server. The copy that counts is the one on vault.
+      set -euo pipefail
+      cd /srv/bookings
+      DAY=$(date -u +%F)
+
+      docker compose exec -T db pg_dump -U postgres -Fc postgres > "/srv/backups/bookings-$DAY.dump"
+      scp "/srv/backups/bookings-$DAY.dump" backup@vault.example:/backups/
+
+      # Sundays: a base backup for point-in-time recovery. -X fetch, because tar to stdout
+      # can't stream the WAL alongside.
+      if [ "$(date -u +%u)" = 7 ]; then
+        docker compose exec -T db pg_basebackup -U postgres -D - -Ft -X fetch \
+          | ssh backup@vault.example "cat > /base/base-$DAY.tar"
+      fi
+
+      find /srv/backups -name 'bookings-*.dump' -mtime +7 -delete
+      ```
+
+      ```text
+      # crontab on the production server
+      * * * * *  rsync -a /srv/wal/ backup@vault.example:/wal/
+      0 2 * * *  /srv/bookings/backup.sh
+      ```
+
+      One detail was found by running it: `pg_basebackup -D - -Ft` refuses with "cannot stream write-ahead logs in tar mode to stdout", so writing the tar to a pipe needs `-X fetch`.
+
+      The drill runs every Monday on the backup host, never on production. It restores last night's dump into a throwaway PostgreSQL 17 and checks what a person would check: that bookings came back, that the newest one is recent enough to prove the dump is last night's, that the exclusion rule still holds, and that the restore fit inside the RTO.
+
+      ```bash
+      #!/usr/bin/env bash
+      # Weekly, on the backup host, never on the production server.
+      # Restores the newest dump into a throwaway PostgreSQL and proves the data is usable.
+      set -euo pipefail
+      BACKUPS="${BACKUPS:-/backups}"
+      RTO_SECONDS=1800          # restore must finish within 30 minutes
+      MAX_AGE_SECONDS=93600     # newest booking at most 26 hours old: the dump is last night's
+
+      DUMP=$(ls -1 "$BACKUPS"/bookings-*.dump | sort | tail -n 1)
+      NAME=restore-drill
+      docker rm -f "$NAME" >/dev/null 2>&1 || true
+      docker run -d --name "$NAME" -e POSTGRES_PASSWORD=drill postgres:17 >/dev/null
+      trap 'docker rm -f "$NAME" >/dev/null' EXIT
+
+      # Over TCP: the image's first-run setup server listens on a socket only, so this
+      # waits for the real server rather than the temporary one.
+      until docker exec "$NAME" pg_isready -h 127.0.0.1 -U postgres >/dev/null 2>&1; do sleep 1; done
+
+      started=$(date +%s)
+      docker exec -i "$NAME" pg_restore -U postgres -d postgres --no-owner --exit-on-error < "$DUMP"
+      took=$(( $(date +%s) - started ))
+
+      q() { docker exec "$NAME" psql -U postgres -d postgres -Atc "$1"; }
+      bookings=$(q "SELECT count(*) FROM bookings")
+      age=$(q "SELECT coalesce(extract(epoch FROM now() - max(created_at))::int, 999999999) FROM bookings")
+      overlaps=$(q "SELECT count(*) FROM bookings a JOIN bookings b
+        ON a.room_id = b.room_id AND a.id < b.id AND a.during && b.during
+        WHERE a.status <> 'cancelled' AND b.status <> 'cancelled'")
+
+      echo "{\"dump\":\"$(basename "$DUMP")\",\"seconds\":$took,\"bookings\":$bookings,\"newestAgeSeconds\":$age,\"overlaps\":$overlaps}"
+
+      fail() { echo "RESTORE DRILL FAILED: $1" >&2; exit 1; }
+      [ "$bookings" -gt 0 ] || fail "no bookings restored"
+      [ "$age" -le "$MAX_AGE_SECONDS" ] || fail "newest booking is ${age}s old"
+      [ "$overlaps" -eq 0 ] || fail "$overlaps overlapping bookings"
+      [ "$took" -le "$RTO_SECONDS" ] || fail "restore took ${took}s, over the ${RTO_SECONDS}s objective"
+      ```
+
+      Against a dump of the seeded database it printed `{"dump":"bookings-2026-09-25.dump","seconds":2,"bookings":5000,"newestAgeSeconds":535,"overlaps":0}` and exited 0. Against a dump with an empty bookings table it printed `RESTORE DRILL FAILED: no bookings restored` and exited 1, which is what raises the alert. The JSON line goes to the log, so the trend of restore times is visible long before it reaches the RTO.
+
+      A point-in-time drill runs each quarter by hand, following the runbook. It was rehearsed on this stack. After a base backup, 200 rooms were added, the time noted, and the rooms deleted. A new PostgreSQL 17 container started on a copy of the base backup, with `recovery.signal` and these lines in `postgresql.auto.conf`:
+
+      ```text
+      restore_command = 'cp /wal/%f %p'
+      recovery_target_time = '2026-09-25 17:05:08.047729+00'
+      ```
+
+      Its log said "recovery stopping before commit of transaction 135556", and the 200 rooms were there. Two lessons went into the runbook. The default at the target is to pause, read-only, so you can check the data before `SELECT pg_wal_replay_resume()` promotes it. And the first attempt ran `DELETE ...; SELECT pg_switch_wal();` in one `psql -c`, which is one transaction, so the delete's commit landed in a segment that was never archived. Recovery never saw a commit past the target, ended with the target unreached, and the server shut down. Force the segment out in its own statement.
+  - title: '14. Watching it run, and the trade-offs'
+    body: |-
+      The API writes one JSON line per request with a request id, route, status and duration, and one per state change with the user id. It never logs passwords, cookies or tokens. Pages are few and tied to the objectives: the error rate burning the 99.5% budget fast, any dead job, a failed restore drill, a backup missing from vault by 03:00, and `pg_stat_archiver.failed_count` rising. Slow p95, disk above 80% and a certificate near expiry open tickets instead. Each alert links to its runbook, and in an incident the first move is to stop the harm, usually a rollback.
+
+      The biggest risks this build accepts are the server as a single point of failure, bounded by a drilled 30-minute restore, and PostgreSQL doing three jobs, bounded by ADR 2's revisit conditions. The next steps wait for a reason: a managed PostgreSQL with a standby, Redis for limits if their writes show in latency, a lease column if jobs grow long, and feature flags with a canary for risky changes. Each would add something to run.
+checklist:
+  - 'The threat model lists assets, attackers and entry points, and every STRIDE row names a control and, where one exists, the test that proves it.'
+  - 'Every endpoint that returns or changes one user''s data has owner, stranger and signed-out tests expecting 200, 404 and 401, and admin routes have a customer test expecting 403.'
+  - 'Ownership is enforced in the SQL WHERE clause, and a stranger''s reply is identical to the reply for an id that doesn''t exist.'
+  - 'Login is limited per account and per client address, and a test shows the sixth wrong password from different addresses gets 429 with Retry-After.'
+  - 'Rate-limit state lives in the shared database, updated in one statement, with a parallel test proving a bucket can''t be overspent.'
+  - 'The client address comes from the last X-Forwarded-For entry, and no port except Caddy''s is published.'
+  - 'CI runs lint, build, tests on PostgreSQL 17, npm audit and a p95 budget against the built image, and the deploy jobs need all of them.'
+  - 'The booking request does no email or other slow outside call; its job row is written in the same transaction as the booking.'
+  - 'Workers ack after the work, retry with jittered backoff, park jobs as dead after a cap, and an alert fires when any job is dead.'
+  - 'Every job handler is safe to run twice, and passes an idempotency key to outside services.'
+  - 'The domain imports no framework, driver or platform code, and the lint rule fails the build on an import past a module''s index.ts.'
+  - 'Three ADRs exist, each with context, decision, costs beside gains, and the condition that would make the team revisit.'
+  - 'The image is multi-stage, runs as the node user, holds no secrets, is tagged with the commit, and .dockerignore excludes .env, .git and node_modules.'
+  - 'The health endpoint checks the database with a deadline and fails while the process drains on SIGTERM.'
+  - 'A release starts the new version, waits for health, drains the old one, and a load test during a release shows no failed requests.'
+  - 'Migrations expand before the code that needs them and contract a release later, with a lock_timeout.'
+  - 'Nightly dumps and archived WAL leave the server, and archive_timeout plus the copy interval stays within the stated RPO.'
+  - 'A scheduled drill restores the newest dump elsewhere, checks row counts, freshness and invariants, times it against the RTO, and alerts on failure.'
+  - 'Secrets live in secrets.env at mode 600 on the server and in the CI secret store, never in the repository, the image or the workflow file.'

@@ -1,0 +1,279 @@
+summary: >-
+  An example-based test checks the inputs you thought of. A property-based test states a rule
+  that must hold for every input, and a library such as fast-check generates hundreds of
+  inputs to try, biased towards the awkward ones: empty lists, zero, negative numbers,
+  duplicates, strings full of commas and quotes. When one breaks the rule, it **shrinks** the
+  input to a small case that still fails, and prints a seed so you can replay the exact run.
+
+
+  The hard part is finding the rule. A handful of shapes cover most code: an invariant that
+  holds after every operation, a round trip where decoding an encoding gives back the
+  original, idempotence, agreement with a slow but plainly correct oracle, and a
+  comparison against a simple model of the system. The same idea checks output with no
+  single right answer, such as an AI model's reply, and it's the basis of an eval.
+
+
+  Concurrency bugs need a different kind of control. A race only shows when operations
+  overlap in an unlucky order, and a real run hits that order rarely. So you start the
+  operations together and take control of the order in which their awaited steps finish,
+  either by hand or with fast-check's scheduler, which tries many orders and reports the one
+  that broke your invariant.
+remember:
+  - A property is a rule that holds for every valid input, and the tool, not you, picks the inputs, including the edge cases you would not have written.
+  - '`fc.assert(fc.property(arbitrary, predicate))` runs the predicate 100 times by default, and a thrown error or a returned `false` counts as a failure.'
+  - Shrinking reduces a failing input to a small one that still fails, and the printed seed and path replay that exact run.
+  - 'Round trips, invariants, idempotence, an oracle and a model are the five property shapes that cover most code.'
+  - A property that re-implements the code under test proves nothing, so state what must be true of the output rather than how to compute it.
+  - A race needs overlapping operations, so start them together with `Promise.all`, and control the order their awaited steps finish to test it deterministically.
+  - Check an invariant after every operation, so the first step that breaks it is the one that fails.
+sections:
+  - title: A round trip that finds a real bug
+    body: |-
+      A round-trip property says that encoding then decoding gives back what you started
+      with. It needs no expected values, only the two functions. Here's a naive CSV row
+      writer and reader:
+
+      ```js
+      import fc from 'fast-check';
+
+      const toCsvRow = (fields) => fields.join(',');
+      const parseCsvRow = (line) => line.split(',');
+
+      test('a row survives a round trip', () => {
+        fc.assert(
+          fc.property(fc.array(fc.string(), { minLength: 1 }), (fields) => {
+            expect(parseCsvRow(toCsvRow(fields))).toEqual(fields);
+          }),
+        );
+      });
+      ```
+
+      Run under Vitest with fast-check 4, it failed within five runs every time:
+
+      ```text
+      Property failed after 2 tests
+      { seed: -10946215, path: "1:1:0:2:1:6:6", endOnFailure: true }
+      Counterexample: [[",",""]]
+      Shrunk 6 time(s)
+      ```
+
+      A field that contains a comma. The failing input the generator first found was longer
+      and messier; shrinking cut it down in six steps. To replay that run while you fix it,
+      pass the seed and path back: `fc.assert(property, { seed: -10946215, path: "1:1:0:2:1:6:6" })`.
+
+      Fixing it means quoting fields that contain a comma, a quote or a newline, and doubling
+      quotes inside them. With that fix and `minLength: 1`, the property held over 2,000 runs.
+      Without `minLength`, it still failed, on `[]`: an empty row writes `''`, which reads
+      back as one empty field, `['']`. That isn't a bug in the quoting. It's a decision the
+      format forces on you, and the property made you face it. You either document that an
+      empty row means one empty field, or change the format.
+
+      Shrinking is a search for a smaller failing input, not a proof of the smallest one. It
+      stopped at `[",", ""]` here although `[","]` also fails. It's small enough to read,
+      which is the point.
+  - title: Five shapes of property
+    body: |-
+      Most code has a property in one of these shapes. Reach for them in this order.
+
+      - **Round trip.** `decode(encode(x))` equals `x`. Serialisers, parsers, URL builders,
+        database mappers, compression. Cheap to write and brutal at finding escaping bugs.
+      - **Invariant.** Something stays true whatever happens. A sorted list is ordered and
+        has the same items. A basket total is never negative. Stock never goes below zero.
+      - **Idempotence.** Doing it twice equals doing it once: `normalise(normalise(s))`
+        equals `normalise(s)`, and so does applying the same payment webhook twice.
+      - **Oracle.** Compare a fast, clever implementation with a slow, plainly correct
+        one. A binary search against a linear scan, or a new pricing engine against the old.
+      - **Model.** Run random sequences of operations on the real system and on a simple
+        model, a `Map` or an array, and check they agree after each step.
+
+      Two related ideas help when no exact answer exists. A **metamorphic** property relates
+      two runs: sorting a reversed list gives the same result as sorting the list, and adding
+      a filter to a search never returns more results. And for fuzzy output, such as an AI
+      model's reply, properties like "names the order number", "is valid JSON matching the
+      schema" and "stays under 200 characters" run over many saved cases, and you track the
+      pass rate. That's an eval.
+
+      Arbitraries compose. `fc.integer({ min: 0, max: 120 })`, `fc.string()`,
+      `fc.array(...)`, `fc.record({ sku: fc.string(), quantity: fc.nat() })`,
+      `fc.constantFrom('GBP', 'EUR')` and `fc.oneof(...)` build most inputs, and `.map`
+      turns generated values into domain objects. Prefer building valid inputs directly to
+      generating anything and discarding most with `.filter` or `fc.pre`, which wastes runs.
+      For async code, use `fc.asyncProperty` and `await fc.assert(...)`.
+  - title: Model-based testing with commands
+    body: |-
+      Invariants over one call are good. Many bugs only appear after a particular sequence:
+      add, remove, add again. fast-check can generate the sequences for you. Each command
+      says when it's allowed, applies itself to a simple model and to the real object, and
+      checks that they agree.
+
+      ```js
+      import fc from 'fast-check';
+
+      class Basket {
+        #lines = new Map();
+        add(sku) { this.#lines.set(sku, (this.#lines.get(sku) ?? 0) + 1); }
+        remove(sku) {
+          const n = this.#lines.get(sku);
+          if (n === undefined) return;
+          this.#lines.set(sku, n - 1); // bug: a line at 0 stays in the basket
+        }
+        count() { return this.#lines.size; }
+      }
+
+      class Add {
+        constructor(sku) { this.sku = sku; }
+        check() { return true; }
+        run(model, real) { model[this.sku] = (model[this.sku] ?? 0) + 1; real.add(this.sku); }
+        toString() { return `add(${this.sku})`; }
+      }
+
+      class Remove {
+        constructor(sku) { this.sku = sku; }
+        check(model) { return (model[this.sku] ?? 0) > 0; }
+        run(model, real) {
+          model[this.sku] -= 1;
+          if (model[this.sku] === 0) delete model[this.sku];
+          real.remove(this.sku);
+          expect(real.count()).toBe(Object.keys(model).length);
+        }
+        toString() { return `remove(${this.sku})`; }
+      }
+
+      test('the basket behaves like a simple model', () => {
+        const sku = fc.constantFrom('kettle', 'toaster', 'mug');
+        const commands = [sku.map((s) => new Add(s)), sku.map((s) => new Remove(s))];
+        fc.assert(
+          fc.property(fc.commands(commands, { maxCommands: 30 }), (cmds) => {
+            fc.modelRun(() => ({ model: {}, real: new Basket() }), cmds);
+          }),
+        );
+      });
+      ```
+
+      The run failed and shrank a random sequence of up to 30 commands to the whole story:
+
+      ```text
+      Counterexample: [add(kettle),remove(kettle) /*replayPath="CCB:F"*/]
+      ```
+
+      Add one kettle, remove it, and the basket still counts a line. The `check` method
+      keeps sequences legal, so `remove` never runs on an empty model, and the assertion runs
+      after every step, which is why the failure points at the exact command. For async
+      systems, such as a service behind an API, `fc.asyncModelRun` does the same with
+      commands whose `run` is async.
+  - title: Testing a race deterministically
+    body: |-
+      Two buyers, one ticket. Each `buy` reads the stock, awaits the database, then writes.
+      `Promise.all` starts both, but whether they overlap badly depends on timing, so the
+      test passes most runs. To make it certain, take control of the order in which the
+      awaited database calls come back. fast-check's scheduler does this, and tries a
+      different order on each run.
+
+      ```js
+      import fc from 'fast-check';
+
+      function createStock(db) {
+        return {
+          async buy() {
+            const left = await db.read();
+            if (left < 1) return false;
+            await db.write(left - 1);
+            return true;
+          },
+        };
+      }
+
+      test('one ticket is sold once, whatever the order', async () => {
+        await fc.assert(
+          fc.asyncProperty(fc.scheduler(), async (s) => {
+            let value = 1;
+            const db = {
+              read: s.scheduleFunction(async function read() { return value; }),
+              write: s.scheduleFunction(async function write(v) { value = v; }),
+            };
+            const stock = createStock(db);
+            const results = Promise.all([stock.buy(), stock.buy()]);
+            const sold = (await s.waitFor(results)).filter(Boolean).length;
+            expect(sold).toBe(1);
+            expect(value).toBe(0);
+          }),
+        );
+      });
+      ```
+
+      `scheduleFunction` wraps each database call so the scheduler decides when its result
+      is delivered, and `waitFor` keeps releasing scheduled calls until the promise settles.
+      The racy stock failed on the first run and printed the order it chose:
+
+      ```text
+      -> [task${1}] function::read() resolved with value 1
+      -> [task${3}] function::write(0) resolved
+      -> [task${2}] function::read() resolved with value 1
+      -> [task${4}] function::write(0) resolved
+      ```
+
+      The wrapped call runs at once and only its result waits, so both reads captured one
+      ticket when both buyers started, like two `SELECT`s that reach the database before
+      either `UPDATE`. The log shows the order the results were delivered. Both buyers saw one
+      ticket, so both got it. A version that queues each `buy`
+      behind the previous one, so a read never starts before the last write, passed every
+      order. In a real database the fix is an atomic statement, `UPDATE ... SET stock = stock
+      - 1 WHERE stock > 0`, or a row lock, and the test belongs against the real database
+      too: fire many buys at once and assert that sales never exceed seats.
+
+      Keep the steps coarse. The number of possible orders grows very fast with the number
+      of awaited steps, so a scheduler finds races in a few interleaved calls, not in a whole
+      request pipeline.
+pitfalls:
+  - '**Restating the implementation as the property.** `expect(sort(xs)).toEqual([...xs].sort())` only proves both call the same code. State what must be true of the output: ordered, same length, same items.'
+  - '**Filtering away most generated inputs.** `.filter` or `fc.pre` that rejects nine in ten values wastes runs and can starve the property. Build valid inputs directly with the right arbitrary and `.map`.'
+  - '**Throwing away the seed.** A failure you can''t reproduce gets ignored. Copy the printed seed and path into `fc.assert` while you fix it, then add the shrunk case as a plain unit test.'
+  - '**Awaiting overlapping calls one after another.** `await a(); await b();` never overlaps, so it can''t find a race. Start them together, then control or vary their order.'
+  - '**Checking the invariant only at the end.** A later step can undo the damage, and you lose which step caused it. Check after every operation.'
+  - '**Forgetting that generated numbers include the edges.** `fc.integer()` produces negatives and large values, and `fc.double()` can produce `NaN`, `-0` and infinities. Constrain the arbitrary to the real domain, or handle them.'
+  - '**Trusting a green concurrency test that relied on timing.** One lucky run proves nothing about races. Control the order, or run against the real database with many concurrent calls.'
+interview:
+  - question: What is property-based testing, and when does it pay off?
+    answer: >-
+      It's stating a rule that must hold for all valid inputs and letting a tool generate
+      and shrink counterexamples. In JavaScript that's fast-check: `fc.assert(fc.property(fc.array(fc.string()), fields => ...))`
+      runs a hundred generated cases, biased to edge cases, and shrinks any failure to a
+      small readable one with a replay seed. It pays off most on code with a large input
+      space and a clear rule: parsers and serialisers with a round trip, data structures with
+      invariants, a rewrite that should match an old implementation, and stateful objects
+      checked against a model. I once had a naive CSV writer fail on a field containing a
+      comma within five runs. The cost is that good properties take thought, and a sloppy
+      property that re-implements the code proves nothing, so I keep example tests alongside
+      for readability.
+  - question: How would you test for a race condition, such as two users buying the last ticket?
+    answer: >-
+      By making the operations overlap and controlling the order. A test that awaits one buy
+      then the other can never race. So I start both with `Promise.all` and check the
+      invariant: exactly one sale, stock at zero. Timing alone makes that flaky, so in unit
+      tests I control when each awaited dependency resolves, by hand with deferred promises
+      or with fast-check's scheduler, which tries different orders and prints the one that
+      failed, such as both reads before either write. Then I test the real fix at the real
+      layer: an atomic conditional `UPDATE` or a row lock, exercised with many concurrent
+      requests against a real database, asserting sales never exceed stock. The trade-off is
+      that exhaustive orderings explode, so I keep the steps coarse.
+  - question: How do you test output that has no single right answer, such as an LLM response?
+    answer: >-
+      With properties over many cases instead of exact matches. A good reply to a support
+      ticket can be worded a hundred ways, so `toBe` fails on good output. Instead I
+      define checks every good reply must pass: it parses as the JSON schema we expect,
+      mentions the order number from the ticket, stays under a length limit, and doesn't
+      promise a refund the policy forbids. I run those over a saved set of real cases and
+      track the pass rate over time, which is an eval. Deterministic checks go first because
+      they're cheap and stable. For qualities like tone I add a model-graded check, and I
+      calibrate that grader against human labels, because a grader can be wrong too.
+  - question: What makes a good property? Give some examples.
+    answer: >-
+      A good property states what must be true of the result without re-computing it. The
+      shapes I reach for are a round trip, where `parse(serialise(x))` equals `x`; an
+      invariant, where a sorted list is ordered and contains the same items, or stock never
+      goes negative; idempotence, where applying a webhook twice equals applying it once; an
+      oracle, comparing an optimised function with a slow, plainly correct one; and a model, where
+      random sequences of operations on the real object agree with a `Map`. A bad property
+      is `sort(xs)` equals `xs.sort()`, which only proves both call the same code. I also
+      make sure the generator produces valid inputs directly instead of filtering, so every
+      run tests something.

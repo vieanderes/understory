@@ -1,0 +1,326 @@
+id: tooling.configuration-and-environment
+title: Configuration and environment
+objective: Check the environment with a schema, keep secrets out of the bundle, and separate build-time from runtime config.
+level: essential
+minutes: 10
+concepts: [tooling.env-schema, tooling.client-bundle-secrets, tooling.build-and-runtime-config]
+prerequisites: [tooling.node, tooling.what-a-build-does]
+opening:
+  text: >-
+    You'll run one build on your laptop, a test server and the live site, each with its own
+    settings. And your secret keys will stay where no visitor can read them.
+
+steps:
+  - type: prose
+    id: what-env-vars-are
+    body: |-
+      You met `process.env` in What Node is. The same code runs in several places: your
+      laptop, **staging** (a private copy of the site for testing) and **production** (the
+      live site real people use). Only the settings differ.
+
+      Typing them before every command gets old. Put them in a `.env` file instead:
+
+      ```bash
+      $ cat .env
+      PORT=9090
+      $ node --env-file=.env server.js
+      Port: 9090
+      ```
+
+      Add `.env` to `.gitignore`, so it never reaches Git.
+
+  - type: prose
+    id: what-a-schema-is
+    body: |-
+      **zod** is a package that checks data against a description you write, a **schema**.
+      Check the environment once, when the program starts:
+
+      ```js
+      import { z } from "zod";
+      const EnvSchema = z.object({
+        PORT: z.coerce.number().int().default(3000),
+        DATABASE_URL: z.url(),
+      });
+      export const env = EnvSchema.parse(process.env);
+      ```
+
+      `z.coerce.number()` turns the text into a number, and `.default(3000)` fills in a
+      missing port. `DATABASE_URL` is the database's address. `parse` throws an error if
+      anything doesn't fit.
+
+  - type: predict-output
+    id: predict-schema-stops
+    concept: tooling.env-schema
+    difficulty: 1
+    language: bash
+    code: |
+      $ cat start.js
+      import { env } from "./env.js";
+      console.log("Starting on port", env.PORT + 1);
+      $ PORT=8080 DATABASE_URL=postgres://db.local/shop node start.js
+      Starting on port 8081
+      $ PORT=eighty DATABASE_URL=postgres://db.local/shop node start.js
+    question: '`env.js` is the schema file from the last step. What happens on the last run?'
+    choices:
+      - text: It stops with an error about `PORT`
+        correct: true
+        feedback: >-
+          Yes. `eighty` isn't a number, so `parse` throws before anything starts.
+      - text: It starts on port 3000
+        feedback: >-
+          The default only fills in a missing `PORT`. A wrong one is an error, not a gap.
+      - text: 'It prints `Starting on port NaN`'
+        feedback: >-
+          Without the schema, it would. `parse` stops the program before that line runs.
+      - text: 'It prints `Starting on port eighty1`'
+        feedback: >-
+          That's the text-joining trap. The schema turns `PORT` into a number, or refuses.
+
+  - type: prose
+    id: build-time-and-runtime
+    body: >-
+      Browsers have no `process.env`. So for browser code, the bundler swaps each
+      `process.env.NAME` for its value while it builds. esbuild does it with `--define`.
+
+
+      That's **build-time config**: the value is written into the file. **Runtime config** is
+      read each time the program starts, like `PORT` a moment ago.
+
+  - type: bug-hunt
+    id: hunt-baked-url
+    concept: tooling.build-and-runtime-config
+    difficulty: 3
+    language: bash
+    code: |
+      # build.sh, run once in CI
+      esbuild server.js --bundle --platform=node --outfile=dist/server.js --define:process.env.API_URL='"https://staging.example.com"'
+
+      # on the test server
+      API_URL=https://staging.example.com node dist/server.js
+
+      # on the production server
+      API_URL=https://example.com node dist/server.js
+    prompt: >-
+      Production keeps calling the staging API. Tap the line at fault.
+    lines: [2]
+    reasons:
+      - text: The URL was fixed into the file at build time
+        correct: true
+        feedback: >-
+          Right. `--define` wrote the staging URL into `server.js`. No setting can change it now.
+      - text: '`API_URL=` must come after `node`'
+        feedback: >-
+          Before the command is right: that's how the first step set `PORT`. But the built file
+          never reads it.
+      - text: Production needs a build of its own
+        feedback: >-
+          That would work, but then you'd ship something you never tested. Read the URL at
+          runtime and build once.
+    fix: |
+      # build.sh, run once in CI
+      esbuild server.js --bundle --platform=node --outfile=dist/server.js
+
+      # on the test server
+      API_URL=https://staging.example.com node dist/server.js
+
+      # on the production server
+      API_URL=https://example.com node dist/server.js
+
+  - type: prose
+    id: secrets-and-the-bundle
+    body: >-
+      An **API** is a service your code calls over the web, such as an AI model or a weather
+      service. It gives you an **API key**, a password that proves the calls come from you.
+
+
+      A key like that is a **secret**: anyone who has it can act as you. So a secret stays
+      on the server. The browser bundle is the opposite. It's a file every visitor downloads.
+
+  - type: multiple-choice
+    id: pick-who-reads-key
+    concept: tooling.client-bundle-secrets
+    difficulty: 3
+    language: js
+    code: |
+      // out.js, built with --define for API_URL and API_KEY
+      var response = await fetch("https://api.example.com/weather", {
+        headers: { Authorization: "Bearer sk_live_51abc" }
+      });
+      console.log(response.status);
+    question: The site serves `out.js` to browsers. Who can read `sk_live_51abc`?
+    choices:
+      - text: Anyone who loads the page
+        correct: true
+        feedback: >-
+          Right. The key is plain text in a file every visitor downloads.
+      - text: No one, since it's only sent in a header
+        feedback: >-
+          The header is built from text inside the file. Open the file, and there's the key.
+      - text: Only signed-in users
+        feedback: >-
+          Signing in guards data, not your JavaScript. The bundle is the same file for everyone.
+
+  - type: ai-review
+    id: review-logged-config
+    concept: tooling.env-schema
+    difficulty: 4
+    language: js
+    request: Check our environment at start-up, and log what it loaded so we can debug.
+    flawClass: security
+    code: |
+      import { z } from 'zod';
+
+      const EnvSchema = z.object({
+        PORT: z.coerce.number().int().default(3000),
+        DATABASE_URL: z.url(),
+      });
+
+      export const env = EnvSchema.parse(process.env);
+      console.log('Starting with', env);
+    prompt: >-
+      An assistant wrote this. Its test starts the app and sees
+      `{ PORT: 8080, DATABASE_URL: 'postgres://app:s3cret@db.local/shop' }`. Tap the line at fault.
+    lines: [9]
+    reasons:
+      - text: It writes the database password into the logs
+        correct: true
+        feedback: >-
+          Yes. Logs get copied and shared widely. Log the port, never the secret.
+      - text: '`parse` should be `safeParse`'
+        feedback: >-
+          Throwing at start-up is what you want here. A broken config should stop the app.
+      - text: '`z.url()` can''t read a `postgres://` address'
+        feedback: >-
+          It accepted it, as the log shows. The problem is who now sees that address.
+    fix: |
+      import { z } from 'zod';
+
+      const EnvSchema = z.object({
+        PORT: z.coerce.number().int().default(3000),
+        DATABASE_URL: z.url(),
+      });
+
+      export const env = EnvSchema.parse(process.env);
+      console.log('Starting on port', env.PORT);
+
+  - type: code-challenge
+    id: write-public-defines
+    concept: tooling.client-bundle-secrets
+    difficulty: 4
+    language: ts
+    prompt: >-
+      Only variables named `PUBLIC_something` may reach the browser. Write
+      `publicDefines(env)`, which builds esbuild's `define` object from them.
+
+
+      For each name that starts with `PUBLIC_` and has a string value, add a key
+      `process.env.NAME` whose value is `JSON.stringify(value)`. Leave every other variable out.
+      `name.startsWith('PUBLIC_')` checks the prefix.
+
+
+      So `{ PUBLIC_REGION: 'eu', API_KEY: 'x' }` gives `{ 'process.env.PUBLIC_REGION': '"eu"' }`.
+    hints:
+      - The whole point is what you leave out. Decide that before you add anything.
+      - A missing value is `undefined`, which isn't a string. Skip it too.
+      - 'Start with `const defines: Record<string, string> = {};` and loop over `Object.keys(env)`.'
+
+  - type: explain-back
+    id: explain-one-build
+    concept: tooling.build-and-runtime-config
+    difficulty: 4
+    prompt: >-
+      Why must a server read its API URL at runtime, if one build goes to both servers?
+    rubric:
+      - A value fixed at build time is written into the file, the same everywhere it runs.
+      - A runtime value is read from the environment each time the process starts.
+      - So one tested build can use a different URL on each server with no rebuild.
+    modelAnswer: >-
+      A build-time value is text inside the built file, so every copy carries the same URL.
+      To change it, you'd need another build, and that build is one you never tested. Read at
+      runtime, the URL comes from the environment each server starts with. The identical file
+      then talks to staging on one machine and production on the other.
+
+
+recap:
+  - Keep local settings in a `.env` file, and keep that file out of Git.
+  - Check every variable at start-up with a schema, and stop on a bad one.
+  - Keep secrets out of browser bundles, and read deploy-specific values at runtime.
+
+recall:
+  - id: card-why-schema
+    concept: tooling.env-schema
+    front: Why check the environment with a schema when the program starts?
+    back: >-
+      Every value arrives as text, and some may be missing. The schema converts them, or stops
+      the program at once with a clear message.
+  - id: card-env-file
+    concept: tooling.build-and-runtime-config
+    front: Where do local settings go, and what keeps them out of Git?
+    back: >-
+      In a `.env` file, loaded with `node --env-file=.env`. `.gitignore` lists `.env`, so it's
+      never committed.
+  - id: card-define-is-public
+    concept: tooling.client-bundle-secrets
+    front: Why is a key passed through `--define` into browser code no longer secret?
+    back: >-
+      The bundler writes its value into the file, and every visitor downloads that file.
+  - id: card-build-or-runtime
+    concept: tooling.build-and-runtime-config
+    front: What's the difference between build-time and runtime config?
+    back: >-
+      Build-time values are written into the output when you build. Runtime values are read
+      each time the program starts.
+
+references:
+  - kind: docs
+    title: Process
+    authors: Node.js
+    venue: Node.js documentation
+    url: https://nodejs.org/api/process.html#processenv
+    note: '`process.env`, and why every value in it is a string.'
+    primary: true
+    verified: true
+  - kind: docs
+    title: Environment Variables
+    authors: Node.js
+    venue: Node.js documentation
+    url: https://nodejs.org/api/environment_variables.html
+    note: '`.env` files, `--env-file`, and which value wins.'
+    verified: true
+  - kind: docs
+    title: API
+    authors: Evan Wallace
+    venue: esbuild documentation
+    url: https://esbuild.github.io/api/#define
+    note: How `define` swaps an expression for a constant while building.
+    verified: true
+  - kind: docs
+    title: Defining schemas
+    authors: Zod contributors
+    venue: Zod documentation
+    url: https://zod.dev/api
+    note: '`z.coerce`, `.default` and `z.url()`, the pieces of the schema in this lesson.'
+    verified: true
+  - kind: essay
+    title: 'The Twelve-Factor App: III. Config'
+    authors: Adam Wiggins
+    year: 2011
+    venue: 12factor.net
+    url: https://12factor.net/config
+    note: Keep config that varies between deploys in the environment, apart from the code.
+    primary: true
+    verified: true
+
+deepDive: >-
+  `node --env-file=.env server.js` loads variables from a file, with no package needed. A
+  variable already set wins over the file. So `PORT=1` on the command line beats `PORT=9090`
+  in `.env`.
+
+
+  Frameworks pick a prefix for what may reach the browser: `NEXT_PUBLIC_` in Next.js,
+  `VITE_` in Vite. The prefix is a promise you make, not a check. Name a secret with it, and
+  it ships.
+
+
+  zod's error for a bad variable names the field, not its value. So a failed start-up
+  doesn't print the password it rejected.

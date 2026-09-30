@@ -1,0 +1,218 @@
+summary: >-
+  An index is a second, sorted structure beside a table that lets Postgres find rows without
+  reading all of them. The default kind is a B-tree: a shallow, balanced tree of 8 kB pages
+  whose leaves hold every key in order, each with a pointer to its row. A lookup walks from
+  the root to one leaf in three or four page reads, whether the table holds ten thousand rows
+  or a hundred million.
+
+
+  Indexes are the single biggest lever on read performance, and they're not free. Every
+  insert, every delete and many updates must change every index on the table, each index
+  takes disk and memory, and the planner only uses one when it expects fewer page reads than
+  a straight scan. So you index for the queries you actually run: the columns in `WHERE`,
+  `JOIN ... ON` and `ORDER BY`, in the right order.
+
+
+  These notes go under the lesson: how a B-tree serves equality, ranges, sorting and prefixes;
+  the three ways a plan uses an index; the rules for multicolumn indexes, including the skip
+  scan Postgres 18 added; partial, covering and unique indexes; and what indexes cost.
+remember:
+  - A B-tree index keeps keys sorted in linked leaf pages, so it serves `=`, `<`, `>`, `BETWEEN`, `IN`, `ORDER BY` and `LIKE 'prefix%'`, but not `LIKE '%middle%'`.
+  - A multicolumn index is sorted by its first column, then the next, so put equality columns first and the range or sort column last.
+  - The planner skips an index when a condition matches a large share of the table, because reading pages in order beats jumping about.
+  - A condition on an expression such as `lower(email)` needs an index on that exact expression.
+  - Postgres indexes primary keys and unique constraints for you, never foreign keys.
+  - Every index slows writes and takes space, so index what queries filter, join and sort by, and drop indexes that `pg_stat_user_indexes` shows are never scanned.
+  - A partial index (`WHERE status = 'open'`) stays small by holding only the rows queries ask for, and a covering index (`INCLUDE`) can answer a query without visiting the table.
+  - On a live table, build indexes with `CREATE INDEX CONCURRENTLY` so writes aren't blocked.
+sections:
+  - title: How a B-tree finds rows
+    body: |-
+      A B-tree is made of pages. The root and inner pages hold separator keys and pointers to
+      the pages below; the leaves hold every indexed value in order, each paired with the
+      row's physical address, called a TID. One 8 kB page holds hundreds of entries, so the
+      tree is wide and shallow: a few levels cover millions of rows. A lookup reads one page
+      per level, then fetches the row from the table, which Postgres calls the heap.
+
+      Leaves are linked to their neighbours in both directions. That's what makes ranges and
+      sorting cheap: find the first matching key, then walk sideways until the keys stop
+      matching. `ORDER BY created_at DESC LIMIT 20` reads the leaves backwards and stops after
+      twenty rows, with no sort at all.
+
+      An index entry carries no visibility information. Under MVCC a row may be deleted or
+      not yet committed for your transaction, so Postgres usually checks the heap row as well.
+      That gives three plan shapes:
+
+      - **Index Scan**: walk the index and fetch each row from the heap as you go. Best for a
+        few rows, or when the order of the index is wanted.
+      - **Bitmap Index Scan** plus **Bitmap Heap Scan**: collect all matching TIDs first,
+        sort them by page, then read each heap page once. Best for hundreds or thousands of
+        rows scattered around the table. The `Recheck Cond` line is normal.
+      - **Index Only Scan**: every column the query needs is in the index, and the visibility
+        map says the pages are all-visible, so the heap is skipped. `Heap Fetches: 0` in
+        `EXPLAIN ANALYZE` means it worked fully.
+
+      A `Seq Scan` isn't a failure. For a condition that matches a large share of the rows,
+      reading the table in order costs less than thousands of random page reads, and the
+      planner is right to choose it.
+  - title: Multicolumn indexes, and Postgres 18's skip scan
+    body: |-
+      A multicolumn index is sorted like a phone book: by the first column, then the second
+      within each first value. Equality on the leading column pins one contiguous stretch of
+      leaves, and within it the second column is in order. Run on 200,000 support tickets with
+      an index on `(status, created_at)`:
+
+      ```sql
+      EXPLAIN (COSTS OFF)
+      SELECT * FROM tickets WHERE status = 'open' ORDER BY created_at DESC LIMIT 20;
+      -- Limit
+      --   ->  Index Scan Backward using tickets_status_created_idx on tickets
+      --         Index Cond: (status = 'open'::text)
+      ```
+
+      One seek, twenty rows, no sort. Reverse the columns to `(created_at, status)` and the
+      open tickets are scattered across every date, so the index reads far more than it keeps.
+      The rule of thumb is **equality columns first, then one range or sort column**. A range
+      on an early column stops later columns from narrowing the search.
+
+      Before Postgres 18, an index was rarely useful for a query that skipped its first
+      column. Postgres 18 added **skip scan** for B-trees: when the leading column has few
+      distinct values, the planner can run one search per value. The same table, filtered on
+      `created_at` alone:
+
+      ```sql
+      EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+      SELECT * FROM tickets
+      WHERE created_at >= '2025-03-01' AND created_at < '2025-03-02';
+      -- Bitmap Heap Scan on tickets (actual rows=1440.00 loops=1)
+      --   ->  Bitmap Index Scan on tickets_status_created_idx (actual rows=1440.00 loops=1)
+      --         Index Cond: ((created_at >= ...) AND (created_at < ...))
+      --         Index Searches: 7
+      ```
+
+      `Index Searches: 7` shows several searches, one or more per status. Skip scan helps
+      only when the leading column has a handful of values. A query on `created_at` that
+      matters should still get an index that starts with `created_at`.
+  - title: Partial, covering, unique and expression indexes
+    body: |-
+      Four variations solve problems a plain index can't.
+
+      A **partial index** holds only rows that match a condition. When 80% of tickets are
+      closed and pages only list open ones, index the open ones:
+
+      ```sql
+      CREATE INDEX tickets_open_idx ON tickets (created_at) WHERE status = 'open';
+      -- 456 kB, against 6184 kB for the full (status, created_at) index
+      ```
+
+      The planner uses it only when the query's `WHERE` implies the index condition, so the
+      query must also say `status = 'open'`.
+
+      A **covering index** stores extra columns in its leaves with `INCLUDE`, so a query that
+      needs only those columns becomes an index-only scan:
+
+      ```sql
+      CREATE INDEX tickets_customer_idx ON tickets (customer_id) INCLUDE (status);
+      EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF)
+      SELECT status FROM tickets WHERE customer_id = 42;
+      -- Index Only Scan using tickets_customer_idx on tickets (actual rows=40.00 loops=1)
+      --   Index Cond: (customer_id = 42)
+      --   Heap Fetches: 0
+      ```
+
+      A **unique index** enforces a rule as well as speeding reads. A `UNIQUE` constraint
+      creates one. A unique index on an expression goes further: `CREATE UNIQUE INDEX ON users
+      (lower(email))` stops `Ana@Example.com` and `ana@example.com` both registering, and
+      serves case-insensitive sign-in in the same breath.
+
+      **Prefix search** with `LIKE 'abc%'` can use a B-tree, which turns it into a range
+      (`subject >= 'Subject 1234' AND subject < 'Subject 1235'`). That works directly when the
+      column uses the `C` collation. With a language collation such as `en_GB`, create the
+      index with the `text_pattern_ops` operator class. A leading wildcard, `LIKE '%1234'`,
+      can't use a B-tree at all; the `pg_trgm` extension with a GIN index can.
+  - title: What indexes cost, and how to keep the right ones
+    body: |-
+      Every index is maintained on every write. An insert adds an entry to each index, a
+      delete leaves entries for vacuum to clean up, and an update that changes an indexed
+      column adds new entries. Postgres softens updates with **HOT** (heap-only tuple)
+      updates: when no indexed column changes and the page has room, the new row version goes
+      on the same page and no index is touched. Indexing a frequently updated column such as
+      `last_seen_at` gives that up.
+
+      Indexes also compete for memory. The pages that are read often need to stay in the
+      buffer cache, and five large indexes on one table crowd out the table itself.
+
+      Keep the set honest with the statistics Postgres already collects:
+
+      ```sql
+      SELECT indexrelname, idx_scan, pg_size_pretty(pg_relation_size(indexrelid)) AS size
+      FROM pg_stat_user_indexes
+      WHERE relname = 'tickets'
+      ORDER BY idx_scan;
+      ```
+
+      An index with `idx_scan = 0` after weeks of normal traffic is a candidate to drop,
+      unless it backs a unique constraint or serves a rare but important job such as month-end
+      reporting. The counters are per server, so check replicas too.
+
+      Building an index on a busy table needs care. Plain `CREATE INDEX` blocks inserts,
+      updates and deletes until it finishes. `CREATE INDEX CONCURRENTLY` allows writes, takes
+      longer, can't run inside a transaction block, and if it fails it leaves an index marked
+      invalid that you drop and build again.
+pitfalls:
+  - "**Wrapping the indexed column in a function or cast.** `WHERE lower(email) = $1` or `WHERE created_at::date = $1` can't use an index on the bare column. Index the expression, as with `lower(email)`, or rewrite a date filter as a range: `created_at >= $1 AND created_at < $2`. A cast of `timestamptz` to `date` depends on the time zone, so it can't be indexed at all."
+  - "**Putting the range column first in a multicolumn index.** `(created_at, status)` scatters each status across all dates. Equality columns go first."
+  - "**Forgetting the foreign key index.** Joins, per-parent lists and deletes of the parent all scan the child table without one."
+  - "**Expecting `LIKE '%term%'` to use a B-tree.** Only a fixed prefix can. Use `pg_trgm` with GIN, or full-text search."
+  - "**Indexing every column just in case.** Each index slows writes and uses memory, and single-column indexes rarely combine as well as one well-ordered multicolumn index."
+  - "**Testing on a tiny table and concluding the index is ignored.** On a few hundred rows a sequential scan is cheapest. Test with realistic row counts, and run `ANALYZE` after loading data."
+  - "**Running plain `CREATE INDEX` on a large production table.** It blocks writes for the whole build. Use `CONCURRENTLY`."
+interview:
+  - question: How does a database index work, and why does it make lookups fast?
+    answer: >-
+      A B-tree index is a separate, sorted structure of pages: inner pages hold separator keys
+      that route a search, and leaf pages hold every key in order with a pointer to its row. A
+      page holds hundreds of keys, so the tree is only three or four levels deep for millions
+      of rows, and a lookup reads a handful of pages instead of the whole table. Linked leaves
+      make ranges and `ORDER BY` cheap too. The cost is on writes: each insert, delete and
+      indexed update changes every index, and the index takes space and cache. So I index for
+      real query patterns, not every column.
+  - question: You have an index on `(status, created_at)`. Which queries can use it?
+    answer: >-
+      Queries that constrain the leading column: `status = 'open'`, `status = 'open' AND
+      created_at > ...`, and `status = 'open' ORDER BY created_at` with no sort step, even
+      backwards. It's sorted by status first and by date within each status, so equality on
+      status gives one contiguous, date-ordered range. A query on `created_at` alone
+      traditionally can't use it well. Postgres 18 added skip scan, which can run one search
+      per distinct status when there are only a few, but a frequent query on `created_at`
+      still deserves its own index. The general rule is equality columns first, then one range
+      or sort column.
+  - question: There's an index on the column, but `EXPLAIN` shows a sequential scan. Why?
+    answer: >-
+      Usually because the planner expects the scan to be cheaper, and often it's right. If the
+      condition matches a large share of the table, random page reads through the index cost
+      more than one sequential pass. Other causes are fixable: the query wraps the column in a
+      function or cast, so the index doesn't match; a type mismatch between the parameter and
+      the column; a leading wildcard in `LIKE`; stale statistics after a bulk load, fixed by
+      `ANALYZE`; or a tiny test table. I'd compare estimated and actual rows in `EXPLAIN
+      ANALYZE` to tell which. I wouldn't force the index, because the planner's choice usually
+      reflects real costs.
+  - question: What are partial and covering indexes, and when would you use them?
+    answer: >-
+      A partial index holds only rows matching a condition, such as `WHERE status = 'pending'`.
+      I use it when queries target a small, hot subset: it's a fraction of the size, stays in
+      cache and costs less to maintain, but only queries whose `WHERE` implies the condition
+      can use it. A partial unique index also enforces rules like "one active subscription per
+      user". A covering index adds columns with `INCLUDE` so a query can be answered by an
+      index-only scan without touching the table, which helps hot, narrow reads. The trade-off
+      for covering indexes is size: every included column is copied into the index and
+      maintained on writes.
+  - question: How do you add an index to a large table in production?
+    answer: >-
+      With `CREATE INDEX CONCURRENTLY`, from a migration that runs outside a transaction.
+      Plain `CREATE INDEX` holds a lock that blocks inserts, updates and deletes for the whole
+      build, which on a big table can be minutes of failed writes. The concurrent build scans
+      the table twice and waits for older transactions, so it's slower and uses more
+      resources, and if it fails it leaves an invalid index that I drop before retrying. I'd
+      check it with `EXPLAIN` on a copy of production data first, and confirm with
+      `pg_stat_user_indexes` afterwards that it's being used.

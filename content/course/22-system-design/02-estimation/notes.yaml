@@ -1,0 +1,174 @@
+summary: >-
+  Back-of-the-envelope estimation turns a sentence like "20 million daily users" into the
+  handful of numbers that decide a design: requests per second at the peak, bytes stored,
+  bytes moved, and milliseconds spent. The lesson gives you the formulas. These notes give
+  you the shortcuts that make them fast, a full worked example, and two tools the lesson
+  only touches: Little's law and the latency budget.
+
+
+  An estimate is a classification, not a calculation. Its job is to tell you which band the
+  system sits in: one machine, one machine with a cache and replicas, or data spread over
+  many machines. A factor of two rarely moves you between bands. A factor of 100 always
+  does.
+
+
+  Estimate when a decision depends on scale: choosing a store, deciding whether to cache,
+  sizing a queue, pricing an AI feature. Skip it when the interviewer has already told you
+  the load is tiny, and say that instead.
+remember:
+  - A day has 86,400 seconds, about 10^5, so one million events a day is about 12 a second and one billion a day is about 11,600 a second.
+  - Peak traffic is two to three times the average for most consumer products, and you design for the peak.
+  - Storage is records per day times bytes per record times days kept times copies, plus room for indexes.
+  - Bandwidth is requests per second times bytes per response, and it's the number that makes a CDN necessary.
+  - "Little's law: items in flight equal arrival rate times time spent inside, so 3,000 requests a second at 50 ms each means 150 in progress at once."
+  - Memory is about 100 ns, an SSD read about 16 µs, a same-datacentre round trip about 500 µs, and California to the Netherlands and back about 150 ms.
+  - "A latency target is a budget: every hop on the path spends part of it, and serial hops add up."
+sections:
+  - title: Shortcuts that make the sums fast
+    body: |-
+      Nobody expects exact arithmetic. You're expected to be quick and roughly right. A few
+      anchors make that possible.
+
+      ```text
+      seconds in a day        86,400  ≈ 10^5
+      1 million a day         ≈ 12 a second
+      100 million a day       ≈ 1,160 a second
+      1 billion a day         ≈ 11,600 a second
+      2^10 ≈ 1 thousand, 2^20 ≈ 1 million, 2^30 ≈ 1 billion
+      KB 10^3, MB 10^6, GB 10^9, TB 10^12, PB 10^15 bytes
+      ```
+
+      Round the inputs to one significant figure, work in powers of ten, and round the
+      answer again. "20 million users times 50 views is 10^9 views a day, so about 12,000 a
+      second, say 35,000 at peak" takes ten seconds to say.
+
+      Two rules keep you honest. Count reads and writes separately, because they scale
+      differently and land on different components. And say every assumption out loud, so
+      the interviewer can correct an input rather than your conclusion.
+
+      Record sizes are worth a rule of thumb too: an id is 8 bytes, a timestamp 8, a short
+      text row a few hundred bytes, a JSON document one to a few kilobytes, a phone photo a
+      few megabytes.
+  - title: A worked estimate, end to end
+    body: |-
+      A photo-sharing app: 20 million daily users. Each views 50 photos a day, and one user
+      in five uploads one photo. Originals average 2 MB. Viewers get a resized 200 KB copy.
+      Peak factor 3.
+
+      ```ts
+      const SECONDS_PER_DAY = 86_400;
+      const perSecond = (perDay: number) => perDay / SECONDS_PER_DAY;
+
+      const views = perSecond(20_000_000 * 50);     // 11,574 a second
+      const uploads = perSecond(20_000_000 * 0.2);  // 46 a second
+      const viewsPeak = views * 3;                  // about 35,000
+      const storedPerDay = 20_000_000 * 0.2 * 2e6;  // 8 TB a day
+      const perYear = storedPerDay * 365;           // about 2.9 PB
+      const egress = views * 200_000;               // 2.3 GB a second
+      ```
+
+      Now read the numbers for what they mean.
+
+      - 46 uploads a second is a small write load. One database handles the metadata.
+      - 35,000 views a second at peak is far too many for a database to serve photo
+        metadata directly. Cache it.
+      - 2.9 PB a year doesn't fit on a database's disks. Photos go to object storage, and
+        the database keeps only a pointer.
+      - 2.3 GB a second is about 18.5 Gbit a second on average. That's a CDN's job, not your
+        servers'.
+
+      Four numbers, four design decisions. That's the whole point of the exercise.
+  - title: "Little's law: how many at once"
+    body: |-
+      Requests per second doesn't tell you how many connections, workers or model calls are
+      open at the same time. **Little's law** does:
+
+      ```text
+      in flight = arrival rate × time each one spends inside
+      ```
+
+      It holds for any stable system, whatever the traffic pattern, as long as the average
+      rates stay steady.
+
+      - 3,000 requests a second at 50 ms each: 150 requests in progress. A pool of 20
+        database connections at 5 ms per query can do 4,000 queries a second, so it copes.
+      - 35,000 image views a second at 20 ms each: 700 in flight across the fleet.
+      - 20 AI chat requests a second, each streaming for 8 seconds: 160 open streams. That's
+        why streaming AI features need servers built for many long-lived connections, and why
+        providers limit concurrent requests.
+
+      It also explains why slowness is dangerous. If a dependency slows from 50 ms to 500 ms
+      at the same arrival rate, in-flight work grows tenfold, and pools sized for the normal
+      case run out. The failure looks like "too many connections", but the cause is latency.
+  - title: Latency budgets
+    body: |-
+      A latency target such as "search answers within 200 ms at p95" is a budget to divide
+      between the hops on the path. Write the path down and give each hop a share.
+
+      ```text
+      client to edge, TLS reused      30 ms
+      balancer and service logic      10 ms
+      cache lookup                     1 ms
+      database query on a miss        20 ms
+      search index                    60 ms
+      serialisation and response      10 ms
+      headroom                        69 ms
+      total                          200 ms
+      ```
+
+      Three consequences follow. Serial calls add up, so 20 sequential queries of 5 ms each
+      spend 100 ms on their own. Calls that don't depend on each other should run in
+      parallel, so the path costs the slowest one, not the sum. And cross-region hops are
+      the most expensive line: light in fibre covers about 200 km a millisecond, so a
+      5,500 km route costs at least 28 ms each way before any processing.
+
+      Percentiles matter here. Budgets are set on p95 or p99, not the average, because the
+      average hides the slow requests users complain about. A path that calls many services
+      in parallel is only as fast as its slowest call, so every service needs a tight tail.
+pitfalls:
+  - "**Dividing by the wrong unit.** Dividing a daily count by 1,440 gives a per-minute rate, 60 times the per-second one. Write the units next to every number."
+  - "**Designing for the average.** Systems fail at the busiest hour. Multiply by a peak factor and say which you chose."
+  - "**Forgetting copies and indexes.** Three replicas triple storage, and indexes often add a large fraction on top. The raw data size is the smallest number you'll quote."
+  - "**Precision theatre.** Quoting 11,574.07 requests a second wastes time and implies accuracy the inputs don't have. Round to one or two significant figures."
+  - "**Estimating and then ignoring the result.** Each number should end in a decision: cache or not, one database or several, CDN or not. Say the decision out loud."
+  - "**Mixing bits and bytes.** Network links are sold in bits a second, storage in bytes. Multiply bytes by 8 before comparing with a link speed."
+interview:
+  - question: Estimate the load on a messaging app with 10 million daily users.
+    answer: >-
+      Around 4,600 messages a second on average, about 14,000 at peak, and about 88 TB a
+      year, so storage growth pushes me towards partitioning by conversation before write
+      load does. The working: I'll assume 40 messages per user a day, so 400 million a day. Divided by
+      about 86,400 seconds, that's 4,630 a second, and a peak factor of three gives about
+      14,000. Storage at 200 bytes each, kept a year with three copies, is 87.6 TB before
+      indexes. Bandwidth is small, under 1 MB a
+      second for message text. The assumption I'd check first is messages per user, since
+      group chats can multiply delivery work by the group size.
+  - question: Why bother estimating when the numbers could be off by a factor of two?
+    answer: >-
+      Because designs change at orders of magnitude, and a factor of two keeps you in the
+      same band. At 100 requests a second, one server and one database are plenty. At
+      10,000 you need caching and replicas. At a million you split the data across machines.
+      Being off by half doesn't move me between those. The estimate also writes my
+      assumptions down, so the interviewer or the team can correct an input. Where I'd be
+      careful is compounding: five assumptions each off by two can be off by 32 together,
+      so I sanity-check the result against something I know.
+  - question: How would you size the database connection pool for a service?
+    answer: >-
+      With Little's law: connections needed equal queries per second times the time each
+      query holds a connection. At 2,000 queries a second and 5 ms each, that's 10
+      connections busy on average, so a pool of 20 to 30 gives headroom for bursts. More
+      isn't better: each Postgres connection is a separate process with its own memory, and
+      too many active queries contend for CPU and locks. With many service instances, the
+      total across all of them must stay under what the database accepts, which is where a
+      pooler such as PgBouncer comes in. The same formula tells you what happens when
+      queries slow down: at 50 ms you'd need 100, and the pool runs dry.
+  - question: A page makes 20 database queries and the database moves to another region. What happens?
+    answer: >-
+      The page gets roughly 20 cross-region round trips slower, which can mean seconds, so
+      the fix is fewer trips, not faster code. In one datacentre a round trip is about half
+      a millisecond, so 20 sequential queries cost 10 ms. Across a continent each can be
+      tens of milliseconds, and California to Europe is about 150 ms, so the same page takes
+      seconds. I'd batch the queries into one, for example with `WHERE id = ANY($1)`, run
+      independent queries in parallel, or keep a read replica in the service's region. The
+      rule behind it: keep chatty communication inside a region and cross regions once per
+      request at most.

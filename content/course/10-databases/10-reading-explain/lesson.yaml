@@ -1,0 +1,288 @@
+id: db.reading-explain
+title: Reading `EXPLAIN`
+objective: "Read a real query plan, find the clue that points at the slow part, and run `EXPLAIN ANALYZE` safely."
+level: advanced
+minutes: 10
+concepts: [db.query-plan, db.explain-analyze]
+prerequisites: [db.indexes]
+opening:
+  text: >-
+    You'll read the plan Postgres made for a slow page and point at the exact line to fix. You'll
+    also learn the one `EXPLAIN` that deletes your data.
+
+steps:
+  - type: prose
+    id: what-a-plan-is
+    body: >-
+      A **plan** is a tree of small steps, called nodes. Each line starting with `->` is a node,
+      and it feeds rows to the line it's indented under:
+
+
+      ```text
+
+      Nested Loop
+
+        ->  Index Scan using customers_pkey on customers
+
+        ->  Seq Scan on orders
+
+              Filter: (customer_id = 42)
+
+      ```
+
+
+      Read from the most indented lines outwards. Here, Postgres finds customer 42, reads the
+      orders, and pairs them up in the **Nested Loop** at the top.
+
+  - type: prose
+    id: explain-analyze-adds-actuals
+    body: >-
+      Plain `EXPLAIN` shows guesses. `EXPLAIN ANALYZE` runs the query for real and adds what
+      actually happened to each node:
+
+
+      ```text
+
+      Seq Scan on orders  (cost=0.00..359.00 rows=10 width=12)
+
+                          (actual time=0.021..2.110 rows=10.00 loops=1)
+
+      ```
+
+
+      The first brackets are the planner's estimate. `actual time` is in milliseconds, and
+      `rows` is how many rows the node really produced. Ignore `cost` and `width` for now.
+
+  - type: sql
+    id: run-explain-analyze
+    prompt: >-
+      A customer's order history page is slow. Run `EXPLAIN ANALYZE` on its query and find the
+      node that reads the whole `orders` table.
+    setup: &shop |
+      CREATE TABLE customers (id integer PRIMARY KEY, name text NOT NULL);
+      CREATE TABLE orders (
+        id integer PRIMARY KEY,
+        customer_id integer NOT NULL REFERENCES customers(id),
+        total_pence integer NOT NULL
+      );
+      INSERT INTO customers SELECT n, 'Customer ' || n FROM generate_series(1, 2000) AS n;
+      INSERT INTO orders SELECT n, 1 + n % 2000, 500 + n % 7000 FROM generate_series(1, 20000) AS n;
+      ANALYZE customers;
+      ANALYZE orders;
+      -- Reports whether the plan for a query uses an index on orders.
+      CREATE FUNCTION orders_use_index(query text) RETURNS boolean LANGUAGE plpgsql AS $f$
+      DECLARE line text;
+      BEGIN
+        FOR line IN EXECUTE 'EXPLAIN (COSTS OFF) ' || query LOOP
+          IF line LIKE '%Index%Scan%orders%' THEN RETURN true; END IF;
+        END LOOP;
+        RETURN false;
+      END $f$;
+    starter: |
+      EXPLAIN ANALYZE
+      SELECT customers.name, orders.id, orders.total_pence
+      FROM orders JOIN customers ON customers.id = orders.customer_id
+      WHERE orders.customer_id = 42;
+    showSchema: true
+
+  - type: multiple-choice
+    id: pick-the-clue
+    concept: db.query-plan
+    difficulty: 2
+    language: text
+    code: |
+      Nested Loop  (actual time=0.076..2.182 rows=10.00 loops=1)
+        ->  Index Scan using customers_pkey on customers  (actual time=0.027..0.029 rows=1.00 loops=1)
+              Index Cond: (id = 42)
+        ->  Seq Scan on orders  (actual time=0.021..2.110 rows=10.00 loops=1)
+              Filter: (customer_id = 42)
+              Rows Removed by Filter: 19990
+    question: This is the plan you ran, trimmed. Which line tells you an index is missing?
+    choices:
+      - text: '`Rows Removed by Filter: 19990`'
+        correct: true
+        feedback: >-
+          Right. It read every order to keep a handful. An index would jump to them.
+      - text: '`Index Cond: (id = 42)`'
+        feedback: >-
+          That node already uses an index, the primary key. It's the fast part.
+      - text: '`Nested Loop` at the top'
+        feedback: >-
+          A nested loop is a fine way to pair one customer with a few orders. Look below it.
+      - text: '`loops=1` on every node'
+        feedback: >-
+          Each node ran once, which is normal here. The waste is in how many rows were read.
+
+  - type: sql
+    id: fix-the-plan
+    concept: db.query-plan
+    difficulty: 3
+    prompt: >-
+      Add the index the plan is asking for, then run the `EXPLAIN ANALYZE` again. The `Seq Scan
+      on orders` should become an index scan.
+    setup: *shop
+    starter: |
+      EXPLAIN ANALYZE
+      SELECT customers.name, orders.id, orders.total_pence
+      FROM orders JOIN customers ON customers.id = orders.customer_id
+      WHERE orders.customer_id = 42;
+    solution: |
+      CREATE INDEX ON orders (customer_id);
+      EXPLAIN ANALYZE
+      SELECT customers.name, orders.id, orders.total_pence
+      FROM orders JOIN customers ON customers.id = orders.customer_id
+      WHERE orders.customer_id = 42;
+    checks:
+      query: >-
+        SELECT orders_use_index($$SELECT * FROM orders WHERE customer_id = 42$$)
+        AS orders_lookup_uses_an_index
+    showSchema: true
+    hints:
+      - The `Filter` line under the `Seq Scan` names the column being searched.
+      - A foreign key has no index of its own. `CREATE INDEX ON orders (...)` goes first.
+
+  - type: prose
+    id: analyze-runs-it
+    body: >-
+      `EXPLAIN ANALYZE` gets its actual numbers by running the statement. For a `SELECT` that's
+      harmless. For a `DELETE`, the rows are really deleted.
+
+
+      To measure a write safely, wrap it: `BEGIN;` before, `ROLLBACK;` after. Everything
+      between them is undone at `ROLLBACK`. The transactions lesson explains how that works.
+
+  - type: sql
+    id: explain-a-delete-safely
+    concept: db.explain-analyze
+    difficulty: 3
+    prompt: >-
+      Run this. The count shows the sessions really went, because `ANALYZE` ran the delete. Make
+      it measure the delete and keep every session.
+    setup: |
+      CREATE TABLE sessions (id integer PRIMARY KEY, user_id integer NOT NULL, expires_at timestamptz NOT NULL);
+      INSERT INTO sessions
+        SELECT n, 1 + n % 300, timestamptz '2026-08-01' + n * interval '1 hour'
+        FROM generate_series(1, 2000) AS n;
+    starter: |
+      EXPLAIN ANALYZE DELETE FROM sessions WHERE expires_at < '2026-09-01';
+      SELECT count(*) AS sessions_left FROM sessions;
+    solution: |
+      BEGIN;
+      EXPLAIN ANALYZE DELETE FROM sessions WHERE expires_at < '2026-09-01';
+      ROLLBACK;
+      SELECT count(*) AS sessions_left FROM sessions;
+    checks:
+      query: SELECT count(*) AS sessions_left FROM sessions
+    showSchema: true
+    hints:
+      - Something must undo the delete after the plan is measured.
+      - '`BEGIN;` goes before the `EXPLAIN ANALYZE`, and `ROLLBACK;` right after it.'
+
+  - type: ai-review
+    id: review-analyze-on-production
+    concept: db.explain-analyze
+    difficulty: 4
+    language: sql
+    request: The checkout is slow. Add a diagnostic endpoint that shows the plan for the order clean-up.
+    flawClass: performance
+    code: |
+      -- runs when someone opens /admin/diagnose
+      EXPLAIN (ANALYZE, BUFFERS)
+      DELETE FROM orders WHERE placed_at < now() - interval '2 years';
+    prompt: >-
+      An assistant wrote this. The endpoint shows a detailed plan, and the test that checks the
+      output passes. The next morning, two years of orders are gone. Tap the line at fault.
+    lines: [2]
+    reasons:
+      - text: '`ANALYZE` runs the statement for real, `DELETE` included'
+        correct: true
+        feedback: >-
+          Yes. For a write, drop `ANALYZE` or wrap it in `BEGIN` and `ROLLBACK`.
+      - text: '`BUFFERS` should be removed'
+        feedback: >-
+          `BUFFERS` only adds memory reads to the report. It changes nothing about what runs.
+      - text: '`interval` should be a date'
+        feedback: >-
+          The date maths is fine. The problem is that the plan was executed, not estimated.
+    fix: |
+      -- runs when someone opens /admin/diagnose
+      EXPLAIN
+      DELETE FROM orders WHERE placed_at < now() - interval '2 years';
+
+  - type: explain-back
+    id: explain-read-a-plan
+    concept: db.query-plan
+    difficulty: 3
+    prompt: >-
+      A page is slow and you have its `EXPLAIN ANALYZE` output. Say how you'd find the part to
+      fix.
+    rubric:
+      - Read the tree from the most indented nodes outwards, and find where the time goes.
+      - Look for a `Seq Scan` with a large `Rows Removed by Filter` on a big table.
+      - The `Filter` line names the column that probably needs an index.
+    modelAnswer: >-
+      I'd read from the innermost nodes out and look at `actual time` to see where the time
+      goes. The usual culprit is a `Seq Scan` on a big table with a huge `Rows Removed by
+      Filter`: it read everything to keep a few rows. Its `Filter` line names the column to
+      index. Then I'd add the index and run `EXPLAIN ANALYZE` again to confirm.
+
+recap:
+  - Read a plan from the innermost node out, and find where the rows and time go.
+  - Treat a `Seq Scan` with a big `Rows Removed by Filter` as a missing index.
+  - Measure writes with `EXPLAIN ANALYZE` only between `BEGIN` and `ROLLBACK`.
+
+recall:
+  - id: card-plan-order
+    concept: db.query-plan
+    front: In what order do you read the nodes of a plan?
+    back: From the most indented outwards. Inner nodes feed rows to the node above them.
+  - id: card-analyze-runs
+    concept: db.explain-analyze
+    front: What's the difference between `EXPLAIN` and `EXPLAIN ANALYZE`?
+    back: >-
+      `EXPLAIN` shows the plan with estimates. `EXPLAIN ANALYZE` runs the statement and adds the
+      actual rows and times.
+  - id: card-safe-analyze
+    concept: db.explain-analyze
+    front: How do you measure a `DELETE` with `EXPLAIN ANALYZE` without deleting anything?
+    back: Run it between `BEGIN;` and `ROLLBACK;`.
+  - id: card-rows-removed
+    concept: db.query-plan
+    front: What does a large `Rows Removed by Filter` under a `Seq Scan` usually mean?
+    back: The scan read far more rows than it kept, so an index on the filtered column would help.
+
+references:
+  - kind: docs
+    title: 14.1. Using EXPLAIN
+    authors: The PostgreSQL Global Development Group
+    venue: PostgreSQL 18 documentation
+    url: https://www.postgresql.org/docs/18/using-explain.html
+    note: How to read plans, estimates and actuals, with the warning that `ANALYZE` executes.
+    primary: true
+    verified: true
+  - kind: docs
+    title: EXPLAIN
+    authors: The PostgreSQL Global Development Group
+    venue: PostgreSQL 18 documentation
+    url: https://www.postgresql.org/docs/18/sql-explain.html
+    note: Every option, and the advice to wrap a write in `BEGIN` and `ROLLBACK`.
+    verified: true
+
+deepDive: >-
+  `cost` is in made-up units: roughly, reading one page in order costs 1. The two numbers are
+  the cost to produce the first row and all rows. They compare plans; they aren't milliseconds.
+
+
+  When estimated and actual rows differ a lot, the planner is working from stale statistics
+  and may pick a bad plan. `ANALYZE orders;` refreshes them, and autovacuum usually does it for
+  you in the background.
+
+
+  There are three ways to join. A **Nested Loop** looks up the inner side once per outer row,
+  great for a few rows. A **Hash Join** builds a hash table from one side, good for many rows.
+  A **Merge Join** walks two sorted inputs together.
+
+
+  Since Postgres 18, `EXPLAIN ANALYZE` adds `Buffers` lines by default: how many 8 kB pages
+  each node read from memory (`hit`) or disk (`read`). On a real server, `pg_stat_statements`
+  lists which queries take the most total time, so you know which plan to read first.

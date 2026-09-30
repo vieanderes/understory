@@ -1,0 +1,308 @@
+id: pyai.generators-and-decorators
+title: Generators and decorators
+objective: "Hand on a streamed reply piece by piece with a generator, and retry a failing call with a decorator."
+level: essential
+minutes: 10
+concepts: [pyai.generators, pyai.streaming-tokens, pyai.decorators, pyai.rate-limits-and-retries]
+prerequisites: [pyai.pydantic]
+opening:
+  text: >-
+    You'll show a model's answer word by word as it's written, and make a call survive a
+    busy provider. Both use Python features you'll see in every AI codebase.
+
+steps:
+  - type: prose
+    id: what-yield-does
+    body: |-
+      In chapter 18, a generator expression made values one at a time. A function can do
+      the same with `yield`:
+
+      ```python
+      def countdown(n):
+          while n > 0:
+              yield n
+              n = n - 1
+
+      for number in countdown(3):
+          print(number)   # 3, then 2, then 1
+      ```
+
+      Calling it returns a **generator**. Each `yield` hands one value to the loop and
+      pauses until the loop asks for the next.
+
+  - type: prose
+    id: streaming
+    body: |-
+      A long reply can take twenty seconds to write. Nobody wants to stare at a spinner.
+      With **streaming**, the reply arrives in small pieces as the model writes it:
+
+      ```python
+      with client.messages.stream(
+          model="claude-opus-5",
+          max_tokens=2000,
+          messages=[{"role": "user", "content": "Explain tides."}],
+      ) as stream:
+          for text in stream.text_stream:
+              print(text, end="", flush=True)
+      ```
+
+      `text_stream` gives each piece as it lands, the way a generator does.
+
+  - type: fill-blank
+    id: fill-stream
+    concept: pyai.streaming-tokens
+    difficulty: 1
+    language: python
+    prompt: Complete it so each piece of the reply prints as soon as it arrives.
+    template: |
+      with client.messages.{{1}}(
+          model="claude-opus-5",
+          max_tokens=2000,
+          messages=[{"role": "user", "content": "A poem about rain."}],
+      ) as stream:
+          for text in stream.{{2}}:
+              print(text, end="", flush=True)
+    blanks:
+      - key: '1'
+        answer: stream
+      - key: '2'
+        answer: text_stream
+    bank: [stream, create, text_stream, content, text]
+
+  - type: prose
+    id: used-once
+    body: >-
+      One catch. A generator runs once. After a loop has taken every value, it's empty,
+      and a second loop gets nothing. No error, and nothing to show.
+
+
+      To use the values twice, keep them: `pieces = list(generator)` stores them in a list
+      you can read as often as you like.
+
+  - type: ai-review
+    id: review-stream-used-twice
+    concept: pyai.generators
+    difficulty: 3
+    language: python
+    request: Stream the answer to the screen, then save the full answer to the chat history.
+    flawClass: logic
+    code: |
+      def reply_pieces(client, question):
+          with client.messages.stream(model="claude-opus-5", max_tokens=2000,
+                  messages=[{"role": "user", "content": question}]) as stream:
+              for text in stream.text_stream:
+                  yield text
+
+      pieces = reply_pieces(client, "Explain tides.")
+      for piece in pieces:
+          print(piece, end="")
+      history.append("".join(pieces))
+    prompt: >-
+      An assistant wrote this. The answer streams to the screen, but every saved answer in
+      the history is an empty string. Tap the line where the text is lost.
+    lines: [10]
+    reasons:
+      - text: The first loop already used up the generator
+        correct: true
+        feedback: >-
+          Yes. By the `join`, `pieces` has nothing left to give.
+      - text: '`join` needs a list, not a generator'
+        feedback: >-
+          `join` takes any iterable. The generator is empty by then.
+      - text: '`yield` inside `with` closes the stream early'
+        feedback: >-
+          The stream stayed open for the whole first loop. It printed every piece.
+    fix: |
+      def reply_pieces(client, question):
+          with client.messages.stream(model="claude-opus-5", max_tokens=2000,
+                  messages=[{"role": "user", "content": question}]) as stream:
+              for text in stream.text_stream:
+                  yield text
+
+      answer = []
+      for piece in reply_pieces(client, "Explain tides."):
+          print(piece, end="")
+          answer.append(piece)
+      history.append("".join(answer))
+
+  - type: prose
+    id: what-a-decorator-is
+    body: |-
+      A **decorator** is a function that takes a function and returns a wrapped one:
+
+      ```python
+      def log_calls(func):
+          def wrapper(*args, **kwargs):
+              print("calling the model")
+              return func(*args, **kwargs)
+          return wrapper
+
+      @log_calls
+      def ask(client, question): ...
+      ```
+
+      `@log_calls` above `def` means `ask = log_calls(ask)`. `*args` and `**kwargs`, from
+      chapter 18, pass every argument through.
+
+  - type: bug-hunt
+    id: hunt-missing-return
+    concept: pyai.decorators
+    difficulty: 2
+    language: python
+    code: |
+      def log_calls(func):
+          def wrapper(*args, **kwargs):
+              print("calling the model")
+              func(*args, **kwargs)
+          return wrapper
+
+      @log_calls
+      def ask(client, question):
+          ...
+
+      answer = ask(client, "Capital of Peru?")
+    prompt: >-
+      Since someone added `@log_calls`, `answer` is always `None`, though the model still
+      answers. Tap the line to fix.
+    lines: [4]
+    reasons:
+      - text: The wrapper drops the result instead of returning it
+        correct: true
+        feedback: >-
+          Right. A function without `return` gives `None`, and the wrapper is what callers get.
+      - text: '`@log_calls` should be `@log_calls()`'
+        feedback: >-
+          With brackets, `log_calls` would be called with no function. It takes `func` directly.
+      - text: '`print` swallows the return value'
+        feedback: >-
+          `print` runs on its own line. The call below it loses the answer.
+    fix: |
+      def log_calls(func):
+          def wrapper(*args, **kwargs):
+              print("calling the model")
+              return func(*args, **kwargs)
+          return wrapper
+
+  - type: prose
+    id: why-retry
+    body: >-
+      Providers cap how many requests you may send each minute. That cap is a **rate
+      limit**. Go over it, and the reply is an error with status `429`, Too Many Requests.
+
+
+      The fix is to wait and try again, and to wait longer each time: 1 second, then 2,
+      then 4. Doubling the wait is called **exponential backoff**. It gives the provider room
+      to recover.
+
+  - type: code-challenge
+    id: write-retry
+    concept: pyai.rate-limits-and-retries
+    difficulty: 3
+    language: python
+    starter: retry.starter.py
+    solution: retry.solution.py
+    tests: retry.tests.py
+    prompt: >-
+      Write `retry(func, attempts=3, sleep=time.sleep)`. It returns a wrapper that calls
+      `func` with any arguments and tries again on `RateLimitError`.
+
+
+      Wait 1 second before the second try, then double each time. If the last attempt
+      fails, let its error reach the caller. Don't retry other errors. Keep `func`'s name
+      with `@functools.wraps(func)` on the wrapper. The tests pass a fake `sleep` that only
+      records each wait.
+
+
+      Example: a call that fails twice, then works, returns its answer after waits of
+      `[1, 2]`.
+    hints:
+      - The wrapper is a loop around a `try`. Where does the last attempt go?
+      - Run all but the last attempt inside `try`, and the last one outside it, so its error escapes.
+      - 'Start the wrapper with `delay = 1`, and loop `for attempt in range(attempts - 1):`.'
+
+  - type: explain-back
+    id: explain-streaming
+    concept: pyai.streaming-tokens
+    difficulty: 2
+    prompt: >-
+      A streamed reply and a normal one take the same total time. Why do users say the
+      streamed one feels faster?
+    rubric:
+      - The first words appear within a second or so, not after the whole reply.
+      - The user starts reading while the model is still writing.
+      - Waiting with nothing on screen feels longer than watching text arrive.
+    modelAnswer: >-
+      Without streaming, nothing shows until the last token is written. With it, the first
+      words show almost at once. I read while the model writes, so the wait mostly
+      disappears, even though the total time is the same.
+
+recap:
+  - Write a generator with `yield`, and keep its values in a list to use them twice.
+  - Stream a reply with `messages.stream` and `text_stream`.
+  - Wrap a call in a decorator that retries a `429` with exponential backoff.
+
+recall:
+  - id: card-generator-once
+    concept: pyai.generators
+    front: What does a second loop over a used-up generator give?
+    back: >-
+      Nothing, and no error. Keep the values in a list with `list(...)` to read them twice.
+  - id: card-stream
+    concept: pyai.streaming-tokens
+    front: Which SDK call and attribute print a reply as it's written?
+    back: >-
+      `with client.messages.stream(...) as stream:`, then loop over `stream.text_stream`.
+  - id: card-decorator
+    concept: pyai.decorators
+    front: What does `@log_calls` above `def ask` do?
+    back: >-
+      It means `ask = log_calls(ask)`. Callers get the wrapper, so it must return the
+      result of `func`.
+  - id: card-backoff
+    concept: pyai.rate-limits-and-retries
+    front: What is exponential backoff?
+    back: >-
+      Retrying after waits that double each time, such as 1, 2 and 4 seconds, so a busy
+      provider gets room to recover.
+
+references:
+  - kind: docs
+    title: Generators
+    authors: Python Software Foundation
+    venue: Python documentation, Functional Programming HOWTO
+    url: https://docs.python.org/3/howto/functional.html#generators
+    note: yield, pausing, and why a generator runs once.
+    primary: true
+    verified: true
+  - kind: docs
+    title: Streaming messages
+    authors: Anthropic
+    venue: Claude Platform documentation
+    url: https://platform.claude.com/docs/en/build-with-claude/streaming
+    note: The event stream and the SDK's text stream helper.
+    primary: true
+    verified: true
+  - kind: essay
+    title: Exponential Backoff And Jitter
+    authors: Marc Brooker
+    year: 2015
+    venue: AWS Architecture Blog
+    url: https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/
+    note: Why doubling waits, with some randomness, beats retrying at once.
+    verified: true
+
+deepDive: >-
+  **The SDK already retries.** The Anthropic Python SDK retries a `429`, a `5xx` and a
+  dropped connection twice by default, with backoff, before it raises. Set `max_retries`
+  on the client to change that. Your own decorator is for work the SDK can't see, such as
+  a whole pipeline step.
+
+
+  **Jitter.** When a hundred workers all back off 1, 2, 4 seconds, they retry together
+  and hit the limit together. Adding a small random amount to each wait spreads them out.
+  If the provider sends a `retry-after` header, wait that long instead.
+
+
+  **functools.wraps** copies the wrapped function's name and docstring onto the wrapper,
+  so logs and error messages still say `summarise`, not `wrapper`. `functools.cache` is
+  another decorator worth knowing: it remembers results by their arguments.

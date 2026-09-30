@@ -99,7 +99,7 @@ describe('CodeChallengeStep', () => {
     const { onSubmissionChange, createRunner } = setup();
     expect(onSubmissionChange).not.toHaveBeenCalled();
     expect(createRunner).not.toHaveBeenCalled();
-    expect(screen.getByText('Unplugged · no AI, no code hints')).toBeInTheDocument();
+    expect(screen.getByText('Unplugged · no AI in the editor')).toBeInTheDocument();
     expect(screen.getByText('Tab indents. Escape, then Tab, leaves the editor.')).toBeVisible();
   });
 

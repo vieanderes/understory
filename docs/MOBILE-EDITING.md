@@ -76,7 +76,7 @@ The code challenge ("Write · Unplugged") gets typing help only, and only after 
 has typed at least one letter. The suggestions come from two sources: the language's
 keywords, and the words already in the document. Nothing from outside the file, and
 nothing before the first letter. It works like a phone keyboard's word completion for a
-vocabulary the learner has already met. The label says "no AI, no code hints".
+vocabulary the learner has already met. The label says "no AI in the editor".
 
 The playground ("Build · Live") and the sql step ("Query · Live") are for trying things and
 seeing the result. They also get a small vocabulary of the language: HTML tags, CSS

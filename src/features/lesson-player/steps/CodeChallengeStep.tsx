@@ -284,7 +284,7 @@ export function CodeChallengeStep({
   // its Full screen key at the end.
   const header = (
     <div className="flex min-h-5 flex-wrap items-center justify-between gap-x-2">
-      <p className="t-label">Unplugged · no AI, no code hints</p>
+      <p className="t-label">Unplugged · no AI in the editor</p>
       <div className="ml-auto flex items-center gap-1">
         {confirmingReset ? (
           <>

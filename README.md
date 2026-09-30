@@ -1147,6 +1147,9 @@ for the `good first issue` label.
   arbitrary values, gradients or emoji icons. Check every changed screen at 390, 768, 1024
   and 1440 px, in light and dark, and attach screenshots. Every route passes axe (WCAG 2.2
   AA).
+- **The README.** Please help keep it current. If your change adds or alters something the
+  README describes or shows, update that part in the same pull request, including the
+  screenshots. That way it never falls behind, and it does not rest on one person.
 - **Scout and MCP.** Scout runs on the learner's own Claude: never a server-side key, never a
   paid call on a visitor's behalf, never a stored learner key. It stays out of anything that
   measures the learner. Start at `src/core/ports/assistant.ts` and

@@ -23,4 +23,5 @@
 - [ ] One change, and the title reads like a commit subject
 - [ ] Follows `AGENTS.md`, and for lessons `docs/WRITING-GUIDE.md`
 - [ ] Examples are generic and name no real company's product
+- [ ] The README and its screenshots still match, or I updated them
 - [ ] I have read, run and understood every line, including any written with AI help

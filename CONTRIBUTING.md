@@ -94,6 +94,22 @@ Read [`docs/DESIGN.md`](docs/DESIGN.md) and [`docs/MOTION.md`](docs/MOTION.md).
 - Scout stays out of anything that measures the learner: timed tests, checkpoints, test-outs
   and placement.
 
+### Keeping the README current
+
+The README is the front door, and I would love it to stay up to date without resting on one
+person. If your change adds a feature, changes a screen the README shows, or alters anything
+it describes (a path, a count, a command), please update the README in the same pull
+request, or suggest the change in the description if you are not sure how it should read.
+
+Screenshots live in `docs/assets/readme/`, one per theme: `<name>-light.png` and
+`<name>-dark.png`. To match the ones already there:
+
+- Desktop at 1440 by 900, phone at 390 by 844, both at a device scale of 2, with reduced
+  motion and the Next.js dev indicator hidden.
+- Show the feature doing something real: tests passing, a live preview, a real answer.
+- Resize desktop shots to 1600 px wide. Keep phone shots as they are.
+- Reference them with a `<picture>` element, dark source first, as the README does.
+
 ## Before you open a pull request
 
 ```sh

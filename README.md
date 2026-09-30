@@ -23,7 +23,9 @@
   <a href="#inside-a-lesson">Inside a lesson</a> ·
   <a href="#the-course">The course</a> ·
   <a href="#practise-the-real-test">Practise the real test</a> ·
-  <a href="#run-it">Run it</a>
+  <a href="#keep-up-with-the-field">News</a> ·
+  <a href="#run-it">Run it</a> ·
+  <a href="#contributing">Contributing</a>
 </p>
 
 <br>
@@ -153,7 +155,7 @@ steps to race conditions and prompt injection, and tells you where to begin.
 | **Rehearse** | Timed online coding tests in a simulator, with an optional guided mode.                             | 30 original tasks with hidden correctness and performance tests. See [Practise the real test](#practise-the-real-test).                    |
 | **Prove it** | A checkpoint and capstone at the end of each part. A final exam at the end of each path.            | Capstones come with worked solutions, each built and tested as a real project.                                                             |
 | **Read**     | Every lesson as a lecture: the explanation, worked examples, every solution, the lines to remember. | Readable per lesson, chapter, part or path. Downloadable as PDF and as an audiobook with chapters.                                         |
-| **Keep up**  | A daily digest of software and AI news, each item linked to the lessons underneath it.              | 41 verified feeds, fetched by a scheduled GitHub Action. See [`SIGNAL.md`](docs/SIGNAL.md).                                                |
+| **Keep up**  | A daily digest of software and AI news, each item linked to the lessons underneath it.              | 41 verified feeds, fetched by a scheduled GitHub Action. See [Keep up with the field](#keep-up-with-the-field).                            |
 
 Nothing in the course asks you to do arithmetic in your head. Every scored step asks you to
 do something a working engineer does: write code, fix it, read it, review it or decide.
@@ -967,6 +969,31 @@ the assistant transcript.
 <sub>Understory is not affiliated with any assessment platform. The simulator rehearses the
 format; the tasks and the code are our own.</sub>
 
+## Keep up with the field
+
+AI research moves faster than any course can be rewritten. A new model, method or tool
+lands every week, and it is easy to lose track of what matters. Understory has a news
+section for that: a short daily digest, plus a weekly and a monthly one, under **News**.
+
+- **Where the news comes from.** 41 hand-checked sources, listed in
+  [`content/feeds.yaml`](content/feeds.yaml): the AI labs and researchers (OpenAI, Google
+  DeepMind, Hugging Face, Simon Willison, Sebastian Raschka, Lilian Weng, Import AI), the
+  web platform and the tools the course teaches (web.dev, WebKit, Chrome, React, Next.js,
+  Node.js, TypeScript, PostgreSQL), engineering and security writing (The Pragmatic
+  Engineer, Martin Fowler, Julia Evans, Jepsen, PortSwigger, Trail of Bits), plus Hacker
+  News and arXiv.
+- **How it is picked.** Each morning a scheduled job fetches the sources, drops anything
+  older than 72 hours, merges duplicates, and scores what is left by topic, source,
+  engagement and recency. The best dozen become the day's edition.
+- **How it is explained.** Every item gets a brief in a fixed shape: what happened, why it
+  matters, and the two to four key concepts behind it. Each links to the lessons underneath
+  it, so a headline about a new attention trick leads to the lesson on how models work.
+  With an Anthropic key the briefs are written by a model; without one they are drawn from
+  the source text.
+
+The pipeline is a plain Node script, so it runs just as well from a timer on a server. The
+details are in [`SIGNAL.md`](docs/SIGNAL.md).
+
 ## Run it
 
 You need Node 24 and pnpm.
@@ -1059,7 +1086,46 @@ docs/                          the documents below
 | [`SANDBOX.md`](docs/SANDBOX.md)                   | How learner code runs safely in the browser                 |
 | [`ONLINE-TEST.md`](docs/ONLINE-TEST.md)           | The online-test simulator: how it matches, how to add tasks |
 | [`SYNC-PROTOCOL.md`](docs/SYNC-PROTOCOL.md)       | How devices will sync, designed and not yet built           |
-| [`AGENTS.md`](AGENTS.md)                          | Rules for coding agents working in this repository          |
+| [`SIGNAL.md`](docs/SIGNAL.md)                     | The news feed: sources, scoring, briefs                     |
+| [`ROADMAP.md`](docs/ROADMAP.md)                   | Where it stands and what comes next                         |
+| [`AGENTS.md`](AGENTS.md)                          | The laws of the codebase, for people and coding agents      |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md)              | How to contribute, and what a good pull request looks like  |
+
+## Where it is going
+
+Understory is not finished, and I do not want it to be. I will keep building it.
+
+- **New ideas become lessons.** When I learn a method or concept in AI engineering, or
+  anywhere else in the craft, that belongs in the course, I will add it and mark it as new,
+  so returning learners see what changed without hunting for it.
+- **A more premium feel.** I will keep steering the design towards a calmer, more crafted
+  and more recognisable look, until the brand is as clear as the content.
+- **Scout and the simulator** will grow with the tools they mirror.
+
+What is next, in order, is in [`ROADMAP.md`](docs/ROADMAP.md).
+
+## Contributing
+
+Contributions are very welcome, wherever you think they help: a correction, a clearer
+explanation, a new lesson or a whole course, a new UI feature, a better lab, or an
+improvement to Scout's harness or its MCP server. First contributions are welcome too.
+
+A few things keep the course consistent:
+
+- **Open an issue first for anything larger than a fix,** so we agree on the shape before
+  you spend the time.
+- **Keep a pull request to one change,** with tests for any rule and screenshots for any
+  screen, in light and dark, at phone and desktop width.
+- **Lessons follow the writing guide:** plain, short and generic examples, never a real
+  company's product. Code follows the laws in [`AGENTS.md`](AGENTS.md).
+- **Run `pnpm check` before you push.** CI on GitHub is only the fast gate.
+- **AI-assisted contributions are fine,** as long as you have read, run and understood every
+  line you submit. That is the point of this project, after all.
+
+The full guide, with the setup, the checklist and how reviews work, is in
+[`CONTRIBUTING.md`](CONTRIBUTING.md). Please read the
+[code of conduct](CODE_OF_CONDUCT.md), and report security issues privately as described in
+[`SECURITY.md`](SECURITY.md).
 
 ## Licence
 

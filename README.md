@@ -25,7 +25,8 @@
   <a href="#practise-the-real-test">Practise the real test</a> ·
   <a href="#keep-up-with-the-field">News</a> ·
   <a href="#run-it">Run it</a> ·
-  <a href="#contributing">Contributing</a>
+  <a href="#contributing">Contributing</a> ·
+  <a href="#support">Support</a>
 </p>
 
 <br>
@@ -1192,6 +1193,12 @@ the full `pnpm check` and `pnpm test:e2e`.
 
 The full guide, with setup and more detail for each area, is in
 [`CONTRIBUTING.md`](CONTRIBUTING.md).
+
+## Support
+
+Understory is free and stays free. If it has helped you and you would like to give something
+back, the **Sponsor** button at the top of this repository takes you to my Ko-fi page. Every
+coffee gives me time to keep writing lessons and looking after the project. Thank you.
 
 ## Licence
 

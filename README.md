@@ -1117,24 +1117,73 @@ What is next, in order, is in [`ROADMAP.md`](docs/ROADMAP.md).
 
 Contributions are very welcome, wherever you think they help: a correction, a clearer
 explanation, a new lesson or a whole course, a new UI feature, a better lab, or an
-improvement to Scout's harness or its MCP server. First contributions are welcome too.
+improvement to Scout's harness or its MCP server. First contributions are welcome too; look
+for the `good first issue` label.
 
-A few things keep the course consistent:
+### How a contribution flows
 
-- **Open an issue first for anything larger than a fix,** so we agree on the shape before
-  you spend the time.
-- **Keep a pull request to one change,** with tests for any rule and screenshots for any
-  screen, in light and dark, at phone and desktop width.
-- **Lessons follow the writing guide:** plain, short and generic examples, never a real
-  company's product. Code follows the laws in [`AGENTS.md`](AGENTS.md).
-- **Run `pnpm check` before you push.** CI on GitHub is only the fast gate.
+1. **Small fix?** A typo, a broken link, an obvious bug: open a pull request straight away.
+2. **Anything bigger?** A new lesson, a feature, a change to a rule or a schema: open an
+   issue first and describe the problem and the shape you have in mind. Agreeing on it first
+   saves you from building something that cannot be merged.
+3. **Build it** on a branch, one change per pull request, and run the checks below.
+4. **Open the pull request** with the template filled in. Drafts are welcome for early
+   feedback.
+5. **Review.** A maintainer reviews every pull request, usually within a week. Expect
+   questions; they are about the work, never about you. It is squashed into one commit on
+   merge.
+
+### The rules that keep it consistent
+
+- **Everywhere.** Follow the laws in [`AGENTS.md`](AGENTS.md). Match the code around you.
+  Rules in `src/core` are written test first and keep 95% coverage. British English, no
+  marketing language.
+- **Lessons.** Follow [`CONTENT-GUIDE.md`](docs/CONTENT-GUIDE.md) and
+  [`WRITING-GUIDE.md`](docs/WRITING-GUIDE.md): one idea per screen, explain before you test,
+  no mental arithmetic. Plain, generic examples, never a real company's product. Every
+  solution passes its tests and every fact has a checked source. Say when a lesson is new,
+  so it can be marked as new.
+- **Interface.** Design tokens only ([`DESIGN.md`](docs/DESIGN.md)): no literal colours,
+  arbitrary values, gradients or emoji icons. Check every changed screen at 390, 768, 1024
+  and 1440 px, in light and dark, and attach screenshots. Every route passes axe (WCAG 2.2
+  AA).
+- **Scout and MCP.** Scout runs on the learner's own Claude: never a server-side key, never a
+  paid call on a visitor's behalf, never a stored learner key. It stays out of anything that
+  measures the learner. Start at `src/core/ports/assistant.ts` and
+  [`ONLINE-TEST.md`](docs/ONLINE-TEST.md), section 6.
+
+### Before you open a pull request
+
+```sh
+pnpm check         # content, audit, lint, typecheck, unit tests, build
+pnpm test:e2e      # for any change to a screen
+```
+
+CI on GitHub runs only the fast part of this, so a green badge is not the whole check.
+
+### Commits and pull requests
+
+- **Commit subject:** imperative, what changed and where, no full stop, under 72 characters:
+  `Add hint ladder to code-challenge steps`. Add a short body only when the reason is not
+  obvious.
+- **One logical change per commit and per pull request.** A fix and a refactor are two.
+- **Pull request title** reads like a commit subject; the description says what, why, how
+  you tested it, and links the issue it closes.
+- Answer review comments with new commits rather than force-pushes, so the conversation
+  stays readable.
+
+### AI help, licensing and conduct
+
 - **AI-assisted contributions are fine,** as long as you have read, run and understood every
-  line you submit. That is the point of this project, after all.
+  line you submit, and can explain it in review. Unchecked generated code will be closed.
+  Understanding the code is the whole point of this project.
+- **Licensing:** by contributing you agree that code, design and docs are licensed under
+  MIT, and lesson content under CC BY-NC-SA 4.0, like the rest of the repository.
+- **Conduct:** everyone follows the [code of conduct](CODE_OF_CONDUCT.md). Report security
+  issues privately as described in [`SECURITY.md`](SECURITY.md), never in a public issue.
 
-The full guide, with the setup, the checklist and how reviews work, is in
-[`CONTRIBUTING.md`](CONTRIBUTING.md). Please read the
-[code of conduct](CODE_OF_CONDUCT.md), and report security issues privately as described in
-[`SECURITY.md`](SECURITY.md).
+The full guide, with setup and more detail for each area, is in
+[`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## Licence
 

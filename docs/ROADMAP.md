@@ -44,7 +44,7 @@ holds state and priorities only, so keep it short and current.
   response handler. The editor test `typecheck.test.tsx` has an intermittent jsdom
   `getClientRects` error.
 - **Readability.** When every lesson passes `pnpm content:readability`, move its rules into
-  `pnpm validate:content` as warnings, then run CI with `--strict`.
+  `pnpm validate:content` as warnings, then make them errors under `--strict`.
 
 ## 3. Priorities
 
@@ -66,6 +66,9 @@ a SQL step or a figure cannot.
 ## 4. How to run the work
 
 - Definition of done for any change: `pnpm check` and `pnpm test:e2e` green.
+- CI on GitHub is only the fast gate (content rules, lint, types, unit tests; a few
+  minutes). The solution gates, coverage, build and end-to-end suite run locally and in the
+  "Full check" workflow, started by hand before a release.
 - One chapter or one feature per agent, and at most four agents at a time.
 - Commit after every finished piece of work. Never leave work only on disk.
 - Parallel agents each use their own `NEXT_DIST_DIR` and `PW_PORT` for builds and e2e

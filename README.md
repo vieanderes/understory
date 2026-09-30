@@ -43,8 +43,17 @@ teaches an experienced engineer something.
 Most of all, it became my preparation for interviews in AI engineering and coding in
 general. The online-test simulator is built to work the way real assessments do: the same
 kind of IDE, one clock that never pauses, hidden tests, an optional built-in AI assistant,
-and a report that reads like the reviewer's. I may have overprepared. But the result is
-here, and I would rather share it than keep it to myself.
+and a report that reads like the reviewer's. I may have overprepared.
+
+When it reached a certain point, I had a choice to make. I could spend more time polishing
+it and try to turn it into a business. Or I could give it away. I kept thinking about how it
+feels to find a really good way to learn something, and then hit a paywall, a sign-up form
+or a trial that runs out. I have always found that a shame. Learning should be open to
+everyone, free, and something we build together. So I made Understory public.
+
+Maybe nobody will notice, and I will simply keep using it myself. That is fine. But maybe
+some of you will like it, see where it could go, and make it part of how you learn. And maybe
+a few of you will help build it. If so, you are very welcome.
 
 If it helps you learn something new, rehearse for an interview, or get fluent again after
 too much vibe coding, it has done its job.

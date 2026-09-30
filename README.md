@@ -45,21 +45,24 @@ general. The online-test simulator is built to work the way real assessments do:
 kind of IDE, one clock that never pauses, hidden tests, an optional built-in AI assistant,
 and a report that reads like the reviewer's. I may have overprepared.
 
-When it reached a certain point, I had a choice to make. I could spend more time polishing
-it and try to turn it into a business. Or I could give it away. I kept thinking about how it
-feels to find a really good way to learn something, and then hit a paywall, a sign-up form
-or a trial that runs out. I have always found that a shame. Learning should be open to
-everyone, free, and something we build together. So I made Understory public.
+Once it had grown into something bigger and useful, I had a real decision to make. I could
+keep polishing it on my own and try to build a business around it, or I could open it up
+for everyone else to use and improve.
 
-Maybe nobody will notice, and I will simply keep using it myself. That is fine. But maybe
-some of you will like it, see where it could go, and make it part of how you learn. And maybe
-a few of you will help build it. If so, you are very welcome.
+I kept coming back to a feeling most of us know. You find a genuinely good way to learn
+something, and then you hit a paywall, a sign-up form or a trial that runs out. That has
+always seemed a shame to me. I believe learning should be free, open to everyone, and
+something we build together. So I decided to make Understory open source.
 
-If it helps you learn something new, rehearse for an interview, or get fluent again after
-too much vibe coding, it has done its job.
+It may stay a quiet project that mostly I use, and I would be happy with that. But I hope
+some of you find it useful, see what it could become, and make it part of how you learn. If
+you would like to help build it, you are very welcome.
 
-And yes, it was built with AI assistance too. The point was never to code without AI. It
-was to know what the code underneath does.
+If it helps you learn something new, prepare for an interview, or feel at home in your own
+code again after a stretch of vibe coding, it has done what I built it for.
+
+And yes, I built it with AI assistance. Avoiding AI was never the goal. Understanding the
+code underneath is, whoever or whatever wrote it.
 
 > In a randomised trial with 52 engineers, the group that coded with AI assistance scored
 > **50%** on a comprehension quiz. The group that coded by hand scored **67%**, with no
@@ -1196,6 +1199,8 @@ The full guide, with setup and more detail for each area, is in
 - **Lessons** in `content/` are under [CC BY-NC-SA 4.0](content/LICENSE). Share and adapt
   them with credit, not for commercial use, and release what you adapt under the same
   licence. The credit line to use is at the top of [`content/LICENSE`](content/LICENSE).
+- **Bundled open-source packages** in the sandbox runtimes keep their own licences, listed
+  in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
 
 <br>
 

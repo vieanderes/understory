@@ -39,7 +39,9 @@ const filesUnder = (dir: string): string[] =>
 // on a CI runner it takes about three minutes, and longer beside the other test processes,
 // so the limit leaves room for the course to grow.
 describe('validate-content.ts', { timeout: 600_000 }, () => {
-  it('passes on the real content, even under --strict', () => {
+  // CI runs `pnpm validate:content --strict` as a step of its own, so the same three
+  // minutes are not paid twice there.
+  it.skipIf(process.env.CI === 'true')('passes on the real content, even under --strict', () => {
     const { code, stdout } = runScript(VALIDATE, REPO, ['--strict']);
     expect(stdout).toContain('no problems');
     expect(code).toBe(0);

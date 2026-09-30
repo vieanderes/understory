@@ -1,6 +1,6 @@
 'use client';
 
-import { ArrowUp, Check, ChevronDown, Copy, CornerDownRight, Square, X } from 'lucide-react';
+import { ArrowUp, Check, ChevronDown, Copy, CornerDownRight, Square } from 'lucide-react';
 import {
   useEffect,
   useId,
@@ -75,8 +75,8 @@ export interface AssistantPanelProps {
 
 const PROVIDER_LABEL: Record<AssistantProviderId, string> = {
   'api-key': 'Your API key',
-  'claude-cli': 'Your Claude account, here',
-  mcp: 'Your Claude account (MCP)',
+  'claude-cli': 'Claude Code on this machine',
+  mcp: 'Your Claude account',
 };
 
 const MODEL_LABEL: Record<AssistantModel, string> = {
@@ -145,6 +145,99 @@ function CopyButton({ value, label }: { value: string; label: string }) {
   );
 }
 
+/** A value to paste somewhere else: shown in full, one tap to copy. */
+function CopyField({ value, label }: { value: string; label: string }) {
+  return (
+    <div className="border-border bg-sunken rounded-control flex items-start gap-0.5 border py-0.5 pr-0.5 pl-1">
+      <code className="min-w-0 flex-1 py-1 font-mono text-sm wrap-break-word select-all">
+        {value}
+      </code>
+      <CopyButton value={value} label={label} />
+    </div>
+  );
+}
+
+/** One numbered step of connecting the Claude app: the order is the instruction. */
+function Step({ n, title, children }: { n: number; title: string; children: ReactNode }) {
+  return (
+    <li className="flex gap-1">
+      <span
+        aria-hidden
+        className="border-border-strong t-figure text-muted inline-flex size-3 shrink-0 items-center justify-center rounded-full border text-sm"
+      >
+        {n}
+      </span>
+      <div className="flex min-w-0 flex-1 flex-col gap-1">
+        <p className="flex min-h-3 items-center text-sm font-medium">{title}</p>
+        {children}
+      </div>
+    </li>
+  );
+}
+
+const PROVIDER_HINT: Record<AssistantProviderId, string> = {
+  mcp: 'Connect the Claude app once. Works on web, desktop and phone.',
+  'claude-cli': 'Uses the account logged in to Claude Code. Nothing to set up.',
+  'api-key': 'An Anthropic key, kept in this browser.',
+};
+
+function ProviderChoice({
+  provider,
+  cliAvailable,
+  disabled,
+  onChange,
+}: {
+  provider: AssistantProviderId;
+  cliAvailable: boolean;
+  disabled: boolean;
+  onChange: (id: AssistantProviderId) => void;
+}) {
+  const name = useId();
+  const options: AssistantProviderId[] = cliAvailable
+    ? ['mcp', 'claude-cli', 'api-key']
+    : ['mcp', 'api-key'];
+  return (
+    <fieldset disabled={disabled} className="flex min-w-0 flex-col gap-1">
+      <legend className="t-label mb-1">Assistant</legend>
+      <div className="border-border rounded-panel divide-border flex flex-col divide-y border">
+        {options.map((id) => (
+          <label
+            key={id}
+            className={cn(
+              'group first:rounded-t-panel last:rounded-b-panel flex cursor-pointer items-start gap-1 p-1.5',
+              'transition-press hover:bg-raised has-checked:bg-raised',
+              'has-focus-visible:outline-accent has-focus-visible:relative has-focus-visible:outline-2 has-focus-visible:-outline-offset-2',
+              'has-disabled:cursor-default has-disabled:opacity-60',
+            )}
+          >
+            <input
+              type="radio"
+              name={name}
+              value={id}
+              checked={provider === id}
+              onChange={() => onChange(id)}
+              className="peer sr-only"
+            />
+            <span
+              aria-hidden
+              className={cn(
+                'border-border-strong mt-0.5 inline-flex size-2 shrink-0 items-center justify-center rounded-full border',
+                'transition-press peer-checked:border-fg',
+              )}
+            >
+              <span className="bg-fg transition-press size-1 scale-0 rounded-full group-has-checked:scale-100" />
+            </span>
+            <span className="flex min-w-0 flex-col">
+              <span className="text-sm font-medium">{PROVIDER_LABEL[id]}</span>
+              <span className="text-muted text-sm text-pretty">{PROVIDER_HINT[id]}</span>
+            </span>
+          </label>
+        ))}
+      </div>
+    </fieldset>
+  );
+}
+
 function ProviderSetup({
   provider,
   onEdit,
@@ -201,9 +294,8 @@ function ProviderSetup({
             }}
             className={cn(FIELD, 'mt-0.5 h-5 font-mono')}
           />
-          <p className="text-muted mt-0.5 text-sm">
-            Kept in this browser. Sent only to this app, which passes it to Anthropic and never
-            stores it.
+          <p className="text-muted mt-0.5 text-sm text-pretty">
+            Sent only to this app, which passes it to Anthropic and never stores it.
           </p>
         </div>
         {modelField}
@@ -211,16 +303,7 @@ function ProviderSetup({
     );
   }
 
-  if (provider === 'claude-cli') {
-    return (
-      <div className="flex flex-col gap-2">
-        <p className="text-muted text-sm">
-          Uses the account logged in to Claude Code on this machine. Nothing to set up.
-        </p>
-        {modelField}
-      </div>
-    );
-  }
+  if (provider === 'claude-cli') return modelField;
 
   const endpoint = `${origin}/api/mcp`;
   const command = `claude mcp add --transport http understory ${endpoint}`;
@@ -228,39 +311,40 @@ function ProviderSetup({
   // Claude Code and Claude Desktop's local connections, not for the web or phone apps.
   const local = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:|\/|$)/.test(origin);
   const formatted = pairing ? formatPairingCode(pairing) : '';
+  const prompt = `Answer my Understory question, code ${formatted}`;
   return (
-    <div className="flex flex-col gap-2 text-sm">
-      <div>
-        <p className="t-label">Pairing code</p>
-        <div className="mt-0.5 flex items-center gap-1">
-          <span className="t-figure text-lg font-semibold">{formatted}</span>
-          <CopyButton value={formatted} label="Copy pairing code" />
+    <div className="flex flex-col gap-3">
+      <div className="bg-raised rounded-panel shadow-edge flex items-center gap-1 py-1 pr-1 pl-2">
+        <div className="flex min-w-0 flex-1 flex-col">
+          <p className="t-label">Pairing code</p>
+          <p className="font-mono text-lg font-semibold">{formatted}</p>
         </div>
+        <CopyButton value={formatted} label="Copy pairing code" />
       </div>
-      <div>
-        <p className="t-label">Connect your Claude app once</p>
-        <p className="text-muted mt-0.5">
-          {local
-            ? 'In Claude Code, run the command below. The Claude web and phone apps need the deployed site, not localhost.'
-            : 'In Claude (web, desktop or phone): Settings, Connectors, Add custom connector, with this URL. Or run the command below in Claude Code.'}
-        </p>
-        {local ? null : (
-          <div className="border-border bg-sunken rounded-control mt-0.5 flex items-start gap-0.5 border py-0.5 pr-0.5 pl-1">
-            <code className="min-w-0 flex-1 py-0.5 font-mono text-sm break-all">{endpoint}</code>
-            <CopyButton value={endpoint} label="Copy connector URL" />
-          </div>
-        )}
-      </div>
-      <div>
-        <p className="t-label">Claude Code</p>
-        <div className="border-border bg-sunken rounded-control mt-0.5 flex items-start gap-0.5 border py-0.5 pr-0.5 pl-1">
-          <code className="min-w-0 flex-1 py-0.5 font-mono text-sm break-all">{command}</code>
-          <CopyButton value={command} label="Copy command" />
-        </div>
-      </div>
-      <p className="text-muted">
-        Then ask here, and tell Claude: answer my simulator question, code {formatted}.
-      </p>
+      <ol aria-label="Connect your Claude app" className="flex flex-col gap-3">
+        <Step n={1} title={local ? 'Add Understory to Claude Code' : 'Add Understory to Claude'}>
+          {local ? (
+            <>
+              <p className="text-muted text-sm text-pretty">
+                Run this once. The Claude web and phone apps need the deployed site, not localhost.
+              </p>
+              <CopyField value={command} label="Copy command" />
+            </>
+          ) : (
+            <>
+              <p className="text-muted text-sm text-pretty">
+                In Settings, Connectors, add a custom connector with this URL.
+              </p>
+              <CopyField value={endpoint} label="Copy connector URL" />
+              <p className="text-muted text-sm">Or in Claude Code:</p>
+              <CopyField value={command} label="Copy command" />
+            </>
+          )}
+        </Step>
+        <Step n={2} title="Ask here, then tell Claude">
+          <CopyField value={prompt} label="Copy the message for Claude" />
+        </Step>
+      </ol>
     </div>
   );
 }
@@ -292,7 +376,6 @@ export function AssistantPanel({
   const controller = useRef<AbortController | null>(null);
   const scroller = useRef<HTMLDivElement>(null);
 
-  const providerId = useId();
   const draftId = useId();
   const setupId = useId();
   const hintId = useId();
@@ -371,6 +454,7 @@ export function AssistantPanel({
     <section aria-label="Assistant" className="bg-surface flex h-full min-h-0 flex-1 flex-col">
       <div
         ref={scroller}
+        hidden={setupOpen}
         className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-2 pt-2 pb-3"
         role="log"
         aria-label="Conversation"
@@ -474,63 +558,53 @@ export function AssistantPanel({
         </ol>
       </div>
 
-      {error ? (
-        <p role="alert" className="text-danger px-2 pb-1 text-sm">
-          {error}
-        </p>
-      ) : null}
-
       {setupOpen ? (
+        // The connection is a view of its own that scrolls, not a block stacked on the
+        // conversation: on a phone that pushed the question box out of the sheet.
         <div
           id={setupId}
           role="group"
           aria-labelledby={`${setupId}-title`}
-          className="rule-t bg-raised flex flex-col gap-2 px-2 pt-1 pb-2"
+          className="scout-view min-h-0 flex-1 overflow-y-auto overscroll-contain px-2 pt-1 pb-3"
         >
-          <div className="-mr-1 flex items-center justify-between gap-1">
-            <p id={`${setupId}-title`} className="text-sm font-semibold">
+          <div className="bg-surface sticky top-0 z-10 -mr-1 flex h-5 items-center justify-between gap-1">
+            <h3 id={`${setupId}-title`} className="text-base font-semibold">
               Connection
-            </p>
+            </h3>
             <button
               type="button"
               onClick={() => setSetupChoice(false)}
-              aria-label="Close connection settings"
-              title="Close"
               className={cn(
-                'text-muted hover:text-fg hover:bg-sunken rounded-control inline-flex size-5 items-center justify-center',
+                'text-fg hover:bg-raised rounded-control inline-flex h-5 items-center px-1 text-sm font-medium',
                 'transition-press active:scale-98',
                 FOCUS,
               )}
             >
-              <X aria-hidden size={16} strokeWidth={2} />
+              Done
             </button>
           </div>
-          <div>
-            <label htmlFor={providerId} className="t-label">
-              Assistant
-            </label>
-            <select
-              id={providerId}
-              value={provider}
-              onChange={(event) => {
-                providerStore.set(event.target.value);
+          <div className="mt-2 flex flex-col gap-3">
+            <ProviderChoice
+              provider={provider}
+              cliAvailable={cli === 'available'}
+              disabled={busy}
+              onChange={(id) => {
+                providerStore.set(id);
                 setError(null);
               }}
-              disabled={busy}
-              className={cn(FIELD, 'disabled:text-faint mt-0.5 h-5 font-medium')}
-            >
-              <option value="mcp">{PROVIDER_LABEL.mcp}</option>
-              {cli === 'available' ? (
-                <option value="claude-cli">{PROVIDER_LABEL['claude-cli']}</option>
-              ) : null}
-              <option value="api-key">{PROVIDER_LABEL['api-key']}</option>
-            </select>
+            />
+            <ProviderSetup
+              provider={provider}
+              onEdit={() => setSetupChoice((choice) => choice ?? true)}
+            />
           </div>
-          <ProviderSetup
-            provider={provider}
-            onEdit={() => setSetupChoice((choice) => choice ?? true)}
-          />
         </div>
+      ) : null}
+
+      {error ? (
+        <p role="alert" className="text-danger px-2 pb-1 text-sm">
+          {error}
+        </p>
       ) : null}
 
       <form

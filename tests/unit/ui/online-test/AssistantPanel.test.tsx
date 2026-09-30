@@ -101,8 +101,8 @@ describe('AssistantPanel', () => {
     // A Claude account through MCP is the default; a key is chosen explicitly.
     // The connection sits behind a chip; setup opens on demand.
     await user.click(screen.getByRole('button', { name: /Assistant settings/ }));
-    expect(screen.getByRole('combobox', { name: 'Assistant' })).toHaveValue('mcp');
-    await user.selectOptions(screen.getByRole('combobox', { name: 'Assistant' }), 'api-key');
+    expect(screen.getByRole('radio', { name: /Your Claude account/ })).toBeChecked();
+    await user.click(screen.getByRole('radio', { name: /Your API key/ }));
     expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled();
     const key = screen.getByLabelText('Anthropic API key');
     await user.type(key, 'sk-ant-123');
@@ -212,7 +212,8 @@ describe('AssistantPanel', () => {
       />,
     );
     await user.click(screen.getByRole('button', { name: /Assistant settings/ }));
-    await user.selectOptions(screen.getByRole('combobox', { name: 'Assistant' }), 'mcp');
+    await user.click(screen.getByRole('radio', { name: /Your API key/ }));
+    await user.click(screen.getByRole('radio', { name: /Your Claude account/ }));
     expect(window.localStorage.getItem('understory:assistant:provider')).toBe('mcp');
     expect(ids.at(-1)).toBe('mcp');
 
@@ -233,7 +234,7 @@ describe('AssistantPanel', () => {
     await waitFor(() => expect(fetch).toHaveBeenCalled());
     await user.click(screen.getByRole('button', { name: /Assistant settings/ }));
     expect(
-      screen.queryByRole('option', { name: 'Your Claude account, here' }),
+      screen.queryByRole('radio', { name: /Claude Code on this machine/ }),
     ).not.toBeInTheDocument();
     unmount();
 
@@ -242,7 +243,7 @@ describe('AssistantPanel', () => {
     render(<Harness createPort={() => controllablePort().port} />);
     await user.click(await screen.findByRole('button', { name: /Assistant settings/ }));
     expect(
-      await screen.findByRole('option', { name: 'Your Claude account, here' }),
+      await screen.findByRole('radio', { name: /Claude Code on this machine/ }),
     ).toBeInTheDocument();
   });
 });

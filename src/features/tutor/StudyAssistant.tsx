@@ -198,6 +198,15 @@ export function StudyAssistant({
         </span>
       )}
       {open ? (
+        // On a phone the sheet covers the page: the dimmed page behind marks where it ends,
+        // and a tap there closes it. Desktop keeps the page in view and usable.
+        <div
+          aria-hidden
+          onClick={close}
+          className="scout-scrim bg-scrim fixed inset-0 z-40 md:hidden print:hidden"
+        />
+      ) : null}
+      {open ? (
         <aside
           aria-label="Scout AI"
           data-from={docked ? 'top' : 'bottom'}

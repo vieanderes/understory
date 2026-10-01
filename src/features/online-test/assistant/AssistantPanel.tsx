@@ -8,6 +8,7 @@ import {
   CornerDownRight,
   RefreshCw,
   Square,
+  TriangleAlert,
 } from 'lucide-react';
 import {
   useEffect,
@@ -322,6 +323,25 @@ function ProviderSetup({
 
   if (provider === 'claude-cli') return modelField;
 
+  if (status.unavailable) {
+    return (
+      <section className="flex flex-col gap-1">
+        <h4 className="flex items-center gap-1 text-base font-semibold">
+          <TriangleAlert aria-hidden size={16} strokeWidth={2} className="text-warning shrink-0" />
+          Not available on this site
+        </h4>
+        <p className="text-muted text-sm text-pretty">
+          This site’s server has no shared store, so Claude cannot reach this tab. Choose another
+          assistant above.
+        </p>
+        <p className="text-muted text-sm text-pretty">
+          Run this site? Connect a Redis store to the deployment and redeploy. The deployment guide
+          has the steps.
+        </p>
+      </section>
+    );
+  }
+
   const endpoint = `${origin}/api/mcp`;
   const command = `claude mcp add --transport http understory ${endpoint}`;
   // claude.ai reaches connectors from its own servers, so a localhost URL only works for
@@ -425,7 +445,9 @@ export function AssistantPanel({
   const setupId = useId();
   const hintId = useId();
 
-  const ready = provider !== 'api-key' || apiKey.length > 0;
+  const mcpStatus = useMcpStatus(provider === 'mcp' && !createPort);
+  const ready =
+    provider === 'api-key' ? apiKey.length > 0 : !(provider === 'mcp' && mcpStatus.unavailable);
   // Open by itself until the provider is ready; after that the candidate decides.
   const setupOpen = setupChoice ?? !ready;
   const busy = streaming !== null;
@@ -436,7 +458,6 @@ export function AssistantPanel({
     // eslint-disable-next-line react-hooks/exhaustive-deps -- pairing is read inside defaultCreatePort
     [createPort, provider, pairing],
   );
-  const mcpStatus = useMcpStatus(provider === 'mcp' && !createPort);
   const decide = async (allow: boolean) => {
     const request = mcpStatus.request;
     if (!request) return;

@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { clientOf, limited, recordFailure } from '@/adapters/assistant/server/rate-limit';
-import { getBridgeStore } from '@/adapters/assistant/server/bridge-store';
+import { getBridgeStore, sharedStoreMissing } from '@/adapters/assistant/server/bridge-store';
 import {
   PAIRING_HEADER,
   pairingCodeSchema,
@@ -52,6 +52,12 @@ function credentials(request: Request) {
 const MALFORMED = () =>
   errorResponse('failed', 'The pairing code or tab secret is malformed.', 400);
 
+const NO_SHARED_STORE = () =>
+  errorResponse(
+    'unavailable',
+    'Claude via MCP is not set up on this server: it needs a shared store. Choose another assistant for now.',
+  );
+
 /** Another tab holds this code: counted, since a stranger guessing looks like this. */
 async function forbidden(request: Request): Promise<Response> {
   await recordFailure(getBridgeStore().backend, clientOf(request));
@@ -65,6 +71,7 @@ async function forbidden(request: Request): Promise<Response> {
 export async function POST(request: Request) {
   const tooMany = await limited(request, 'bridge');
   if (tooMany) return tooMany;
+  if (sharedStoreMissing()) return NO_SHARED_STORE();
   const pair = credentials(request);
   if (!pair) return MALFORMED();
   const parsed = await readBody(request, bodySchema);
@@ -95,6 +102,7 @@ export async function POST(request: Request) {
 export async function GET(request: Request) {
   const tooMany = await limited(request, 'bridge');
   if (tooMany) return tooMany;
+  if (sharedStoreMissing()) return NO_SHARED_STORE();
   const pair = credentials(request);
   if (!pair) return MALFORMED();
   const since = Number(new URL(request.url).searchParams.get('since') ?? '0');

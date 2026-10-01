@@ -136,6 +136,8 @@ export interface McpStatus {
   agentSeenAt: number | null;
   /** Another tab holds this code: the panel makes a new one. */
   taken: boolean;
+  /** The server cannot pair at all (no shared store), so the setup steps would not work. */
+  unavailable: boolean;
 }
 
 export const NO_MCP_STATUS: McpStatus = {
@@ -143,6 +145,7 @@ export const NO_MCP_STATUS: McpStatus = {
   request: null,
   agentSeenAt: null,
   taken: false,
+  unavailable: false,
 };
 
 /** Reads the connection, without touching the replies (since is past them all). */
@@ -156,6 +159,7 @@ export async function fetchMcpStatus(
       cache: 'no-store',
     });
     if (response.status === 403) return { ...NO_MCP_STATUS, taken: true };
+    if (response.status === 503) return { ...NO_MCP_STATUS, unavailable: true };
     if (!response.ok) return undefined;
     const body = (await response.json()) as {
       agentSeenAt: number | null;
@@ -166,6 +170,7 @@ export async function fetchMcpStatus(
       request: body.connection.request,
       agentSeenAt: body.agentSeenAt,
       taken: false,
+      unavailable: false,
     };
   } catch {
     return undefined;

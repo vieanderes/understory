@@ -20,10 +20,23 @@ and `/api/mcp`. Each is rate-limited per client
 calls a minute, and a client that sends twenty wrong pairing codes or tab secrets is shut
 out for ten minutes. The API key route spends the candidate's own key, never one of ours. The
 local route answers only on the candidate's machine. The MCP bridge keeps sessions in
-memory by default, which is enough on the VPS. On Vercel, create a free Upstash Redis
-database (or add Vercel's Redis integration) and set `UPSTASH_REDIS_REST_URL` and
-`UPSTASH_REDIS_REST_TOKEN` (or `KV_REST_API_URL` and `KV_REST_API_TOKEN`): every instance then
-shares the sessions, and connecting Claude through MCP works there too. The rate limits
+memory by default, which is enough on the VPS. On Vercel it is not: the tab's route and
+the app's route run as separate functions, so without a shared store Claude never finds
+the tab's code, and the panel says Claude via MCP is not available on this site. To set
+the store up:
+
+1. In the Vercel project, open Storage (or the Marketplace) and choose **Upstash for
+   Redis**. Not "Redis" (Redis Cloud): that one gives a `redis://` URL, and the bridge
+   speaks Upstash's REST API.
+2. Create a database on the free plan, in the region nearest the functions (US East,
+   N. Virginia, for the default `iad1`), with no read regions and eviction off (every key
+   expires by itself), and connect it to the project for Production and Preview.
+   The integration sets `KV_REST_API_URL` and `KV_REST_API_TOKEN`; there are no keys to copy.
+3. Redeploy: environment variables apply only to new deployments.
+
+Outside the Marketplace, a database made at upstash.com shows the same two values under
+REST API; set them as `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN`. Every
+instance then shares the sessions, and connecting Claude through MCP works. The rate limits
 are counted in the same store, so with Redis they hold across every instance; without it,
 each instance keeps its own count, a floor rather than a ceiling. How the MCP connection
 stays safe without a sign-in is in docs/ONLINE-TEST.md, section 6.

@@ -1,6 +1,6 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Pairing } from '@/adapters/assistant/pairing';
 import { collect, CONTEXT } from './fixtures';
 
@@ -349,6 +349,26 @@ describe('bridge route', () => {
     expect(bad.status).toBe(400);
   });
 
+  it('says so at once on a serverless host with no shared store', async () => {
+    vi.stubEnv('VERCEL', '1');
+    try {
+      const pair = pairing('ABCD2345');
+      const asked = await tab(pair, {
+        type: 'ask',
+        turns: [{ role: 'user', text: 'Hi' }],
+        context: CONTEXT,
+      });
+      expect(asked.status).toBe(503);
+      expect(((await asked.json()) as { error: { code: string } }).error.code).toBe('unavailable');
+      expect((await get({ 'x-pairing-code': pair.code, 'x-tab-secret': pair.secret })).status).toBe(
+        503,
+      );
+      expect((await fetchMcpStatus(pair, appFetch))?.unavailable).toBe(true);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it('stores pushed context, and refuses another tab with the same code', async () => {
     const pair = pairing('CTXT2345');
     expect(await (await tab(pair, { type: 'context', context: CONTEXT })).json()).toEqual({
@@ -363,5 +383,6 @@ describe('bridge route', () => {
     expect(refused.status).toBe(403);
     expect((await fetchMcpStatus(intruder, fetcher))?.taken).toBe(true);
     expect((await fetchMcpStatus(pair, fetcher))?.taken).toBe(false);
+    expect((await fetchMcpStatus(pair, fetcher))?.unavailable).toBe(false);
   });
 });

@@ -451,13 +451,27 @@ export class BridgeStore {
   }
 }
 
-/** Redis when configured, memory otherwise. */
-export function backendFromEnv(
-  env: Record<string, string | undefined> = process.env,
-): SessionBackend & KeyValue {
+type Env = Record<string, string | undefined>;
+
+function redisFromEnv(env: Env): { url: string; token: string } | undefined {
   const url = env.UPSTASH_REDIS_REST_URL ?? env.KV_REST_API_URL;
   const token = env.UPSTASH_REDIS_REST_TOKEN ?? env.KV_REST_API_TOKEN;
-  return url && token ? new RedisRestBackend(url, token) : new MemoryBackend();
+  return url && token ? { url, token } : undefined;
+}
+
+/** Redis when configured, memory otherwise. */
+export function backendFromEnv(env: Env = process.env): SessionBackend & KeyValue {
+  const redis = redisFromEnv(env);
+  return redis ? new RedisRestBackend(redis.url, redis.token) : new MemoryBackend();
+}
+
+/**
+ * On Vercel the tab's route and the app's route run as separate functions with no memory
+ * in common, so without Redis the app never finds the tab's code and the tab waits out
+ * its five minutes. Better to say so on the first request.
+ */
+export function sharedStoreMissing(env: Env = process.env): boolean {
+  return Boolean(env.VERCEL) && !redisFromEnv(env);
 }
 
 // One store per server process. On globalThis so that dev hot reloads, which re-evaluate

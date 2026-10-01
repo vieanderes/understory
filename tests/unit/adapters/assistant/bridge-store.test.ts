@@ -7,6 +7,7 @@ import {
   hashSecret,
   MemoryBackend,
   RedisRestBackend,
+  sharedStoreMissing,
 } from '@/adapters/assistant/server/bridge-store';
 import {
   createPairingCode,
@@ -284,6 +285,14 @@ describe('BridgeStore backends', () => {
     expect(backendFromEnv({ KV_REST_API_URL: 'https://r', KV_REST_API_TOKEN: 't' })).toBeInstanceOf(
       RedisRestBackend,
     );
+  });
+
+  it('reports a serverless host with no shared store', () => {
+    expect(sharedStoreMissing({})).toBe(false);
+    expect(sharedStoreMissing({ VERCEL: '1' })).toBe(true);
+    expect(
+      sharedStoreMissing({ VERCEL: '1', KV_REST_API_URL: 'https://r', KV_REST_API_TOKEN: 't' }),
+    ).toBe(false);
   });
 
   it('is one store per process, kept on globalThis across module reloads', () => {

@@ -643,9 +643,11 @@ export function AssistantPanel({
           id={setupId}
           role="group"
           aria-labelledby={`${setupId}-title`}
-          className="scout-view min-h-0 flex-1 overflow-y-auto overscroll-contain px-2 pt-1 pb-3"
+          className="scout-view min-h-0 flex-1 overflow-y-auto overscroll-contain px-2 pb-3"
         >
-          <div className="bg-surface sticky top-0 z-10 -mr-1 flex h-5 items-center justify-between gap-1">
+          {/* The top padding lives on the sticky bar, not the scroller: padding above a
+              sticky bar is a strip the scrolled content shows through. */}
+          <div className="bg-surface sticky top-0 z-10 -mr-1 box-content flex h-5 items-center justify-between gap-1 pt-1">
             <h3 id={`${setupId}-title`} className="text-base font-semibold">
               Connection
             </h3>

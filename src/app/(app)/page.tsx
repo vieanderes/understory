@@ -1,7 +1,12 @@
+import type { Metadata } from 'next';
+import { JsonLd } from '@/components/app/JsonLd';
 import { courseTree } from '@/features/paths/custom';
 import { HomeScreen, type CourseOutline, type NewsBrief } from '@/features/paths/HomeScreen';
 import { getManifest, getPaths, getPlanCatalog } from '@/lib/content';
 import { getLatestDay } from '@/lib/news';
+import { siteData } from '@/lib/structured-data';
+
+export const metadata: Metadata = { alternates: { canonical: '/' } };
 
 export default async function HomePage() {
   const [paths, manifest, catalog, day] = await Promise.all([
@@ -36,12 +41,15 @@ export default async function HomePage() {
       }
     : null;
   return (
-    <HomeScreen
-      paths={paths}
-      course={course}
-      catalog={catalog}
-      news={news}
-      tree={courseTree(manifest)}
-    />
+    <>
+      <JsonLd data={siteData()} />
+      <HomeScreen
+        paths={paths}
+        course={course}
+        catalog={catalog}
+        news={news}
+        tree={courseTree(manifest)}
+      />
+    </>
   );
 }

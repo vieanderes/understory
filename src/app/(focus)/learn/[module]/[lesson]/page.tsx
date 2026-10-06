@@ -1,8 +1,10 @@
 import type { Metadata } from 'next';
 import { notFound } from 'next/navigation';
+import { JsonLd } from '@/components/app/JsonLd';
 import { PlayerForLesson } from '@/features/lesson-player/PlayerForLesson';
 import { onPath } from '@/features/paths/links';
 import { getAllLessonRoutes, getLessonByRoute, getModule, getPaths } from '@/lib/content';
+import { lessonData } from '@/lib/structured-data';
 
 type Props = { params: Promise<{ module: string; lesson: string }> };
 
@@ -14,7 +16,13 @@ export async function generateStaticParams() {
 export async function generateMetadata({ params }: Props): Promise<Metadata> {
   const { module: moduleSlug, lesson: lessonSlug } = await params;
   const lesson = await getLessonByRoute(moduleSlug, lessonSlug);
-  return lesson ? { title: lesson.title, description: lesson.objective } : {};
+  return lesson
+    ? {
+        title: lesson.title,
+        description: lesson.objective,
+        alternates: { canonical: `/learn/${moduleSlug}/${lessonSlug}` },
+      }
+    : {};
 }
 
 export default async function LessonPage({ params }: Props) {
@@ -44,20 +52,29 @@ export default async function LessonPage({ params }: Props) {
     });
 
   return (
-    <PlayerForLesson
-      paths={onPaths}
-      lesson={lesson}
-      moduleTitle={courseModule?.title ?? ''}
-      exitHref="/paths"
-      solutionsUrl={solutionsFile ? `/content/v1/${solutionsFile}` : undefined}
-      next={
-        nextRoute && nextLesson
-          ? {
-              href: `/learn/${nextRoute.moduleSlug}/${nextRoute.lessonSlug}`,
-              title: nextLesson.title,
-            }
-          : null
-      }
-    />
+    <>
+      <JsonLd
+        data={lessonData({
+          title: lesson.title,
+          objective: lesson.objective,
+          href: `/learn/${moduleSlug}/${lessonSlug}`,
+        })}
+      />
+      <PlayerForLesson
+        paths={onPaths}
+        lesson={lesson}
+        moduleTitle={courseModule?.title ?? ''}
+        exitHref="/paths"
+        solutionsUrl={solutionsFile ? `/content/v1/${solutionsFile}` : undefined}
+        next={
+          nextRoute && nextLesson
+            ? {
+                href: `/learn/${nextRoute.moduleSlug}/${nextRoute.lessonSlug}`,
+                title: nextLesson.title,
+              }
+            : null
+        }
+      />
+    </>
   );
 }

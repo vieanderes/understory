@@ -3,15 +3,38 @@ import { HydrationMark } from '@/components/app/HydrationMark';
 import { InlineScript } from '@/components/theme/InlineScript';
 import { Arrival } from '@/features/motion/MotionLayer';
 import { MOTION_INIT_SCRIPT } from '@/features/motion/init-script';
+import { SITE_DESCRIPTION, SITE_NAME, SITE_TITLE, SITE_URL } from '@/lib/site';
 import { THEME_INIT_SCRIPT } from '@/lib/theme';
 import { fontVariables } from './fonts';
 import './globals.css';
 
 export const metadata: Metadata = {
-  title: { default: 'Understory', template: '%s · Understory' },
-  description:
-    'Learn software engineering from the page to the platform, keep it through spaced practice, and follow what changes. Local-first. No account.',
-  applicationName: 'Understory',
+  metadataBase: new URL(SITE_URL),
+  title: { default: SITE_TITLE, template: `%s · ${SITE_NAME}` },
+  description: SITE_DESCRIPTION,
+  applicationName: SITE_NAME,
+  keywords: [
+    'software engineering course',
+    'learn to code',
+    'free coding course',
+    'open source course',
+    'AI coding test practice',
+    'coding interview preparation',
+    'system design',
+    'AI engineering',
+    'Python',
+    'TypeScript',
+    'SQL',
+  ],
+  openGraph: {
+    type: 'website',
+    siteName: SITE_NAME,
+    locale: 'en_GB',
+    title: SITE_TITLE,
+    description: SITE_DESCRIPTION,
+    url: '/',
+  },
+  twitter: { card: 'summary_large_image', title: SITE_TITLE, description: SITE_DESCRIPTION },
 };
 
 export const viewport: Viewport = {

@@ -46,7 +46,9 @@ stays safe without a sign-in is in docs/ONLINE-TEST.md, section 6.
 1. Import the GitHub repo `vieanderes/understory`.
 2. Framework preset: Next.js. Build command and output directory: defaults.
 3. Node.js version: 24.x. The install uses `pnpm` from `packageManager`.
-4. Environment variable: `NEXT_PUBLIC_SITE_URL` with the production origin.
+4. Environment variable: `NEXT_PUBLIC_SITE_URL` with the production origin. Without it the
+   site falls back to Vercel's production domain, so the sitemap and share cards never point
+   at localhost, but set it once you have your own domain.
 5. Deploy. Every push to `main` redeploys, including the daily Signal commit.
 
 `pnpm build` runs `pnpm build:content` first (the `prebuild` script), so the content bundle

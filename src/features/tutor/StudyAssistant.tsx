@@ -2,9 +2,18 @@
 
 import { Plus, X } from 'lucide-react';
 import { usePathname } from 'next/navigation';
-import { lazy, Suspense, useEffect, useMemo, useState, useSyncExternalStore } from 'react';
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+  useSyncExternalStore,
+} from 'react';
 import type { AssistantContext } from '@/core/ports/assistant';
 import { cn } from '@/lib/cn';
+import type { PathIndexEntry } from './learner-situation';
 import { pageGuide } from './page-guide';
 import { ScoutMark } from './ScoutMark';
 import {
@@ -20,13 +29,10 @@ import {
   useTutorWithheld,
 } from './tutor-store';
 
-// The panel, its providers and the Markdown renderer arrive on the first open, not with
-// every page: the button alone is all a page pays for (tests/e2e/bundle-budget.spec.ts).
-const AssistantPanel = lazy(() =>
-  import('@/features/online-test/assistant/AssistantPanel').then((m) => ({
-    default: m.AssistantPanel,
-  })),
-);
+// The panel, its providers, the Markdown renderer and the app guide arrive on the first
+// open, not with every page: the button alone is all a page pays for
+// (tests/e2e/bundle-budget.spec.ts).
+const ScoutPanel = lazy(() => import('./ScoutPanel').then((m) => ({ default: m.ScoutPanel })));
 
 const TUTOR_STARTERS = [
   'Explain this step in plain words',
@@ -111,14 +117,21 @@ export function AskScoutButton({
  * or the corner of any other page, and on Command or Ctrl and J. It opens the
  * same assistant as the coding simulator. In a lesson it is a tutor that knows the step on
  * screen (tutor-store.ts); on any other page it is a guide that knows what the page offers
- * (page-guide.ts). It answers in Markdown with highlighted code, and connects the same three
+ * (page-guide.ts). Either way it carries a map of the whole app (app-guide.ts), so it can
+ * say where anything is from anywhere. It answers in Markdown with highlighted code, and connects the same three
  * ways: your Claude account through MCP, your API key, or Claude Code on this machine.
  */
 export function StudyAssistant({
   shell = false,
+  paths = [],
+  latestNews,
 }: {
   /** In the app shell a phone's tab bar is the bottom edge, so the button sits above it. */
   shell?: boolean;
+  /** Every path by its lesson ids, so Scout can say where the learner is and what is next. */
+  paths?: readonly PathIndexEntry[];
+  /** The newest news edition, YYYY-MM-DD. */
+  latestNews?: string;
 }) {
   const pathname = usePathname();
   const scope = useTutorScope();
@@ -175,6 +188,12 @@ export function StudyAssistant({
           },
     [scope, guide],
   );
+
+  // On a phone the sheet covers the page a link opens, so following one closes it; desktop
+  // keeps the conversation beside the page.
+  const followLink = useCallback(() => {
+    if (window.innerWidth < 768) setTutorOpen(false);
+  }, []);
 
   if (withheld || HIDDEN.some((pattern) => pattern.test(pathname))) return null;
 
@@ -287,7 +306,11 @@ export function StudyAssistant({
               </div>
             }
           >
-            <AssistantPanel
+            <ScoutPanel
+              pathname={pathname}
+              paths={paths}
+              {...(latestNews ? { latestNews } : {})}
+              onFollowLink={followLink}
               context={context}
               transcript={history}
               onMessage={(message) => appendMessage(key, message)}
@@ -295,7 +318,7 @@ export function StudyAssistant({
                 ? {
                     greeting: 'Where do you want to go?',
                     intro:
-                      'Scout AI knows the course and this page. Ask where to start, or which option fits you.',
+                      'Scout AI knows the whole app and this page. Ask where something is, where to start, or what to do next.',
                     placeholder: 'Ask Scout AI about the course',
                     suggestions: guide.starters,
                   }

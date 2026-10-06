@@ -1,5 +1,10 @@
 # Understory for Claude Code
 
+> **Not offered to learners yet.** Claude Code runs a channel like this one without a
+> developer warning only once Anthropic has approved it. Until Understory's is approved,
+> Scout tells Claude Code users so and connects them with `claude mcp add` instead. The
+> steps below are for developers trying the plugin.
+
 Ask in Understory's Scout, and Claude Code answers: each question arrives in your session as
 a [channel](https://code.claude.com/docs/en/channels-reference) event, and the answer goes
 back to Scout.

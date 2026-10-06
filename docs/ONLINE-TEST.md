@@ -210,7 +210,7 @@ providers sit behind `src/core/ports/assistant.ts`:
    - Claude on the web, desktop or phone: Settings, Connectors, Add custom connector, with
      `<site>/api/mcp`. This needs the deployed site: claude.ai cannot reach localhost.
    - Claude Code, with a server: `claude mcp add --transport http understory <site>/api/mcp`.
-   - Claude Code, with the Understory plugin, a [channel](https://code.claude.com/docs/en/channels-reference)
+   - Not offered in Scout yet: Claude Code with the Understory plugin, a [channel](https://code.claude.com/docs/en/channels-reference)
      in `integrations/claude-code/`: questions are pushed into the session, so Claude spends
      nothing while it waits. Install it once with
      `claude plugin marketplace add vieanderes/understory && claude plugin install understory@understory`,
@@ -218,7 +218,9 @@ providers sit behind `src/core/ports/assistant.ts`:
      and send "Connect Understory at <site>, code ABCD-EFGH". During the research preview
      a channel outside Anthropic's allowlist needs that flag and a confirmation, and Team
      and Enterprise plans must turn channels on. The plugin has no dependencies; it is a
-     client of the same `/api/mcp`, so the same locks below apply.
+     client of the same `/api/mcp`, so the same locks below apply. Scout shows Claude Code
+     users a note that the plugin is waiting for approval, with the server steps above; when
+     it is on the allowlist, `PluginNotReady` in `AssistantPanel.tsx` gives way to its steps.
    - The pending question and the replies live in a bridge store. On one long-running
      server (`pnpm dev`, the VPS) memory is enough. On Vercel set `UPSTASH_REDIS_REST_URL`
      and `UPSTASH_REDIS_REST_TOKEN` (or Vercel's Redis integration's `KV_REST_API_URL` and

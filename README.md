@@ -122,16 +122,15 @@ three steps:
   once, then send Claude "Keep answering my Understory questions, code ABCD-EFGH". From then
   on you just ask in Scout: Claude listens and answers by itself, and Scout shows "Claude is
   listening". The web and phone apps need a deployed site; they cannot reach localhost.
-- **Claude Code**, with the Understory plugin. Questions arrive in your terminal session
-  by themselves, and nothing is spent while it waits:
+- **Claude Code.** Add Understory once with
+  `claude mcp add --transport http understory <site>/api/mcp`, then send the same message.
+  Claude listens and answers in Scout by itself.
 
-  ```sh
-  claude plugin marketplace add vieanderes/understory && claude plugin install understory@understory
-  claude --dangerously-load-development-channels plugin:understory@understory
-  ```
-
-  Then send "Connect Understory at <site>, code ABCD-EFGH". Channels are a research preview,
-  so Claude Code asks you to confirm this one until it is on Anthropic's list.
+  > **Coming: the Claude Code plugin.** With it, questions reach your Claude Code session by
+  > themselves, with no message to send and nothing spent while it waits. It is built
+  > (`integrations/claude-code/`) but not offered yet: during the channels research preview,
+  > Claude Code runs only plugins like it that Anthropic has approved, and Understory's is
+  > still waiting. Scout will offer it as soon as it is approved.
 
 - **Claude Code on this machine.** Running Understory yourself (`pnpm dev`) with Claude Code
   logged in? Pick "Claude Code on this machine": nothing to set up.

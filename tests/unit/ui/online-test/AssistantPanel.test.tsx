@@ -245,20 +245,20 @@ describe('AssistantPanel', () => {
     expect(screen.getByRole('button', { name: 'Copy command' })).toBeInTheDocument();
   });
 
-  it('gives Claude Code its own steps: the plugin, the start command and one message', async () => {
+  it('says the Claude Code plugin is not ready yet, and sets Claude Code up the way that works', async () => {
     const user = userEvent.setup();
     render(<Harness createPort={() => controllablePort().port} />);
     await user.click(screen.getByRole('button', { name: /Assistant settings/ }));
-    await user.click(screen.getByRole('radio', { name: /^Claude Code\s*Your questions/ }));
+    await user.click(screen.getByRole('radio', { name: /^Claude Code\s*Works now/ }));
     expect(window.localStorage.getItem('understory:assistant:provider')).toBe('mcp');
     expect(window.localStorage.getItem('understory:assistant:claude-client')).toBe('code');
+    expect(
+      screen.getByRole('region', { name: 'The Claude Code plugin is not ready yet' }),
+    ).toHaveTextContent(/approved/);
     const steps = screen.getByRole('list', { name: 'Connect Claude Code' });
     expect(
-      within(steps).getByText(/claude plugin install understory@understory/),
-    ).toBeInTheDocument();
-    expect(
       within(steps).getByText(
-        'claude --dangerously-load-development-channels plugin:understory@understory',
+        `claude mcp add --transport http understory ${window.location.origin}/api/mcp`,
       ),
     ).toBeInTheDocument();
     const [code = ''] = (window.sessionStorage.getItem('understory:assistant:pairing') ?? '').split(
@@ -266,9 +266,10 @@ describe('AssistantPanel', () => {
     );
     expect(
       within(steps).getByText(
-        `Connect Understory at ${window.location.origin}, code ${code.slice(0, 4)}-${code.slice(4)}`,
+        `Keep answering my Understory questions, code ${code.slice(0, 4)}-${code.slice(4)}`,
       ),
     ).toBeInTheDocument();
+    expect(screen.queryByText(/dangerously-load-development-channels/)).not.toBeInTheDocument();
   });
 
   it('offers the local Claude account only when the server says it is available', async () => {

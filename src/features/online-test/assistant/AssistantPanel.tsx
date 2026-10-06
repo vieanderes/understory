@@ -200,7 +200,10 @@ type Choice = ClaudeClient | 'claude-cli' | 'api-key';
 
 const CHOICES: Record<Choice, { label: string; hint: string }> = {
   app: { label: 'Claude app', hint: 'Web, desktop or phone. Connect once, then just ask here.' },
-  code: { label: 'Claude Code', hint: 'Your questions arrive in your terminal by themselves.' },
+  code: {
+    label: 'Claude Code',
+    hint: 'Works now with one command. A plugin that needs even less is coming.',
+  },
   'claude-cli': {
     label: 'Claude Code on this machine',
     hint: 'Already signed in on this computer. Nothing to set up.',
@@ -276,13 +279,30 @@ function ProviderChoice({
 export const listenMessage = (code: string) =>
   `Keep answering my Understory questions, code ${code}`;
 
-/** The plugin's install, start and connect lines for Claude Code. */
-export const PLUGIN_INSTALL =
-  'claude plugin marketplace add vieanderes/understory && claude plugin install understory@understory';
-export const PLUGIN_START =
-  'claude --dangerously-load-development-channels plugin:understory@understory';
-export const connectMessage = (origin: string, code: string) =>
-  `Connect Understory at ${origin}, code ${code}`;
+/**
+ * The Claude Code plugin (integrations/claude-code) works, but during the channels research
+ * preview Claude Code runs only channels on Anthropic's allowlist without a warning meant
+ * for developers. Until Understory's is on it, Scout says so and sets Claude Code up the way
+ * that works today. When it is approved, this note gives way to the plugin's steps.
+ */
+function PluginNotReady() {
+  return (
+    <section
+      aria-labelledby="plugin-not-ready"
+      className="border-border rounded-panel flex flex-col gap-0.5 border p-1.5"
+    >
+      <h4 id="plugin-not-ready" className="flex items-center gap-1 text-sm font-medium">
+        <TriangleAlert aria-hidden size={16} strokeWidth={2} className="text-warning shrink-0" />
+        The Claude Code plugin is not ready yet
+      </h4>
+      <p className="text-muted text-sm text-pretty">
+        With the plugin, your questions would reach Claude Code by themselves. Claude Code only runs
+        plugins like it once Anthropic has approved them, and Understory&rsquo;s is still waiting.
+        Until then, connect Claude Code this way. Scout will say when the plugin is ready.
+      </p>
+    </section>
+  );
+}
 
 function ProviderSetup({
   provider,
@@ -429,37 +449,21 @@ function ProviderSetup({
         </p>
       </div>
       {client === 'code' ? (
-        <ol aria-label="Connect Claude Code" className="flex flex-col gap-3">
-          <Step n={1} title="Install the Understory plugin, once">
-            <CopyField value={PLUGIN_INSTALL} label="Copy the install command" />
-          </Step>
-          <Step n={2} title="Start Claude Code with it">
-            <CopyField value={PLUGIN_START} label="Copy the start command" />
-            <p className="text-muted text-sm text-pretty">
-              Claude Code asks you to confirm, because channels are a preview and Understory is not
-              on Anthropic’s list yet. Choose I am using this for local development.
-            </p>
-          </Step>
-          <Step n={3} title="Send Claude this">
-            <CopyField
-              value={connectMessage(origin, formatted)}
-              label="Copy the message for Claude"
-            />
-          </Step>
-          {allowStep(4)}
-          <li>
-            <details className="group/plain text-sm">
-              <summary className="text-muted hover:text-fg cursor-pointer list-none">
-                No plugin? Add Understory as a server instead
-              </summary>
-              <div className="mt-1 flex flex-col gap-1">
-                <CopyField value={command} label="Copy command" />
-                <p className="text-muted text-pretty">Then send Claude:</p>
-                <CopyField value={listenMessage(formatted)} label="Copy the message" />
-              </div>
-            </details>
-          </li>
-        </ol>
+        <>
+          <PluginNotReady />
+          <ol aria-label="Connect Claude Code" className="flex flex-col gap-3">
+            <Step n={1} title="Add Understory to Claude Code, once">
+              <CopyField value={command} label="Copy command" />
+            </Step>
+            <Step n={2} title="Send Claude this">
+              <CopyField value={listenMessage(formatted)} label="Copy the message for Claude" />
+              <p className="text-muted text-sm text-pretty">
+                Claude then waits for your questions. Keep that session open and ask here.
+              </p>
+            </Step>
+            {allowStep(3)}
+          </ol>
+        </>
       ) : (
         <ol aria-label="Connect your Claude app" className="flex flex-col gap-3">
           <Step n={1} title="Add Understory to Claude, once">

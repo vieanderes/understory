@@ -1,6 +1,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
 import { z } from 'zod';
+import { NAVIGATION_RULES, type AssistantContext } from '@/core/ports/assistant';
 import { pairingCodeSchema } from '../pairing';
 import { getBridgeStore, type BridgeStore, type KeyValue } from './bridge-store';
 import { clientOf, recordFailure } from './rate-limit';
@@ -25,7 +26,7 @@ import { clientOf, recordFailure } from './rate-limit';
 export const MCP_INSTRUCTIONS = [
   'You are the assistant inside Understory, a course that teaches software engineering. You serve two places:',
   '- the AI-assisted coding simulator, a timed practice assessment: keep replies short and precise, code only when asked, because a reviewer reads the conversation;',
-  '- the study assistant beside a lesson: be a patient tutor, explain, and write code freely. get_task says which one it is.',
+  '- Scout AI, the study assistant on every other page: beside a lesson a patient tutor who explains and writes code freely, elsewhere a guide to the app who says where things are and what to do next. get_task says which one it is, and carries a guide to the whole app.',
   'The learner gives you a pairing code shown in the assistant panel. Pass it to every tool.',
   'When asked something, call get_pending_question first, then get_task and get_code (and get_test_output when it helps).',
   'Answer with the reply tool: that is the only way your answer reaches the app. Use Markdown, with code in fenced blocks and the language named.',
@@ -53,6 +54,12 @@ function text(value: string): ToolResult {
 export function untrusted(source: string, body: string): string {
   const safe = body.replace(/<\/?untrusted/gi, (tag) => tag.replace('<', '<\u200b'));
   return `<untrusted source="${source}">\n${safe}\n</untrusted>`;
+}
+
+/** The app guide for the study modes, so an app connection can give directions as well. */
+function appGuide(context: AssistantContext): string[] {
+  if (!context.app) return [];
+  return ['', NAVIGATION_RULES, '', `The app:\n${untrusted('app-guide', context.app)}`];
 }
 
 const READ_ONLY = { readOnlyHint: true, openWorldHint: false } as const;
@@ -177,13 +184,21 @@ export function createAssistantMcpServer(options: McpServerOptions): McpServer {
               'Be a patient tutor: the one-sentence answer, one small example, then stop. Markdown, code in fenced blocks with the language named. British English.',
               '',
               `On screen now:\n${untrusted('page', `Lesson: ${context.taskTitle}\n\n${context.statement || '(nothing specific)'}`)}`,
+              ...(context.app
+                ? [
+                    '',
+                    'If the learner asks about the app rather than the lesson, answer as its guide.',
+                  ]
+                : []),
+              ...appGuide(context),
             ].join('\n')
           : context.mode === 'guide'
             ? [
                 `The learner is on a page of Understory, not in a lesson, and wants guidance: where to start, which option fits them, what each part is for.`,
-                'Be Scout AI, the guide: two or three sentences, then one concrete next step on this page. Ask one short question when the choice depends on them. British English.',
+                'Be Scout AI, the guide: two or three sentences, then one concrete next step. Ask one short question when the choice depends on them. British English.',
                 '',
                 `The page offers:\n${untrusted('page', `Page: ${context.taskTitle}\n\n${context.statement || '(nothing specific)'}`)}`,
+                ...appGuide(context),
               ].join('\n')
             : untrusted(
                 'task',

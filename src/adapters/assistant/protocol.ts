@@ -34,6 +34,8 @@ export const contextSchema = z.object({
   code: z.string().max(MAX_TEXT),
   output: z.string().max(MAX_TEXT),
   mode: z.enum(['test', 'tutor', 'guide']).optional(),
+  // A few hundred tokens in practice; the ceiling only stops a tab padding the prompt.
+  app: z.string().max(8_000).optional(),
 });
 
 export const turnSchema = z.object({

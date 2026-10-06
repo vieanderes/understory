@@ -34,6 +34,35 @@ describe('assistant system prompts', () => {
     expect(prompt).not.toContain('Lesson:');
   });
 
+  it('carries the app guide in guide mode and asks for direct, linked directions', () => {
+    const prompt = assistantSystemPrompt({
+      ...base,
+      mode: 'guide',
+      taskTitle: 'Settings',
+      app: 'News /signal: the fourth tab on a phone.',
+    });
+    expect(prompt).toContain('News /signal: the fourth tab on a phone.');
+    expect(prompt).toMatch(/on a phone/i);
+    expect(prompt).toMatch(/\[News\]\(\/signal\)/);
+    expect(prompt).toMatch(/never say you cannot see/i);
+  });
+
+  it('carries the app guide in tutor mode too, for questions about the app', () => {
+    const prompt = assistantSystemPrompt({
+      ...base,
+      mode: 'tutor',
+      taskTitle: 'Counting with a Map',
+      app: 'Practice /practise: topics and a mixed session.',
+    });
+    expect(prompt).toContain('Practice /practise: topics and a mixed session.');
+    expect(prompt).toContain('Lesson: Counting with a Map');
+  });
+
+  it('leaves the app guide out of the assessment', () => {
+    const prompt = assistantSystemPrompt({ ...base, app: 'News /signal' });
+    expect(prompt).not.toContain('News /signal');
+  });
+
   it('keeps the assessment prompt as the default', () => {
     expect(assistantSystemPrompt(base)).toContain('online coding assessment');
   });

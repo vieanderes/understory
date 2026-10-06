@@ -100,12 +100,12 @@ On Vercel, the daily news commit triggers a redeploy. On a VPS choose one:
 
 Understory has no login, on purpose: a visitor can start at once. What protects it:
 
-| Risk                            | Guard                                                                                                                                                       |
-| ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Copying lessons                 | `LICENSE`: lessons are CC BY-NC-SA 4.0, code is MIT. The licence line is in Settings                                                                        |
-| AI training on the content      | `robots.ts` refuses the known AI crawlers. The `tdm-reservation: 1` header and `/.well-known/tdmrep.json` are the legal opt-out under EU Directive 2019/790 |
-| A request that costs us money   | There is none. Pages and the bundle are static, the code runner runs in the browser and news runs in GitHub Actions                                         |
-| A future one (sync, an AI call) | `tests/unit/scripts/public-surface.test.ts` fails on any per-request route or server action until it is rate-limited and listed there                       |
+| Risk                            | Guard                                                                                                                                                                                                                        |
+| ------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Copying lessons                 | `LICENSE`: lessons are CC BY-NC-SA 4.0, code is MIT. The licence line is in Settings                                                                                                                                         |
+| AI training on the content      | `robots.ts` refuses the known AI training crawlers; AI search engines that cite and link pages are allowed. The `tdm-reservation: 1` header and `/.well-known/tdmrep.json` are the legal opt-out under EU Directive 2019/790 |
+| A request that costs us money   | There is none. Pages and the bundle are static, the code runner runs in the browser and news runs in GitHub Actions                                                                                                          |
+| A future one (sync, an AI call) | `tests/unit/scripts/public-surface.test.ts` fails on any per-request route or server action until it is rate-limited and listed there                                                                                        |
 
 When a rate-limited route is added:
 

@@ -83,6 +83,8 @@ export interface Activity {
   readonly goal: number;
   /** Weeks of those shown whose goal was met. */
   readonly met: number;
+  /** Any week holds XP or time, so there is something to chart. */
+  readonly active: boolean;
 }
 
 function mondayOf(localDate: string): Date {
@@ -141,10 +143,16 @@ export function weeklyActivity(input: {
   const weeks = [...byWeek].map(([key, w]) => ({
     weekKey: key,
     ...w,
-    met: w.xp >= goal,
+    // A goal is never met by doing nothing, whatever the tier.
+    met: w.xp > 0 && w.xp >= goal,
     current: key === thisWeek,
   }));
-  return { weeks, goal, met: weeks.filter((w) => w.met).length };
+  return {
+    weeks,
+    goal,
+    met: weeks.filter((w) => w.met).length,
+    active: weeks.some((w) => w.xp > 0 || w.minutes > 0),
+  };
 }
 
 // ---------------------------------------------------------------------------

@@ -1,10 +1,14 @@
 'use client';
 
-import { Settings } from 'lucide-react';
+import { ChartColumn, Settings } from 'lucide-react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import { Wordmark } from '@/components/brand/Logo';
 import { ThemeToggle } from '@/components/theme/ThemeToggle';
+import { ProgressLine } from '@/components/ui/ProgressLine';
+import { useOverview } from '@/features/catalog/useOverview';
+import { chosenPathIds, CHOSEN_PATH } from '@/features/paths/current';
+import { useProgress } from '@/features/store/StoreProvider';
 import { cn } from '@/lib/cn';
 import { isCurrent, LIBRARY, PLACES, type Place } from './nav';
 
@@ -14,7 +18,16 @@ const item =
 const utility =
   'hover:text-fg hover:bg-raised rounded-control inline-flex size-5 items-center justify-center transition-colors duration-150 ease-out';
 
-function RailLink({ place, current }: { place: Place; current: boolean }) {
+function RailLink({
+  place,
+  current,
+  count,
+}: {
+  place: Place;
+  current: boolean;
+  /** A figure beside the label, such as the items due on Practice. */
+  count?: number;
+}) {
   const { href, label, icon: Icon, hint } = place;
   return (
     <Link
@@ -27,7 +40,13 @@ function RailLink({ place, current }: { place: Place; current: boolean }) {
       )}
     >
       <Icon aria-hidden size={16} strokeWidth={2} />
-      {label}
+      <span className="flex-1">{label}</span>
+      {count ? (
+        <span className="t-figure text-muted text-sm">
+          {count}
+          <span className="sr-only"> due</span>
+        </span>
+      ) : null}
     </Link>
   );
 }
@@ -37,9 +56,102 @@ function RailLink({ place, current }: { place: Place; current: boolean }) {
  * library, settings and the theme at the foot, drawn smaller, so they read as utilities you
  * reach for, not places you choose between. Where you are is a lifted row, not a colour.
  */
-export function Sidebar() {
+/** A path as the rail knows it: enough to link to it and count what is done. */
+export interface RailPath {
+  id: string;
+  name: string;
+  lessonIds: readonly string[];
+}
+
+/**
+ * The paths the learner chose, each with what is done: the way back into a path from any
+ * page. Without a choice yet, one quiet link to make it.
+ */
+function YourPaths({ paths }: { paths: readonly RailPath[] }) {
+  const { status, state } = useProgress();
+  if (status !== 'ready') return null;
+  const all: RailPath[] = state.customPath
+    ? [{ id: 'custom', name: 'My path', lessonIds: state.customPath }, ...paths]
+    : [...paths];
+  const chosen = chosenPathIds(state.settings[CHOSEN_PATH]).flatMap(
+    (id) => all.find((p) => p.id === id) ?? [],
+  );
+  return (
+    <nav aria-labelledby="rail-paths" className="flex flex-col gap-0.5">
+      <p id="rail-paths" className="t-label px-1 pb-0.5">
+        Your paths
+      </p>
+      {chosen.length === 0 ? (
+        <Link
+          href="/paths"
+          className={cn(item, 'text-muted hover:text-fg hover:bg-raised font-normal')}
+        >
+          Choose your path
+        </Link>
+      ) : (
+        chosen.map((path) => {
+          const done = path.lessonIds.filter((id) => state.completedLessons.has(id)).length;
+          return (
+            <Link
+              key={path.id}
+              href={`/paths?path=${path.id}`}
+              className={cn(item, 'text-muted hover:text-fg hover:bg-raised font-normal')}
+            >
+              <span className="min-w-0 flex-1 truncate">{path.name}</span>
+              <span className="t-figure text-faint text-sm">
+                {done}/{path.lessonIds.length}
+              </span>
+            </Link>
+          );
+        })
+      )}
+    </nav>
+  );
+}
+
+/** This week's XP against the goal: a glance at the pace, one tap from the whole picture. */
+function WeekMeter() {
+  const { view } = useOverview();
+  if (!view) return null;
+  const { xpThisWeek, goal, met } = view.week;
+  return (
+    <Link
+      href="/progress"
+      title="Your progress"
+      className="rounded-control hover:bg-raised flex flex-col gap-1 px-1 py-1 transition-colors duration-150 ease-out"
+    >
+      <span className="flex items-baseline justify-between gap-1">
+        <span className="t-label">This week</span>
+        <span className="t-figure text-sm">
+          {xpThisWeek}
+          <span className="text-muted"> / {goal} XP</span>
+        </span>
+      </span>
+      <ProgressLine
+        value={Math.min(1, xpThisWeek / Math.max(1, goal))}
+        label={met ? 'Weekly goal met' : `${xpThisWeek} of ${goal} XP this week`}
+      />
+    </Link>
+  );
+}
+
+/**
+ * Desktop: a quiet rail on the ground, beside the page. The four places at the top, the
+ * paths the learner chose under them, and at the foot this week's pace, the library and
+ * progress, settings and the theme, drawn smaller: utilities you reach for, not places.
+ */
+export function Sidebar({ paths = [] }: { paths?: readonly RailPath[] }) {
   const pathname = usePathname();
-  const onLibrary = isCurrent(pathname, LIBRARY.href);
+  const { view } = useOverview();
+  const due = view?.due.dueNow ?? 0;
+  const onLibrary = isCurrent(pathname, LIBRARY.href) && !pathname.startsWith('/progress');
+  const onProgress = pathname.startsWith('/progress');
+  const utilityRow = (current: boolean) =>
+    cn(
+      item,
+      'font-normal',
+      current ? 'bg-raised text-fg' : 'text-muted hover:text-fg hover:bg-raised',
+    );
   return (
     <aside className="sticky top-0 hidden h-dvh w-30 shrink-0 flex-col gap-4 px-1.5 py-2 md:flex print:hidden">
       <Link
@@ -51,23 +163,38 @@ export function Sidebar() {
       </Link>
       <nav aria-label="Primary" className="flex flex-col gap-0.5">
         {PLACES.map((place) => (
-          <RailLink key={place.href} place={place} current={isCurrent(pathname, place.href)} />
+          <RailLink
+            key={place.href}
+            place={place}
+            current={isCurrent(pathname, place.href)}
+            {...(place.href === '/practise' && due > 0 ? { count: due } : {})}
+          />
         ))}
       </nav>
+      <div className="rule-t min-h-0 overflow-y-auto pt-2">
+        <YourPaths paths={paths} />
+      </div>
       <div className="mt-auto flex flex-col gap-1">
-        <Link
-          href={LIBRARY.href}
-          title={LIBRARY.hint}
-          aria-current={onLibrary ? 'page' : undefined}
-          className={cn(
-            item,
-            'font-normal',
-            onLibrary ? 'bg-raised text-fg' : 'text-muted hover:text-fg hover:bg-raised',
-          )}
-        >
-          <LIBRARY.icon aria-hidden size={16} strokeWidth={2} />
-          {LIBRARY.label}
-        </Link>
+        <WeekMeter />
+        <div className="flex flex-col gap-0.5">
+          <Link
+            href="/progress"
+            aria-current={onProgress ? 'page' : undefined}
+            className={utilityRow(onProgress)}
+          >
+            <ChartColumn aria-hidden size={16} strokeWidth={2} />
+            Progress
+          </Link>
+          <Link
+            href={LIBRARY.href}
+            title={LIBRARY.hint}
+            aria-current={onLibrary ? 'page' : undefined}
+            className={utilityRow(onLibrary)}
+          >
+            <LIBRARY.icon aria-hidden size={16} strokeWidth={2} />
+            {LIBRARY.label}
+          </Link>
+        </div>
         <div className="rule-t flex items-center gap-0.5 pt-1">
           <Link
             href="/settings"

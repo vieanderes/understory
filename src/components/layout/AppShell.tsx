@@ -1,14 +1,21 @@
-import { PhoneBar, Sidebar, TabBar } from './PrimaryNav';
+import { PhoneBar, Sidebar, TabBar, type RailPath } from './PrimaryNav';
 
 /**
  * The frame around every learner-facing page. On desktop, a rail on the ground and the page
  * on a raised panel beside it, the way a tool sits on a desk. On phones, a slim bar above and
  * the four places in a tab bar below, so `main` keeps clear of it.
  */
-export function AppShell({ children }: { children: React.ReactNode }) {
+export function AppShell({
+  children,
+  paths = [],
+}: {
+  children: React.ReactNode;
+  /** The written paths, for the rail's list of the learner's own. */
+  paths?: readonly RailPath[];
+}) {
   return (
     <div className="bg-bg text-fg flex min-h-dvh">
-      <Sidebar />
+      <Sidebar paths={paths} />
       <div className="flex min-w-0 flex-1 flex-col md:py-1 md:pr-1">
         <PhoneBar />
         <main

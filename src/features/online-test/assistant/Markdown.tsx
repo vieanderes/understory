@@ -4,6 +4,7 @@ import { javascriptLanguage, typescriptLanguage } from '@codemirror/lang-javascr
 import { pythonLanguage } from '@codemirror/lang-python';
 import { classHighlighter, highlightTree } from '@lezer/highlight';
 import { Check, Copy } from 'lucide-react';
+import Link from 'next/link';
 import { useState, type ReactNode } from 'react';
 
 /*
@@ -12,6 +13,29 @@ import { useState, type ReactNode } from 'react';
  * needs: paragraphs, headings, lists, quotes, inline code, bold, italic, links and fenced
  * code, highlighted with the editor's own grammars and a copy button.
  */
+
+/** Where in-app links go when a reply may use them: Scout's directions, never a test. */
+export interface InAppLinks {
+  /** Called when one is followed, so a sheet covering the page can get out of the way. */
+  onFollow?: () => void;
+}
+
+const BASE = 'https://understory.invalid';
+
+/**
+ * A model's relative link as a path in this app, or null. Only a single leading slash
+ * counts: `//host` and `/\host` are other sites to a browser, and a scheme never matches.
+ */
+export function inAppHref(href: string): string | null {
+  if (!/^\/(?![/\\])/.test(href) || /[\\\s\p{Cc}]/u.test(href)) return null;
+  try {
+    const url = new URL(href, BASE);
+    if (url.origin !== BASE) return null;
+    return `${url.pathname}${url.search}${url.hash}`;
+  } catch {
+    return null;
+  }
+}
 
 const PARSERS = {
   js: javascriptLanguage.parser,
@@ -75,10 +99,10 @@ function CodeBlock({ code, language }: { code: string; language: string }) {
 }
 
 /** Inline spans: code first, so nothing inside backticks is read as emphasis or a link. */
-function inline(text: string, key: string): ReactNode[] {
+function inline(text: string, key: string, links?: InAppLinks): ReactNode[] {
   const out: ReactNode[] = [];
   const pattern =
-    /(`[^`]+`)|(\*\*[^*]+\*\*)|(\*[^*\s][^*]*\*|_[^_\s][^_]*_)|(\[[^\]]+\]\((https?:\/\/[^)\s]+)\))/g;
+    /(`[^`]+`)|(\*\*[^*]+\*\*)|(\*[^*\s][^*]*\*|_[^_\s][^_]*_)|(\[[^\]]+\]\((https?:\/\/[^)\s]+|\/[^)\s]*)\))/g;
   let at = 0;
   let match: RegExpExecArray | null;
   let n = 0;
@@ -94,7 +118,25 @@ function inline(text: string, key: string): ReactNode[] {
       );
     } else if (match[2]) out.push(<strong key={k}>{token.slice(2, -2)}</strong>);
     else if (match[3]) out.push(<em key={k}>{token.slice(1, -1)}</em>);
-    else if (match[4] && match[5]) {
+    else if (match[4] && match[5] && !/^https?:/.test(match[5])) {
+      // A path in the app: followed in place, or left as plain words where links may not go.
+      const label = token.slice(1, token.indexOf(']('));
+      const href = links ? inAppHref(match[5]) : null;
+      out.push(
+        href ? (
+          <Link
+            key={k}
+            href={href}
+            onClick={() => links?.onFollow?.()}
+            className="underline underline-offset-4"
+          >
+            {label}
+          </Link>
+        ) : (
+          token
+        ),
+      );
+    } else if (match[4] && match[5]) {
       const label = token.slice(1, token.indexOf(']('));
       out.push(
         <a
@@ -189,7 +231,7 @@ export function parseBlocks(source: string): Block[] {
   return blocks;
 }
 
-export function Markdown({ text }: { text: string }) {
+export function Markdown({ text, links }: { text: string; links?: InAppLinks }) {
   return (
     <div className="flex flex-col gap-1 text-sm">
       {parseBlocks(text).map((block, i) => {
@@ -200,7 +242,7 @@ export function Markdown({ text }: { text: string }) {
           case 'heading':
             return (
               <p key={key} className="pt-0.5 font-semibold">
-                {inline(block.text, key)}
+                {inline(block.text, key, links)}
               </p>
             );
           case 'list': {
@@ -209,7 +251,7 @@ export function Markdown({ text }: { text: string }) {
               <List key={key} className={block.ordered ? 'list-decimal pl-3' : 'list-disc pl-3'}>
                 {block.items.map((item, j) => (
                   <li key={j} className="pl-0.5">
-                    {inline(item, `${key}-${j}`)}
+                    {inline(item, `${key}-${j}`, links)}
                   </li>
                 ))}
               </List>
@@ -218,11 +260,11 @@ export function Markdown({ text }: { text: string }) {
           case 'quote':
             return (
               <blockquote key={key} className="border-border text-muted border-l-2 pl-1">
-                {inline(block.text, key)}
+                {inline(block.text, key, links)}
               </blockquote>
             );
           case 'paragraph':
-            return <p key={key}>{inline(block.text, key)}</p>;
+            return <p key={key}>{inline(block.text, key, links)}</p>;
         }
       })}
     </div>

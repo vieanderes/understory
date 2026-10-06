@@ -292,6 +292,38 @@ describe('MCP server hardening', () => {
     expect(text.trimEnd().endsWith('</untrusted>')).toBe(true);
   });
 
+  it('gives the guide the whole app in get_task, fenced as data, and keeps it from a test', async () => {
+    const pair = pairing('GUDE2345');
+    await tab(pair, {
+      type: 'context',
+      context: {
+        ...CONTEXT,
+        mode: 'guide',
+        taskTitle: 'Settings',
+        statement: 'Your goals and data.',
+        app: 'News /signal: the fourth tab on a phone, the left rail on desktop.',
+      },
+    });
+    const client = await connect();
+    const [result] = await Promise.all([
+      client.callTool({ name: 'get_task', arguments: { code: pair.code } }),
+      answerRequest(pair, true),
+    ]);
+    const text = textOf(result);
+    expect(text).toContain('<untrusted source="app-guide">');
+    expect(text).toContain('News /signal');
+    expect(text).toMatch(/\[News\]\(\/signal\)/);
+
+    const test = pairing('TSTA2345');
+    await tab(test, { type: 'context', context: { ...CONTEXT, app: 'News /signal' } });
+    const other = await connect();
+    const [plain] = await Promise.all([
+      other.callTool({ name: 'get_task', arguments: { code: test.code } }),
+      answerRequest(test, true),
+    ]);
+    expect(textOf(plain)).not.toContain('News /signal');
+  });
+
   it('refuses a browser request from another site', async () => {
     const response = await mcpPost(
       new Request(`${ORIGIN}/api/mcp`, {

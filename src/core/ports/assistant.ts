@@ -37,6 +37,27 @@ export interface AssistantContext {
    * which option fits. `taskTitle` and `statement` then hold the page and what it offers.
    */
   mode?: 'test' | 'tutor' | 'guide';
+  /**
+   * The app guide, in `tutor` and `guide` modes: the places, the library, the routes and
+   * the learner's situation, built in the tab from the navigation itself. Scout answers
+   * "where is X" from it on any page. An assessment never gets it.
+   */
+  app?: string;
+}
+
+/**
+ * How Scout answers questions about the app itself. Shared by both study modes, so a
+ * learner in a lesson gets the same directions as one on Settings.
+ */
+export const NAVIGATION_RULES = [
+  'You know the whole app from the guide below. Never say you cannot see the navigation or the rest of Understory.',
+  'When asked where something is or how to do something in the app, answer directly in a sentence or two: name the place, then how to reach it on a phone and on desktop.',
+  'Link pages as Markdown links with the relative path from the guide, such as [News](/signal). Only use paths from the guide, never a full URL to Understory.',
+  'When asked what to do next, use the learner’s situation in the guide and link the one next step.',
+].join('\n');
+
+function appSection(context: AssistantContext): string[] {
+  return context.app ? ['', 'About Understory:', context.app] : [];
 }
 
 export interface AssistantRequest {
@@ -105,6 +126,12 @@ function tutorSystemPrompt(context: AssistantContext): string {
     'Use Markdown. Put code in fenced blocks with the language named (```ts, ```python). Keep examples short and runnable.',
     'If the learner is working on an exercise, help them think it through first: a hint, then a nudge, and the full answer when they ask for it.',
     'Use British English.',
+    ...(context.app
+      ? [
+          'If the learner asks about the app rather than the lesson, answer as its guide.',
+          NAVIGATION_RULES,
+        ]
+      : []),
     '',
     `Lesson: ${context.taskTitle}`,
     ...(context.statement ? ['On screen now:', context.statement] : []),
@@ -112,6 +139,7 @@ function tutorSystemPrompt(context: AssistantContext): string {
       ? ['', `The learner's code (${context.language || 'code'}):`, context.code]
       : []),
     ...(context.output ? ['', 'Their last run:', context.output] : []),
+    ...appSection(context),
   ].join('\n');
 }
 
@@ -124,10 +152,12 @@ function guideSystemPrompt(context: AssistantContext): string {
     'You are Scout AI, the guide in Understory, a course that teaches software engineering from a first line of code to production systems.',
     'The learner is on the page below, not in a lesson. Help them decide where to start, which option fits them, and what each part of the app is for.',
     'Ask one short question when the right choice depends on them: what they already know, their goal, their time.',
-    'Answer in two or three sentences, then name one concrete next step on this page. Offer more rather than writing an essay.',
+    'Answer in two or three sentences, then name one concrete next step. Offer more rather than writing an essay.',
     'Use Markdown sparingly. Use British English.',
+    NAVIGATION_RULES,
     '',
     `Page: ${context.taskTitle}`,
     ...(context.statement ? ['On screen now:', context.statement] : []),
+    ...appSection(context),
   ].join('\n');
 }

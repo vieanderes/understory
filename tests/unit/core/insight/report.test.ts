@@ -124,6 +124,20 @@ describe('weeklyActivity', () => {
     expect(met).toBe(1);
   });
 
+  it('meets no goal and reports nothing to chart when nothing was done', () => {
+    const state = reduce([event('2026-09-20T09:00:00Z', 'goal_tier_set', { tier: 'light' })]);
+    const activity = weeklyActivity({ catalog: course, state, scope: all, today: TODAY });
+    expect(activity.weeks.every((w) => !w.met && w.xp === 0)).toBe(true);
+    expect(activity.met).toBe(0);
+    expect(activity.active).toBe(false);
+  });
+
+  it('has something to chart once a week holds XP or time', () => {
+    const state = reduce([answered('2026-09-21T10:00:00Z', 'js.scope')]);
+    const activity = weeklyActivity({ catalog: course, state, scope: all, today: TODAY });
+    expect(activity.active).toBe(true);
+  });
+
   it('caps a sitting at its time limit', () => {
     const state = reduce([
       sat('2026-10-06T11:00:00Z', 'practice-1', 4, {

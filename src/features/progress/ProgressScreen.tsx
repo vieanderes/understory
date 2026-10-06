@@ -5,6 +5,7 @@ import Link from 'next/link';
 import { useMemo, type ReactNode } from 'react';
 import { Ledger, PageHead, type LedgerRow } from '@/components/layout/PageHead';
 import { buttonClass } from '@/components/ui/Button';
+import { rowAction, rowArrow, rowItem, rowList } from '@/components/ui/rows';
 import {
   formatMinutes,
   progressReport,
@@ -16,6 +17,7 @@ import {
   type TestCatalogEntry,
   type WorkItem,
 } from '@/core/insight';
+import type { MasteryState } from '@/core/mastery';
 import type { PlanCatalog } from '@/core/plan';
 import { useCatalog } from '@/features/catalog/useCatalog';
 import { useNow } from '@/features/catalog/useNow';
@@ -31,7 +33,7 @@ import type { PathSummary } from '@/lib/content';
 import { cn } from '@/lib/cn';
 import { workCopy } from './copy';
 import { setScopeParam, useScopeParam } from './useScopeParam';
-import { WeekChart, weekLabel } from './WeekChart';
+import { WeekBaseline, WeekChart, weekLabel } from './WeekChart';
 
 const DATE = new Intl.DateTimeFormat('en-GB', { day: 'numeric', month: 'short', timeZone: 'UTC' });
 const dateOf = (localDate: string) => DATE.format(new Date(`${localDate}T12:00:00Z`));
@@ -144,22 +146,33 @@ export function ProgressScreen(props: ProgressScreenProps) {
       {report.workOn.length > 1 ? <WorkOn items={report.workOn.slice(1)} /> : null}
 
       <Section id="activity" title="Activity" note={activityNote(report)}>
-        <WeekChart weeks={report.weeks} />
-        <Disclosure label="Show as a table">
-          <WeekTable report={report} />
-        </Disclosure>
+        {report.activity.active ? (
+          <>
+            <WeekChart weeks={report.weeks} />
+            <Disclosure label="Show as a table">
+              <WeekTable report={report} />
+            </Disclosure>
+          </>
+        ) : (
+          <WeekBaseline weeks={report.weeks} />
+        )}
       </Section>
 
-      <Section id="mastery" title="Mastery" note={masteryNote(report)}>
-        <RecallLine report={report} />
-        <Legend />
-        <MapView
-          key={scope.id}
-          modules={props.modules}
-          parts={props.parts}
-          concepts={new Set(scope.conceptIds)}
-          folded
-        />
+      <Section
+        id="mastery"
+        title="Mastery"
+        note="Memory fades, so this does too. Practice brings it back."
+      >
+        <MasteryOverview report={report} scope={scope} />
+        <div className="pt-2 md:pt-3">
+          <MapView
+            key={scope.id}
+            modules={props.modules}
+            parts={props.parts}
+            concepts={new Set(scope.conceptIds)}
+            folded
+          />
+        </div>
       </Section>
 
       <Results report={report} scope={scope} />
@@ -220,7 +233,7 @@ function ledgerRows(report: ProgressReport): LedgerRow[] {
       value: week?.xp ?? 0,
       unit: `/ ${report.activity.goal} XP`,
     },
-    { label: 'Goal met, last 8 weeks', short: 'Goal met', value: report.activity.met, unit: '/ 8' },
+    { label: 'Weeks at goal', short: 'At goal', value: report.activity.met, unit: '/ 8' },
   ];
   return rows;
 }
@@ -230,16 +243,13 @@ function ScopePicker({ scopes, value }: { scopes: readonly ProgressScope[]; valu
   const parts = scopes.filter((s) => s.kind === 'part');
   const path = scopes.find((s) => s.kind === 'path');
   return (
-    <label className="flex flex-wrap items-center gap-1">
-      <span className="t-label">Show</span>
+    <label className="flex max-w-full min-w-0 items-center gap-1">
+      <span className="t-label shrink-0">Show</span>
       <span className="relative inline-flex min-w-0">
         <select
           value={value}
           onChange={(e) => setScopeParam(e.target.value)}
-          className={cn(
-            buttonClass('secondary', 'md'),
-            'max-w-full min-w-0 cursor-pointer appearance-none truncate pr-4 text-left',
-          )}
+          className="border-border hover:border-border-strong rounded-control h-5 max-w-full min-w-0 cursor-pointer appearance-none truncate border bg-transparent pr-4 pl-1 text-left font-medium transition-colors duration-150 ease-out"
         >
           <option value="all">Everything</option>
           {path ? <option value="path">My path: {path.label}</option> : null}
@@ -338,7 +348,7 @@ function Section({
       id={id}
       aria-labelledby={`${id}-title`}
       data-arrive="rise"
-      className="rule-t flex scroll-mt-12 flex-col gap-3 pt-3"
+      className="flex scroll-mt-12 flex-col gap-3"
     >
       <div className="flex flex-col gap-0.5">
         <h2 id={`${id}-title`} className="t-section">
@@ -369,7 +379,7 @@ function Disclosure({ label, children }: { label: string; children: ReactNode })
 }
 
 function RowList({ children }: { children: ReactNode }) {
-  return <ul className="rule-b flex flex-col">{children}</ul>;
+  return <ul className={rowList()}>{children}</ul>;
 }
 
 function LinkRow({
@@ -384,20 +394,15 @@ function LinkRow({
   action: string;
 }) {
   return (
-    <li className="rule-t">
-      <Link
-        href={href}
-        className="group hover:bg-surface flex min-h-6 items-center gap-2 py-1 transition-colors duration-150 ease-out sm:px-1"
-      >
+    <li className={rowItem}>
+      <Link href={href} className={rowAction()}>
         <span className="flex min-w-0 flex-1 flex-col">
-          <span className="group-hover:text-accent font-medium transition-colors duration-150 ease-out">
-            {title}
-          </span>
+          <span className="font-medium">{title}</span>
           <span className="text-muted text-sm">{detail}</span>
         </span>
-        <span className="text-muted group-hover:text-fg inline-flex shrink-0 items-center gap-0.5 text-sm font-medium transition-colors duration-150 ease-out">
+        <span className="text-muted group-hover:text-fg inline-flex shrink-0 items-center gap-1 text-sm transition-colors duration-150 ease-out">
           <span className="hidden sm:inline">{action}</span>
-          <ArrowRight aria-hidden size={16} strokeWidth={2} />
+          <ArrowRight aria-hidden size={16} strokeWidth={2} className={rowArrow} />
         </span>
       </Link>
     </li>
@@ -406,10 +411,7 @@ function LinkRow({
 
 function WorkOn({ items }: { items: readonly WorkItem[] }) {
   return (
-    <section aria-labelledby="work-title" data-arrive="rise" className="flex flex-col gap-2">
-      <h2 id="work-title" className="t-section">
-        Work on next
-      </h2>
+    <Section id="work-on" title="Work on next">
       <RowList>
         {items.map((item) => {
           const copy = workCopy(item);
@@ -424,17 +426,20 @@ function WorkOn({ items }: { items: readonly WorkItem[] }) {
           );
         })}
       </RowList>
-    </section>
+    </Section>
   );
 }
 
 function activityNote(report: ProgressReport): string {
   const minutes = report.weeks.reduce((sum, w) => sum + w.minutes, 0);
   const lessons = report.weeks.reduce((sum, w) => sum + w.lessons, 0);
-  if (minutes === 0) return 'No lessons or tests in the last eight weeks.';
-  return `About ${formatMinutes(minutes)} and ${lessons} ${
+  if (!report.activity.active) {
+    return `Nothing in the last eight weeks yet. Your goal is ${report.activity.goal} XP a week.`;
+  }
+  if (minutes === 0) return 'Reviews and practice only, no lessons or tests in eight weeks.';
+  return `About ${formatMinutes(minutes)} over ${lessons} ${
     lessons === 1 ? 'lesson' : 'lessons'
-  } in eight weeks. Time is estimated from lessons and tests.`;
+  } in eight weeks, estimated from lessons and tests.`;
 }
 
 function WeekTable({ report }: { report: ProgressReport }) {
@@ -477,40 +482,87 @@ function WeekTable({ report }: { report: ProgressReport }) {
   );
 }
 
-function masteryNote(report: ProgressReport): string {
-  const { total, started, solid } = report.concepts;
-  return `${started} of ${total} concepts started, ${solid} solid. Memory fades, so this does too: practice brings it back.`;
-}
+type Bucket = (typeof LEGEND)[number];
 
-function RecallLine({ report }: { report: ProgressReport }) {
+/** The bar's order, firmest first. Unseen is what is left, drawn last as the track. */
+const OVERVIEW: readonly Bucket[] = ['fluent', 'solid', 'practised', 'assumed', 'gap', 'unseen'];
+
+const bucketOf = (state: MasteryState): Bucket => (state === 'introduced' ? 'practised' : state);
+
+/**
+ * Every concept in scope as one bar, firmest first, with the legend and its counts inline,
+ * so an empty scope reads as a measured start and not as a row of zeros. Recall joins the
+ * line once there is a card to recall.
+ */
+function MasteryOverview({ report, scope }: { report: ProgressReport; scope: ProgressScope }) {
+  const ids = new Set(scope.conceptIds);
+  const counts = new Map<Bucket, number>(LEGEND.map((s) => [s, 0]));
+  let seen = 0;
+  for (const view of report.views) {
+    if (!ids.has(view.id) || view.state === 'unseen') continue;
+    const bucket = bucketOf(view.state);
+    counts.set(bucket, (counts.get(bucket) ?? 0) + 1);
+    seen += 1;
+  }
+  const total = report.concepts.total;
+  counts.set('unseen', Math.max(0, total - seen));
   const { due, fading, holding } = report.recall;
-  const items = [
-    { label: 'Due now', value: due },
+  const recall = [
+    { label: 'Due now', value: due, gap: false },
     { label: 'Fading', value: fading, gap: fading > 0 },
-    { label: 'Holding', value: holding },
+    { label: 'Holding', value: holding, gap: false },
   ];
-  return (
-    <dl className="grid grid-cols-3 gap-x-4">
-      {items.map((item) => (
-        <div key={item.label} className="rule-t flex flex-col-reverse gap-0.5 pt-1">
-          <dt className="t-label">{item.label}</dt>
-          <dd className={cn('t-figure text-lg', item.gap && 'text-accent')}>{item.value}</dd>
-        </div>
-      ))}
-    </dl>
-  );
-}
+  const summary = LEGEND.map((s) => `${STATE_LABEL[s]} ${counts.get(s) ?? 0}`).join(', ');
 
-function Legend() {
   return (
-    <ul aria-label="How state is shown" className="flex flex-wrap gap-x-3 gap-y-1">
-      {LEGEND.map((state) => (
-        <li key={state} className="text-muted flex items-center gap-1 text-sm">
-          <span aria-hidden className={cn('size-1 shrink-0', CELL_STYLE[state])} />
-          {STATE_LABEL[state]}
-        </li>
-      ))}
-    </ul>
+    <div className="flex flex-col gap-2">
+      <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
+        <p className="flex items-baseline gap-1">
+          <span className="t-figure text-lg">{report.concepts.started}</span>
+          <span className="text-muted text-sm">
+            of <span className="t-figure">{total}</span> concepts started
+          </span>
+        </p>
+        {due + fading + holding > 0 ? (
+          <dl className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+            {recall.map((item) => (
+              <div key={item.label} className="flex items-baseline gap-1">
+                <dt className="t-label">{item.label}</dt>
+                <dd className={cn('t-figure', item.gap && 'text-accent')}>{item.value}</dd>
+              </div>
+            ))}
+          </dl>
+        ) : null}
+      </div>
+      <div
+        role="img"
+        aria-label={`Concepts by state: ${summary}.`}
+        className="flex h-1 w-full gap-0.5"
+      >
+        {OVERVIEW.map((state) => {
+          const count = counts.get(state) ?? 0;
+          return count === 0 ? null : (
+            <span
+              key={state}
+              className={cn('rounded-inner h-full min-w-1', CELL_STYLE[state])}
+              style={{ flexGrow: count, flexBasis: 0 }}
+            />
+          );
+        })}
+      </div>
+      <ul aria-hidden className="flex flex-wrap gap-x-3 gap-y-1">
+        {LEGEND.map((state) => {
+          const count = counts.get(state) ?? 0;
+          return (
+            <li key={state} className="text-muted flex items-center gap-1 text-sm">
+              <span className={cn('size-1 shrink-0', CELL_STYLE[state])} />
+              {STATE_LABEL[state]}
+              <span className={cn('t-figure', count > 0 ? 'text-fg' : 'text-faint')}>{count}</span>
+            </li>
+          );
+        })}
+      </ul>
+    </div>
   );
 }
 
@@ -631,7 +683,7 @@ function Results({ report, scope }: { report: ProgressReport; scope: ProgressSco
               key={c.partId}
               label="Capstone"
               title={c.title}
-              value={c.built ? 'Built' : c.ready ? 'Ready' : '··'}
+              value={c.built ? 'Built' : c.ready ? 'Ready' : undefined}
               detail={
                 c.built
                   ? c.written
@@ -659,7 +711,7 @@ function ResultRow({
 }: {
   label: string;
   title: string;
-  value: string;
+  value?: string;
   detail: string;
   href?: string;
 }) {
@@ -670,20 +722,17 @@ function ResultRow({
         <span className="font-medium">{title}</span>
         <span className="text-muted text-sm">{detail}</span>
       </span>
-      <span className="t-figure shrink-0 text-lg">{value}</span>
+      {value ? <span className="t-figure shrink-0 text-lg">{value}</span> : null}
     </>
   );
   return (
-    <li className="rule-t">
+    <li className={rowItem}>
       {href ? (
-        <Link
-          href={href}
-          className="hover:bg-surface flex min-h-6 items-center gap-2 py-1 transition-colors duration-150 ease-out sm:px-1"
-        >
+        <Link href={href} className={rowAction()}>
           {body}
         </Link>
       ) : (
-        <div className="flex min-h-6 items-center gap-2 py-1 sm:px-1">{body}</div>
+        <div className="flex min-h-6 items-center gap-2 py-1.5">{body}</div>
       )}
     </li>
   );

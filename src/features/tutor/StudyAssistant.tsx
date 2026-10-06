@@ -182,11 +182,11 @@ export function StudyAssistant({
     <>
       {open || docked ? null : (
         // Bottom right, the same margin from both screen edges; on a phone in the app shell
-        // the tab bar is the bottom edge.
+        // the tab bar is the bottom edge. Both clear the home indicator (globals.css).
         <span
           className={cn(
             'fixed right-2 z-30 md:right-3 md:bottom-3 print:hidden',
-            shell ? 'bottom-10' : 'bottom-2',
+            shell ? 'scout-fab-shell' : 'scout-fab',
           )}
         >
           <AskScoutButton

@@ -110,7 +110,7 @@ test('a walk records each answer and one result, and the result links onward', a
   await begin(page, 'New to code');
   await walkToResult(page);
 
-  await expect(page.getByRole('link', { name: 'See the map' })).toBeVisible();
+  await expect(page.getByRole('link', { name: 'See your progress' })).toBeVisible();
   const events = await readEvents(page);
   const answered = events.filter((e) => e.type === 'placement_answered');
   expect(answered.length).toBeGreaterThanOrEqual(1);

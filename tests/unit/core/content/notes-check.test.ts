@@ -242,4 +242,15 @@ describe('guides and fast tracks', () => {
       ['warning', 'online-test-off-path', 'No path stage lists the training task "streak".'],
     ]);
   });
+
+  it('warns about a lab that no path places', () => {
+    const issues = validateTestsOnPaths([plan([[{ lab: 'event-loop-stepper' }]])], {
+      presets: new Set(),
+      tasks: new Set(),
+      labs: new Set(['event-loop-stepper', 'box-model-explorer']),
+    });
+    expect(issues.map((issue) => issue.message)).toEqual([
+      'No path stage lists the lab "box-model-explorer".',
+    ]);
+  });
 });

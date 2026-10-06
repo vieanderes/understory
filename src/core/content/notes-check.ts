@@ -174,6 +174,8 @@ export function validateLectures(catalog: RawCatalog): Issue[] {
 export interface OnlineTestIds {
   presets: ReadonlySet<string>;
   tasks: ReadonlySet<string>;
+  /** Lab ids that should each sit on a stage; none in a fixture tree. */
+  labs?: ReadonlySet<string>;
 }
 
 const NO_ONLINE_TESTS: OnlineTestIds = { presets: new Set(), tasks: new Set() };
@@ -284,10 +286,8 @@ export function validateTestsOnPaths(
       .filter((id) => !placed.has(`task:${id}`))
       .map((id) => warn(`No path stage lists the training task "${id}".`)),
     // Labs too: a learner following a path should meet every one of them.
-    ...(onlineTests.presets.size > 0
-      ? [...LAB_INFO_BY_ID.keys()]
-          .filter((id) => !placed.has(`lab:${id}`))
-          .map((id) => warn(`No path stage lists the lab "${id}".`))
-      : []),
+    ...[...(onlineTests.labs ?? [])]
+      .filter((id) => !placed.has(`lab:${id}`))
+      .map((id) => warn(`No path stage lists the lab "${id}".`)),
   ];
 }

@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import type { Issue, RawCatalog, RawLesson } from '../../src/core/content/catalog';
+import { LAB_INFO } from '../../src/core/labs/catalog';
 import { allLessons } from '../../src/core/content/catalog';
 import type { CodeChallengeStep } from '../../src/core/content/schema';
 import { challengeVariants, languageLabel } from '../../src/core/content/twin';
@@ -132,6 +133,7 @@ function readOnlineTestIds(root: string): OnlineTestIds | undefined {
         .filter((entry) => entry.isDirectory())
         .map((entry) => entry.name),
     ),
+    labs: new Set(LAB_INFO.map((lab) => lab.id)),
   };
 }
 

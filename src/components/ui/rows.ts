@@ -14,13 +14,12 @@ export const rowList = (className?: string) =>
 export const rowItem = 'border-border border-t';
 
 /**
- * The pressable row inside a cell. It reaches 4 px past the text on both sides, so the
- * hover fill has room to breathe while the text stays on the column edge.
+ * The pressable row inside a cell. No fill on hover: a fill would sit across the rules and
+ * break the column edge, so the title takes a quiet underline instead (`.hairline-row`).
  */
 export const rowAction = (className?: string) =>
   cn(
-    'group rounded-control transition-press -mx-0.5 flex min-h-6 w-full items-center gap-2 px-0.5 py-1.5 text-left select-none',
-    'hover:bg-raised active:scale-98',
+    'hairline-row group flex min-h-6 w-full items-center gap-2 py-1.5 text-left select-none',
     className,
   );
 

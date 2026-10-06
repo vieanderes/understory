@@ -56,12 +56,7 @@ function PathRow({
   const custom = path.id === CUSTOM_PATH_ID;
   return (
     <li className={rowItem}>
-      <div
-        className={cn(
-          'group rounded-control relative -mx-1 flex items-start gap-1.5 px-1 py-1.5 transition-colors duration-150 ease-out',
-          chosen ? 'bg-raised' : 'hover:bg-raised',
-        )}
-      >
+      <div className={cn('hairline-row group relative flex items-start gap-1.5 py-1.5')}>
         <OrderTick order={order} />
         <div className="flex min-w-0 flex-1 flex-col gap-0.5">
           <div className="flex items-baseline justify-between gap-2">
@@ -146,7 +141,7 @@ function PathPicker({
           <li className={rowItem}>
             <Link
               href="/learn/build"
-              className="group rounded-control hover:bg-raised -mx-1 flex items-start gap-1.5 px-1 py-1.5 transition-colors duration-150 ease-out"
+              className="hairline-row group flex items-start gap-1.5 py-1.5 transition-colors duration-150 ease-out"
             >
               <span
                 aria-hidden

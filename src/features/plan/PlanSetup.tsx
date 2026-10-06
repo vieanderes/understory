@@ -222,7 +222,7 @@ export function PlanSetup({
                         aria-checked={selected}
                         onClick={() => pickGoal(id)}
                         className={cn(
-                          'group hover:bg-raised rounded-control -mx-1 flex min-h-6 w-full items-center gap-2 px-1 py-2 text-left transition-colors duration-150 ease-out',
+                          'hairline-row group flex min-h-6 w-full items-center gap-2 py-2 text-left transition-colors duration-150 ease-out',
                           selected && 'bg-raised',
                         )}
                       >
@@ -246,7 +246,7 @@ export function PlanSetup({
                   <div className="rule-t">
                     <Link
                       href="/learn/build"
-                      className="group hover:bg-raised rounded-control -mx-1 flex min-h-6 w-full items-center gap-2 px-1 py-2 text-left transition-colors duration-150 ease-out"
+                      className="hairline-row group flex min-h-6 w-full items-center gap-2 py-2 text-left transition-colors duration-150 ease-out"
                     >
                       <span className="min-w-0 flex-1">
                         <span className="block font-medium">Choose my own lessons</span>

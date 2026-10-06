@@ -29,7 +29,7 @@ function ShelfRow({ shelf }: { shelf: Shelf }) {
     <li className="rule-t">
       <Link
         href={href}
-        className="group hover:bg-raised rounded-control -mx-1 flex min-h-7 items-center gap-2 px-1 py-1.5 transition-colors duration-150 ease-out"
+        className="hairline-row group flex min-h-7 items-center gap-2 py-1.5 transition-colors duration-150 ease-out"
       >
         <Icon aria-hidden size={20} strokeWidth={2} className="text-muted shrink-0" />
         <span className="min-w-0 flex-1">

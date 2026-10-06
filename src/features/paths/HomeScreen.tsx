@@ -70,7 +70,7 @@ function NewsToday({ news, lead = false }: { news: NewsBrief; lead?: boolean }) 
           <li key={item.id} className="rule-t">
             <Link
               href={`/signal/${news.date}#story-${item.id}`}
-              className="group hover:bg-raised rounded-control -mx-1 flex min-h-6 items-baseline gap-2 px-1 py-1.5 transition-colors duration-150 ease-out"
+              className="hairline-row group flex min-h-6 items-baseline gap-2 py-1.5 transition-colors duration-150 ease-out"
             >
               <span
                 className={cn(
@@ -107,7 +107,7 @@ function PracticeLine() {
     <section aria-label="Practice" className="rule-t rule-b">
       <Link
         href="/practise"
-        className="group hover:bg-raised rounded-control -mx-1 flex min-h-7 items-center gap-2 px-1 py-1.5 transition-colors duration-150 ease-out"
+        className="hairline-row group flex min-h-7 items-center gap-2 py-1.5 transition-colors duration-150 ease-out"
       >
         <Repeat2 aria-hidden size={20} strokeWidth={2} className="text-muted shrink-0" />
         <span className="min-w-0 flex-1">

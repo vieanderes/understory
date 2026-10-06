@@ -21,7 +21,7 @@ export function EditionList({ editions }: { editions: EditionSummary[] }) {
           <li key={edition.date} className="rule-t first:border-t-0">
             <Link
               href={`/signal/${edition.date}`}
-              className="group hover:bg-raised rounded-control -mx-1 flex min-h-6 items-baseline gap-2 px-1 py-1 transition-colors duration-150 ease-out"
+              className="hairline-row group flex min-h-6 items-baseline gap-2 py-1 transition-colors duration-150 ease-out"
             >
               <span className="t-label t-figure w-10 shrink-0 whitespace-nowrap">
                 {formatWeekday(edition.date)}

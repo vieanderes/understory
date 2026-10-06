@@ -26,7 +26,7 @@ export function GoalShortcuts({
           <li key={goal} className="rule-t">
             <Link
               href={`/plan?goal=${goal}`}
-              className="group hover:bg-raised rounded-control -mx-1 flex min-h-6 items-center gap-2 px-1 py-2 transition-colors duration-150 ease-out"
+              className="hairline-row group flex min-h-6 items-center gap-2 py-2 transition-colors duration-150 ease-out"
             >
               <span className="min-w-0 flex-1">
                 <span className="block font-medium">{GOAL_COPY[goal].title}</span>

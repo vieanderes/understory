@@ -66,8 +66,8 @@ describe('PlanSetup', () => {
     const user = userEvent.setup();
     const onDone = vi.fn();
     render(<PlanSetup catalog={CATALOG} onDone={onDone} />);
-    expect(screen.getByRole('heading', { name: 'What do you want?' })).toBeInTheDocument();
-    await user.click(screen.getByRole('radio', { name: /Learn to code from zero/ }));
+    expect(screen.getByRole('heading', { name: 'What would you like to do?' })).toBeInTheDocument();
+    await user.click(screen.getByRole('radio', { name: /Learn to code from scratch/ }));
     expect(
       screen.getByRole('heading', { name: 'What are you interested in?' }),
     ).toBeInTheDocument();
@@ -80,7 +80,9 @@ describe('PlanSetup', () => {
     await user.click(screen.getByRole('button', { name: /Next/ }));
     await user.click(screen.getByRole('radio', { name: 'Python' }));
     await user.click(screen.getByRole('button', { name: /Next/ }));
-    expect(screen.getByRole('heading', { name: 'How much time a day?' })).toBeInTheDocument();
+    expect(
+      screen.getByRole('heading', { name: 'How much time do you have a day?' }),
+    ).toBeInTheDocument();
     await user.click(screen.getByRole('radio', { name: '1½ h' }));
     await user.click(screen.getByRole('button', { name: /Next/ }));
     await user.click(screen.getByRole('radio', { name: 'No' }));
@@ -102,6 +104,23 @@ describe('PlanSetup', () => {
       }),
     );
     expect(onDone).toHaveBeenCalled();
+  });
+
+  it('asks what to specialise in, and keeps the order the focus was tapped', async () => {
+    const user = userEvent.setup();
+    render(<PlanSetup catalog={CATALOG} onDone={() => {}} />);
+    await user.click(screen.getByRole('radio', { name: /Refresh, then specialise/ }));
+    expect(
+      screen.getByRole('heading', { name: 'What would you like to specialise in?' }),
+    ).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'System design' }));
+    await user.click(screen.getByRole('button', { name: 'AI engineering' }));
+    for (let i = 0; i < 4; i++) await user.click(screen.getByRole('button', { name: /Next/ }));
+    await user.click(screen.getByRole('button', { name: 'Start' }));
+    expect(record).toHaveBeenCalledWith(
+      'plan_set',
+      expect.objectContaining({ goal: 'refresh-specialise', focus: ['systems', 'ai'] }),
+    );
   });
 
   it('ends after the interests for the news alone, with no plan', async () => {
@@ -136,7 +155,9 @@ describe('PlanView', () => {
     const user = userEvent.setup();
     const onChange = vi.fn();
     render(<PlanView catalog={CATALOG} onChange={onChange} />);
-    expect(screen.getByRole('heading', { level: 1 })).toHaveTextContent('Learn to code from zero');
+    expect(screen.getByRole('heading', { level: 1 })).toHaveTextContent(
+      'Learn to code from scratch',
+    );
     expect(screen.getByRole('heading', { name: 'basics lesson 2' })).toBeInTheDocument();
     expect(screen.getByRole('link', { name: /Start · 10 min/ })).toHaveAttribute(
       'href',

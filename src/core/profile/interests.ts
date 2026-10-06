@@ -74,6 +74,11 @@ export function newsTopicRank(topic: string, interests: readonly Interest[]): nu
 
 const GOAL_INTERESTS: Record<PlanGoal, readonly Interest[]> = {
   'from-zero': ['basics', 'web'],
+  'first-job': ['basics', 'web', 'algorithms'],
+  // Everything means everything: no topic is favoured until the learner says so.
+  everything: [],
+  // The focus is the question here, so nothing is chosen for them.
+  'refresh-specialise': [],
   refresh: ['typescript', 'algorithms'],
   'second-language': ['typescript', 'python'],
   builder: ['web', 'backend'],

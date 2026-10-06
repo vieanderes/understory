@@ -113,6 +113,50 @@ describe('building a plan', () => {
     }
   });
 
+  it('learns it all: the start, then every part in course order with its checkpoint', () => {
+    const plan = buildPlan({ ...base, goal: 'everything' }, CATALOG);
+    expect(plan.phases.map((p) => p.id)).toEqual([
+      'foundations',
+      'part-interfaces',
+      'part-servers',
+      'part-production',
+      'part-senior',
+    ]);
+    expect(plan.phases[1]?.milestone).toEqual({
+      kind: 'checkpoint',
+      partId: 'interfaces',
+      title: 'Interfaces checkpoint',
+    });
+    // Someone who already codes starts at the first part.
+    expect(buildPlan({ ...base, goal: 'everything', level: 'pro' }, CATALOG).phases[0]?.id).toBe(
+      'part-interfaces',
+    );
+  });
+
+  it('refreshes, then goes deep in the chosen focus, in the order it was given', () => {
+    const plan = buildPlan(
+      { ...base, goal: 'refresh-specialise', level: 'pro', focus: ['ai', 'systems'] },
+      CATALOG,
+    );
+    expect(plan.phases.map((p) => p.id)).toEqual([
+      'language',
+      'patterns',
+      'focus-ai',
+      'focus-systems',
+    ]);
+    // Without a focus it is a refresh with the timed check.
+    expect(
+      buildPlan({ ...base, goal: 'refresh-specialise' }, CATALOG).phases.map((p) => p.id),
+    ).toEqual(['language', 'patterns', 'check']);
+  });
+
+  it('takes a first job from the basics to the interview', () => {
+    const ids = buildPlan({ ...base, goal: 'first-job' }, CATALOG).phases.map((p) => p.id);
+    expect(ids[0]).toBe('foundations');
+    expect(ids).toContain('interfaces');
+    expect(ids.at(-1)).toBe('talking');
+  });
+
   it('skips what a professional already knows', () => {
     expect(
       buildPlan({ ...base, goal: 'builder', level: 'pro' }, CATALOG).phases.map((p) => p.id),

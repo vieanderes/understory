@@ -1,3 +1,5 @@
+import type { Interest } from '@/core/profile/interests';
+
 /*
  * "Your plan" (docs/LEARNING-SCIENCE.md, "Plans"): the learner says what they want, how
  * much time they have and where they start; the plan orders the course for them into phases
@@ -10,8 +12,11 @@
 
 export const PLAN_GOALS = [
   'from-zero',
-  'refresh',
+  'first-job',
   'second-language',
+  'everything',
+  'refresh',
+  'refresh-specialise',
   'builder',
   'ai-engineer',
   'interviews',
@@ -32,6 +37,8 @@ export interface PlanAnswers {
   deadline?: string;
   /** The day the plan was set, YYYY-MM-DD. Pace is counted from it. */
   since: string;
+  /** What to go deep in after a refresh, in the learner's order. */
+  focus?: Interest[];
 }
 
 // ---- The catalogue a plan is built from ---------------------------------------------------
@@ -85,36 +92,48 @@ export interface Plan {
 
 export const GOAL_COPY: Record<PlanGoal, { title: string; who: string }> = {
   'from-zero': {
-    title: 'Learn to code from zero',
-    who: 'You have never written code, or only copied it.',
+    title: 'Learn to code from scratch',
+    who: 'Start with your first line of code. No experience needed.',
   },
-  refresh: {
-    title: 'Refresh my fundamentals',
-    who: 'An assistant writes most of your code, and doing it by hand has got harder.',
+  'first-job': {
+    title: 'Get my first developer job',
+    who: 'Go from the basics to a real app, then practise the tests and interviews that hire.',
   },
   'second-language': {
     title: 'Learn a second language',
-    who: 'You know one of TypeScript or Python and need the other.',
+    who: 'You know TypeScript or Python and want the other one too.',
+  },
+  everything: {
+    title: 'Learn it all, in a good order',
+    who: 'The whole course, one part after another, starting where you are.',
+  },
+  refresh: {
+    title: 'Refresh my fundamentals',
+    who: 'Feel confident writing code by hand again, without an assistant doing it for you.',
+  },
+  'refresh-specialise': {
+    title: 'Refresh, then specialise',
+    who: 'Get the basics back first, then go deep in the areas you choose.',
   },
   builder: {
-    title: 'Build and ship full-stack products',
-    who: 'You want a real app in production: web, server, data.',
+    title: 'Build and ship full-stack apps',
+    who: 'Make a real app that runs in production: web, server and data.',
   },
   'ai-engineer': {
     title: 'Become an AI engineer',
-    who: 'You want to build with language models, and know why they fail.',
+    who: 'Build products with language models, and understand why they fail.',
   },
   interviews: {
     title: 'Get ready for coding interviews',
-    who: 'An online coding test or live coding round is coming.',
+    who: 'Prepare for an online coding test or a live coding round.',
   },
   senior: {
-    title: 'Prepare for senior and system design rounds',
-    who: 'You can code; the round is about design, trade-offs and explaining them.',
+    title: 'Prepare for senior interviews',
+    who: 'Practise system design and explaining your trade-offs out loud.',
   },
   'stay-sharp': {
     title: 'Stay sharp',
-    who: 'You code for a living and want ten minutes a day that keep it fresh.',
+    who: 'Ten minutes a day to keep your skills fresh.',
   },
 };
 
@@ -139,8 +158,66 @@ function exam(pathId: string, title: string): Milestone {
   return { kind: 'path-exam', pathId, title };
 }
 
+/** The deep phase for one focus, after a refresh. Each is a path or a part of the course. */
+function focusPhase(focus: Interest, priority: number): PhaseSpec {
+  const phase = (
+    title: string,
+    why: string,
+    lessons: PhaseSpec['lessons'],
+    milestone?: Milestone,
+  ): PhaseSpec => ({
+    id: `focus-${focus}`,
+    title,
+    why,
+    priority,
+    lessons,
+    ...(milestone ? { milestone } : {}),
+  });
+  const part = (partId: string, title: string, why: string) =>
+    phase(
+      title,
+      why,
+      { part: partId },
+      { kind: 'checkpoint', partId, title: `${title} checkpoint` },
+    );
+  const path = (pathId: string, title: string, why: string) =>
+    phase(title, why, { path: pathId }, exam(pathId, `${title} exam`));
+  switch (focus) {
+    case 'basics':
+      return path('start-coding', 'Start coding', 'The ground every program stands on.');
+    case 'web':
+      return part('interfaces', 'Interfaces', 'The web, React and accessible design.');
+    case 'typescript':
+      return path('javascript-typescript', 'TypeScript', 'The language of the web, typed.');
+    case 'python':
+      return path('python', 'Python', 'Clean, typed Python, by hand.');
+    case 'backend':
+      return part('servers', 'Servers and data', 'APIs, databases, auth and testing.');
+    case 'algorithms':
+      return path('coding-rounds', 'Algorithms', 'The patterns behind most coding questions.');
+    case 'ai':
+      return path(
+        'ai-engineering',
+        'AI engineering',
+        'Retrieval, agents and evaluations, built and measured.',
+      );
+    case 'systems':
+      return part(
+        'senior',
+        'Senior engineer',
+        'Scale, consistency and failure, and explaining the trade-offs.',
+      );
+    case 'interviews':
+      return path(
+        'interview-loop',
+        'Interview skills',
+        'Your stories, system design and closing well.',
+      );
+  }
+}
+
 /** The phases for a goal, in the order to work through them. */
-function specs(answers: PlanAnswers): PhaseSpec[] {
+function specs(answers: PlanAnswers, catalog: PlanCatalog): PhaseSpec[] {
   const { goal, level, language } = answers;
   const foundations: PhaseSpec = {
     id: 'foundations',
@@ -167,21 +244,86 @@ function specs(answers: PlanAnswers): PhaseSpec[] {
     milestone: exam('coding-rounds', 'Algorithms exam'),
   };
 
+  const timedCheck: PhaseSpec = {
+    id: 'check',
+    title: 'Prove it under a clock',
+    why: 'A timed test with the assistant off shows what came back and what did not.',
+    priority: 3,
+    tests: [{ key: 'demo', target: 80 }],
+    milestone: { kind: 'test', key: 'demo', title: 'Your first test at 80%', target: 80 },
+  };
+
   switch (goal) {
+    case 'everything':
+      // The course is written in a good order already: every part, one after another, each
+      // closed by its checkpoint. A beginner starts on the path built for a first week.
+      return [
+        ...(level === 'new' ? [foundations] : []),
+        ...catalog.parts.map((p, i): PhaseSpec => ({
+          id: `part-${p.id}`,
+          title: p.title,
+          why: `Part ${i + 1} of ${catalog.parts.length}. It ends with a checkpoint on the whole part.`,
+          priority: i + 2,
+          lessons: { part: p.id },
+          milestone: { kind: 'checkpoint', partId: p.id, title: `${p.title} checkpoint` },
+        })),
+      ];
+    case 'refresh-specialise': {
+      const focus = answers.focus ?? [];
+      return [
+        { ...firstLanguage, title: 'Back to the language, by hand', priority: 1 },
+        { ...patterns, priority: 2 },
+        ...(focus.length === 0 ? [timedCheck] : focus.map((f, i) => focusPhase(f, i + 3))),
+      ];
+    }
+    case 'first-job':
+      return [
+        ...(level === 'new' ? [foundations] : []),
+        ...(level !== 'pro' ? [firstLanguage] : []),
+        {
+          id: 'interfaces',
+          title: 'Interfaces',
+          why: 'The web, React and accessible design: the part of an app people see first.',
+          priority: 2,
+          lessons: { part: 'interfaces' },
+          milestone: { kind: 'checkpoint', partId: 'interfaces', title: 'Interfaces checkpoint' },
+        },
+        {
+          id: 'servers',
+          title: 'Servers and data',
+          why: 'APIs, databases and tests: what a junior role expects on day one.',
+          priority: 3,
+          lessons: { part: 'servers' },
+          milestone: { kind: 'checkpoint', partId: 'servers', title: 'Servers checkpoint' },
+        },
+        { ...patterns, priority: 3 },
+        {
+          id: 'timed',
+          title: 'Timed practice',
+          why: 'The online test comes first in most hiring. Rehearse it until it is familiar.',
+          priority: 4,
+          tests: [
+            { key: 'demo', target: 80 },
+            { key: 'screen-a', target: 70 },
+            { key: 'mock-a', target: 70 },
+          ],
+          milestone: { kind: 'test', key: 'mock-a', title: 'Practice test 1 at 70%', target: 70 },
+        },
+        {
+          id: 'talking',
+          title: 'The talking rounds',
+          why: 'Behavioural questions, your stories and a design on a whiteboard.',
+          priority: 5,
+          lessons: { path: 'interview-loop' },
+        },
+      ];
     case 'from-zero':
       return [foundations, { ...firstLanguage, priority: 2 }, { ...patterns, priority: 3 }];
     case 'refresh':
       return [
         { ...firstLanguage, title: 'Back to the language, by hand', priority: 1 },
         { ...patterns, priority: 2 },
-        {
-          id: 'check',
-          title: 'Prove it under a clock',
-          why: 'A timed test with the assistant off shows what came back and what did not.',
-          priority: 3,
-          tests: [{ key: 'demo', target: 80 }],
-          milestone: { kind: 'test', key: 'demo', title: 'Your first test at 80%', target: 80 },
-        },
+        timedCheck,
       ];
     case 'second-language':
       return [
@@ -349,7 +491,7 @@ export function daysBetween(from: string, to: string): number {
 export function buildPlan(answers: PlanAnswers, catalog: PlanCatalog): Plan {
   const seen = new Set<string>();
   const phases: (Phase & { priority: number })[] = [];
-  for (const spec of specs(answers)) {
+  for (const spec of specs(answers, catalog)) {
     // A lesson appears once, in the first phase that asks for it.
     const items = [
       ...lessonsFor(spec, catalog).filter((item) => item.kind !== 'lesson' || !seen.has(item.id)),

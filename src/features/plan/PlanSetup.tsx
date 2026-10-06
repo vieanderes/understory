@@ -8,7 +8,6 @@ import { Segmented } from '@/components/ui/Segmented';
 import {
   buildPlan,
   GOAL_COPY,
-  PLAN_GOALS,
   type PlanAnswers,
   type PlanCatalog,
   type PlanGoal,
@@ -52,7 +51,7 @@ const DATED: readonly PlanGoal[] = ['interviews', 'senior'];
 type Goal = PlanGoal | 'news';
 const NEWS_ONLY = {
   title: 'Just follow the news',
-  who: 'You want a short daily read on what changed, and why it matters.',
+  who: 'A short daily read on what changed in software, and why it matters.',
 };
 
 type Step = 'goal' | 'interests' | 'start' | 'time' | 'news' | 'preview';
@@ -60,13 +59,21 @@ const PLAN_STEPS: Step[] = ['goal', 'interests', 'start', 'time', 'news', 'previ
 const NEWS_STEPS: Step[] = ['goal', 'interests'];
 
 const TITLES: Record<Step, string> = {
-  goal: 'What do you want?',
+  goal: 'What would you like to do?',
   interests: 'What are you interested in?',
   start: 'Where are you starting from?',
-  time: 'How much time a day?',
-  news: "Today's news on Home?",
+  time: 'How much time do you have a day?',
+  news: "Would you like today's news on Home?",
   preview: 'Your plan',
 };
+
+/** The goals in groups, so twelve choices read as four short lists. */
+const GROUPS: { title: string; goals: readonly Goal[] }[] = [
+  { title: 'Start', goals: ['from-zero', 'first-job', 'second-language', 'everything'] },
+  { title: 'Grow', goals: ['refresh', 'refresh-specialise', 'builder', 'ai-engineer'] },
+  { title: 'Get ready', goals: ['interviews', 'senior'] },
+  { title: 'Keep up', goals: ['stay-sharp', 'news'] },
+];
 
 const daily = (minutesPerWeek: number) =>
   String(
@@ -138,6 +145,8 @@ export function PlanSetup({
         minutesPerWeek: Number(perDay) * 7,
         ...(dated && deadline ? { deadline } : {}),
         since: today || '2026-01-01',
+        // The focus keeps the order the learner tapped, which is the order of the phases.
+        ...(goal === 'refresh-specialise' && interests.length > 0 ? { focus: [...interests] } : {}),
       };
   // Cheap to build: the preview follows every answer as it changes.
   const preview = answers ? buildPlan(answers, catalog) : undefined;
@@ -171,10 +180,8 @@ export function PlanSetup({
     onDone();
   }
 
-  const goals: { id: Goal; title: string; who: string }[] = [
-    ...PLAN_GOALS.map((id) => ({ id, ...GOAL_COPY[id] })),
-    { id: 'news', ...NEWS_ONLY },
-  ];
+  const copyOf = (id: Goal) => (id === 'news' ? NEWS_ONLY : GOAL_COPY[id]);
+  const specialise = goal === 'refresh-specialise';
 
   return (
     <section aria-labelledby={titleId} className="flex max-w-3xl flex-col gap-4">
@@ -186,44 +193,68 @@ export function PlanSetup({
             : ` · ${index + 1} of ${steps.filter((s) => s !== 'preview').length}`}
         </p>
         <h1 id={titleId} className="t-section">
-          {TITLES[step]}
+          {step === 'interests' && specialise
+            ? 'What would you like to specialise in?'
+            : TITLES[step]}
         </h1>
       </div>
 
       {step === 'goal' ? (
-        <div
-          role="radiogroup"
-          aria-labelledby={titleId}
-          className="grid grid-cols-1 gap-1 sm:grid-cols-2"
-        >
-          {goals.map(({ id, title, who }) => {
-            const selected = id === goal;
-            return (
-              <button
-                key={id}
-                type="button"
-                role="radio"
-                aria-checked={selected}
-                onClick={() => pickGoal(id)}
-                className={cn(
-                  'rounded-panel transition-press flex flex-col items-start gap-0.5 border p-2 text-left active:scale-98',
-                  selected
-                    ? 'border-accent bg-accent-tint'
-                    : 'border-border hover:border-border-strong hover:bg-raised',
-                )}
+        <div className="flex flex-col gap-3">
+          <p className="text-muted">Pick the closest. You can change it any time.</p>
+          {GROUPS.map((group) => (
+            <section key={group.title} className="flex flex-col gap-1">
+              <h2 className="t-label">{group.title}</h2>
+              <div
+                role="radiogroup"
+                aria-label={group.title}
+                className="grid grid-cols-1 gap-1 sm:grid-cols-2"
               >
-                <span className="font-medium">{title}</span>
-                <span className="text-muted text-sm">{who}</span>
-              </button>
-            );
-          })}
+                {group.goals.map((id) => {
+                  const { title, who } = copyOf(id);
+                  const selected = id === goal;
+                  return (
+                    <button
+                      key={id}
+                      type="button"
+                      role="radio"
+                      aria-checked={selected}
+                      onClick={() => pickGoal(id)}
+                      className={cn(
+                        'rounded-panel transition-press flex flex-col items-start gap-0.5 border p-2 text-left active:scale-98',
+                        selected
+                          ? 'border-accent bg-accent-tint'
+                          : 'border-border hover:border-border-strong hover:bg-raised',
+                      )}
+                    >
+                      <span className="font-medium">{title}</span>
+                      <span className="text-muted text-sm">{who}</span>
+                    </button>
+                  );
+                })}
+                {group.title === 'Keep up' ? (
+                  <Link
+                    href="/learn/build"
+                    className="rounded-panel transition-press border-border hover:border-border-strong hover:bg-raised flex flex-col items-start gap-0.5 border p-2 text-left active:scale-98"
+                  >
+                    <span className="font-medium">Choose my own lessons</span>
+                    <span className="text-muted text-sm">
+                      Pick parts, chapters or single lessons from the whole course.
+                    </span>
+                  </Link>
+                ) : null}
+              </div>
+            </section>
+          ))}
         </div>
       ) : null}
 
       {step === 'interests' ? (
         <div className="flex flex-col gap-2">
           <p className="text-muted">
-            Pick any. Practice and the news start with these. Nothing else is hidden.
+            {specialise
+              ? 'Pick one or more, in the order you want to go deep. Practice and the news start with these too.'
+              : 'Pick any. Practice and the news start with these. Nothing else is hidden.'}
           </p>
           <ul aria-labelledby={titleId} className="flex flex-wrap gap-1">
             {INTERESTS.map((id) => {

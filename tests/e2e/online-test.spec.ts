@@ -256,7 +256,7 @@ test('a plan is made in five questions and leads Home with a step for today', as
   await expect(page.getByRole('heading', { name: 'What are you interested in?' })).toBeVisible();
   await page.getByRole('button', { name: 'Next', exact: true }).click();
   await page.getByRole('button', { name: 'Next', exact: true }).click();
-  await expect(page.getByRole('heading', { name: 'How much time a day?' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'How much time do you have a day?' })).toBeVisible();
   await page.getByRole('radio', { name: '45 min' }).check({ force: true });
   await page.getByRole('button', { name: 'Next', exact: true }).click();
   await page.getByRole('button', { name: 'Next', exact: true }).click();

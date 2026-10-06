@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { idSchema, localIdSchema } from '@/core/content/ids';
 import { cardStateSchema, ratingSchema } from '@/core/scheduling/card-state';
+import { PLAN_GOALS } from '@/core/plan/plan';
 import { INTERESTS } from '@/core/profile/interests';
 import type { Clock } from '@/core/ports/clock';
 import type { IdGen } from '@/core/ports/id-gen';
@@ -241,21 +242,13 @@ export const onlineTestSubmittedPayloadSchema = z
  */
 export const planSetPayloadSchema = z
   .strictObject({
-    goal: z.enum([
-      'from-zero',
-      'refresh',
-      'second-language',
-      'builder',
-      'ai-engineer',
-      'interviews',
-      'senior',
-      'stay-sharp',
-    ]),
+    goal: z.enum(PLAN_GOALS),
     level: z.enum(['new', 'some', 'pro']),
     language: z.enum(['js', 'python']),
     minutesPerWeek: z.int().min(15).max(3000),
     deadline: z.iso.date().optional(),
     since: z.iso.date(),
+    focus: z.array(z.enum(INTERESTS)).max(INTERESTS.length).optional(),
   })
   .refine(
     (p) => p.deadline === undefined || p.deadline >= p.since,

@@ -200,7 +200,14 @@ function CustomBuilder({ index }: { index: OnlineTestIndex }) {
  * The simulator's front door: the preset tests, training on any one task, a custom test
  * and past results. One primary action: the demo test, the shortest way in.
  */
-export function OnlineTestHub({ index }: { index: OnlineTestIndex }) {
+export function OnlineTestHub({
+  index,
+  levelledHref,
+}: {
+  index: OnlineTestIndex;
+  /** The levelled mock, a lesson that is one more full practice test to a learner. */
+  levelledHref?: string;
+}) {
   const { state } = useProgress();
   const now = useSecondClock();
   const keys = [
@@ -306,6 +313,25 @@ export function OnlineTestHub({ index }: { index: OnlineTestIndex }) {
                   </div>
                 </li>
               ))}
+              {group.mode === 'mock' && levelledHref ? (
+                <li className="rule-t grid grid-cols-4 items-center gap-2 py-2 md:grid-cols-12">
+                  <div className="col-span-4 flex flex-col md:col-span-8">
+                    <span className="font-medium">Practice test 4: one task in four levels</span>
+                    <span className="text-muted text-sm">
+                      One system that grows over four levels in 90 minutes, in TypeScript. Every
+                      earlier level must keep passing.
+                    </span>
+                    <span className="text-muted t-figure pt-0.5 text-sm">
+                      90 minutes for 1 task
+                    </span>
+                  </div>
+                  <div className="col-span-4 md:text-right">
+                    <Link href={levelledHref} className={buttonClass('secondary', 'md')}>
+                      Start
+                    </Link>
+                  </div>
+                </li>
+              ) : null}
             </ul>
           </section>
         );

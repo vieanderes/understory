@@ -71,6 +71,17 @@ describe('claude CLI arguments', () => {
     expect(args.slice(-2)).toEqual(['--model', 'claude-opus-5-5']);
   });
 
+  it('puts the planner course on stdin, and says so in the system prompt', () => {
+    const planner = { ...BODY, context: { ...BODY.context, mode: 'planner' as const } };
+    const args = cliArgs(planner, '# The course');
+    const system = args[args.indexOf('--system-prompt') + 1]!;
+    expect(system).toContain('The course is at the top of the prompt.');
+    expect(system).not.toContain('# The course');
+    expect(cliPrompt(BODY.turns, '# The course')).toBe(
+      '# The course\n\nWhat does a run mean here?',
+    );
+  });
+
   it('writes earlier turns above the new question', () => {
     expect(cliPrompt(BODY.turns)).toBe('What does a run mean here?');
     const prompt = cliPrompt([

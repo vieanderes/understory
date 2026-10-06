@@ -19,6 +19,8 @@ export type { CatalogSummary, ConceptEntry, LessonRoute } from './loaders';
 export { ContentError } from './fs';
 export { getOnlineTestIndex } from './online-tests';
 export { getPlanCatalog } from './plan-catalog';
+export { getPlannerCourse } from './planner-course';
+export type { PlannerCourseFile } from './planner-course';
 export { getPath, getPaths } from './paths';
 export type { PathLesson, PathStage, PathSummary, PathTest } from './paths';
 export {

@@ -262,10 +262,17 @@ describe('the course for Scout', () => {
     expect(text).toContain('## Part: Foundations (foundations)');
     expect(text).toContain('### Chapter 2: Web (web)');
     expect(text).toContain(
-      '- web.rest | Title web.rest | 25 min | essential | Do web.rest. | needs web.http, ghost.lesson',
+      '- web.rest | Title web.rest | 25 min | essential | Do web.rest. | needs ghost.lesson',
     );
     expect(text).toContain(
       '- basics.values | Title basics.values | 10 min | essential | Do basics.values.\n',
+    );
+    // A prerequisite from another chapter is named; the lesson just above is implied.
+    expect(text).toContain(
+      '- web.http | Title web.http | 20 min | essential | Do web.http. | needs basics.functions',
+    );
+    expect(text).toContain(
+      '- basics.functions | Title basics.functions | 15 min | essential | Do basics.functions.\n',
     );
   });
 

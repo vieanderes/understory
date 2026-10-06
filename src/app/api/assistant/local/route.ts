@@ -1,6 +1,7 @@
 import { limited } from '@/adapters/assistant/server/rate-limit';
 import { cliAvailable, runClaudeCli } from '@/adapters/assistant/server/claude-cli';
 import { localCliAllowed, localCliEnabled } from '@/adapters/assistant/server/local-guard';
+import { plannerCourseText } from '@/adapters/assistant/server/planner-course';
 import {
   assistantBodySchema,
   NDJSON_HEADERS,
@@ -43,6 +44,8 @@ export async function POST(request: Request) {
   if (request.signal.aborted) abort();
   request.signal.addEventListener('abort', abort, { once: true });
 
-  const events = runClaudeCli(parsed.body, controller.signal);
+  const course =
+    parsed.body.context.mode === 'planner' ? await plannerCourseText(request.url) : undefined;
+  const events = runClaudeCli(parsed.body, controller.signal, undefined, undefined, course);
   return new Response(ndjsonStream(events, abort), { headers: NDJSON_HEADERS });
 }

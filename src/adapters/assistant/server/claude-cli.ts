@@ -17,7 +17,7 @@ export function claudeCommand(env: Record<string, string | undefined> = process.
   return env.CLAUDE_CLI_PATH || 'claude';
 }
 
-export function cliArgs(body: AssistantBody): string[] {
+export function cliArgs(body: AssistantBody, course?: string): string[] {
   return [
     '-p',
     '--output-format',
@@ -25,7 +25,11 @@ export function cliArgs(body: AssistantBody): string[] {
     '--verbose',
     '--include-partial-messages',
     '--system-prompt',
-    assistantSystemPrompt(body.context),
+    // An argument has a size limit, so the planner's course goes on stdin (cliPrompt).
+    assistantSystemPrompt(
+      body.context,
+      course ? 'The course is at the top of the prompt.' : undefined,
+    ),
     '--tools',
     '',
     '--strict-mcp-config',
@@ -40,15 +44,17 @@ export function cliArgs(body: AssistantBody): string[] {
  * Print mode takes one prompt, so earlier turns are written out above the new question.
  * It goes in on stdin: a long conversation would overflow an argument.
  */
-export function cliPrompt(turns: AssistantBody['turns']): string {
+export function cliPrompt(turns: AssistantBody['turns'], course?: string): string {
   const all = normaliseTurns(turns);
   const question = all.at(-1)?.text ?? '';
   const earlier = all.slice(0, -1);
-  if (earlier.length === 0) return question;
+  // The planner's course is long, so it rides on stdin too, ahead of the conversation.
+  const head = course ? `${course}\n\n` : '';
+  if (earlier.length === 0) return `${head}${question}`;
   const history = earlier
     .map((turn) => `${turn.role === 'user' ? 'Candidate' : 'Assistant'}: ${turn.text}`)
     .join('\n\n');
-  return `The conversation so far:\n\n${history}\n\nThe candidate now asks:\n\n${question}`;
+  return `${head}The conversation so far:\n\n${history}\n\nThe candidate now asks:\n\n${question}`;
 }
 
 export type CliLine =
@@ -121,10 +127,12 @@ export async function* runClaudeCli(
   signal: AbortSignal,
   spawn: Spawn = nodeSpawn,
   command: string = claudeCommand(),
+  /** Scout's text of the course, in planner mode. */
+  course?: string,
 ): AsyncGenerator<StreamEvent> {
   let child: ChildProcess;
   try {
-    child = spawn(command, cliArgs(body), {
+    child = spawn(command, cliArgs(body, course), {
       cwd: tmpdir(),
       stdio: ['pipe', 'pipe', 'ignore'],
       env: process.env,
@@ -151,7 +159,7 @@ export async function* runClaudeCli(
 
   // A missing binary errors stdin too; the 'error' event on the child says why.
   child.stdin?.on('error', () => {});
-  child.stdin?.end(cliPrompt(body.turns));
+  child.stdin?.end(cliPrompt(body.turns, course));
 
   let streamed = false;
   let finished = false;

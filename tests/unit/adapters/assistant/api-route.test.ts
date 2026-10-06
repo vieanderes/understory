@@ -1,4 +1,5 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { forgetPlannerCourse } from '@/adapters/assistant/server/planner-course';
 import { BODY, jsonRequest, readAll } from './fixtures';
 
 const create = vi.fn();
@@ -33,6 +34,11 @@ const delta = (text: string) => ({
 beforeEach(() => {
   create.mockReset();
   constructed.length = 0;
+  forgetPlannerCourse();
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
 });
 
 describe('POST /api/assistant', () => {
@@ -120,5 +126,36 @@ describe('POST /api/assistant', () => {
       { type: 'text', text: 'Half' },
       { type: 'error', code: 'failed', message: expect.any(String) },
     ]);
+  });
+
+  it('plans with the course from its own origin, cached as one block, and room for a path', async () => {
+    const course = vi.fn(async (url: string) => {
+      expect(url).toBe('http://localhost:3000/api/planner/course');
+      return Response.json({ catalog: '# The course\n- web.http | HTTP' });
+    });
+    vi.stubGlobal('fetch', course);
+    create.mockResolvedValue(events([]));
+    const planner = {
+      ...BODY,
+      context: { ...BODY.context, mode: 'planner', planner: 'Today is 2026-10-06.' },
+    };
+    await POST(jsonRequest(URL, planner, { 'x-anthropic-key': 'k' }));
+    await POST(jsonRequest(URL, planner, { 'x-anthropic-key': 'k' }));
+    expect(course).toHaveBeenCalledTimes(1);
+    const [params] = create.mock.calls[0]!;
+    expect(params.max_tokens).toBe(8192);
+    expect(params.system).toHaveLength(2);
+    expect(params.system[0].cache_control).toEqual({ type: 'ephemeral' });
+    expect(params.system[0].text).toContain('```scout-path');
+    expect(params.system[0].text).toContain('- web.http | HTTP');
+    expect(params.system[1].text).toContain('Today is 2026-10-06.');
+  });
+
+  it('keeps the plain prompt and token budget outside the planner', async () => {
+    create.mockResolvedValue(events([]));
+    await POST(jsonRequest(URL, BODY, { 'x-anthropic-key': 'k' }));
+    const [params] = create.mock.calls[0]!;
+    expect(params.max_tokens).toBe(4096);
+    expect(typeof params.system).toBe('string');
   });
 });

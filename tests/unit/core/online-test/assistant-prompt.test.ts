@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { assistantSystemPrompt, type AssistantContext } from '@/core/ports/assistant';
+import {
+  assistantSystemPrompt,
+  PLANNER_RULES,
+  plannerPrompt,
+  type AssistantContext,
+} from '@/core/ports/assistant';
 
 const base: AssistantContext = {
   taskTitle: 'Home',
@@ -65,5 +70,29 @@ describe('assistant system prompts', () => {
 
   it('keeps the assessment prompt as the default', () => {
     expect(assistantSystemPrompt(base)).toContain('online coding assessment');
+  });
+
+  it('plans a path with the blocks, the course and the learner, in two parts', () => {
+    const context: AssistantContext = {
+      ...base,
+      mode: 'planner',
+      planner: 'Today is 2026-10-06. Done: 12 lessons.',
+      app: 'Learn /paths',
+    };
+    const { stable, learner } = plannerPrompt(context, '# The course');
+    expect(stable).toContain(PLANNER_RULES);
+    expect(stable).toContain('# The course');
+    expect(stable).not.toContain('2026-10-06');
+    expect(learner).toContain('Today is 2026-10-06.');
+    expect(learner).toContain('Learn /paths');
+    expect(PLANNER_RULES).toContain('```scout-ask');
+    expect(PLANNER_RULES).toContain('Never assume a job or a role.');
+    expect(assistantSystemPrompt(context, '# The course')).toBe(`${stable}\n\n${learner}`);
+  });
+
+  it('will not plan without the course', () => {
+    const { stable, learner } = plannerPrompt({ ...base, mode: 'planner' });
+    expect(stable).toContain('Do not draft a path without it.');
+    expect(learner).toContain('(nothing known yet)');
   });
 });

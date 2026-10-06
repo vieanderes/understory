@@ -1,7 +1,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
 import { z } from 'zod';
-import { NAVIGATION_RULES, type AssistantContext } from '@/core/ports/assistant';
+import { NAVIGATION_RULES, PLANNER_RULES, type AssistantContext } from '@/core/ports/assistant';
 import { pairingCodeSchema } from '../pairing';
 import {
   getBridgeStore,
@@ -9,6 +9,7 @@ import {
   type BridgeStore,
   type KeyValue,
 } from './bridge-store';
+import { plannerCourseText } from './planner-course';
 import { clientOf, recordFailure } from './rate-limit';
 
 /*
@@ -34,6 +35,7 @@ export const MCP_INSTRUCTIONS = [
   '- Scout AI, the study assistant on every other page: beside a lesson a patient tutor who explains and writes code freely, elsewhere a guide to the app who says where things are and what to do next. get_task says which one it is, and carries a guide to the whole app.',
   'The learner gives you a pairing code shown in the assistant panel. Pass it to every tool.',
   'When asked something, call get_pending_question first, then get_task and get_code (and get_test_output when it helps).',
+  'When get_task says Scout is planning a path, call get_course once per conversation for the lessons, and answer with the blocks get_task describes.',
   'When the learner asks you to keep answering (for example "Keep answering my Understory questions"), listen instead: call wait_for_question with the code. It waits until they ask something in the app and returns the question with the page, their code and the test output. Answer with reply, then call wait_for_question again. Go on until the learner tells you to stop or wait_for_question says the tab has closed. Between questions say nothing in this chat beyond one short line.',
   'Answer with the reply tool: that is the only way your answer reaches the app. Use Markdown, with code in fenced blocks and the language named.',
   'Do not edit files or run commands for this: the learner works in the app.',
@@ -89,6 +91,17 @@ function appGuide(context: AssistantContext): string[] {
 
 /** What get_task says: the page or task, by mode. */
 export function pageText(context: AssistantContext): string {
+  if (context.mode === 'planner') {
+    return [
+      'Scout is planning a learning path with the learner, in the plan mode of its panel.',
+      'Call get_course once in this conversation for every lesson id you may use.',
+      '',
+      PLANNER_RULES,
+      '',
+      `The learner:\n${untrusted('learner-plan', context.planner || '(nothing known yet)')}`,
+      ...appGuide(context),
+    ].join('\n');
+  }
   return context.mode === 'tutor'
     ? [
         `The learner is studying a lesson in Understory and wants help understanding it.`,
@@ -158,6 +171,8 @@ export interface McpServerOptions {
   listenPollMs?: number;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
+  /** Scout's text of the course, for get_course. */
+  courseText?: () => Promise<string | undefined>;
 }
 
 const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -246,6 +261,26 @@ export function createAssistantMcpServer(options: McpServerOptions): McpServer {
       annotations: READ_ONLY,
     },
     ({ code }) => withContext(code, pageText),
+  );
+
+  server.registerTool(
+    'get_course',
+    {
+      title: 'Get the course',
+      description:
+        'Every lesson in Understory, by part and chapter, with its id, minutes, level and prerequisites, and the written paths. For planning a path; call it once per conversation.',
+      inputSchema: codeInput,
+      annotations: READ_ONLY,
+    },
+    async ({ code: raw }) => {
+      const gated = await gate(raw);
+      if ('refusal' in gated) return gated.refusal;
+      // Built from the content at build time, not from the tab: it is the app speaking.
+      const course = await options.courseText?.();
+      return course
+        ? text(course)
+        : failure('The course could not be loaded. Try again in a moment.');
+    },
   );
 
   server.registerTool(
@@ -428,6 +463,7 @@ export async function handleMcpRequest(
   }
 
   const server = createAssistantMcpServer({
+    courseText: () => plannerCourseText(request.url),
     ...options,
     store,
     connectionId,

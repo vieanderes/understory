@@ -33,9 +33,11 @@ export const contextSchema = z.object({
   language: z.string().max(100),
   code: z.string().max(MAX_TEXT),
   output: z.string().max(MAX_TEXT),
-  mode: z.enum(['test', 'tutor', 'guide']).optional(),
+  mode: z.enum(['test', 'tutor', 'guide', 'planner']).optional(),
   // A few hundred tokens in practice; the ceiling only stops a tab padding the prompt.
   app: z.string().max(8_000).optional(),
+  // A draft of up to 200 lessons and the progress per chapter: a few thousand characters.
+  planner: z.string().max(16_000).optional(),
 });
 
 export const turnSchema = z.object({

@@ -13,9 +13,13 @@ function chapterLines(mod: PlannerModule): string[] {
     `### Chapter ${mod.number}: ${mod.title} (${mod.id})`,
     `${mod.summary} You can build: ${mod.youCanBuild}`,
   ];
+  let above: string | undefined;
   for (const l of mod.lessons) {
-    const needs = l.prerequisites.length > 0 ? ` | needs ${l.prerequisites.join(', ')}` : '';
+    // Most lessons build on the one just above; saying so 370 times would crowd the prompt.
+    const others = l.prerequisites.filter((id) => id !== above);
+    const needs = others.length > 0 ? ` | needs ${others.join(', ')}` : '';
     lines.push(`- ${l.id} | ${l.title} | ${l.minutes} min | ${l.level} | ${l.objective}${needs}`);
+    above = l.id;
   }
   return lines;
 }
@@ -25,7 +29,7 @@ export function plannerCatalog(course: PlannerCourse, paths: readonly PlannerPat
   const placed = new Set<string>();
   const out = [
     '# The course',
-    'Each lesson: id | title | minutes | level | what the learner can do afterwards | needs (prerequisite ids, advice only).',
+    'Each lesson: id | title | minutes | level | what the learner can do afterwards | needs: prerequisites beyond the lesson just above, which most lessons build on.',
   ];
   for (const part of course.parts) {
     out.push('', `## Part: ${part.title} (${part.id})`, part.summary);

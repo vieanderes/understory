@@ -1,5 +1,6 @@
 import { limited } from '@/adapters/assistant/server/rate-limit';
 import { mapAnthropicError, openAnthropicReply } from '@/adapters/assistant/server/anthropic';
+import { plannerCourseText } from '@/adapters/assistant/server/planner-course';
 import {
   assistantBodySchema,
   errorResponse,
@@ -29,7 +30,9 @@ export async function POST(request: Request) {
   if (!parsed.ok) return parsed.response;
 
   try {
-    const reply = await openAnthropicReply(apiKey, parsed.body, request.signal);
+    const course =
+      parsed.body.context.mode === 'planner' ? await plannerCourseText(request.url) : undefined;
+    const reply = await openAnthropicReply(apiKey, parsed.body, request.signal, undefined, course);
     return new Response(ndjsonStream(reply.events), { headers: NDJSON_HEADERS });
   } catch (error) {
     const mapped = mapAnthropicError(error);

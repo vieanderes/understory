@@ -3,21 +3,28 @@
  * level and prerequisites, the parts, and Scout's compact text of it all, written paths
  * included. Built once at build time and served as a static file.
  */
-import { plannerCatalog, type PlannerCourse, type PlannerLesson } from '@/core/planner';
+import {
+  plannerCatalog,
+  type PlannerLesson,
+  type PlannerModule,
+  type PlannerPart,
+} from '@/core/planner';
 import { getManifest } from './loaders';
 import { getPaths } from './paths';
+
+export type PlannerFileLesson = PlannerLesson & { href: string };
+export type PlannerFileModule = Omit<PlannerModule, 'lessons'> & {
+  slug: string;
+  lessons: PlannerFileLesson[];
+};
 
 export interface PlannerCourseFile {
   /** Changes when the content does. */
   rev: string;
   /** Scout's text of the course, for the planner prompt. */
   catalog: string;
-  course: PlannerCourse & {
-    modules: (PlannerCourse['modules'][number] & {
-      slug: string;
-      lessons: (PlannerLesson & { href: string })[];
-    })[];
-  };
+  /** The planner's course, with each lesson's link. */
+  course: { modules: PlannerFileModule[]; parts: PlannerPart[] };
 }
 
 export async function getPlannerCourse(): Promise<PlannerCourseFile> {

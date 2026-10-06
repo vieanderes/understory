@@ -250,7 +250,7 @@ function specs(answers: PlanAnswers, catalog: PlanCatalog): PhaseSpec[] {
     why: 'A timed test with the assistant off shows what came back and what did not.',
     priority: 3,
     tests: [{ key: 'demo', target: 80 }],
-    milestone: { kind: 'test', key: 'demo', title: 'Your first test at 80%', target: 80 },
+    milestone: { kind: 'test', key: 'demo', title: 'The warm-up at 80%', target: 80 },
   };
 
   switch (goal) {
@@ -307,7 +307,7 @@ function specs(answers: PlanAnswers, catalog: PlanCatalog): PhaseSpec[] {
             { key: 'screen-a', target: 70 },
             { key: 'mock-a', target: 70 },
           ],
-          milestone: { kind: 'test', key: 'mock-a', title: 'Practice test 1 at 70%', target: 70 },
+          milestone: { kind: 'test', key: 'mock-a', title: 'Full mock 1 at 70%', target: 70 },
         },
         {
           id: 'talking',
@@ -405,7 +405,7 @@ function specs(answers: PlanAnswers, catalog: PlanCatalog): PhaseSpec[] {
             { key: 'screen-a', target: 70 },
             { key: 'mock-a', target: 70 },
           ],
-          milestone: { kind: 'test', key: 'mock-a', title: 'Practice test 1 at 70%', target: 70 },
+          milestone: { kind: 'test', key: 'mock-a', title: 'Full mock 1 at 70%', target: 70 },
         },
         { ...patterns, priority: 2 },
         {

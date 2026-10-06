@@ -623,7 +623,7 @@ The coding challenges senior full-stack and AI engineers meet: timed online test
 23. Presenting your build `interview.presenting`: present a build in ten to fifteen minutes around your decisions, demo one path safely, and answer hard follow-up questions well. **E**
 24. Mock assessment A `interview.mock-a`: sit a timed three-task assessment scored on hidden correctness and performance tests. **A**
 25. Mock assessment B `interview.mock-b`: sit a second timed three-task assessment on different patterns. **A**
-26. Practice test 4: one task in four levels `interview.mock-levelled`: sit a timed four-level task that grows a bank system, keeping every earlier level passing. **A**
+26. Full mock 4: one task in four levels `interview.mock-levelled`: sit a timed four-level task that grows a bank system, keeping every earlier level passing. **A**
 27. Mock assessment C, in Python `interview.mock-python`: sit a timed three-task assessment in Python, scored on hidden correctness and performance tests. **A**
 28. AI build: a production LLM client `interview.llm-client-build`: wrap a model call with a timeout, retries on retryable errors only, a concurrency cap, a promise cache that shares identical calls, and JSON validated with one re-ask. **A**
 29. Tasks candidates report `interview.reported-tasks`: name the pattern behind ten commonly reported online-test tasks and solve three of them. **A**

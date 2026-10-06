@@ -11,7 +11,7 @@ export const metadata: Metadata = {
 /** Course mocks the simulator cannot run yet, numbered after its own practice tests. */
 const LESSON_TEST_COPY: Record<string, { title: string; note: string }> = {
   'interview.mock-levelled': {
-    title: 'Practice test 4: one task in four levels',
+    title: 'Full mock 4: one task in four levels',
     note: 'TypeScript',
   },
 };

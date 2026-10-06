@@ -130,7 +130,7 @@ export type TaskFile = z.infer<typeof taskFileSchema>;
 
 export const presetFileSchema = z.strictObject({
   id: slug,
-  title: text('Plain: what the test is, such as "Two-task test".'),
+  title: text('Plain: what the test is, such as "Short screen: two tasks".'),
   summary: text('One line on what the test rehearses.'),
   mode: z.enum(['demo', 'screen', 'ai', 'mock']),
   order: z.number().int().min(0),

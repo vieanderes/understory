@@ -109,7 +109,7 @@ describe('tests on a path', () => {
     expect(resolveStageTest({ lesson: 'interview.mock-levelled' }, index, lesson)).toEqual({
       key: 'interview.mock-levelled',
       kind: 'lesson',
-      title: 'Practice test 4: one task in four levels',
+      title: 'Full mock 4: one task in four levels',
       detail: 'TypeScript · 1 task in four levels',
       minutes: 90,
       href: '/learn/x/y',

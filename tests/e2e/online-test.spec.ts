@@ -198,7 +198,7 @@ test('a path stage offers practice, labs and tests, optional and with their XP',
   await page.goto('/paths/ai-coding-tests');
   const method = page.getByRole('region', { name: 'Try it: The method' });
   await expect(method.getByText('Optional · recommended')).toBeVisible();
-  await expect(method.getByRole('link', { name: /Your first test/ })).toHaveAttribute(
+  await expect(method.getByRole('link', { name: /Warm-up: one easy task/ })).toHaveAttribute(
     'href',
     '/practise/online-test/demo',
   );
@@ -219,7 +219,7 @@ test('a path stage offers practice, labs and tests, optional and with their XP',
   const timed = page.getByRole('region', { name: 'Try it: Timed practice' });
   await timed.getByText(/\d+ more$/).click();
   await expect(
-    timed.getByRole('link', { name: /Practice test 4: one task in four levels/ }),
+    timed.getByRole('link', { name: /Full mock 4: one task in four levels/ }),
   ).toHaveAttribute('href', /^\/learn\/.+/);
 });
 

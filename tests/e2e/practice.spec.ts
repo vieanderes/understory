@@ -34,7 +34,7 @@ test.describe('practice by topic', () => {
     await page.getByRole('link', { name: /Timed coding tests/ }).click();
     await expect(page).toHaveURL('/practise/online-test');
     await expect(
-      page.getByRole('link', { name: /Practice test 4: one task in four levels/ }),
+      page.getByRole('link', { name: /Full mock 4: one task in four levels/ }),
     ).toBeVisible();
     await page.goBack();
     await page.getByText('Check one part').click();

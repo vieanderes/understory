@@ -66,7 +66,7 @@ export interface StageTestLesson {
  */
 const LESSON_TESTS: Readonly<Record<string, { title: string; detail: string }>> = {
   'interview.mock-levelled': {
-    title: 'Practice test 4: one task in four levels',
+    title: 'Full mock 4: one task in four levels',
     detail: 'TypeScript · 1 task in four levels',
   },
 };

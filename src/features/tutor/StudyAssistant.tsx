@@ -21,9 +21,11 @@ import {
   clearHistory,
   restoreHistory,
   setTutorOpen,
+  settleTutorFocus,
   type TutorMessage,
   useHistory,
   useTutorDocked,
+  useTutorFocusRequest,
   useTutorOpen,
   useTutorScope,
   useTutorWithheld,
@@ -72,6 +74,21 @@ function useShortcutLabel(): string | null {
     () => (/Mac|iPhone|iPad/.test(navigator.platform) ? '⌘J' : 'Ctrl J'),
     () => null,
   );
+}
+
+/**
+ * Holds a value as it was when the panel mounted. The focus request is spent as soon as the
+ * panel mounts, but the question box arrives later, with the lazy chunk, and still needs it.
+ */
+function KeepFirst({
+  value,
+  children,
+}: {
+  value: boolean;
+  children: (value: boolean) => React.ReactNode;
+}) {
+  const [kept] = useState(value);
+  return children(kept);
 }
 
 /** The trigger: top right of a page, or docked in a lesson's own bar. */
@@ -138,6 +155,8 @@ export function StudyAssistant({
   const open = useTutorOpen();
   const docked = useTutorDocked();
   const withheld = useTutorWithheld();
+  // True only for the render in which the learner opened the panel; spent once it mounts.
+  const opening = useTutorFocusRequest();
 
   const key = scope?.key ?? `page:${pathname}`;
   const history = useHistory(key);
@@ -161,6 +180,12 @@ export function StudyAssistant({
     };
     document.addEventListener('keydown', onKey);
     return () => document.removeEventListener('keydown', onKey);
+  }, [open]);
+
+  // The first render after an open carries the focus and the entrance; then both are spent,
+  // so a layout that remounts the panel neither slides it in again nor takes focus.
+  useEffect(() => {
+    if (open) settleTutorFocus();
   }, [open]);
 
   // In a lesson Scout tutors the step on screen; anywhere else it guides: which option on
@@ -231,17 +256,32 @@ export function StudyAssistant({
         <aside
           aria-label="Scout AI"
           data-from={docked ? 'top' : 'bottom'}
+          // From lg up the panel docks beside the page instead of floating over it
+          // (globals.css gives the page and its footer the room).
+          data-dock={shell ? 'shell' : 'focus'}
+          data-enter={opening ? '' : undefined}
           className={cn(
             'scout-sheet bg-surface text-fg shadow-float rounded-t-panel md:rounded-panel pb-safe fixed z-40 flex flex-col overflow-hidden md:pb-0 print:hidden',
             // A bottom sheet on a phone, edge to edge and clear of the home indicator. On
-            // desktop a card that grows from the button that opened it:
+            // a tablet a card that grows from the button that opened it:
             // up from the bottom-right corner, or down from a lesson's bar.
             docked
               ? 'inset-x-0 bottom-0 md:inset-x-auto md:top-9 md:right-3 md:bottom-auto md:w-50'
               : 'inset-x-0 bottom-0 md:inset-x-auto md:right-3 md:bottom-3 md:w-50',
+            // Docked: a second card on the shell's desk, or a full-height column beside a
+            // focus screen, ruled off from it and flat, since it no longer floats.
+            shell
+              ? 'xl:border-border xl:shadow-edge xl:top-1 xl:right-1 xl:bottom-1 xl:w-(--scout-dock) xl:border'
+              : 'lg:border-border lg:top-0 lg:right-0 lg:bottom-0 lg:w-(--scout-dock) lg:rounded-none lg:border-l lg:shadow-none',
           )}
         >
-          <header className="rule-b flex h-6 shrink-0 items-center gap-1 pr-1 pl-2">
+          <header
+            className={cn(
+              'rule-b flex h-6 shrink-0 items-center gap-1 pr-1 pl-2',
+              // Beside a focus screen its rule continues the screen's own header rule.
+              !shell && 'lg:box-content lg:h-8',
+            )}
+          >
             <ScoutMark size={20} />
             <h2 className="text-sm font-semibold">Scout AI</h2>
             <p className="text-muted min-w-0 flex-1 truncate text-sm">
@@ -298,41 +338,45 @@ export function StudyAssistant({
               </button>
             </div>
           ) : null}
-          <Suspense
-            fallback={
-              <div className="text-muted flex items-center gap-1 p-2 text-sm">
-                <ScoutMark size={16} thinking />
-                Opening Scout AI…
-              </div>
-            }
-          >
-            <ScoutPanel
-              pathname={pathname}
-              paths={paths}
-              {...(latestNews ? { latestNews } : {})}
-              onFollowLink={followLink}
-              context={context}
-              transcript={history}
-              onMessage={(message) => appendMessage(key, message)}
-              {...(guide
-                ? {
-                    greeting: 'Where do you want to go?',
-                    intro:
-                      'Scout AI knows the whole app and this page. Ask where something is, where to start, or what to do next.',
-                    placeholder: 'Ask Scout AI about the course',
-                    suggestions: guide.starters,
-                  }
-                : {
-                    greeting: 'What would you like to understand?',
-                    intro:
-                      'Scout AI sees the step you are on. Ask about an idea, the code or the exercise.',
-                    placeholder: 'Ask Scout AI about this step',
-                    suggestions: TUTOR_STARTERS,
-                  })}
-              thinkingMark={<ScoutMark size={16} thinking />}
-              autoFocus
-            />
-          </Suspense>
+          <KeepFirst value={opening}>
+            {(focusOnOpen) => (
+              <Suspense
+                fallback={
+                  <div className="text-muted flex items-center gap-1 p-2 text-sm">
+                    <ScoutMark size={16} thinking />
+                    Opening Scout AI…
+                  </div>
+                }
+              >
+                <ScoutPanel
+                  pathname={pathname}
+                  paths={paths}
+                  {...(latestNews ? { latestNews } : {})}
+                  onFollowLink={followLink}
+                  context={context}
+                  transcript={history}
+                  onMessage={(message) => appendMessage(key, message)}
+                  {...(guide
+                    ? {
+                        greeting: 'Where do you want to go?',
+                        intro:
+                          'Scout AI knows the whole app and this page. Ask where something is, where to start, or what to do next.',
+                        placeholder: 'Ask Scout AI about the course',
+                        suggestions: guide.starters,
+                      }
+                    : {
+                        greeting: 'What would you like to understand?',
+                        intro:
+                          'Scout AI sees the step you are on. Ask about an idea, the code or the exercise.',
+                        placeholder: 'Ask Scout AI about this step',
+                        suggestions: TUTOR_STARTERS,
+                      })}
+                  thinkingMark={<ScoutMark size={16} thinking />}
+                  autoFocus={focusOnOpen}
+                />
+              </Suspense>
+            )}
+          </KeepFirst>
         </aside>
       ) : null}
     </>

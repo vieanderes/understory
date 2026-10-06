@@ -130,10 +130,58 @@ const notifyUi = () => uiListeners.forEach((notify) => notify());
 // focus the shortcut was pressed from) gets focus back when it closes.
 let opener: HTMLElement | null = null;
 
-export function setTutorOpen(next: boolean): void {
+/*
+ * From lg up the panel is a column beside the page, so it can stay open from step to step
+ * and page to page. The choice is remembered in this browser and brought back on the next
+ * load, but only where it docks: on a phone it is a sheet over the page, and a sheet that
+ * opens by itself would hide the page the learner came to read.
+ */
+const OPEN_KEY = 'understory:scout:open';
+const DOCKS = '(min-width: 64rem)';
+let restored = false;
+
+function restoreOpen(): void {
+  if (restored) return;
+  restored = true;
+  try {
+    if (window.matchMedia?.(DOCKS).matches && window.localStorage.getItem(OPEN_KEY) === '1') {
+      open = true;
+    }
+  } catch {
+    // Storage blocked: the panel starts closed, as it would on a first visit.
+  }
+}
+
+function rememberOpen(value: boolean): void {
+  try {
+    if (value) window.localStorage.setItem(OPEN_KEY, '1');
+    else window.localStorage.removeItem(OPEN_KEY);
+  } catch {
+    // A private window or a full quota: the choice lasts for this visit only.
+  }
+}
+
+/*
+ * The question box takes focus when the learner opens the panel, not when it comes back
+ * by itself on a page load or as a layout swaps, where it would pull focus off the page.
+ */
+let focusRequested = false;
+
+export function setTutorOpen(
+  next: boolean,
+  { remember = true }: { remember?: boolean } = {},
+): void {
+  restoreOpen();
+  if (remember) {
+    rememberOpen(next);
+    // The page makes room as the learner opens or closes the panel, and only then: a
+    // panel restored on load is in place before anyone could watch it arrive.
+    document.documentElement.dataset.scoutMotion = '';
+  }
   if (next === open) return;
   if (next) {
     opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    focusRequested = remember;
   }
   open = next;
   notifyUi();
@@ -141,6 +189,21 @@ export function setTutorOpen(next: boolean): void {
     opener?.focus();
     opener = null;
   }
+}
+
+/** The panel has mounted: its one focus request is spent. */
+export function settleTutorFocus(): void {
+  if (!focusRequested) return;
+  focusRequested = false;
+  notifyUi();
+}
+
+export function useTutorFocusRequest(): boolean {
+  return useSyncExternalStore(
+    subscribeUi,
+    () => focusRequested,
+    () => false,
+  );
 }
 
 /** A page that shows its own trigger calls this while mounted; it returns the undo. */
@@ -164,7 +227,8 @@ let withheld = 0;
 /** Hides the assistant while the caller is mounted; it returns the undo. */
 export function withholdTutor(): () => void {
   withheld += 1;
-  setTutorOpen(false);
+  // Closed for the test, not by the learner: their choice stands for the pages after it.
+  setTutorOpen(false, { remember: false });
   notifyUi();
   return () => {
     withheld -= 1;
@@ -188,7 +252,10 @@ function subscribeUi(onChange: () => void): () => void {
 export function useTutorOpen(): boolean {
   return useSyncExternalStore(
     subscribeUi,
-    () => open,
+    () => {
+      restoreOpen();
+      return open;
+    },
     () => false,
   );
 }

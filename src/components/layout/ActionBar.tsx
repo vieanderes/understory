@@ -34,7 +34,10 @@ export function ActionBar({ children, className }: { children: ReactNode; classN
   return (
     <>
       <div ref={spacer} aria-hidden className="shrink-0" />
-      <footer ref={bar} className="rule-t bg-bg pb-safe fixed inset-x-0 bottom-0 z-20">
+      <footer
+        ref={bar}
+        className="action-bar rule-t bg-bg pb-safe @container fixed inset-x-0 bottom-0 z-20"
+      >
         <div className={cn('frame flex min-h-9 items-center gap-1 py-1', className)}>
           {children}
         </div>

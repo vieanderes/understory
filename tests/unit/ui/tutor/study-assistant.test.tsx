@@ -106,6 +106,25 @@ describe('StudyAssistant', () => {
     expect(screen.getByRole('button', { name: 'Ask Scout AI' })).toBeInTheDocument();
   });
 
+  it('remembers the learner opening it, and a timed test closing it does not count', async () => {
+    await act(async () => {
+      render(<StudyAssistant />);
+    });
+    act(() => setTutorOpen(true));
+    const panel = screen.getByRole('complementary', { name: 'Scout AI' });
+    // It docks beside the page from lg up; the app shell's panel is the other kind.
+    expect(panel).toHaveAttribute('data-dock', 'focus');
+    expect(window.localStorage.getItem('understory:scout:open')).toBe('1');
+    let release = () => {};
+    act(() => {
+      release = withholdTutor();
+    });
+    expect(window.localStorage.getItem('understory:scout:open')).toBe('1');
+    act(() => release());
+    act(() => setTutorOpen(false));
+    expect(window.localStorage.getItem('understory:scout:open')).toBeNull();
+  });
+
   it('stays out of the coding simulator, which has its own assistant', async () => {
     pathname = '/practise/online-test/demo';
     await act(async () => {

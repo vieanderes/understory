@@ -269,19 +269,20 @@ export function StepRunner({
       </section>
 
       {/* Back stands alone on the left. Then Skip, How sure and Check: how sure is set just
-          before checking, so it sits right beside Check; on a phone it takes its own row. */}
-      <ActionBar className="flex-wrap gap-y-1 sm:flex-nowrap">
+          before checking, so it sits right beside Check. Where the bar is narrow, on a phone or
+          beside a docked Scout, it takes its own row: the bar measures itself, not the window. */}
+      <ActionBar className="flex-wrap gap-y-1 @3xl:flex-nowrap">
         {onBack ? (
           <Button variant="quiet" onClick={onBack} aria-label="Previous step" title="Previous step">
             <ChevronLeft aria-hidden size={16} strokeWidth={2} />
-            <span className="max-sm:sr-only">Back</span>
+            <span className="@max-xl:sr-only">Back</span>
           </Button>
         ) : null}
-        <div className="ml-auto flex items-center gap-2 max-sm:contents">
+        <div className="ml-auto flex items-center gap-2 @max-3xl:contents">
           {scored && phase === 'answering' ? (
             // Any question can wait: nothing in Understory is locked, and a skipped step
             // simply earns nothing until it is answered.
-            <Button variant="quiet" onClick={onContinue} className="max-sm:ml-auto">
+            <Button variant="quiet" onClick={onContinue} className="@max-3xl:ml-auto">
               Skip for now
             </Button>
           ) : null}
@@ -289,13 +290,13 @@ export function StepRunner({
             <ConfidenceControl
               value={confidence}
               onChange={setConfidence}
-              className="max-sm:order-first max-sm:w-full sm:min-w-36"
+              className="@max-3xl:order-first @max-3xl:w-full @3xl:min-w-36"
             />
           ) : null}
           <div
             className={cn(
               'flex items-center gap-1',
-              !(scored && phase === 'answering') && 'max-sm:ml-auto',
+              !(scored && phase === 'answering') && '@max-3xl:ml-auto',
             )}
           >
             {!scored ? (

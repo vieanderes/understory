@@ -17,8 +17,6 @@ import { CHOSEN_PATH, chosenPathIds, chosenPaths, currentPath, togglePath } from
 import { isOwnPathId, withOwnPaths, type CourseTree } from './custom';
 import { FindLesson } from './FindLesson';
 import { OwnPathTools, RemovedPathNotice } from './OwnPathTools';
-import { ScoutMark } from '@/features/tutor/ScoutMark';
-import { openScoutPlanner } from '@/features/tutor/planner/planner-store';
 import { PathView } from './PathView';
 
 /** The tick a path row carries: an empty box, or ink with the path's place in the order. */
@@ -141,24 +139,6 @@ function PathPicker({
           />
         ))}
         <li className={rowItem}>
-          <button
-            type="button"
-            onClick={() => openScoutPlanner()}
-            className="hairline-row group flex w-full items-start gap-1.5 py-1.5 text-left transition-colors duration-150 ease-out"
-          >
-            <span aria-hidden className="mt-0.5 flex size-2.5 shrink-0 items-center justify-center">
-              <ScoutMark size={16} />
-            </span>
-            <span className="flex min-w-0 flex-1 flex-col gap-0.5">
-              <span className="font-medium">Plan a path with Scout</span>
-              <span className="text-muted text-sm">
-                Say what you are learning for and how much time you have; Scout drafts it
-              </span>
-            </span>
-            <ArrowRight aria-hidden size={16} strokeWidth={2} className={cn(rowArrow, 'mt-0.5')} />
-          </button>
-        </li>
-        <li className={rowItem}>
           <Link
             href="/learn/build"
             className="hairline-row group flex items-start gap-1.5 py-1.5 transition-colors duration-150 ease-out"
@@ -172,7 +152,7 @@ function PathPicker({
             <span className="flex min-w-0 flex-1 flex-col gap-0.5">
               <span className="font-medium">Build your own path</span>
               <span className="text-muted text-sm">
-                Whole parts, single chapters or just the lessons you want
+                Parts, chapters or single lessons, by hand or with Scout
               </span>
             </span>
             <ArrowRight aria-hidden size={16} strokeWidth={2} className={cn(rowArrow, 'mt-0.5')} />

@@ -166,6 +166,8 @@ export function PlannerPanel({ onMessage, onFollowLink, ...panel }: PlannerPanel
       text={text}
       {...(reply.links ? { links: reply.links } : {})}
       blocks={{
+        // Already planning: an offer to plan is moot.
+        'scout-plan': () => null,
         'scout-ask': (body, closed) => {
           if (!closed) return <Drafting label="Scout is asking" />;
           const ask = parseAskBlock(body);

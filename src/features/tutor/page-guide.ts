@@ -59,7 +59,7 @@ const GUIDES: ReadonlyArray<readonly [RegExp, PageGuide]> = [
     {
       title: 'Learn',
       offers:
-        'Learn: the current path with its stages, lessons, tests and lectures. Switch path lists all seven paths, Plan a path with Scout, and Build your own path, where you choose parts, chapters or lessons.',
+        'Learn: the current path with its stages, lessons, tests and lectures. Switch path lists all seven paths and Build your own path, where you choose parts, chapters or lessons by hand or plan them with Scout.',
       starters: [
         'Which path should I follow?',
         'How do I switch path?',
@@ -73,7 +73,7 @@ const GUIDES: ReadonlyArray<readonly [RegExp, PageGuide]> = [
     {
       title: 'Build your own path',
       offers:
-        'Choose whole parts, chapters or single lessons from the course, name the path and save it as one of your own paths on Learn. Plan with Scout, at the top, drafts one with you instead.',
+        'Choose whole parts, chapters or single lessons from the course, name the path and save it as one of your own paths on Learn. Plan with Scout, at the top, plans it with you: Scout asks what you are learning for and ticks the lessons here.',
       starters: [
         'How many lessons should I pick?',
         'Can I change my path later?',

@@ -6,15 +6,26 @@ import { AskBlock } from '@/features/tutor/planner/AskBlock';
 import { DraftView } from '@/features/tutor/planner/DraftView';
 import { paceLine, sizeLine } from '@/features/tutor/planner/facts';
 import { PathCard } from '@/features/tutor/planner/PathCard';
+import { PlanOffer } from '@/features/tutor/planner/PlanOffer';
 import {
   draftFromOwnPath,
   draftKey,
   editDraft,
+  isPlanRoute,
   markSaved,
+  NEW_PLAN_HREF,
+  planHref,
   resetPlanner,
+  startPlanning,
   takeBlock,
 } from '@/features/tutor/planner/planner-store';
+import { appendMessage, readHistory } from '@/features/tutor/tutor-store';
+import { readAssistantDraftForTest } from './draft-probe';
 import type { PlannerCourse } from '@/features/tutor/planner/usePlannerCourse';
+
+const push = vi.fn();
+let pathname = '/paths';
+vi.mock('next/navigation', () => ({ useRouter: () => ({ push }), usePathname: () => pathname }));
 
 vi.mock('next/link', () => ({
   default: ({ href, children, ...rest }: { href: string; children: React.ReactNode }) => (
@@ -280,5 +291,53 @@ describe('the planner store', () => {
       deadline: '2026-11-01',
       stages: [{ title: 'S', why: '' }],
     });
+  });
+});
+
+describe('where Scout plans', () => {
+  it('plans only in the builder, which the other entries link to', () => {
+    expect(isPlanRoute('/learn/build')).toBe(true);
+    expect(isPlanRoute('/paths')).toBe(false);
+    expect(isPlanRoute('/learn/javascript/maps')).toBe(false);
+    expect(planHref()).toBe('/learn/build?plan=1');
+    expect(planHref('own-a1b2c3d4')).toBe('/learn/build?path=own-a1b2c3d4&plan=1');
+    expect(NEW_PLAN_HREF).toBe('/learn/build?plan=new');
+  });
+
+  it('starts a new planning conversation from the builder, saving back to the path edited', () => {
+    appendMessage('planner', { role: 'user', text: 'Old plan', at: 1 });
+    startPlanning(DRAFT, { id: 'own-a1b2c3d4', name: 'Backend' });
+    expect(readHistory('planner')).toEqual([]);
+    const stored = JSON.parse(window.localStorage.getItem('understory:planner') ?? '{}');
+    expect(stored).toMatchObject({
+      edited: DRAFT,
+      pathId: 'own-a1b2c3d4',
+      seedName: 'Backend',
+      savedAs: draftKey(DRAFT),
+    });
+    startPlanning(undefined);
+    expect(window.localStorage.getItem('understory:planner')).toBe('{}');
+  });
+});
+
+describe('PlanOffer', () => {
+  it('takes the learner to the builder on a new plan, their words in the question box', async () => {
+    const user = userEvent.setup();
+    pathname = '/paths';
+    render(<PlanOffer body='{"brief":"Backend interviews in six weeks"}' live />);
+    await user.click(screen.getByRole('button', { name: /Plan it with Scout/ }));
+    expect(push).toHaveBeenCalledWith('/learn/build?plan=new');
+    expect(readAssistantDraftForTest()).toBe('Backend interviews in six weeks');
+  });
+
+  it('starts planning in place on the builder, and draws nothing for a broken block', async () => {
+    const user = userEvent.setup();
+    pathname = '/learn/build';
+    push.mockClear();
+    const { container, rerender } = render(<PlanOffer body="" live />);
+    await user.click(screen.getByRole('button', { name: /Plan it with Scout/ }));
+    expect(push).not.toHaveBeenCalled();
+    rerender(<PlanOffer body="not json" live />);
+    expect(container).toBeEmptyDOMElement();
   });
 });

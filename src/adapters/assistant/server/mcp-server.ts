@@ -1,7 +1,12 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
 import * as z from '@/core/zod';
-import { NAVIGATION_RULES, PLANNER_RULES, type AssistantContext } from '@/core/ports/assistant';
+import {
+  NAVIGATION_RULES,
+  PLAN_OFFER,
+  PLANNER_RULES,
+  type AssistantContext,
+} from '@/core/ports/assistant';
 import { pairingCodeSchema } from '../pairing';
 import {
   getBridgeStore,
@@ -86,7 +91,13 @@ function questionText(question: BridgeQuestion, context: AssistantContext): stri
 /** The app guide for the study modes, so an app connection can give directions as well. */
 function appGuide(context: AssistantContext): string[] {
   if (!context.app) return [];
-  return ['', NAVIGATION_RULES, '', `The app:\n${untrusted('app-guide', context.app)}`];
+  return [
+    '',
+    NAVIGATION_RULES,
+    PLAN_OFFER,
+    '',
+    `The app:\n${untrusted('app-guide', context.app)}`,
+  ];
 }
 
 /** What get_task says: the page or task, by mode. */

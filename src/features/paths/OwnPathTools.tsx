@@ -10,12 +10,12 @@ import { useNow } from '@/features/catalog/useNow';
 import type { OwnPath } from '@/core/progress';
 import { useProgress, useStore } from '@/features/store/StoreProvider';
 import { ScoutMark } from '@/features/tutor/ScoutMark';
-import { openScoutPlanner } from '@/features/tutor/planner/planner-store';
+import { planHref } from '@/features/tutor/planner/planner-store';
 import { CHOSEN_PATH, chosenPathIds } from './current';
 
 /*
- * What a learner can do with a path they made: plan it again with Scout, change its lessons
- * and name in the builder, or remove it. Removing is a fact like saving, so Undo records
+ * What a learner can do with a path they made: change it in the builder, by hand or with
+ * Scout, or remove it. Removing is a fact like saving, so Undo records
  * the path again rather than hiding a deletion.
  */
 
@@ -49,10 +49,10 @@ export function OwnPathTools({ pathId }: { pathId: string }) {
 
   return (
     <>
-      <button type="button" onClick={() => openScoutPlanner(path)} className={QUIET}>
+      <Link href={planHref(path.id)} className={QUIET}>
         <ScoutMark size={16} />
         Plan again with Scout
-      </button>
+      </Link>
       <Link href={`/learn/build?path=${path.id}`} className={QUIET}>
         <Pencil aria-hidden size={16} strokeWidth={2} />
         Edit lessons

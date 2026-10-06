@@ -30,13 +30,28 @@ export interface PlannerState {
 }
 
 const STORE_KEY = 'understory:planner';
-const MODE_KEY = 'understory:scout:mode';
+
+/**
+ * Where planning happens: the path builder, where ticking lessons by hand and planning with
+ * Scout edit the same draft. Anywhere else Scout is the usual assistant.
+ */
+const PLAN_ROUTES = /^\/learn\/build(\/|$)/;
+
+/** The builder, opening Scout to plan: "Plan again with Scout" and Scout's own offer. */
+export const planHref = (pathId?: string): string =>
+  pathId ? `/learn/build?path=${pathId}&plan=1` : '/learn/build?plan=1';
+
+/** The builder, opening Scout on a new plan whatever was planned before. */
+export const NEW_PLAN_HREF = '/learn/build?plan=new';
+
+export const isPlanRoute = (pathname: string): boolean => PLAN_ROUTES.test(pathname);
 const EMPTY: PlannerState = {};
 const listeners = new Set<() => void>();
 const notify = () => listeners.forEach((listener) => listener());
 
 let state: PlannerState | undefined;
-let mode: ScoutMode | undefined;
+// In memory only: plan mode is a visit to the planner, not a preference to bring back.
+let mode: ScoutMode = 'ask';
 
 function read<T>(key: string, fallback: T): T {
   try {
@@ -78,14 +93,14 @@ export function usePlanner(): PlannerState {
 export function useScoutMode(): ScoutMode {
   return useSyncExternalStore(
     subscribe,
-    () => (mode ??= read<ScoutMode>(MODE_KEY, 'ask')),
+    () => mode,
     () => 'ask',
   );
 }
 
 export function setScoutMode(next: ScoutMode): void {
+  if (next === mode) return;
   mode = next;
-  write(MODE_KEY, next);
   notify();
 }
 
@@ -132,15 +147,20 @@ export function draftFromOwnPath(path: OwnPath): Draft {
 }
 
 /**
- * Opens Scout in plan mode, from any page. With a path, planning starts again from it: a
- * fresh conversation that saves back to the same path.
+ * A new planning conversation, starting from what the builder shows: the lessons ticked so
+ * far, or the own path being edited (which it then saves back to).
  */
-export function openScoutPlanner(path?: OwnPath): void {
+export function startPlanning(draft: Draft | undefined, path?: { id: string; name: string }): void {
+  clearHistory(PLANNER_KEY);
+  update({
+    ...(draft ? { edited: draft } : {}),
+    ...(path ? { pathId: path.id, seedName: path.name } : {}),
+    ...(path && draft ? { savedAs: draftKey(draft) } : {}),
+  });
+}
+
+/** Opens Scout planning, beside the builder. */
+export function openScoutPlanner(): void {
   setScoutMode('plan');
-  if (path) {
-    clearHistory(PLANNER_KEY);
-    const draft = draftFromOwnPath(path);
-    update({ edited: draft, pathId: path.id, savedAs: draftKey(draft), seedName: path.name });
-  }
   setTutorOpen(true);
 }

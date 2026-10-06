@@ -2,9 +2,10 @@ import AxeBuilder from '@axe-core/playwright';
 import { expect, test, type Page } from '@playwright/test';
 
 /*
- * Planning a path with Scout: the opening question is the app's own, Scout's replies carry
- * a question to tap and then a draft, the draft opens to be changed, and Save puts it on
- * Learn as one of the learner's paths. The model is stubbed at /api/assistant with the
+ * Planning a path with Scout, in the builder: the opening question is the app's own, Scout's
+ * replies carry a question to tap and then a draft, the builder ticks what Scout drafts, the
+ * draft opens to be changed, and Save puts it on Learn. Away from the builder Scout offers
+ * the planner as a button. The model is stubbed at /api/assistant with the
  * learner's-API-key provider, so the run needs no key and no network.
  */
 
@@ -47,6 +48,13 @@ const PATH = [
   '```',
 ].join('\n');
 
+const OFFER = [
+  'Six weeks is enough for the backend rounds. I can plan the path with you in the builder.',
+  '```scout-plan',
+  JSON.stringify({ brief: 'Backend interviews in six weeks' }),
+  '```',
+].join('\n');
+
 async function stubScout(page: Page) {
   const asked: { mode?: string; planner?: string }[] = [];
   await page.route('**/api/assistant', async (route) => {
@@ -56,10 +64,11 @@ async function stubScout(page: Page) {
     };
     asked.push(body.context);
     const questions = body.turns.filter((t) => t.role === 'user').length;
+    const text = body.context.mode !== 'planner' ? OFFER : questions === 1 ? ASK : PATH;
     await route.fulfill({
       status: 200,
       headers: { 'content-type': 'application/x-ndjson; charset=utf-8' },
-      body: ndjson(questions === 1 ? ASK : PATH),
+      body: ndjson(text),
     });
   });
   await page.addInitScript(() => {
@@ -70,18 +79,22 @@ async function stubScout(page: Page) {
 }
 
 async function openPlanner(page: Page) {
-  await page.goto('/paths');
+  await page.goto('/learn/build');
   await page.locator('html[data-hydrated="true"]').waitFor();
-  await page.getByRole('button', { name: /Plan a path with Scout/ }).click();
+  await page.getByRole('button', { name: 'Plan with Scout' }).click();
   const scout = page.getByRole('complementary', { name: 'Scout AI' });
-  await expect(scout.getByRole('radio', { name: 'Plan' })).toBeChecked();
+  await expect(scout.getByText('Planning a path')).toBeVisible();
   await expect(scout.getByText('What brings you here?')).toBeVisible();
   return scout;
 }
 
-test('plan a path with Scout, change the draft and save it to Learn', async ({ page }) => {
+test('plan a path with Scout in the builder, change the draft and save it to Learn', async ({
+  page,
+}) => {
   const asked = await stubScout(page);
   const scout = await openPlanner(page);
+  // No switch: Scout plans because the builder asked it to.
+  await expect(scout.getByRole('radio')).toHaveCount(0);
 
   // The opening question takes several reasons, sent together.
   await scout.getByRole('button', { name: 'Curiosity' }).click();
@@ -101,30 +114,65 @@ test('plan a path with Scout, change the draft and save it to Learn', async ({ p
   // The earlier question shows what was picked and takes no more taps.
   await expect(scout.getByRole('button', { name: 'About 5 hours' })).toBeDisabled();
 
+  // The builder ticks what Scout drafted: one draft, by hand or with Scout.
+  await expect(page.getByRole('main').getByLabel('Name')).toHaveValue(
+    'First programs in two weeks',
+  );
+  await expect(page.getByText('2 lessons · about 20 min').first()).toBeVisible();
+
   await card.getByRole('button', { name: 'Open draft' }).click();
   const draft = scout.getByRole('region', { name: 'Draft path' });
   await draft.getByRole('button', { name: /^Add/ }).click();
   await expect(draft.getByText(/builds on/)).toBeHidden();
   await draft.getByRole('button', { name: 'Code from zero, gently' }).click();
   await expect(draft.getByLabel('Name')).toHaveValue('Code from zero, gently');
+  await expect(page.getByRole('main').getByLabel('Name')).toHaveValue('Code from zero, gently');
   await draft.getByRole('button', { name: 'Save path' }).click();
   await draft.getByRole('link', { name: 'Saved. Open on Learn' }).click();
 
   await expect(page).toHaveURL(/\/paths\?path=own-[a-z0-9]{8}$/);
-  await expect(page.getByRole('heading', { level: 1 })).toHaveText('Code from zero, gently');
   const learn = page.getByRole('main');
+  await expect(page.getByRole('heading', { level: 1 })).toHaveText('Code from zero, gently');
   await expect(learn.getByText('Small programs that calculate and decide.')).toBeVisible();
   await expect(learn.getByRole('region', { name: 'Calculating', exact: true })).toBeVisible();
   await expect(learn.getByText(/About \d+ weeks? at 2 h a week/)).toBeVisible();
 
-  // The next question shows Scout the saved draft, edits included. On a phone the sheet
-  // closed to show the path, so it opens again.
+  // Away from the builder Scout is the usual assistant again.
   if (!(await scout.isVisible())) await page.getByRole('button', { name: 'Ask Scout AI' }).click();
-  await scout.getByRole('button', { name: 'Shorter' }).click();
+  await expect(scout.getByText('Planning a path')).toBeHidden();
+
+  // Planning again goes back to the builder, on the same path, with Scout beside it.
+  await scout.getByRole('button', { name: 'Close Scout AI' }).click();
+  await learn.getByRole('link', { name: 'Plan again with Scout' }).click();
+  await expect(page).toHaveURL(/\/learn\/build\?path=own-[a-z0-9]{8}$/);
+  await expect(page.getByRole('heading', { level: 1 })).toHaveText('Edit Code from zero, gently');
+  await expect(scout.getByText('Planning a path')).toBeVisible();
+  await expect(scout.getByText('What should change?')).toBeVisible();
+  await scout.getByRole('button', { name: 'Make it shorter' }).click();
   await expect
     .poll(() => asked.at(-1)?.planner ?? '')
     .toContain('It is saved as one of their paths');
   expect(asked.at(-1)?.planner).toContain('basics.variables');
+});
+
+test('away from the builder Scout offers to plan, and its button opens the planner', async ({
+  page,
+}) => {
+  await stubScout(page);
+  await page.goto('/paths');
+  await page.locator('html[data-hydrated="true"]').waitFor();
+  await page.getByRole('button', { name: 'Ask Scout AI' }).click();
+  const scout = page.getByRole('complementary', { name: 'Scout AI' });
+  const box = scout.getByRole('textbox', { name: 'Ask the assistant' });
+  await box.fill('What should I learn for backend interviews in six weeks?');
+  await box.press('Enter');
+  await scout.getByRole('button', { name: /Plan it with Scout/ }).click();
+  await expect(page).toHaveURL(/\/learn\/build$/);
+  await expect(scout.getByText('Planning a path')).toBeVisible();
+  await expect(scout.getByText('What brings you here?')).toBeVisible();
+  await expect(scout.getByRole('textbox', { name: 'Ask the assistant' })).toHaveValue(
+    'Backend interviews in six weeks',
+  );
 });
 
 test('the planner passes axe in both themes, with no sideways scroll', async ({ page }) => {
@@ -145,4 +193,30 @@ test('the planner passes axe in both themes, with no sideways scroll', async ({ 
       .analyze();
     expect(violations.map((v) => `${v.id}: ${v.nodes[0]?.target}`)).toEqual([]);
   }
+});
+
+test('on a phone Scout fills the screen and the page behind it holds still', async ({
+  page,
+  isMobile,
+}) => {
+  test.skip(!isMobile, 'The full-screen Scout is the phone layout.');
+  await stubScout(page);
+  await page.goto('/paths');
+  await page.locator('html[data-hydrated="true"]').waitFor();
+  await page.getByRole('button', { name: 'Ask Scout AI' }).click();
+  const scout = page.getByRole('complementary', { name: 'Scout AI' });
+  await expect(scout).toBeVisible();
+  const box = await scout.boundingBox();
+  const viewport = page.viewportSize();
+  expect(box?.x).toBe(0);
+  expect(Math.round(box?.width ?? 0)).toBe(viewport?.width);
+  expect(Math.round(box?.height ?? 0)).toBeGreaterThanOrEqual((viewport?.height ?? 0) - 1);
+  const locked = await page.evaluate(() => [
+    getComputedStyle(document.documentElement).overflow,
+    getComputedStyle(document.body).overflow,
+  ]);
+  expect(locked).toEqual(['hidden', 'hidden']);
+  // Scrolling the page by hand while Scout is open moves nothing behind it.
+  await page.mouse.wheel(0, 600);
+  expect(await page.evaluate(() => window.scrollY)).toBe(0);
 });

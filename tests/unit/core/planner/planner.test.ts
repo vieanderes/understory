@@ -8,6 +8,7 @@ import {
   fixOrder,
   MAX_NAME,
   parseAskBlock,
+  parsePlanOffer,
   parsePathBlock,
   pathPace,
   plannerCatalog,
@@ -118,6 +119,18 @@ describe('Scout blocks', () => {
     ].join('\n');
     expect(scoutBlocks(text).ask?.question).toBe('First');
     expect(scoutBlocks('No blocks at all.')).toEqual({});
+  });
+});
+
+describe('the offer to plan', () => {
+  it('reads a brief, an empty block, and drops anything else', () => {
+    expect(parsePlanOffer('{"brief":"  Backend interviews in six weeks  "}')).toEqual({
+      brief: 'Backend interviews in six weeks',
+    });
+    expect(parsePlanOffer('')).toEqual({ brief: '' });
+    expect(parsePlanOffer('{}')).toEqual({ brief: '' });
+    expect(parsePlanOffer('not json')).toBeNull();
+    expect(parsePlanOffer(JSON.stringify({ brief: 'x'.repeat(301) }))).toBeNull();
   });
 });
 

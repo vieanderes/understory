@@ -1,8 +1,8 @@
 'use client';
 
-import { Bot, Clock, Eye, Play } from 'lucide-react';
+import { Bot, ChevronRight, Clock, Eye, Play } from 'lucide-react';
 import Link from 'next/link';
-import { useId, useState } from 'react';
+import { useId, useState, type ReactNode } from 'react';
 import { buttonClass } from '@/components/ui/Button';
 import {
   customQuery,
@@ -32,30 +32,6 @@ const TYPE_LABEL = {
   coding: 'Coding',
   'bug-fix': 'Bug fixing',
 } as const;
-
-/** The tests, grouped by what they rehearse, in the order to take them. */
-const TEST_GROUPS = [
-  {
-    mode: 'demo',
-    title: 'Start here',
-    note: 'One easy task to learn the screen before anything counts.',
-  },
-  {
-    mode: 'screen',
-    title: 'Practise the format',
-    note: 'The shapes employers use: two tasks, three tasks, a bug fix, a tight clock.',
-  },
-  {
-    mode: 'ai',
-    title: 'With the AI assistant',
-    note: 'The assistant is on, and the report shows your conversation as a reviewer reads it.',
-  },
-  {
-    mode: 'mock',
-    title: 'Full practice tests',
-    note: 'Three tasks in 90 minutes, easy to hard. Sit them once the format feels familiar.',
-  },
-] as const;
 
 function testHref(key: string, query?: string): string {
   return `/practise/online-test/${key}${query ? `?${query}` : ''}`;
@@ -196,11 +172,86 @@ function CustomBuilder({ index }: { index: OnlineTestIndex }) {
   );
 }
 
+/** A course test that runs in the lesson player rather than the simulator. */
+export interface LessonTest {
+  id: string;
+  title: string;
+  note: string;
+  href: string;
+  minutes: number;
+}
+
+type Preset = OnlineTestIndex['presets'][number];
+
+/** The first test not sat yet, in the course's order; once all are sat, the weakest one. */
+function nextTest(presets: readonly Preset[], best: ReadonlyMap<string, number>) {
+  return (
+    presets.find((p) => !best.has(p.id)) ??
+    [...presets].sort((a, b) => (best.get(a.id) ?? 0) - (best.get(b.id) ?? 0))[0]
+  );
+}
+
+function Disclosure({ title, children }: { title: string; children: ReactNode }) {
+  return (
+    <details className="group rule-t">
+      <summary className="flex min-h-6 cursor-pointer list-none items-center gap-2 py-1 font-medium">
+        <span className="min-w-0 flex-1">{title}</span>
+        <ChevronRight
+          aria-hidden
+          size={16}
+          strokeWidth={2}
+          className="text-muted shrink-0 transition-transform duration-150 ease-out group-open:rotate-90"
+        />
+      </summary>
+      <div className="pb-3">{children}</div>
+    </details>
+  );
+}
+
+function TrainOneTask({ index }: { index: OnlineTestIndex }) {
+  return (
+    <div className="flex flex-col gap-2">
+      <p className="text-muted text-sm">One task, 120 minutes, the full report.</p>
+      {TOPICS.filter((topic) => index.tasks.some((t) => t.topic === topic)).map((topic) => (
+        <div key={topic} className="flex flex-col">
+          <h3 className="t-label pb-0.5">{TOPIC_LABEL[topic]}</h3>
+          <ul className="flex flex-col">
+            {index.tasks
+              .filter((t) => t.topic === topic)
+              .map((task) => (
+                <li key={task.id} className="rule-t flex flex-wrap items-center gap-x-2 py-0.5">
+                  <span className="font-medium">{task.title}</span>
+                  <span className="text-muted text-sm">
+                    {DIFFICULTY_LABEL[task.difficulty]} · {TYPE_LABEL[task.type]} ·{' '}
+                    <span className="t-figure">{task.recommendedMinutes}</span> min
+                  </span>
+                  <Link
+                    href={testHref(trainingKey(task.id))}
+                    aria-label={`Train ${task.title}`}
+                    className={cn(buttonClass('quiet', 'md'), 'ml-auto')}
+                  >
+                    Train
+                  </Link>
+                </li>
+              ))}
+          </ul>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 /**
- * The simulator's front door: the preset tests, training on any one task, a custom test
- * and past results. One primary action: the demo test, the shortest way in.
+ * Every timed test, with one recommended: the next one not sat, in the course's order.
+ * The rest is a compact list; training and the custom builder stay folded until asked for.
  */
-export function OnlineTestHub({ index }: { index: OnlineTestIndex }) {
+export function OnlineTestHub({
+  index,
+  lessonTests = [],
+}: {
+  index: OnlineTestIndex;
+  lessonTests?: readonly LessonTest[];
+}) {
   const { state } = useProgress();
   const now = useSecondClock();
   const keys = [
@@ -214,28 +265,23 @@ export function OnlineTestHub({ index }: { index: OnlineTestIndex }) {
       a.phase === 'tour' ||
       a.phase === 'ready',
   );
-  const first = index.presets[0];
+  const best = new Map<string, number>();
+  for (const attempt of state.onlineTests) {
+    const score = percent(scoreTallies(attempt.tasks));
+    best.set(attempt.testKey, Math.max(score, best.get(attempt.testKey) ?? 0));
+  }
+  const next = nextTest(index.presets, best);
   const history = [...state.onlineTests].reverse().slice(0, 12);
 
   return (
     <div className="flex flex-col gap-6 py-4 md:py-6">
-      <section className="flex max-w-3xl flex-col gap-2">
-        <p className="t-label">Practise</p>
-        <h1 className="t-title">AI-assisted coding simulator</h1>
-        <p className="text-muted text-lg">
-          Sit a timed coding test in an IDE laid out like the real assessment platforms, then read
-          your report the way a reviewer does: hidden tests, performance, integrity and the
-          assistant transcript.
+      <header className="flex max-w-3xl flex-col gap-2">
+        <p className="t-label">Practice</p>
+        <h1 className="t-title">Coding tests</h1>
+        <p className="text-muted">
+          Timed tests in an IDE like the real platforms, scored on hidden tests.
         </p>
-        {first ? (
-          <div className="pt-1">
-            <Link href={testHref(first.id)} className={buttonClass('primary', 'lg')}>
-              <Play aria-hidden size={16} strokeWidth={2} />
-              Start {first.title.toLowerCase()}
-            </Link>
-          </div>
-        ) : null}
-      </section>
+      </header>
 
       {inProgress.length > 0 ? (
         <section
@@ -268,105 +314,95 @@ export function OnlineTestHub({ index }: { index: OnlineTestIndex }) {
         </section>
       ) : null}
 
-      {TEST_GROUPS.map((group) => {
-        const presets = index.presets.filter((p) => p.mode === group.mode);
-        if (presets.length === 0) return null;
-        return (
-          <section
-            key={group.mode}
-            aria-labelledby={`tests-${group.mode}`}
-            className="flex flex-col gap-2"
-          >
-            <div className="flex flex-col gap-0.5">
-              <h2 id={`tests-${group.mode}`} className="t-section">
-                {group.title}
-              </h2>
-              <p className="text-muted">{group.note}</p>
-            </div>
-            <ul className="flex flex-col">
-              {presets.map((preset) => (
-                <li
-                  key={preset.id}
-                  className="rule-t grid grid-cols-4 items-center gap-2 py-2 md:grid-cols-12"
-                >
-                  <div className="col-span-4 flex flex-col md:col-span-8">
-                    <span className="font-medium">{preset.title}</span>
-                    <span className="text-muted text-sm">{preset.summary}</span>
-                    <span className="text-muted t-figure flex flex-wrap gap-2 pt-0.5 text-sm">
-                      <span>
-                        {durationLine({ minutes: preset.minutes, taskIds: preset.tasks })}
-                      </span>
-                      <Flags assistant={preset.assistant} proctoring={preset.proctoring} />
-                    </span>
-                  </div>
-                  <div className="col-span-4 md:text-right">
-                    <Link href={testHref(preset.id)} className={buttonClass('secondary', 'md')}>
-                      Start
-                    </Link>
-                  </div>
-                </li>
-              ))}
-            </ul>
-          </section>
-        );
-      })}
-
-      <section aria-labelledby="training-title" className="flex flex-col gap-2">
-        <div className="flex flex-col gap-0.5">
-          <h2 id="training-title" className="t-section">
-            Training
-          </h2>
-          <p className="text-muted">
-            One task, 120 minutes and the full report, as in the platforms&apos; training lessons.
-          </p>
-        </div>
-        {TOPICS.filter((topic) => index.tasks.some((t) => t.topic === topic)).map((topic) => (
-          <div key={topic} className="flex flex-col">
-            <h3 className="t-label pb-0.5">{TOPIC_LABEL[topic]}</h3>
-            <ul className="flex flex-col">
-              {index.tasks
-                .filter((t) => t.topic === topic)
-                .map((task) => (
-                  <li
-                    key={task.id}
-                    className="rule-t flex flex-wrap items-center gap-x-2 gap-y-0.5 py-1"
-                  >
-                    <span className="font-medium">{task.title}</span>
-                    <span className="text-muted text-sm">
-                      {DIFFICULTY_LABEL[task.difficulty]} · {TYPE_LABEL[task.type]} ·{' '}
-                      {task.recommendedMinutes} min
-                    </span>
-                    <Link
-                      href={testHref(trainingKey(task.id))}
-                      className={cn(buttonClass('quiet', 'md'), 'ml-auto')}
-                    >
-                      Train
-                    </Link>
-                  </li>
-                ))}
-            </ul>
+      {next ? (
+        <section
+          aria-labelledby="next-title"
+          className="bg-surface border-border rounded-panel grid grid-cols-4 items-end gap-x-4 gap-y-3 border p-2 sm:p-3 md:grid-cols-12 md:p-4"
+        >
+          <div className="col-span-4 flex min-w-0 flex-col gap-1 md:col-span-8">
+            <p className="t-label">{best.has(next.id) ? 'Sit again' : 'Next test'}</p>
+            <h2 id="next-title" className="t-section">
+              {next.title}
+            </h2>
+            <p className="text-muted">{next.summary}</p>
+            <p className="text-muted t-figure flex flex-wrap gap-x-2 gap-y-0.5 text-sm">
+              <span>{durationLine({ minutes: next.minutes, taskIds: next.tasks })}</span>
+              <Flags assistant={next.assistant} proctoring={next.proctoring} />
+            </p>
           </div>
-        ))}
+          <div className="col-span-4 md:text-right">
+            <Link
+              href={testHref(next.id)}
+              className={buttonClass('primary', 'lg', 'w-full md:w-auto')}
+            >
+              <Play aria-hidden size={16} strokeWidth={2} />
+              Start
+            </Link>
+          </div>
+        </section>
+      ) : null}
+
+      <section aria-labelledby="all-title" className="flex flex-col gap-1">
+        <h2 id="all-title" className="t-section">
+          All tests
+        </h2>
+        <ul className="rule-b flex flex-col">
+          {index.presets.map((preset) => (
+            <li key={preset.id} className="rule-t">
+              <Link
+                href={testHref(preset.id)}
+                className="group flex min-h-6 flex-wrap items-center gap-x-2 py-1"
+              >
+                <span className="group-hover:text-accent min-w-0 flex-1 font-medium transition-colors duration-150 ease-out">
+                  {preset.title}
+                </span>
+                <span className="text-muted t-figure text-sm">
+                  {preset.minutes} min · {preset.tasks.length}{' '}
+                  {preset.tasks.length === 1 ? 'task' : 'tasks'}
+                  {preset.assistant ? ' · AI' : ''}
+                </span>
+                <span className="t-figure w-5 text-right text-sm font-semibold">
+                  {best.has(preset.id) ? `${best.get(preset.id)}%` : ''}
+                </span>
+              </Link>
+            </li>
+          ))}
+          {lessonTests.map((test) => (
+            <li key={test.id} className="rule-t">
+              <Link
+                href={test.href}
+                className="group flex min-h-6 flex-wrap items-center gap-x-2 py-1"
+              >
+                <span className="group-hover:text-accent min-w-0 flex-1 font-medium transition-colors duration-150 ease-out">
+                  {test.title}
+                </span>
+                <span className="text-muted t-figure text-sm">
+                  {test.minutes} min · {test.note}
+                </span>
+                <span className="t-figure w-5 text-right text-sm font-semibold">
+                  {state.completedLessons.has(test.id) ? 'Done' : ''}
+                </span>
+              </Link>
+            </li>
+          ))}
+        </ul>
       </section>
 
-      <section aria-labelledby="custom-title" className="flex flex-col gap-2">
-        <div className="flex flex-col gap-0.5">
-          <h2 id="custom-title" className="t-section">
-            Custom test
-          </h2>
-          <p className="text-muted">
-            Build the test you expect: its tasks, its time and its rules.
-          </p>
-        </div>
-        <CustomBuilder index={index} />
-      </section>
+      <div className="rule-b flex flex-col">
+        <Disclosure title="Train one task">
+          <TrainOneTask index={index} />
+        </Disclosure>
+        <Disclosure title="Build your own test">
+          <CustomBuilder index={index} />
+        </Disclosure>
+      </div>
 
-      <section aria-labelledby="results-title" className="flex flex-col gap-2">
+      <section aria-labelledby="results-title" className="flex flex-col gap-1">
         <h2 id="results-title" className="t-section">
           Your results
         </h2>
         {history.length === 0 ? (
-          <p className="text-muted">Your finished tests appear here, with their scores.</p>
+          <p className="text-muted">Finished tests appear here.</p>
         ) : (
           <ul className="flex flex-col">
             {history.map((attempt) => {

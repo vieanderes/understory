@@ -166,7 +166,7 @@ for (const scheme of ['light', 'dark'] as const) {
   test(`the hub, intro, IDE and report pass axe in ${scheme}`, async ({ page }) => {
     await page.emulateMedia({ colorScheme: scheme });
     await page.goto(HUB);
-    await expect(page.getByRole('heading', { name: 'AI-assisted coding simulator' })).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Coding tests', level: 1 })).toBeVisible();
     expect(await axe(page)).toEqual([]);
 
     await page.goto(DEMO);
@@ -193,7 +193,7 @@ test('Coding tests is a place in the navigation', async ({ page }) => {
     .first()
     .click();
   await expect(page).toHaveURL(HUB);
-  await expect(page.getByRole('heading', { name: 'AI-assisted coding simulator' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Coding tests', level: 1 })).toBeVisible();
 });
 
 test('guided mode walks a task and fills the assistant with its prompt', async ({ page }) => {

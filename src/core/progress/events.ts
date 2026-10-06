@@ -267,12 +267,36 @@ export const profileSetPayloadSchema = z.strictObject({
   news: z.boolean(),
 });
 
+/** `custom` is the one own path from before paths had names; new ones are `own-` and 8 characters. */
+export const ownPathIdSchema = z.string().regex(/^(custom|own-[a-z0-9]{8})$/);
+
+export const ownPathStageSchema = z.strictObject({
+  title: z.string().trim().min(1).max(80),
+  why: z.string().trim().max(240).optional(),
+  lessonIds: z.array(idSchema).min(1).max(200),
+});
+
 /**
- * The lessons of a path the learner built themselves, in any order; the path shows them in
- * course order. An empty list removes it.
+ * A path the learner made, by ticking lessons in the builder or by planning it with Scout.
+ * Each has its own id, so a learner keeps several; the latest event per id wins, and an
+ * empty `lessonIds` removes that path. Without `stages` the path shows its lessons in course
+ * order, a stage per chapter; with them, in the order planned. v1 had only `lessonIds`.
  */
 export const customPathSetPayloadSchema = z.strictObject({
+  pathId: ownPathIdSchema,
+  name: z.string().trim().min(1).max(48),
   lessonIds: z.array(idSchema).max(1000),
+  stages: z.array(ownPathStageSchema).max(12).optional(),
+  /** One or two sentences on what the path is for, shown as its promise. */
+  summary: z.string().trim().max(400).optional(),
+  /** The pace it was planned for, so the path can say how long it takes. */
+  pace: z
+    .strictObject({
+      minutesPerWeek: z.int().min(15).max(3000),
+      deadline: z.iso.date().optional(),
+    })
+    .optional(),
+  origin: z.enum(['builder', 'scout']),
 });
 
 /** A news edition was opened. Read state is a fact, so it follows the progress file. */
@@ -370,7 +394,7 @@ export const LATEST_VERSION = {
   plan_cleared: 1,
   profile_set: 1,
   news_read: 1,
-  custom_path_set: 1,
+  custom_path_set: 2,
 } as const;
 
 export type EventType = keyof typeof LATEST_VERSION;

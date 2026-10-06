@@ -9,6 +9,7 @@ export {
 export {
   applyEvent,
   type CapstoneAdr,
+  type OwnPath,
   type PathExamAttempt,
   initialProgressState,
   reduce,

@@ -372,13 +372,37 @@ describe('applyEvent', () => {
     expect(state.xpByLocalDate).toEqual({});
   });
 
-  it('keeps the latest custom path, and drops it when emptied', () => {
-    const first = makeEvent(deps, 'custom_path_set', { lessonIds: ['js.closures', 'ts.generics'] });
-    const cleared = makeEvent(depsFor('device-1', '2026-09-18T10:00:00Z', 'k'), 'custom_path_set', {
-      lessonIds: [],
+  it('keeps several own paths by id, the latest per id, and drops one when emptied', () => {
+    const at = (key: string) => depsFor('device-1', '2026-09-18T10:00:00Z', key);
+    const path = (pathId: string, name: string, lessonIds: string[]) => ({
+      pathId,
+      name,
+      lessonIds,
+      origin: 'scout' as const,
     });
-    expect(reduce([first]).customPath).toEqual(['js.closures', 'ts.generics']);
-    expect(reduce([first, cleared]).customPath).toBeUndefined();
+    const first = makeEvent(deps, 'custom_path_set', path('custom', 'My path', ['js.closures']));
+    const second = makeEvent(
+      at('k'),
+      'custom_path_set',
+      path('own-a1b2c3d4', 'Backend', ['ts.generics']),
+    );
+    const renamed = makeEvent(
+      at('l'),
+      'custom_path_set',
+      path('custom', 'Closures', ['js.closures']),
+    );
+    const cleared = makeEvent(at('m'), 'custom_path_set', path('custom', 'Closures', []));
+    const state = reduce([first, second, renamed]);
+    expect([...state.ownPaths.keys()]).toEqual(['custom', 'own-a1b2c3d4']);
+    expect(state.ownPaths.get('custom')).toEqual({
+      id: 'custom',
+      name: 'Closures',
+      lessonIds: ['js.closures'],
+      origin: 'scout',
+    });
+    expect([...reduce([first, second, renamed, cleared]).ownPaths.keys()]).toEqual([
+      'own-a1b2c3d4',
+    ]);
   });
 
   it('keeps every online-test sitting as a fact, and grants XP for the score', () => {

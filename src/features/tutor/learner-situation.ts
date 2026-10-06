@@ -3,8 +3,7 @@ import { GOAL_COPY } from '@/core/plan';
 import type { CatalogFile } from '@/core/practice';
 import { INTEREST_COPY } from '@/core/profile';
 import type { ProgressState } from '@/core/progress';
-import { CHOSEN_PATH } from '@/features/paths/current';
-import { CUSTOM_PATH_ID } from '@/features/paths/custom';
+import { chosenPathIds, CHOSEN_PATH } from '@/features/paths/current';
 import { onPath } from '@/features/paths/links';
 import type { PathSummary } from '@/lib/content';
 import type { LearnerSituation } from './app-guide';
@@ -26,17 +25,23 @@ export function pathIndex(paths: readonly PathSummary[]): PathIndexEntry[] {
 
 type SituationState = Pick<
   ProgressState,
-  'plan' | 'profile' | 'completedLessons' | 'settings' | 'customPath' | 'onlineTests' | 'newsRead'
+  'plan' | 'profile' | 'completedLessons' | 'settings' | 'ownPaths' | 'onlineTests' | 'newsRead'
 >;
 
-function customPath(state: SituationState, catalog: CatalogFile | null): PathIndexEntry | null {
-  if (!state.customPath) return null;
-  const chosen = new Set(state.customPath);
-  // The builder keeps a custom path in course order; the index is the course order.
-  const ordered = catalog
-    ? catalog.parts.flatMap((part) => part.lessons).filter((id) => chosen.has(id))
-    : state.customPath;
-  return { id: CUSTOM_PATH_ID, name: 'My path', lessonIds: ordered };
+/** The learner's own paths, each in the order Learn shows it. */
+export function ownPathEntries(
+  state: SituationState,
+  catalog: CatalogFile | null,
+): PathIndexEntry[] {
+  return [...state.ownPaths.values()].map(({ id, name, lessonIds, stages }) => {
+    if (stages) return { id, name, lessonIds: stages.flatMap((s) => s.lessonIds) };
+    // A path built by ticking shows in course order; the catalogue's parts are in it.
+    const chosen = new Set(lessonIds);
+    const ordered = catalog
+      ? catalog.parts.flatMap((part) => part.lessons).filter((l) => chosen.has(l))
+      : lessonIds;
+    return { id, name, lessonIds: ordered };
+  });
 }
 
 /**
@@ -49,10 +54,14 @@ function pathUnderWay(
   paths: readonly PathIndexEntry[],
   catalog: CatalogFile | null,
 ): PathIndexEntry | undefined {
-  const own = customPath(state, catalog);
-  const all = own ? [own, ...paths] : paths;
-  const chosen = all.find((p) => p.id === state.settings[CHOSEN_PATH]);
-  if (chosen) return chosen;
+  const all = [...ownPathEntries(state, catalog), ...paths];
+  const isDone = (id: string) => state.completedLessons.has(id);
+  // Several paths can be chosen; the first unfinished one is the one under way, as on Learn.
+  const chosen = chosenPathIds(state.settings[CHOSEN_PATH]).flatMap(
+    (id) => all.find((p) => p.id === id) ?? [],
+  );
+  const open = chosen.find((p) => p.lessonIds.some((id) => !isDone(id))) ?? chosen[0];
+  if (open) return open;
   const done = (p: PathIndexEntry) =>
     p.lessonIds.filter((id) => state.completedLessons.has(id)).length;
   return all

@@ -58,6 +58,18 @@ describe('upcast', () => {
     const result = upcast(fromTheFuture);
     expect(isUnknownEvent(result)).toBe(true);
   });
+  it('reads a v1 custom path as the one path called My path', () => {
+    const v2 = makeEvent(deps, 'custom_path_set', {
+      pathId: 'custom',
+      name: 'My path',
+      lessonIds: ['js.closures'],
+      origin: 'builder',
+    });
+    const v1 = { ...v2, v: 1, payload: { lessonIds: ['js.closures'] } };
+    const result = upcast(v1);
+    expect(isUnknownEvent(result)).toBe(false);
+    expect(result).toEqual(v2);
+  });
 });
 
 describe('applyUpcastChain (proves the generic chaining mechanism with a synthetic type)', () => {

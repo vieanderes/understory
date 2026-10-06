@@ -14,7 +14,7 @@ import { useProgress, useStore } from '@/features/store/StoreProvider';
 import type { PathSummary } from '@/lib/content';
 import { cn } from '@/lib/cn';
 import { CHOSEN_PATH, chosenPathIds, chosenPaths, currentPath, togglePath } from './current';
-import { CUSTOM_PATH_ID, customPathSummary, type CourseTree } from './custom';
+import { isOwnPathId, withOwnPaths, type CourseTree } from './custom';
 import { FindLesson } from './FindLesson';
 import { PathView } from './PathView';
 
@@ -54,7 +54,7 @@ function PathRow({
   const exam = usePathExam(path.id);
   const total = path.lessonIds.length;
   const chosen = order > 0;
-  const custom = path.id === CUSTOM_PATH_ID;
+  const custom = isOwnPathId(path.id);
   return (
     <li className={rowItem}>
       <div className={cn('hairline-row group relative flex items-start gap-1.5 py-1.5')}>
@@ -121,7 +121,7 @@ function PathPicker({
   const chosen = draft ?? chosenPathIds(state.settings[CHOSEN_PATH]);
   const doneOf = (path: PathSummary) =>
     status === 'ready' ? path.lessonIds.filter((id) => state.completedLessons.has(id)).length : 0;
-  const hasCustom = paths.some((p) => p.id === CUSTOM_PATH_ID);
+  const hasCustom = paths.some((p) => isOwnPathId(p.id));
   const toggle = (id: string) =>
     onToggle
       ? onToggle(id)
@@ -239,10 +239,8 @@ function Learn({
   const [draft, setDraft] = useState<string[]>([]);
   if (status !== 'ready') return <p className="text-muted py-4">Reading your progress...</p>;
   const isDone = (id: string) => state.completedLessons.has(id);
-  // A path the learner built sits first, as one of theirs.
-  const paths = state.customPath
-    ? [customPathSummary(tree, state.customPath, written), ...written]
-    : written;
+  // The paths the learner made sit first, as theirs.
+  const paths = withOwnPaths(tree, state.ownPaths, written);
   const setting = state.settings[CHOSEN_PATH];
   const chosen = chosenPaths(paths, setting);
   const current = currentPath(paths, planState, isDone, setting);
@@ -315,7 +313,7 @@ function Learn({
       <PathView
         path={path}
         embedded
-        custom={path.id === CUSTOM_PATH_ID}
+        custom={isOwnPathId(path.id)}
         tools={
           <button
             type="button"

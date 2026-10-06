@@ -14,7 +14,7 @@ import type { PlanCatalog } from '@/core/plan';
 import { cn } from '@/lib/cn';
 import { onPath } from './links';
 import { CHOSEN_PATH, chosenPathIds, currentPath, nextOnPath } from './current';
-import { customPathSummary, type CourseTree } from './custom';
+import { withOwnPaths, type CourseTree } from './custom';
 
 export interface CourseLesson {
   id: string;
@@ -199,14 +199,18 @@ export function HomeScreen({
   const chosenIds = ready ? chosenPathIds(state.settings[CHOSEN_PATH]) : [];
   // A path chosen or built counts as set up: the learner has said what they want.
   const newcomer =
-    !anythingDone && !hasPlan && !profile && chosenIds.length === 0 && !(ready && state.customPath);
+    !anythingDone &&
+    !hasPlan &&
+    !profile &&
+    chosenIds.length === 0 &&
+    !(ready && state.ownPaths.size > 0);
   // News alone only when nothing else was asked for: no plan, no path chosen or built.
   const newsOnly =
     !hasPlan &&
     !anythingDone &&
     profile !== undefined &&
     chosenIds.length === 0 &&
-    !state.customPath;
+    state.ownPaths.size === 0;
   const showNews = news !== null && (profile?.news ?? true);
 
   // Until the log is read, every answer below would be a guess: a returning learner would
@@ -272,10 +276,7 @@ export function HomeScreen({
 
   // The next step: the next lesson of the path the learner is on (one they chose or built
   // first, else their plan's, else the one with most done); else the course's next lesson.
-  const all =
-    ready && state.customPath
-      ? [customPathSummary(tree, state.customPath, paths), ...paths]
-      : paths;
+  const all = ready ? withOwnPaths(tree, state.ownPaths, paths) : paths;
   const path = currentPath(all, planState, isDone, state.settings[CHOSEN_PATH]);
   const pathNext = path ? nextOnPath(path, isDone) : undefined;
   const begun = path ? path.lessonIds.some(isDone) : false;

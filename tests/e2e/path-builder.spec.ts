@@ -3,7 +3,7 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
 
 /*
  * Building your own path: parts preview what they hold, open to chapters, chapters open to
- * lessons, and the choice saves as "My path" on Learn.
+ * lessons, and the choice saves under its name as one of the learner's paths on Learn.
  */
 
 async function open(page: Page) {
@@ -46,16 +46,18 @@ test('choose a chapter and a single lesson, then save them as my path', async ({
   expect(await partBox.evaluate((el: HTMLInputElement) => el.indeterminate)).toBe(true);
   await expect(first.getByText(/lessons chosen$/)).toBeVisible();
 
-  const save = page.getByRole('button', { name: 'Save my path' });
+  await page.getByLabel('Name').fill('First chapters!');
+  const save = page.getByRole('button', { name: 'Save path' });
   await expect(save).toBeEnabled();
   await save.click();
-  await expect(page).toHaveURL(/\/paths$/);
-  await expect(page.getByRole('heading', { name: 'My path' }).first()).toBeVisible();
+  await expect(page).toHaveURL(/\/paths\?path=own-[a-z0-9]{8}$/);
+  // The name keeps the house style: no exclamation marks on a tab.
+  await expect(page.getByRole('heading', { name: 'First chapters' }).first()).toBeVisible();
 });
 
 test('save waits for a change, and the page passes axe in both themes', async ({ page }) => {
   await open(page);
-  await expect(page.getByRole('button', { name: 'Save my path' })).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Save path' })).toBeDisabled();
   await page
     .getByRole('button', { name: /^Choose individual chapters in/ })
     .first()

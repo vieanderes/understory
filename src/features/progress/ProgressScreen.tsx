@@ -25,7 +25,7 @@ import { MapView, type MapModule, type MapPart } from '@/features/map/MapView';
 import { CELL_STYLE, LEGEND, STATE_LABEL } from '@/features/map/states';
 import { Title } from '@/features/motion/Title';
 import { CHOSEN_PATH, currentPath } from '@/features/paths/current';
-import { customPathSummary, type CourseTree } from '@/features/paths/custom';
+import { withOwnPaths, type CourseTree } from '@/features/paths/custom';
 import { usePlan } from '@/features/plan/usePlan';
 import { useProgress } from '@/features/store/StoreProvider';
 import { localDateOf } from '@/features/store/progress-store';
@@ -74,9 +74,7 @@ export function ProgressScreen(props: ProgressScreenProps) {
   const scopes = useMemo(() => {
     if (!ready) return null;
     const isDone = (id: string) => state.completedLessons.has(id);
-    const paths = state.customPath
-      ? [customPathSummary(tree, state.customPath, written), ...written]
-      : written;
+    const paths = withOwnPaths(tree, state.ownPaths, written);
     const path = currentPath(paths, planState, isDone, state.settings[CHOSEN_PATH]);
     return progressScopes({
       catalog,

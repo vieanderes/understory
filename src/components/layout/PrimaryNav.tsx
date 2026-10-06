@@ -70,9 +70,10 @@ export interface RailPath {
 function YourPaths({ paths }: { paths: readonly RailPath[] }) {
   const { status, state } = useProgress();
   if (status !== 'ready') return null;
-  const all: RailPath[] = state.customPath
-    ? [{ id: 'custom', name: 'My path', lessonIds: state.customPath }, ...paths]
-    : [...paths];
+  const all: RailPath[] = [
+    ...[...state.ownPaths.values()].map(({ id, name, lessonIds }) => ({ id, name, lessonIds })),
+    ...paths,
+  ];
   const chosen = chosenPathIds(state.settings[CHOSEN_PATH]).flatMap(
     (id) => all.find((p) => p.id === id) ?? [],
   );

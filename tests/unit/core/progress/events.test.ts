@@ -171,7 +171,16 @@ describe('makeEvent', () => {
       plan_cleared: {},
       profile_set: { interests: ['web', 'ai'], news: true },
       news_read: { date: '2026-10-05' },
-      custom_path_set: { lessonIds: ['js.closures'] },
+      custom_path_set: {
+        pathId: 'own-a1b2c3d4',
+        name: 'Backend in six weeks',
+        lessonIds: ['js.closures'],
+        stages: [
+          { title: 'Closures', why: 'Everything builds on them.', lessonIds: ['js.closures'] },
+        ],
+        pace: { minutesPerWeek: 240, deadline: '2026-11-20' },
+        origin: 'scout',
+      },
       online_test_submitted: {
         attemptId: 'a1',
         testKey: 'demo',

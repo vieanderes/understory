@@ -131,16 +131,43 @@ describe('the learner situation', () => {
   });
 
   it('prefers the path the learner chose, their own path included', () => {
+    const own = (id: string, name: string, lessonIds: string[], stages?: string[][]) =>
+      [
+        id,
+        {
+          id,
+          name,
+          lessonIds,
+          origin: 'builder' as const,
+          ...(stages ? { stages: stages.map((ids) => ({ title: 'Stage', lessonIds: ids })) } : {}),
+        },
+      ] as const;
     const s = learnerSituation({
       state: state({
         settings: { 'learn.path': 'custom' },
-        customPath: ['py.c', 'basics.b'],
+        ownPaths: new Map([own('custom', 'My path', ['py.c', 'basics.b'])]),
       }),
       paths,
       catalog,
     });
     expect(s.path?.name).toBe('My path');
     expect(s.path?.total).toBe(2);
+
+    // Several chosen: the first with lessons left, in the order planned.
+    const planned = learnerSituation({
+      state: state({
+        settings: { 'learn.path': 'own-a1b2c3d4,custom' },
+        completedLessons: new Set(['py.c']),
+        ownPaths: new Map([
+          own('custom', 'My path', ['basics.b']),
+          own('own-a1b2c3d4', 'Python first', ['basics.b', 'py.c'], [['py.c'], ['basics.b']]),
+        ]),
+      }),
+      paths,
+      catalog,
+    });
+    expect(planned.path?.name).toBe('Python first');
+    expect(planned.path?.done).toBe(1);
   });
 });
 

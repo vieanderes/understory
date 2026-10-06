@@ -8,6 +8,7 @@ import { ActionBar } from '@/components/layout/ActionBar';
 import { Button } from '@/components/ui/Button';
 import { InlineCode } from '@/components/ui/InlineCode';
 import { formatMinutes } from '@/core/insight';
+import { cleanPathName, MAX_NAME } from '@/core/planner';
 import { coverage, toggleGroup, type Coverage } from '@/core/profile';
 import { useProgress, useStore } from '@/features/store/StoreProvider';
 import { cn } from '@/lib/cn';
@@ -22,8 +23,9 @@ import {
   totals,
   totalsLine,
 } from './builder';
-import { CHOSEN_PATH } from './current';
-import { CUSTOM_PATH_ID, type CourseTree } from './custom';
+import { CHOSEN_PATH, chosenPathIds } from './current';
+import { isOwnPathId, newOwnPathId, restage, type CourseTree } from './custom';
+import { usePathParam } from './usePathParam';
 
 type Part = CourseTree['parts'][number];
 type Chapter = Part['chapters'][number];
@@ -339,7 +341,8 @@ function YourPath({
  * Build your own path from the course. It opens on the seven parts, each previewing its
  * chapters; a part can be chosen whole, or opened to choose chapters, and a chapter opened
  * to choose lessons. The choice is saved as one custom_path_set, and Learn then shows it
- * like any other path.
+ * like any other path. With `?path=<id>` it edits that own path and keeps its name and its
+ * planned stages; without, it makes a new one.
  */
 export function PathBuilder({ tree }: { tree: CourseTree }) {
   const { status, state } = useProgress();
@@ -347,23 +350,43 @@ export function PathBuilder({ tree }: { tree: CourseTree }) {
   const router = useRouter();
   const [edited, setEdited] = useState<Set<string> | undefined>(undefined);
   const [saving, setSaving] = useState(false);
-  const saved = new Set(status === 'ready' ? (state.customPath ?? []) : []);
+  const [named, setNamed] = useState<string | undefined>(undefined);
+  const asked = usePathParam();
+  const existing =
+    status === 'ready' && asked && isOwnPathId(asked) ? state.ownPaths.get(asked) : undefined;
+  const saved = new Set(existing?.lessonIds ?? []);
   const chosen = edited ?? saved;
-  const hasPath = Boolean(state.customPath);
+  const hasPath = existing !== undefined;
+  const name = named ?? existing?.name ?? 'My path';
+  const nameId = useId();
 
   const sum = totals(tree, chosen);
   const line = totalsLine(sum.lessons, sum.minutes);
   const everything = allLessonIds(tree);
-  const dirty = edited !== undefined && !sameChoice(edited, saved);
+  const dirty =
+    (edited !== undefined && !sameChoice(edited, saved)) ||
+    (named !== undefined && named.trim() !== (existing?.name ?? '') && sum.lessons > 0);
   const removing = sum.lessons === 0 && hasPath;
 
   const toggle: Toggle = (ids) => setEdited(toggleGroup(chosen, ids));
 
   async function save() {
     setSaving(true);
-    await store.record('custom_path_set', { lessonIds: sum.lessonIds });
-    await store.record('setting_changed', { key: CHOSEN_PATH, value: CUSTOM_PATH_ID });
-    router.push('/paths');
+    const pathId = existing?.id ?? newOwnPathId();
+    const stages = restage(existing?.stages, sum.lessonIds);
+    await store.record('custom_path_set', {
+      pathId,
+      name: cleanPathName(name),
+      lessonIds: sum.lessonIds,
+      ...(stages ? { stages } : {}),
+      ...(existing?.summary ? { summary: existing.summary } : {}),
+      ...(existing?.pace ? { pace: existing.pace } : {}),
+      origin: existing?.origin ?? 'builder',
+    });
+    const others = chosenPathIds(state.settings[CHOSEN_PATH]).filter((id) => id !== pathId);
+    const value = sum.lessons > 0 ? [pathId, ...others] : others;
+    await store.record('setting_changed', { key: CHOSEN_PATH, value: value.join(',') });
+    router.push(sum.lessons > 0 ? `/paths?path=${pathId}` : '/paths');
   }
 
   const saveButton = (wide: boolean) => (
@@ -374,7 +397,7 @@ export function PathBuilder({ tree }: { tree: CourseTree }) {
       disabled={!dirty || (sum.lessons === 0 && !hasPath)}
       className={cn(wide && 'w-full')}
     >
-      {removing ? 'Remove my path' : 'Save my path'}
+      {removing ? 'Remove this path' : 'Save path'}
     </Button>
   );
 
@@ -400,10 +423,24 @@ export function PathBuilder({ tree }: { tree: CourseTree }) {
       >
         <div className="flex flex-col gap-4 lg:col-span-8">
           <div className="flex flex-col gap-2">
-            <h1 className="t-title">Build your own path</h1>
+            <h1 className="t-title">{hasPath ? `Edit ${existing.name}` : 'Build your own path'}</h1>
             <p className="text-muted prose-measure text-lg">
               Tick a whole part, or open it to choose chapters and single lessons.
             </p>
+            <div className="flex max-w-md flex-col gap-0.5">
+              <label htmlFor={nameId} className="text-sm font-medium">
+                Name
+              </label>
+              <input
+                id={nameId}
+                type="text"
+                value={name}
+                maxLength={MAX_NAME}
+                onChange={(event) => setNamed(event.target.value)}
+                // 16 px: iOS zooms the page when a smaller control takes focus.
+                className="border-border bg-surface rounded-control hover:border-border-strong h-5 w-full min-w-0 border px-1 text-base"
+              />
+            </div>
             <div className="-ml-1 flex flex-wrap items-center gap-0.5">
               <Button
                 variant="quiet"

@@ -41,10 +41,22 @@ export function applyUpcastChain(
   return { ...event, v };
 }
 
-/** No shipped event type has changed shape yet, so every chain is empty. A future
- * breaking payload change adds an entry here, for example:
- * `step_answered: [(raw) => ({ ...raw, payload: { ...raw.payload, hintsUsed: raw.payload.hints } })]`. */
-const UPCASTERS: Partial<Record<EventType, readonly Upcaster[]>> = {};
+/** `chain[n]` lifts version n to n + 1; version 0 was never written, so it passes through. */
+const UPCASTERS: Partial<Record<EventType, readonly Upcaster[]>> = {
+  // v2 gave own paths an id and a name: the one path from before is "My path".
+  custom_path_set: [
+    (raw) => raw,
+    (raw) => ({
+      ...raw,
+      payload: {
+        pathId: 'custom',
+        name: 'My path',
+        origin: 'builder',
+        ...(raw.payload as Record<string, unknown>),
+      },
+    }),
+  ],
+};
 
 function isEventType(type: string): type is EventType {
   return Object.hasOwn(LATEST_VERSION, type);

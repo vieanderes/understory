@@ -77,17 +77,29 @@ semantic tokens only, so a palette change is a change to that one file.
 - `.frame`: max 1440 px, side padding 16 / 32 / 48 px.
 - Grid: 4 columns on phones, 12 from `md`, 32 px gutters (`gap-x-4`).
 - Reading measure: 65ch (`.prose-measure`).
-- Masthead: Learn, Practise, Map and News open with `PageHead`
+- Masthead: Learn, Practise, Progress and News open with `PageHead`
   (`src/components/layout/PageHead.tsx`): label, title, one-sentence lede, and a right-hand
   column on the same baseline, usually a `Ledger` of figures. The page's one primary action
   sits directly under it, in a bordered panel, above the fold at 1440.
-- **Desktop**: top bar with the four places (Learn, Practise, Map, Signal); lessons split
+- **Desktop**: the four places (Home, Learn, Practice, News), with Progress and the Library
+  beside Settings as utilities; lessons split
   into code left, question right; keyboard shortcuts and a command menu.
 - **Phone**: bottom tab bar in the thumb zone, clear of the home indicator (`.pb-safe`);
   the primary action sits low; code and question share one viewport; session step types
   need no typing.
 - Checked at 390, 768, 1024, 1440 and ultra-wide. Nothing scrolls sideways except code
   inside its own focusable region. _Test: e2e overflow check._
+
+## Progress
+
+`/progress` is where a learner sees where they stand. It answers two questions on the
+first screen: how am I doing, and what now. A `PageHead` with four figures, then one
+primary action (the most useful thing to do), then a short list to work on next. Below
+that, one section each for activity (a weekly chart with a table behind a disclosure),
+mastery (the concept map's atlas and index, folded), tests and exams, and chapters not
+started. One `Show` control scopes every figure to everything, the learner's path, one
+interest or one part, and keeps the choice in `?scope=`. A learner with nothing yet sees one
+sentence and one action, never a page of zeros. `/map` redirects to `#mastery`.
 
 ## Figures
 

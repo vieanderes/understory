@@ -160,13 +160,14 @@ export function ChapterRow({
   actions?: React.ReactNode;
 }) {
   return (
-    <div className="rule-b flex items-center justify-between gap-2 py-1 sm:gap-4">
+    // The whole row opens the chapter; its actions sit above that layer.
+    <div className="hairline-row group rule-b relative flex items-center justify-between gap-2 py-1 sm:gap-4">
       <div className="flex min-w-0 items-baseline gap-2">
         <span className="t-figure text-faint w-3 shrink-0 text-sm">{pad(chapter.number)}</span>
         <div className="min-w-0">
           <Link
             href={`/lectures/${chapter.slug}`}
-            className="hover:text-accent font-medium transition-colors duration-150 ease-out"
+            className="focus-visible:outline-accent rounded-control font-medium after:absolute after:inset-0 focus-visible:outline-2 focus-visible:outline-offset-2"
           >
             {chapter.title}
           </Link>
@@ -176,7 +177,7 @@ export function ChapterRow({
           </p>
         </div>
       </div>
-      {actions ? <div className="flex shrink-0 gap-1">{actions}</div> : null}
+      {actions ? <div className="relative z-10 flex shrink-0 gap-1">{actions}</div> : null}
     </div>
   );
 }

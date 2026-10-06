@@ -76,24 +76,27 @@ export default async function LecturesPage() {
           {tracks.map((track) => (
             <li
               key={track.id}
-              className="rule-b flex items-center justify-between gap-2 py-1 sm:gap-4"
+              // The whole row opens the lecture; the PDF button sits above that layer.
+              className="hairline-row group rule-b relative flex items-center justify-between gap-2 py-1 sm:gap-4"
             >
               <div className="min-w-0">
                 <Link
                   href={`/lectures/tracks/${track.id}`}
-                  className="hover:text-accent font-medium transition-colors duration-150 ease-out"
+                  className="focus-visible:outline-accent rounded-control font-medium after:absolute after:inset-0 focus-visible:outline-2 focus-visible:outline-offset-2"
                 >
                   {track.title}
                 </Link>
                 <p className="text-muted text-sm">{track.summary}</p>
               </div>
-              <PdfButton
-                scope={{ kind: 'track', id: track.id }}
-                title={track.title}
-                rev={contentRev}
-                variant="quiet"
-                label="PDF"
-              />
+              <div className="relative z-10 shrink-0">
+                <PdfButton
+                  scope={{ kind: 'track', id: track.id }}
+                  title={track.title}
+                  rev={contentRev}
+                  variant="quiet"
+                  label="PDF"
+                />
+              </div>
             </li>
           ))}
         </ul>

@@ -43,6 +43,8 @@ const HIDDEN = [
   /^\/practise\/online-test\//,
   /^\/practise\/(exam|checkpoint|test-out)\//,
   /^\/print\//,
+  // Choosing lessons for a path asks nothing of a tutor, and its bar owns the bottom edge.
+  /^\/learn\/build$/,
 ];
 
 const FOCUS = 'focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent';

@@ -1,7 +1,7 @@
 'use client';
 
 import { Info, X } from 'lucide-react';
-import { useId, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useId, useRef, useState, type ReactNode } from 'react';
 import { cn } from '@/lib/cn';
 import type { SourceGroup } from '@/lib/news/sources';
 
@@ -30,16 +30,21 @@ export function HowNewsWorks({ children, groups }: HowNewsWorksProps) {
     button.current?.focus();
   };
 
+  // On the document, not the wrapper: Safari does not focus a button on click, so after a
+  // tap the key would land on the body and never reach a handler inside.
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      setOpen(false);
+      button.current?.focus();
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [open]);
+
   return (
-    <div
-      className="flex flex-col gap-3"
-      onKeyDown={(event) => {
-        if (event.key === 'Escape' && open) {
-          event.stopPropagation();
-          close();
-        }
-      }}
-    >
+    <div className="flex flex-col gap-3">
       <div className="flex items-end gap-1">
         {children}
         <button
@@ -62,7 +67,7 @@ export function HowNewsWorks({ children, groups }: HowNewsWorksProps) {
           aria-label="How News works"
           className="rule-t rule-b step-in flex flex-col gap-4 py-3"
         >
-          <div className="grid grid-cols-1 gap-x-4 gap-y-3 text-sm md:grid-cols-3">
+          <div className="grid grid-cols-1 gap-x-4 gap-y-3 text-sm lg:grid-cols-3">
             <div className="flex flex-col gap-0.5">
               <h2 className="font-medium">Where stories come from</h2>
               <p className="text-muted">
@@ -94,7 +99,7 @@ export function HowNewsWorks({ children, groups }: HowNewsWorksProps) {
 
           <div className="flex flex-col gap-1">
             <h2 className="t-label">Feeds</h2>
-            <div className="columns-2 gap-x-4 text-sm md:columns-3 lg:columns-4">
+            <div className="columns-2 gap-x-4 text-sm lg:columns-3 xl:columns-4">
               {groups.map((group) => (
                 <div key={group.name} className="break-inside-avoid pb-2">
                   <h3 className="font-medium">{group.name}</h3>

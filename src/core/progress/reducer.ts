@@ -21,8 +21,8 @@ import type { UnknownEvent } from './upcast';
  */
 
 /** 2: `capstoneAdrs` joined the state. 3: `pathExams`. 4: `onlineTests`. 5: `plan`.
- * 6: `profile`, `newsRead`, `customPath`, and XP for timed tests. */
-export const REDUCER_VERSION = 6;
+ * 6: `profile`, `newsRead`, `customPath`, and XP for timed tests. 7: `lessonCompletedOn`. */
+export const REDUCER_VERSION = 7;
 
 /** A day's worth of XP by 24-hour cooldown key, so "no grinding" can be checked. One
  * day of slack either side of midnight is not modelled; a plain 24h window from the
@@ -102,6 +102,8 @@ export interface ProgressState {
   readonly xpByLocalDate: Readonly<Record<string, number>>;
   readonly calibrationAnswers: readonly CalibrationAnswer[];
   readonly completedLessons: ReadonlySet<string>;
+  /** The learner's date of each lesson's first completion, so activity can be told by week. */
+  readonly lessonCompletedOn: Readonly<Record<string, string>>;
   readonly completedCapstones: ReadonlySet<string>;
   /** Last writer wins per part, in (at, deviceId, seq) order. */
   readonly capstoneAdrs: Readonly<Record<string, CapstoneAdr>>;
@@ -146,6 +148,7 @@ export function initialProgressState(): ProgressState {
     xpByLocalDate: {},
     calibrationAnswers: [],
     completedLessons: new Set(),
+    lessonCompletedOn: {},
     completedCapstones: new Set(),
     capstoneAdrs: {},
     resolvedIncidents: [],
@@ -334,6 +337,10 @@ export function applyEvent(state: ProgressState, event: StoryEvent | UnknownEven
       return {
         ...state,
         completedLessons: new Set(state.completedLessons).add(event.payload.lessonId),
+        lessonCompletedOn:
+          event.payload.lessonId in state.lessonCompletedOn
+            ? state.lessonCompletedOn
+            : { ...state.lessonCompletedOn, [event.payload.lessonId]: event.localDate },
       };
 
     case 'explain_back_graded': {

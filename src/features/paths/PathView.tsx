@@ -252,7 +252,7 @@ function NextStep({
       data-arrive="rise"
       className="bg-surface border-border rounded-panel shadow-edge flex flex-col gap-3 border p-2 md:p-3"
     >
-      <div className="flex flex-col gap-2 lg:flex-row lg:items-center lg:gap-4">
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:gap-4">
         <div className="flex min-w-0 flex-1 flex-col gap-0.5">
           <p className="t-label">
             {next && stage

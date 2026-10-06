@@ -171,6 +171,7 @@ describe('makeEvent', () => {
       plan_cleared: {},
       profile_set: { interests: ['web', 'ai'], news: true },
       news_read: { date: '2026-10-05' },
+      custom_path_set: { lessonIds: ['js.closures'] },
       online_test_submitted: {
         attemptId: 'a1',
         testKey: 'demo',

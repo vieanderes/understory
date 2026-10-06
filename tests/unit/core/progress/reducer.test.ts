@@ -363,6 +363,15 @@ describe('applyEvent', () => {
     expect(state.xpByLocalDate).toEqual({});
   });
 
+  it('keeps the latest custom path, and drops it when emptied', () => {
+    const first = makeEvent(deps, 'custom_path_set', { lessonIds: ['js.closures', 'ts.generics'] });
+    const cleared = makeEvent(depsFor('device-1', '2026-09-18T10:00:00Z', 'k'), 'custom_path_set', {
+      lessonIds: [],
+    });
+    expect(reduce([first]).customPath).toEqual(['js.closures', 'ts.generics']);
+    expect(reduce([first, cleared]).customPath).toBeUndefined();
+  });
+
   it('keeps every online-test sitting as a fact, and grants XP for the score', () => {
     const payload = {
       attemptId: 'a1',

@@ -274,6 +274,14 @@ export const profileSetPayloadSchema = z.strictObject({
   news: z.boolean(),
 });
 
+/**
+ * The lessons of a path the learner built themselves, in any order; the path shows them in
+ * course order. An empty list removes it.
+ */
+export const customPathSetPayloadSchema = z.strictObject({
+  lessonIds: z.array(idSchema).max(1000),
+});
+
 /** A news edition was opened. Read state is a fact, so it follows the progress file. */
 export const newsReadPayloadSchema = z.strictObject({
   date: z.iso.date(),
@@ -369,6 +377,7 @@ export const LATEST_VERSION = {
   plan_cleared: 1,
   profile_set: 1,
   news_read: 1,
+  custom_path_set: 1,
 } as const;
 
 export type EventType = keyof typeof LATEST_VERSION;
@@ -493,6 +502,12 @@ export const newsReadEventSchema = envelope(
   newsReadPayloadSchema,
 );
 
+export const customPathSetEventSchema = envelope(
+  'custom_path_set',
+  LATEST_VERSION.custom_path_set,
+  customPathSetPayloadSchema,
+);
+
 export const storyEventSchema = z.discriminatedUnion('type', [
   placementAnsweredEventSchema,
   placementCompletedEventSchema,
@@ -517,6 +532,7 @@ export const storyEventSchema = z.discriminatedUnion('type', [
   planClearedEventSchema,
   profileSetEventSchema,
   newsReadEventSchema,
+  customPathSetEventSchema,
 ]);
 
 export type StoryEvent = z.infer<typeof storyEventSchema>;

@@ -21,7 +21,7 @@ import type { UnknownEvent } from './upcast';
  */
 
 /** 2: `capstoneAdrs` joined the state. 3: `pathExams`. 4: `onlineTests`. 5: `plan`.
- * 6: `profile`, `newsRead`, and XP for timed tests. */
+ * 6: `profile`, `newsRead`, `customPath`, and XP for timed tests. */
 export const REDUCER_VERSION = 6;
 
 /** A day's worth of XP by 24-hour cooldown key, so "no grinding" can be checked. One
@@ -121,6 +121,8 @@ export interface ProgressState {
   readonly profile: PayloadOf<'profile_set'> | undefined;
   /** News editions opened, by date (YYYY-MM-DD). */
   readonly newsRead: ReadonlySet<string>;
+  /** The lessons of the learner's own path, or undefined when they have none. */
+  readonly customPath: readonly string[] | undefined;
   readonly assumedConcepts: ReadonlySet<string>;
   /** How many placement ladders were finished. A later ladder rotates its items. */
   readonly placementsCompleted: number;
@@ -153,6 +155,7 @@ export function initialProgressState(): ProgressState {
     plan: undefined,
     profile: undefined,
     newsRead: new Set(),
+    customPath: undefined,
     assumedConcepts: new Set(),
     placementsCompleted: 0,
     collectedReadings: new Set(),
@@ -477,6 +480,12 @@ export function applyEvent(state: ProgressState, event: StoryEvent | UnknownEven
 
     case 'profile_set':
       return { ...state, profile: event.payload };
+
+    case 'custom_path_set':
+      return {
+        ...state,
+        customPath: event.payload.lessonIds.length > 0 ? event.payload.lessonIds : undefined,
+      };
 
     case 'news_read':
       return { ...state, newsRead: new Set(state.newsRead).add(event.payload.date) };

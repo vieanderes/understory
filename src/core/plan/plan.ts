@@ -307,7 +307,7 @@ function specs(answers: PlanAnswers): PhaseSpec[] {
         {
           id: 'habit',
           title: 'Ten minutes a day',
-          why: 'Review keeps what you learnt; a weekly timed test keeps the speed.',
+          why: 'Practice keeps what you learnt; a weekly timed test keeps the speed.',
           priority: 1,
           habits: [
             { href: '/practise', title: 'Review what is due', minutes: 10, every: 'day' },

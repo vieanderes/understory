@@ -62,36 +62,62 @@ beforeEach(() => {
 });
 
 describe('PlanSetup', () => {
-  it('asks for a goal, time and a starting point, shows the plan, then saves the answers', async () => {
+  it('asks five short questions, shows the plan, then saves the answers and the profile', async () => {
     const user = userEvent.setup();
     const onDone = vi.fn();
     render(<PlanSetup catalog={CATALOG} onDone={onDone} />);
-    expect(
-      screen.getByRole('heading', { name: 'What do you want to be able to do?' }),
-    ).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'What do you want?' })).toBeInTheDocument();
     await user.click(screen.getByRole('radio', { name: /Learn to code from zero/ }));
-    expect(screen.getByRole('heading', { name: 'How much time do you have?' })).toBeInTheDocument();
-    await user.click(screen.getByRole('radio', { name: '7 h' }));
+    expect(
+      screen.getByRole('heading', { name: 'What are you interested in?' }),
+    ).toBeInTheDocument();
+    // The goal suggests its interests; one more is added.
+    expect(screen.getByRole('button', { name: 'Coding basics' })).toHaveAttribute(
+      'aria-pressed',
+      'true',
+    );
+    await user.click(screen.getByRole('button', { name: 'Python' }));
     await user.click(screen.getByRole('button', { name: /Next/ }));
     await user.click(screen.getByRole('radio', { name: 'Python' }));
     await user.click(screen.getByRole('button', { name: /Next/ }));
+    expect(screen.getByRole('heading', { name: 'How much time a day?' })).toBeInTheDocument();
+    await user.click(screen.getByRole('radio', { name: '1½ h' }));
+    await user.click(screen.getByRole('button', { name: /Next/ }));
+    await user.click(screen.getByRole('radio', { name: 'No' }));
+    await user.click(screen.getByRole('button', { name: /Next/ }));
     expect(screen.getByRole('heading', { name: 'Your plan' })).toBeInTheDocument();
     expect(screen.getByText('Python properly')).toBeInTheDocument();
-    await user.click(screen.getByRole('button', { name: 'Start this plan' }));
+    await user.click(screen.getByRole('button', { name: 'Start' }));
+    expect(record).toHaveBeenCalledWith('profile_set', {
+      interests: ['basics', 'web', 'python'],
+      news: false,
+    });
     expect(record).toHaveBeenCalledWith(
       'plan_set',
       expect.objectContaining({
         goal: 'from-zero',
         level: 'new',
         language: 'python',
-        minutesPerWeek: 420,
+        minutesPerWeek: 630,
       }),
     );
     expect(onDone).toHaveBeenCalled();
   });
 
-  it('asks for the date first for interviews, and waits for a valid one', async () => {
+  it('ends after the interests for the news alone, with no plan', async () => {
+    const user = userEvent.setup();
+    render(<PlanSetup catalog={CATALOG} onDone={() => {}} />);
+    await user.click(screen.getByRole('radio', { name: /Just follow the news/ }));
+    await user.click(screen.getByRole('button', { name: 'Show me the news' }));
+    expect(record).toHaveBeenCalledWith('profile_set', { interests: [], news: true });
+    expect(record).not.toHaveBeenCalledWith('plan_set', expect.anything());
+  });
+
+  it('asks for the date for interviews, and waits for a valid one', async () => {
+    const user = userEvent.setup();
     render(<PlanSetup catalog={CATALOG} onDone={() => {}} initialGoal="interviews" />);
+    await user.click(screen.getByRole('button', { name: /Next/ }));
+    await user.click(screen.getByRole('button', { name: /Next/ }));
     expect(screen.getByLabelText('The interview or test is on')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /Next/ })).toBeDisabled();
   });

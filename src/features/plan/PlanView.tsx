@@ -88,14 +88,18 @@ export function TodayCard({ state, headingLevel = 2 }: { state: PlanState; headi
           Every step of your plan is done. Set a new goal, or keep it fresh in Review.
         </Heading>
       )}
-      <div className="flex items-center gap-2">
-        <ProgressLine value={progress.share} label="Plan done" className="max-w-50" />
-        <span className="t-figure text-muted text-sm">
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+        <ProgressLine
+          value={progress.share}
+          label="Plan done"
+          className="max-w-50 min-w-20 flex-1"
+        />
+        <span className="t-figure text-muted shrink-0 text-sm">
           {Math.round(progress.share * 100)}% of {formatHours(plan.minutes)}
         </span>
         <Link
           href="/plan"
-          className="text-muted hover:text-fg ml-auto text-sm underline-offset-4 hover:underline"
+          className="text-muted hover:text-fg ml-auto shrink-0 text-sm underline-offset-4 hover:underline"
         >
           The whole plan
         </Link>

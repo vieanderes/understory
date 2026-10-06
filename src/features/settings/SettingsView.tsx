@@ -116,6 +116,15 @@ export function SettingsView() {
   return (
     <div className="flex flex-col">
       <Row
+        title="Your goals"
+        note="What you want, what interests you, your time a day and whether Home shows the news. They shape your path, practice and news order."
+      >
+        <Link href="/plan?edit" className={buttonClass('secondary')}>
+          Change my answers
+        </Link>
+      </Row>
+
+      <Row
         title="Weekly goal"
         note="XP comes only from shown skill and recall. A missed week spends a rest week; you earn one for every four weeks met."
       >

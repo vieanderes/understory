@@ -1,6 +1,7 @@
 'use client';
 
-import { ArrowLeft, ArrowRight, Flag } from 'lucide-react';
+import { ArrowLeft, ArrowRight, Check, Flag } from 'lucide-react';
+import Link from 'next/link';
 import { useId, useState } from 'react';
 import { Button } from '@/components/ui/Button';
 import { Segmented } from '@/components/ui/Segmented';
@@ -14,16 +15,18 @@ import {
   type PlanLanguage,
   type PlanLevel,
 } from '@/core/plan';
+import { INTEREST_COPY, INTERESTS, interestsForGoal, type Interest } from '@/core/profile';
+import type { PayloadOf } from '@/core/progress';
 import { useStore } from '@/features/store/StoreProvider';
 import { cn } from '@/lib/cn';
 import { formatDate, formatHours, useToday } from './usePlan';
 
-const WEEKLY = [
-  { value: '60', label: '1 h' },
-  { value: '120', label: '2 h' },
-  { value: '210', label: '3½ h' },
-  { value: '420', label: '7 h' },
-  { value: '840', label: '14 h' },
+/** Minutes a day; the plan keeps minutes a week, so these are multiplied by seven. */
+const DAILY = [
+  { value: '10', label: '10 min' },
+  { value: '20', label: '20 min' },
+  { value: '45', label: '45 min' },
+  { value: '90', label: '1½ h' },
 ] as const;
 
 const LEVELS: { value: PlanLevel; label: string }[] = [
@@ -37,78 +40,153 @@ const LANGUAGES: { value: PlanLanguage; label: string }[] = [
   { value: 'python', label: 'Python' },
 ];
 
+const YES_NO = [
+  { value: 'yes', label: 'Yes' },
+  { value: 'no', label: 'No' },
+] as const;
+
 /** Goals where a date is the point, so the date question comes first and open. */
 const DATED: readonly PlanGoal[] = ['interviews', 'senior'];
 
-type Step = 'goal' | 'time' | 'start' | 'preview';
-const STEPS: Step[] = ['goal', 'time', 'start', 'preview'];
+/** "Just the news" is a goal too: no plan, a Home that leads with the edition. */
+type Goal = PlanGoal | 'news';
+const NEWS_ONLY = {
+  title: 'Just follow the news',
+  who: 'You want a short daily read on what changed, and why it matters.',
+};
+
+type Step = 'goal' | 'interests' | 'start' | 'time' | 'news' | 'preview';
+const PLAN_STEPS: Step[] = ['goal', 'interests', 'start', 'time', 'news', 'preview'];
+const NEWS_STEPS: Step[] = ['goal', 'interests'];
+
+const TITLES: Record<Step, string> = {
+  goal: 'What do you want?',
+  interests: 'What are you interested in?',
+  start: 'Where are you starting from?',
+  time: 'How much time a day?',
+  news: "Today's news on Home?",
+  preview: 'Your plan',
+};
+
+const daily = (minutesPerWeek: number) =>
+  String(
+    DAILY.reduce((best, d) =>
+      Math.abs(Number(d.value) * 7 - minutesPerWeek) <
+      Math.abs(Number(best.value) * 7 - minutesPerWeek)
+        ? d
+        : best,
+    ).value,
+  );
 
 interface PlanSetupProps {
   catalog: PlanCatalog;
   /** The current answers when changing a plan. */
   initial?: PlanAnswers | undefined;
+  initialProfile?: PayloadOf<'profile_set'> | undefined;
   initialGoal?: PlanGoal | undefined;
   onDone: () => void;
   onCancel?: () => void;
 }
 
 /**
- * Setting up a plan: what you want, how much time, where you start. Three short questions,
- * then the plan itself to look at before it is saved. The answers go to the event log as
- * one plan_set; the phases are always rebuilt from them.
+ * Setting up: what you want, what interests you, where you start, how much time, and whether
+ * Home shows the news. One short question a screen, most answered with one tap, then the plan
+ * to look at before it is saved. The answers go to the event log as plan_set and profile_set;
+ * the phases, the practice topics and the order of the news are always derived from them.
  */
-export function PlanSetup({ catalog, initial, initialGoal, onDone, onCancel }: PlanSetupProps) {
+export function PlanSetup({
+  catalog,
+  initial,
+  initialProfile,
+  initialGoal,
+  onDone,
+  onCancel,
+}: PlanSetupProps) {
   const store = useStore();
   const today = useToday();
-  const [step, setStep] = useState<Step>(initial || initialGoal ? 'time' : 'goal');
-  const [goal, setGoal] = useState<PlanGoal>(initial?.goal ?? initialGoal ?? 'from-zero');
+  const editing = initial !== undefined || initialProfile !== undefined;
+  const firstGoal: Goal =
+    initial?.goal ?? initialGoal ?? (initialProfile && !initial ? 'news' : 'from-zero');
+  const [step, setStep] = useState<Step>(initialGoal && !editing ? 'interests' : 'goal');
+  const [goal, setGoal] = useState<Goal>(firstGoal);
+  const [interests, setInterests] = useState<readonly Interest[]>(
+    initialProfile?.interests ?? (firstGoal === 'news' ? [] : interestsForGoal(firstGoal)),
+  );
   const [hasDate, setHasDate] = useState(initial ? Boolean(initial.deadline) : false);
   const [deadline, setDeadline] = useState(initial?.deadline ?? '');
-  const [weekly, setWeekly] = useState(String(initial?.minutesPerWeek ?? 210));
+  const [perDay, setPerDay] = useState(daily(initial?.minutesPerWeek ?? 140));
   const [level, setLevel] = useState<PlanLevel>(initial?.level ?? 'new');
   const [language, setLanguage] = useState<PlanLanguage>(initial?.language ?? 'js');
+  const [news, setNews] = useState<'yes' | 'no'>(initialProfile?.news === false ? 'no' : 'yes');
   const [saving, setSaving] = useState(false);
   const titleId = useId();
   const dateId = useId();
-  const dated = hasDate || DATED.includes(goal);
+
+  const newsOnly = goal === 'news';
+  const steps = newsOnly ? NEWS_STEPS : PLAN_STEPS;
+  const index = steps.indexOf(step);
+  const last = index === steps.length - 1;
+  const dated = !newsOnly && (hasDate || DATED.includes(goal));
   const validDate = !dated || (deadline !== '' && deadline >= today);
 
-  const answers: PlanAnswers = {
-    goal,
-    level,
-    language,
-    minutesPerWeek: Number(weekly),
-    ...(dated && deadline ? { deadline } : {}),
-    since: today || '2026-01-01',
-  };
+  const answers: PlanAnswers | undefined = newsOnly
+    ? undefined
+    : {
+        goal,
+        level,
+        language,
+        minutesPerWeek: Number(perDay) * 7,
+        ...(dated && deadline ? { deadline } : {}),
+        since: today || '2026-01-01',
+      };
   // Cheap to build: the preview follows every answer as it changes.
-  const preview = buildPlan(answers, catalog);
+  const preview = answers ? buildPlan(answers, catalog) : undefined;
 
-  const index = STEPS.indexOf(step);
-  const next = () => setStep(STEPS[Math.min(STEPS.length - 1, index + 1)]!);
-  const back = () => (index === 0 ? onCancel?.() : setStep(STEPS[index - 1]!));
+  const next = () => setStep(steps[Math.min(steps.length - 1, index + 1)]!);
+  const back = () => (index === 0 ? onCancel?.() : setStep(steps[index - 1]!));
+
+  function pickGoal(id: Goal) {
+    setGoal(id);
+    if (id !== 'news' && DATED.includes(id)) setHasDate(true);
+    // A new goal suggests its interests, unless the learner already chose their own.
+    if (!initialProfile) setInterests(id === 'news' ? [] : interestsForGoal(id));
+    setStep('interests');
+  }
+
+  function toggle(id: Interest) {
+    setInterests((current) =>
+      current.includes(id) ? current.filter((i) => i !== id) : [...current, id],
+    );
+  }
 
   async function save() {
     setSaving(true);
-    await store.record('plan_set', answers);
+    await store.record('profile_set', {
+      interests: INTERESTS.filter((id) => interests.includes(id)),
+      news: newsOnly || news === 'yes',
+    });
+    if (answers) await store.record('plan_set', answers);
+    else if (initial) await store.record('plan_cleared', {});
     setSaving(false);
     onDone();
   }
+
+  const goals: { id: Goal; title: string; who: string }[] = [
+    ...PLAN_GOALS.map((id) => ({ id, ...GOAL_COPY[id] })),
+    { id: 'news', ...NEWS_ONLY },
+  ];
 
   return (
     <section aria-labelledby={titleId} className="flex max-w-3xl flex-col gap-4">
       <div className="flex flex-col gap-1">
         <p className="t-label t-figure">
-          {initial ? 'Change your plan' : 'Make your plan'} · step {index + 1} of {STEPS.length}
+          {editing ? 'Your goals' : 'Set up'}
+          {step === 'preview'
+            ? ''
+            : ` · ${index + 1} of ${steps.filter((s) => s !== 'preview').length}`}
         </p>
         <h1 id={titleId} className="t-section">
-          {step === 'goal'
-            ? 'What do you want to be able to do?'
-            : step === 'time'
-              ? 'How much time do you have?'
-              : step === 'start'
-                ? 'Where are you starting from?'
-                : 'Your plan'}
+          {TITLES[step]}
         </h1>
       </div>
 
@@ -118,7 +196,7 @@ export function PlanSetup({ catalog, initial, initialGoal, onDone, onCancel }: P
           aria-labelledby={titleId}
           className="grid grid-cols-1 gap-1 sm:grid-cols-2"
         >
-          {PLAN_GOALS.map((id) => {
+          {goals.map(({ id, title, who }) => {
             const selected = id === goal;
             return (
               <button
@@ -126,29 +204,76 @@ export function PlanSetup({ catalog, initial, initialGoal, onDone, onCancel }: P
                 type="button"
                 role="radio"
                 aria-checked={selected}
-                onClick={() => {
-                  setGoal(id);
-                  if (DATED.includes(id)) setHasDate(true);
-                  next();
-                }}
+                onClick={() => pickGoal(id)}
                 className={cn(
-                  'rounded-panel flex flex-col items-start gap-0.5 border p-2 text-left transition-colors duration-150 ease-out',
+                  'rounded-panel transition-press flex flex-col items-start gap-0.5 border p-2 text-left active:scale-98',
                   selected
                     ? 'border-accent bg-accent-tint'
                     : 'border-border hover:border-border-strong hover:bg-raised',
                 )}
               >
-                <span className="font-medium">{GOAL_COPY[id].title}</span>
-                <span className="text-muted text-sm">{GOAL_COPY[id].who}</span>
+                <span className="font-medium">{title}</span>
+                <span className="text-muted text-sm">{who}</span>
               </button>
             );
           })}
         </div>
       ) : null}
 
+      {step === 'interests' ? (
+        <div className="flex flex-col gap-2">
+          <p className="text-muted">
+            Pick any. Practice and the news start with these. Nothing else is hidden.
+          </p>
+          <ul aria-labelledby={titleId} className="flex flex-wrap gap-1">
+            {INTERESTS.map((id) => {
+              const on = interests.includes(id);
+              return (
+                <li key={id}>
+                  <button
+                    type="button"
+                    aria-pressed={on}
+                    onClick={() => toggle(id)}
+                    className={cn(
+                      'rounded-control transition-press inline-flex h-5 items-center gap-0.5 border px-1.5 text-sm font-medium active:scale-98',
+                      on
+                        ? 'border-fg bg-fg text-bg'
+                        : 'border-border text-muted hover:border-border-strong hover:text-fg',
+                    )}
+                  >
+                    {on ? <Check aria-hidden size={16} strokeWidth={2} /> : null}
+                    {INTEREST_COPY[id].label}
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+      ) : null}
+
+      {step === 'start' ? (
+        <div className="flex flex-col gap-3">
+          <Segmented label="Coding so far" value={level} onChange={setLevel} options={LEVELS} />
+          <Segmented
+            label="Main language"
+            value={language}
+            onChange={setLanguage}
+            options={LANGUAGES}
+          />
+          <p className="text-muted text-sm">
+            Not sure?{' '}
+            <Link href="/start" className="text-fg underline underline-offset-4">
+              Find your level in 8 minutes
+            </Link>
+            .
+          </p>
+        </div>
+      ) : null}
+
       {step === 'time' ? (
         <div className="flex flex-col gap-3">
-          {DATED.includes(goal) ? null : (
+          <Segmented label="Time a day" value={perDay} onChange={setPerDay} options={DAILY} />
+          {DATED.includes(goal as PlanGoal) ? null : (
             <label className="flex min-h-5 cursor-pointer items-center gap-1">
               <input
                 type="checkbox"
@@ -162,7 +287,7 @@ export function PlanSetup({ catalog, initial, initialGoal, onDone, onCancel }: P
           {dated ? (
             <div className="flex flex-col gap-0.5">
               <label htmlFor={dateId} className="t-label">
-                {goal === 'interviews' || goal === 'senior'
+                {DATED.includes(goal as PlanGoal)
                   ? 'The interview or test is on'
                   : 'I want to be ready by'}
               </label>
@@ -176,27 +301,26 @@ export function PlanSetup({ catalog, initial, initialGoal, onDone, onCancel }: P
               />
             </div>
           ) : null}
-          <Segmented label="Time a week" value={weekly} onChange={setWeekly} options={WEEKLY} />
-          <p className="text-muted text-sm">
-            About {formatHours(Math.round(Number(weekly) / 7))} a day. Short and often beats long
-            and rare.
-          </p>
         </div>
       ) : null}
 
-      {step === 'start' ? (
-        <div className="flex flex-col gap-3">
-          <Segmented label="Coding so far" value={level} onChange={setLevel} options={LEVELS} />
+      {step === 'news' ? (
+        <div className="flex flex-col gap-2">
+          <p className="text-muted">
+            A short daily edition: what changed in software and why it matters. Always there under
+            News either way.
+          </p>
           <Segmented
-            label="Main language"
-            value={language}
-            onChange={setLanguage}
-            options={LANGUAGES}
+            label="Show today's news on Home"
+            hideLabel
+            value={news}
+            onChange={setNews}
+            options={YES_NO}
           />
         </div>
       ) : null}
 
-      {step === 'preview' ? (
+      {step === 'preview' && preview && answers ? (
         <div className="flex flex-col gap-2">
           <p className="text-muted">
             {preview.title}. {formatHours(preview.minutes)} of work
@@ -224,10 +348,9 @@ export function PlanSetup({ catalog, initial, initialGoal, onDone, onCancel }: P
                       : formatHours(phase.items.reduce((s, it) => s + it.minutes, 0))}
                   </span>
                 </p>
-                <p className="text-muted text-sm">{phase.why}</p>
                 {phase.milestone ? (
-                  <p className="flex items-center gap-0.5 text-sm">
-                    <Flag aria-hidden size={16} strokeWidth={2} className="text-muted" />
+                  <p className="text-muted flex items-center gap-0.5 text-sm">
+                    <Flag aria-hidden size={16} strokeWidth={2} />
                     {phase.milestone.title}
                   </p>
                 ) : null}
@@ -244,9 +367,9 @@ export function PlanSetup({ catalog, initial, initialGoal, onDone, onCancel }: P
             {index === 0 ? 'Cancel' : 'Back'}
           </Button>
         ) : null}
-        {step === 'preview' ? (
+        {last ? (
           <Button variant="primary" onClick={() => void save()} loading={saving}>
-            {initial ? 'Save the new plan' : 'Start this plan'}
+            {newsOnly ? 'Show me the news' : editing ? 'Save' : 'Start'}
           </Button>
         ) : step !== 'goal' ? (
           <Button variant="primary" onClick={next} disabled={step === 'time' && !validDate}>

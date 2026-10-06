@@ -16,6 +16,11 @@
 </p>
 
 <p align="center">
+  <a href="https://understory-khaki-ten.vercel.app"><strong>Open Understory in your browser</strong></a>
+  · free, no account, nothing to install
+</p>
+
+<p align="center">
   <a href="#a-note-before-you-start">Why this exists</a> ·
   <a href="#meet-scout-your-ai-tutor">Scout AI</a> ·
   <a href="#start-here">Start here</a> ·
@@ -144,6 +149,9 @@ The details, including the shared store a serverless host needs for MCP, are in
 [`ONLINE-TEST.md`](docs/ONLINE-TEST.md), section 6.
 
 ## Start here
+
+[Open Understory](https://understory-khaki-ten.vercel.app) and start. Everything runs in your
+browser, and your progress stays on your device.
 
 The first visit asks five short questions, most answered with one tap: what you want (learn
 it all, a first job, refresh and then specialise, AI engineering, interviews, or just the

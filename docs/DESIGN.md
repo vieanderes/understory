@@ -87,7 +87,10 @@ semantic tokens only, so a palette change is a change to that one file.
   Words are the same everywhere: Course, Parts, Chapters, Lessons; a path has Stages, each
   with its lessons and its tests, labs and practice.
 - **Desktop**: a rail with the four places, and the Library, Settings and theme at its foot;
-  lessons split into code left, question right; keyboard shortcuts and a command menu.
+  lessons put the question across the top, then code left and answers right on one top
+  edge; keyboard shortcuts and a command menu. Scout AI opens as a column beside the page,
+  never over it: from lg on a focus screen, from xl in the shell (below that it floats as a
+  card), and it stays open across steps and pages until closed.
 - **Phone**: the four places in a bottom tab bar in the thumb zone, clear of the home
   indicator (`.pb-safe`), the Library (named) and Settings in the top bar;
   the primary action sits low; code and question share one viewport; session step types

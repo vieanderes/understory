@@ -98,7 +98,7 @@ answer. It replies with short explanations and highlighted code you can copy.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/scout-dark.png">
-  <img alt="Scout AI open beside a code challenge. The learner asked for a hint, not the answer, and Scout, running on Claude on this machine, explains converting the form's strings to numbers first, without giving the solution." src="docs/assets/readme/scout-light.png" width="100%">
+  <img alt="Scout AI docked beside a code challenge. The learner asked for a hint, not the answer, and Scout, running on Claude on this machine, explains converting the form's strings to numbers first, with a small example and without the solution." src="docs/assets/readme/scout-light.png" width="100%">
 </picture>
 
 It is built to keep you thinking. On an exercise it gives a hint first, then a nudge, and
@@ -228,7 +228,7 @@ closing the lesson returns you to the page you opened it from.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/challenge-dark.png">
-  <img alt="A code challenge. The learner has written cartTotal and all five tests pass." src="docs/assets/readme/challenge-light.png" width="100%">
+  <img alt="A code challenge. The learner has written cartTotal and all five tests pass. The bar below reads Back, Skip for now, Guess, Pretty sure or Certain, and Check." src="docs/assets/readme/challenge-light.png" width="100%">
 </picture>
 
 **Playgrounds** render HTML, CSS, JavaScript and React as you type, and check the page itself: its elements, its text, what happens on a click.

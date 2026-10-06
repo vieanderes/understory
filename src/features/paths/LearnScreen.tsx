@@ -250,7 +250,7 @@ function Learn({
   const [switching, setSwitching] = useState(false);
   // On a first visit the choice is a draft, so several paths can be ticked before Start.
   const [draft, setDraft] = useState<string[]>([]);
-  if (status !== 'ready') return <p className="text-muted py-4">Reading your progress...</p>;
+  if (status !== 'ready') return <PathIndex paths={written} />;
   const isDone = (id: string) => state.completedLessons.has(id);
   // The paths the learner made sit first, as theirs.
   const paths = withOwnPaths(tree, state.ownPaths, written);
@@ -370,6 +370,39 @@ function Learn({
   );
 }
 
+/**
+ * What the server sends before the learner's progress is read: every path as a plain link.
+ * The screen needs the URL and local progress, so without this the HTML a search engine or
+ * a slow phone receives would be a single loading line.
+ */
+function PathIndex({ paths }: { paths: readonly PathSummary[] }) {
+  return (
+    <section aria-labelledby="path-index" className="flex max-w-5xl flex-col gap-2 md:pt-2">
+      <h1 id="path-index" className="t-section">
+        Learning paths
+      </h1>
+      <ul className={rowList()}>
+        {paths.map((path) => (
+          <li key={path.id} className={rowItem}>
+            <Link href={`/paths/${path.id}`} className="group flex items-start gap-2 py-1.5">
+              <span className="flex min-w-0 flex-1 flex-col">
+                <span className="font-medium">{path.name}</span>
+                <span className="text-muted text-sm">{path.promise}</span>
+              </span>
+              <ArrowRight
+                aria-hidden
+                size={16}
+                strokeWidth={2}
+                className={cn(rowArrow, 'mt-0.5')}
+              />
+            </Link>
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
 export function LearnScreen(props: {
   paths: readonly PathSummary[];
   catalog: PlanCatalog;
@@ -377,7 +410,7 @@ export function LearnScreen(props: {
 }) {
   // `?path=` is read on the client; the boundary keeps the rest of the page static.
   return (
-    <Suspense fallback={<p className="text-muted py-4">Reading your progress...</p>}>
+    <Suspense fallback={<PathIndex paths={props.paths} />}>
       <Learn {...props} />
     </Suspense>
   );

@@ -8,6 +8,7 @@ import { getSourceGroups } from '@/lib/news/sources';
 import { Title } from '@/features/motion/Title';
 import { getStoryContext } from './data';
 import { EditionList } from './EditionList';
+import { EditionNav } from './EditionNav';
 import { formatDay, formatMonth, formatShort, isoWeekOf } from './format';
 import { HowNewsWorks } from './HowNewsWorks';
 import { MarkEditionRead } from './MarkEditionRead';
@@ -46,16 +47,18 @@ export async function SignalDayView({ day, editions }: SignalDayViewProps) {
           </HowNewsWorks>
         }
         actions={
-          <PeriodLinks
-            links={[
-              {
-                href: `/signal/week/${week}`,
-                label: `Week of ${formatShort(weekRange(week)?.from ?? day.date)}`,
-              },
-              { href: `/signal/month/${month}`, label: formatMonth(month) },
-              { href: '/signal/archive', label: 'All editions' },
-            ]}
-          />
+          <EditionNav dates={dates} current={day.date}>
+            <PeriodLinks
+              links={[
+                {
+                  href: `/signal/week/${week}`,
+                  label: `Week of ${formatShort(weekRange(week)?.from ?? day.date)}`,
+                },
+                { href: `/signal/month/${month}`, label: formatMonth(month) },
+                { href: '/signal/archive', label: 'All editions' },
+              ]}
+            />
+          </EditionNav>
         }
       />
 

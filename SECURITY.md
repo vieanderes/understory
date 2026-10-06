@@ -22,3 +22,15 @@ Of most interest:
 
 Understory keeps progress on the learner's device and has no accounts, so there is no
 server-side user data to reach.
+
+## Dependency audit
+
+`pnpm check` runs `pnpm audit` and fails on any known vulnerability. Fixes come first: a
+direct dependency is raised, a transitive one is pinned to its patched release with
+`pnpm.overrides` in `package.json`. An advisory is ignored (`pnpm.auditConfig.ignoreGhsas`)
+only when no patched release exists and the code cannot be reached from the app; each is
+listed here with the reason.
+
+| Advisory                                                                 | Package  | Why it is ignored                                                                                                                                                                                                                 |
+| ------------------------------------------------------------------------ | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [GHSA-vfj7-8cjw-p6xm](https://github.com/advisories/GHSA-vfj7-8cjw-p6xm) | `braces` | No patched release. It is reached only through `eslint-config-next`, a development tool that expands our own fixed glob patterns; nothing at run time or from a visitor reaches it. Remove the entry once a fixed release exists. |

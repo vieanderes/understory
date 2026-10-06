@@ -12,3 +12,4 @@ export * from './rollup';
 export * from './merge';
 export * from './brief';
 export * from './edition';
+export * from './calendar';

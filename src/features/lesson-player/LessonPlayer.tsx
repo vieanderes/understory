@@ -82,6 +82,18 @@ export function LessonPlayer({
     if (stage === 'opening') headingRef.current?.focus();
   }, [stage]);
 
+  // The step being worked on rides in the address, so a refresh or a closed tab lands on it
+  // again through the deep link above. replaceState, so Back still leaves the lesson.
+  useEffect(() => {
+    const target = stage === 'steps' && step ? `#${step.id}` : '';
+    if (window.location.hash === target) return;
+    window.history.replaceState(
+      window.history.state,
+      '',
+      `${window.location.pathname}${window.location.search}${target}`,
+    );
+  }, [stage, step]);
+
   // The top bar holds the assistant's trigger, so the floating one steps aside and never
   // sits on the fixed footer. A registration with an external store, undone on unmount.
   useEffect(() => dockTutorTrigger(), []);
@@ -154,7 +166,10 @@ export function LessonPlayer({
           {/* The same lesson as one page to read, at any step. */}
           <Link
             href={`/lectures/${lesson.moduleSlug}/${lesson.slug}`}
-            aria-label="Read as a lecture"
+            // A new tab, so the lesson and the learner's place in it stay where they are.
+            target="_blank"
+            rel="noopener"
+            aria-label="Read as a lecture, in a new tab"
             title="Read as a lecture"
             className="text-muted hover:text-fg hover:bg-raised rounded-control inline-flex size-5 shrink-0 items-center justify-center transition-colors duration-150 ease-out"
           >

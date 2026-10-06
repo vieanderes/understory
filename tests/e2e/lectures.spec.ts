@@ -97,8 +97,22 @@ test('a lesson links to its lecture from every step', async ({ page }) => {
   await page.goto('/learn/javascript/values-types-coercion');
   const lecture = page.getByRole('link', { name: 'Read as a lecture' });
   await expect(lecture).toHaveAttribute('href', '/lectures/javascript/values-types-coercion');
+  // A new tab keeps the learner's place in the lesson.
+  await expect(lecture).toHaveAttribute('target', '_blank');
   await page.getByRole('button', { name: 'Begin' }).click();
   await expect(lecture).toBeVisible();
+});
+
+test('a lesson survives a refresh on the step being worked on', async ({ page }) => {
+  await page.goto('/learn/javascript/values-types-coercion');
+  await page.locator('html[data-hydrated="true"]').waitFor();
+  await page.getByRole('button', { name: 'Begin' }).click();
+  await expect(page).toHaveURL(/#.+$/);
+  const step = new URL(page.url()).hash;
+  await page.reload();
+  await page.locator('html[data-hydrated="true"]').waitFor();
+  await expect(page).toHaveURL(new RegExp(`${step}$`));
+  await expect(page.getByRole('button', { name: 'Begin' })).toBeHidden();
 });
 
 test('the old fast track address leads to the paths', async ({ page }) => {

@@ -267,56 +267,54 @@ export function StepRunner({
         )}
       </section>
 
-      {/* A phone takes two rows: how sure, then the buttons. Wider, one row. */}
-      <ActionBar className="flex-wrap justify-between gap-y-1 sm:flex-nowrap">
-        {scored && phase === 'answering' && step.type !== 'explain-back' ? (
-          <ConfidenceControl
-            value={confidence}
-            onChange={setConfidence}
-            className="w-full sm:w-auto sm:min-w-36"
-          />
+      {/* Back stands alone on the left. How sure sits beside Check, where it is set just
+          before checking; on a phone it takes its own row above the buttons. */}
+      <ActionBar className="flex-wrap gap-y-1 sm:flex-nowrap">
+        {onBack ? (
+          <Button variant="quiet" onClick={onBack} aria-label="Previous step" title="Previous step">
+            <ChevronLeft aria-hidden size={16} strokeWidth={2} />
+            <span className="max-sm:sr-only">Back</span>
+          </Button>
         ) : null}
-        <div className="ml-auto flex items-center gap-1">
-          {onBack ? (
-            <Button
-              variant="quiet"
-              onClick={onBack}
-              aria-label="Previous step"
-              title="Previous step"
-            >
-              <ChevronLeft aria-hidden size={16} strokeWidth={2} />
-              <span className="max-sm:sr-only">Back</span>
-            </Button>
+        <div className="ml-auto flex items-center gap-2 max-sm:contents">
+          {scored && phase === 'answering' && step.type !== 'explain-back' ? (
+            <ConfidenceControl
+              value={confidence}
+              onChange={setConfidence}
+              className="max-sm:order-first max-sm:w-full sm:min-w-36"
+            />
           ) : null}
-          {!scored ? (
-            <Button variant="primary" onClick={onContinue}>
-              Continue
-            </Button>
-          ) : phase === 'answering' ? (
-            <>
-              {/* Any question can wait: nothing in Understory is locked, and a skipped
+          <div className="flex items-center gap-1 max-sm:ml-auto">
+            {!scored ? (
+              <Button variant="primary" onClick={onContinue}>
+                Continue
+              </Button>
+            ) : phase === 'answering' ? (
+              <>
+                {/* Any question can wait: nothing in Understory is locked, and a skipped
                     step simply earns nothing until it is answered. */}
-              <Button variant="quiet" onClick={onContinue}>
-                Skip for now
+                <Button variant="quiet" onClick={onContinue}>
+                  Skip for now
+                </Button>
+                <Button variant="primary" onClick={check} disabled={!canCheck}>
+                  Check
+                </Button>
+              </>
+            ) : canRetry ? (
+              <>
+                <Button variant="quiet" onClick={showAnswer}>
+                  Show answer
+                </Button>
+                <Button variant="primary" onClick={retry}>
+                  Try again
+                </Button>
+              </>
+            ) : (
+              <Button variant="primary" onClick={onContinue}>
+                Continue
               </Button>
-              <Button variant="primary" onClick={check} disabled={!canCheck}>
-                Check
-              </Button>
-            </>
-          ) : canRetry ? (
-            <>
-              <Button variant="quiet" onClick={showAnswer}>
-                Show answer
-              </Button>
-              <Button variant="primary" onClick={retry}>
-                Try again
-              </Button>
-            </>
-          ) : (
-            <Button variant="primary" onClick={onContinue}>
-              Continue
-            </Button>
-          )}
+            )}
+          </div>
         </div>
       </ActionBar>
     </>

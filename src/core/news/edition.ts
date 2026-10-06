@@ -29,6 +29,53 @@ export function storySummary(item: NewsItem): string | null {
   return excerpt.length > 0 ? excerpt : null;
 }
 
+/** About two lines at the reading measure, so every story's lead has the same shape. */
+const LEAD_CHARS = 160;
+
+/**
+ * Whole sentences up to the budget. A trailing fragment (a feed's excerpt cut mid-word) is
+ * dropped; one sentence longer than the budget is cut at a word and says so.
+ */
+function twoLines(text: string): string {
+  const clean = text.replace(/\s+/g, ' ').trim();
+  // A sentence ends at a stop followed by a space, so "0.8.7" and "e.g" stay whole.
+  const sentences = clean
+    .split(/(?<=[.!?]["')\]]*)\s+/)
+    .filter((part) => /[.!?]["')\]]*$/.test(part));
+  let kept = '';
+  for (const sentence of sentences) {
+    const next = `${kept} ${sentence}`.trim();
+    if (next.length > LEAD_CHARS) break;
+    kept = next;
+  }
+  if (kept.length > 0) return kept;
+  if (clean.length <= LEAD_CHARS) return clean;
+  const cut = clean.slice(0, LEAD_CHARS);
+  const space = cut.lastIndexOf(' ');
+  return `${(space > 0 ? cut.slice(0, space) : cut).replace(/[\s,;:]+$/, '')}…`;
+}
+
+export interface StoryLead {
+  text: string;
+  /** Where the line came from, best first. */
+  from: 'summary' | 'concepts' | 'why' | 'source';
+}
+
+/**
+ * One or two lines under every headline, so no story is a bare link: what happened when a
+ * source said, else what the story is about, else why its topic matters.
+ */
+export function storyLead(item: NewsItem): StoryLead {
+  const summary = storySummary(item);
+  if (summary !== null) return { text: twoLines(summary), from: 'summary' };
+  const concepts = item.brief?.keyConcepts.map((concept) => concept.term) ?? [];
+  if (concepts.length > 0) return { text: `About: ${concepts.join(', ')}`, from: 'concepts' };
+  const why = item.brief?.whyItMatters.trim() ?? '';
+  if (why.length > 0)
+    return { text: twoLines(why.match(/^[^.!?]+[.!?]/)?.[0] ?? why), from: 'why' };
+  return { text: `No description from ${item.source.name} yet.`, from: 'source' };
+}
+
 /**
  * Extractive briefs share one "why it matters" per topic, so a day of agent stories says
  * the same sentence five times. Each reason is shown once, on the first story that has it.

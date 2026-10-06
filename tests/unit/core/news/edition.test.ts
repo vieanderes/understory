@@ -3,6 +3,7 @@ import {
   editionWeeks,
   neighbours,
   orderByInterest,
+  storyLead,
   storySummary,
   withoutRepeatedWhy,
   type Brief,
@@ -57,6 +58,75 @@ describe('storySummary', () => {
     );
     expect(storySummary(item({ brief: brief() }))).toBeNull();
     expect(storySummary(item({ excerpt: 'No brief at all.' }))).toBe('No brief at all.');
+  });
+});
+
+describe('storyLead', () => {
+  const hnFrame =
+    '"Postgres 19 ships asynchronous I/O" reached the Hacker News front page with 382 points and 259 comments.';
+
+  it('opens with the summary when the brief says more than the headline', () => {
+    const story = item({
+      brief: brief({
+        whatHappened:
+          'PostgreSQL News published "Postgres 19 ships asynchronous I/O". Reads no longer block.',
+      }),
+    });
+    expect(storyLead(story)).toEqual({ text: 'Reads no longer block.', from: 'summary' });
+  });
+
+  it('uses the excerpt next, cleaned and cut at a sentence near two lines', () => {
+    const long =
+      'Version 19 is out.   It reads from disk without blocking a backend, which matters for large scans. ' +
+      'The planner also learns a new trick for joins on partitioned tables that saves a sort. ' +
+      'Changes since the last release include: What';
+    const lead = storyLead(item({ brief: brief({ whatHappened: hnFrame }), excerpt: long }));
+    expect(lead).toEqual({
+      text: 'Version 19 is out. It reads from disk without blocking a backend, which matters for large scans.',
+      from: 'summary',
+    });
+  });
+
+  it('cuts one long sentence at a word and marks the cut', () => {
+    const words = Array.from({ length: 60 }, (_, i) => `word${i}`).join(' ');
+    const lead = storyLead(item({ excerpt: words }));
+    expect(lead?.text.endsWith('…')).toBe(true);
+    expect(lead?.text.length).toBeLessThanOrEqual(161);
+    expect(lead?.text).toMatch(/ word\d+…$/);
+  });
+
+  it('cuts a single unbroken run of text and keeps a why without a full stop', () => {
+    expect(storyLead(item({ excerpt: 'x'.repeat(200) })).text).toBe(`${'x'.repeat(160)}…`);
+    const story = item({
+      brief: brief({ whatHappened: hnFrame, keyConcepts: [], whyItMatters: 'Databases matter' }),
+    });
+    expect(storyLead(story).text).toBe('Databases matter');
+  });
+
+  it('names the key concepts when the source said nothing', () => {
+    const story = item({ brief: brief({ whatHappened: hnFrame }) });
+    expect(storyLead(story)).toEqual({ text: 'About: I/O, WAL', from: 'concepts' });
+  });
+
+  it('falls back to a short why it matters without concepts', () => {
+    const story = item({
+      brief: brief({
+        whatHappened: hnFrame,
+        keyConcepts: [],
+        whyItMatters: 'Databases change what you can build. A second sentence says more.',
+      }),
+    });
+    expect(storyLead(story)).toEqual({
+      text: 'Databases change what you can build.',
+      from: 'why',
+    });
+  });
+
+  it('never leaves a story with nothing to read', () => {
+    expect(storyLead(item())).toEqual({
+      text: 'No description from PostgreSQL News yet.',
+      from: 'source',
+    });
   });
 });
 

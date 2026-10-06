@@ -1,6 +1,6 @@
 'use client';
 
-import { ArrowRight, Library, Repeat2 } from 'lucide-react';
+import { ArrowRight, ChartColumn, Library, Repeat2 } from 'lucide-react';
 import Link from 'next/link';
 import { buttonClass } from '@/components/ui/Button';
 import { InlineCode } from '@/components/ui/InlineCode';
@@ -130,15 +130,24 @@ function PracticeLine() {
   );
 }
 
-function LibraryLink() {
+const footLink =
+  'text-muted hover:text-fg inline-flex min-h-5 w-fit items-center gap-1 text-sm underline-offset-4 hover:underline';
+
+/** The way out to everything else: progress for those under way, the library for all. */
+function LibraryLink({ progress = false }: { progress?: boolean }) {
   return (
-    <Link
-      href="/library"
-      className="text-muted hover:text-fg inline-flex w-fit items-center gap-1 text-sm underline-offset-4 hover:underline"
-    >
-      <Library aria-hidden size={16} strokeWidth={2} />
-      Every path, lesson, lecture and test is in the Library
-    </Link>
+    <div className="flex flex-wrap gap-x-4">
+      {progress ? (
+        <Link href="/progress" className={footLink}>
+          <ChartColumn aria-hidden size={16} strokeWidth={2} />
+          Your progress
+        </Link>
+      ) : null}
+      <Link href="/library" className={footLink}>
+        <Library aria-hidden size={16} strokeWidth={2} />
+        Every path, lesson, lecture and test is in the Library
+      </Link>
+    </div>
   );
 }
 
@@ -274,7 +283,7 @@ export function HomeScreen({
       </section>
       <PracticeLine />
       {showNews ? <NewsToday news={news} /> : null}
-      <LibraryLink />
+      <LibraryLink progress />
     </div>
   );
 }

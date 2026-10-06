@@ -46,10 +46,10 @@ export default async function LibraryPage() {
       count: `${LABS.length} labs`,
     },
     {
-      href: '/map',
+      href: '/progress',
       icon: SHELF_ICONS.map,
-      title: 'Concept map',
-      note: 'What you know, concept by concept',
+      title: 'Your progress',
+      note: 'What you have done, what you know and what to work on',
     },
     {
       href: '/signal/archive',

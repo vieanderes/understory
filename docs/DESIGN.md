@@ -77,13 +77,19 @@ semantic tokens only, so a palette change is a change to that one file.
 - `.frame`: max 1440 px, side padding 16 / 32 / 48 px.
 - Grid: 4 columns on phones, 12 from `md`, 32 px gutters (`gap-x-4`).
 - Reading measure: 65ch (`.prose-measure`).
-- Masthead: Learn, Practise, Map and News open with `PageHead`
+- Masthead: Practice, Progress and News open with `PageHead`
   (`src/components/layout/PageHead.tsx`): label, title, one-sentence lede, and a right-hand
   column on the same baseline, usually a `Ledger` of figures. The page's one primary action
   sits directly under it, in a bordered panel, above the fold at 1440.
-- **Desktop**: top bar with the four places (Learn, Practise, Map, Signal); lessons split
-  into code left, question right; keyboard shortcuts and a command menu.
-- **Phone**: bottom tab bar in the thumb zone, clear of the home indicator (`.pb-safe`);
+- **Places**: four, one job each. Home (what to do today), Learn (your path), Practice
+  (topics and tests), News (the daily edition). The Library (every path, lesson, lecture,
+  lab and test) and Settings are utilities, drawn smaller, never a place to choose between.
+  Words are the same everywhere: Course, Parts, Chapters, Lessons; a path has Stages, each
+  with its lessons and its tests, labs and practice.
+- **Desktop**: a rail with the four places, and the Library, Settings and theme at its foot;
+  lessons split into code left, question right; keyboard shortcuts and a command menu.
+- **Phone**: the four places in a bottom tab bar in the thumb zone, clear of the home
+  indicator (`.pb-safe`), the Library (named) and Settings in the top bar;
   the primary action sits low; code and question share one viewport; session step types
   need no typing.
 - Checked at 390, 768, 1024, 1440 and ultra-wide. Nothing scrolls sideways except code

@@ -160,15 +160,15 @@ export function MapView({
   };
 
   return (
-    <div className="flex flex-col gap-6 md:gap-8">
-      <section aria-labelledby="atlas-title" className="flex flex-col gap-3">
+    <div className="flex flex-col gap-4 md:gap-6">
+      <section aria-labelledby="atlas-title" className="flex flex-col gap-2">
         <div className="flex flex-col gap-0.5">
-          <p className="t-label">One cell per concept</p>
-          <h3 id="atlas-title" className="t-section">
+          <h3 id="atlas-title" className="font-semibold">
             The atlas
           </h3>
+          <p className="text-muted text-sm">One cell per concept. Open a part to see it below.</p>
         </div>
-        <ul className="border-border flex flex-col border-b sm:grid sm:grid-cols-2 sm:gap-2 sm:border-b-0 lg:grid-cols-4">
+        <ul className="grid grid-cols-1 gap-x-4 sm:grid-cols-2 lg:grid-cols-4">
           {allGroups.map((group) => {
             const concepts = group.modules.flatMap((m) => m.concepts);
             const started = startedIn(concepts);
@@ -186,11 +186,11 @@ export function MapView({
                 <button
                   type="button"
                   onClick={() => openPart(group.id)}
-                  className="group border-border sm:bg-surface sm:rounded-panel sm:hover:border-fg flex h-full min-h-6 w-full flex-col gap-1 border-t py-1 text-left transition-colors duration-150 ease-out active:scale-98 sm:gap-2 sm:border sm:p-2"
+                  className="hairline-row group border-border flex h-full min-h-6 w-full flex-col gap-1 border-t py-1.5 text-left sm:gap-1.5 sm:py-2"
                 >
                   <span className="flex items-baseline justify-between gap-2">
                     <span className="t-label hidden sm:inline">{partLabel}</span>
-                    <span className="group-hover:text-accent min-w-0 font-medium transition-colors duration-150 ease-out sm:hidden">
+                    <span className="min-w-0 font-medium sm:hidden">
                       {group.number === null ? null : (
                         <span className="t-figure text-faint pr-1 text-sm">
                           {pad(group.number)}
@@ -205,9 +205,7 @@ export function MapView({
                       ) : null}
                     </span>
                   </span>
-                  <span className="group-hover:text-accent hidden font-medium transition-colors duration-150 ease-out sm:block">
-                    {group.title}
-                  </span>
+                  <span className="hidden font-medium sm:block">{group.title}</span>
                   <span aria-hidden className="hidden flex-wrap gap-0.5 sm:flex">
                     {concepts.map((c) => (
                       <span key={c.id} className={cn('size-1', CELL_STYLE[stateOf(c.id)])} />
@@ -232,10 +230,10 @@ export function MapView({
       <section aria-labelledby="index-title" className="flex flex-col gap-3">
         <div className="flex flex-wrap items-end justify-between gap-x-4 gap-y-2">
           <div className="flex flex-col gap-0.5">
-            <p className="t-label">Recall and due dates</p>
-            <h3 id="index-title" className="t-section">
+            <h3 id="index-title" className="font-semibold">
               The index
             </h3>
+            <p className="text-muted text-sm">Every concept, with its recall and when it is due.</p>
           </div>
           <div className="flex w-full flex-wrap items-end gap-2 sm:w-auto">
             <Segmented
@@ -286,7 +284,7 @@ export function MapView({
                   <div className="grid grid-cols-4 gap-x-4 gap-y-1 py-3 md:grid-cols-12">
                     <p
                       aria-hidden
-                      className="t-figure text-faint hidden text-xl md:col-span-2 md:block"
+                      className="t-figure text-faint hidden text-lg md:col-span-2 md:block"
                     >
                       {group.number === null ? '' : pad(group.number)}
                     </p>

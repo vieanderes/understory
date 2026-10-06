@@ -432,7 +432,7 @@ export function PathBuilder({ tree }: { tree: CourseTree }) {
           </ul>
         </div>
 
-        <aside className="hidden lg:sticky lg:top-12 lg:col-span-4 lg:block">
+        <aside className="mt-6 hidden lg:sticky lg:top-12 lg:col-span-4 lg:mt-0 lg:block">
           <YourPath tree={tree} chosen={chosen} line={line} dirty={dirty} save={saveButton(true)} />
         </aside>
       </main>

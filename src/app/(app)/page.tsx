@@ -1,3 +1,4 @@
+import { courseTree } from '@/features/paths/custom';
 import { HomeScreen, type CourseOutline, type NewsBrief } from '@/features/paths/HomeScreen';
 import { getManifest, getPaths, getPlanCatalog } from '@/lib/content';
 import { getLatestDay } from '@/lib/news';
@@ -34,5 +35,13 @@ export default async function HomePage() {
         items: day.items.map(({ id, title, topics }) => ({ id, title, topics })),
       }
     : null;
-  return <HomeScreen paths={paths} course={course} catalog={catalog} news={news} />;
+  return (
+    <HomeScreen
+      paths={paths}
+      course={course}
+      catalog={catalog}
+      news={news}
+      tree={courseTree(manifest)}
+    />
+  );
 }

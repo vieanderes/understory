@@ -13,7 +13,8 @@ import { usePlan } from '@/features/plan/usePlan';
 import type { PlanCatalog } from '@/core/plan';
 import { cn } from '@/lib/cn';
 import { onPath } from './links';
-import { CHOSEN_PATH, currentPath, nextOnPath } from './current';
+import { CHOSEN_PATH, chosenPathIds, currentPath, nextOnPath } from './current';
+import { customPathSummary, type CourseTree } from './custom';
 
 export interface CourseLesson {
   id: string;
@@ -158,11 +159,13 @@ export function HomeScreen({
   course,
   catalog,
   news,
+  tree,
 }: {
   paths: readonly PathSummary[];
   course: CourseOutline;
   catalog: PlanCatalog;
   news: NewsBrief | null;
+  tree: CourseTree;
 }) {
   const planState = usePlan(catalog);
   const { status, state } = useProgress();
@@ -172,10 +175,28 @@ export function HomeScreen({
   const anythingDone = ready && state.completedLessons.size > 0;
   const hasPlan = planState.plan !== undefined;
   const profile = ready ? state.profile : undefined;
-  // A path built by hand counts as set up: the learner has said what they want.
-  const newcomer = !anythingDone && !hasPlan && !profile && !(ready && state.customPath);
-  const newsOnly = !hasPlan && !anythingDone && profile !== undefined;
+  const chosenIds = ready ? chosenPathIds(state.settings[CHOSEN_PATH]) : [];
+  // A path chosen or built counts as set up: the learner has said what they want.
+  const newcomer =
+    !anythingDone && !hasPlan && !profile && chosenIds.length === 0 && !(ready && state.customPath);
+  // News alone only when nothing else was asked for: no plan, no path chosen or built.
+  const newsOnly =
+    !hasPlan &&
+    !anythingDone &&
+    profile !== undefined &&
+    chosenIds.length === 0 &&
+    !state.customPath;
   const showNews = news !== null && (profile?.news ?? true);
+
+  // Until the log is read, every answer below would be a guess: a returning learner would
+  // flash the first-visit screen. Hold the space quietly instead.
+  if (!ready) {
+    return (
+      <p className="text-muted pt-2 md:pt-4" aria-busy="true">
+        Reading your progress...
+      </p>
+    );
+  }
 
   const beginner = paths.find((p) => p.id === 'start-coding');
   const firstStep = beginner?.stages[0]?.lessons[0];
@@ -228,13 +249,15 @@ export function HomeScreen({
     );
   }
 
-  // Without a plan, the next step is the next lesson of the path under way, else the
-  // course's next lesson.
-  const path = currentPath(paths, planState, isDone, state.settings[CHOSEN_PATH]);
-  let next: { title: string; href: string; minutes: number; where: string } | undefined = path
-    ? nextOnPath(path, isDone)
-    : undefined;
-  if (!next && anythingDone) {
+  // The next step: the next lesson of the path the learner is on (one they chose or built
+  // first, else their plan's, else the one with most done); else the course's next lesson.
+  const all =
+    ready && state.customPath ? [customPathSummary(tree, state.customPath), ...paths] : paths;
+  const path = currentPath(all, planState, isDone, state.settings[CHOSEN_PATH]);
+  const pathNext = path ? nextOnPath(path, isDone) : undefined;
+  const begun = path ? path.lessonIds.some(isDone) : false;
+  let next = pathNext;
+  if (!next && !path && anythingDone) {
     const lesson = course.order.find((l) => !isDone(l.id));
     if (lesson)
       next = {
@@ -244,6 +267,7 @@ export function HomeScreen({
         where: lesson.part,
       };
   }
+  const usePlanCard = hasPlan && chosenIds.length === 0;
 
   return (
     <div className="flex flex-col gap-8">
@@ -251,32 +275,48 @@ export function HomeScreen({
         <h1 id="home-title" className="t-section">
           Your next step
         </h1>
-        {hasPlan ? (
+        {usePlanCard ? (
           <TodayCard state={planState} />
-        ) : next ? (
+        ) : (
           <div
             data-arrive="rise"
-            className="bg-surface border-border rounded-panel flex flex-col gap-3 border p-3 md:flex-row md:items-center md:justify-between md:p-4"
+            className="bg-surface border-border rounded-panel shadow-edge flex flex-col gap-3 border p-3 sm:flex-row sm:items-center sm:justify-between sm:gap-4 md:p-4"
           >
             <div className="flex min-w-0 flex-col gap-0.5">
-              <p className="t-label">{next.where}</p>
-              <p className="text-lg font-semibold">
-                <InlineCode text={next.title} />
-              </p>
+              {next ? (
+                <>
+                  <p className="t-label">{next.where}</p>
+                  <p className="text-lg font-semibold">
+                    <InlineCode text={next.title} />
+                  </p>
+                </>
+              ) : path ? (
+                <>
+                  <p className="t-label">{path.name}</p>
+                  <p className="text-lg font-semibold">Every lesson on this path is done</p>
+                  <p className="text-muted text-sm">Sit its exam, or choose what to learn next.</p>
+                </>
+              ) : (
+                <>
+                  <p className="text-lg font-semibold">Choose what to learn</p>
+                  <p className="text-muted text-sm">
+                    Pick one or more paths, or build your own from the course.
+                  </p>
+                </>
+              )}
             </div>
-            <Link href={next.href} className={buttonClass('primary', 'lg', 'shrink-0')}>
-              Continue · {next.minutes} min
-              <ArrowRight aria-hidden size={16} strokeWidth={2} />
-            </Link>
+            {next ? (
+              <Link href={next.href} className={buttonClass('primary', 'lg', 'shrink-0')}>
+                {begun || (!path && anythingDone) ? 'Continue' : 'Start'} · {next.minutes} min
+                <ArrowRight aria-hidden size={16} strokeWidth={2} />
+              </Link>
+            ) : (
+              <Link href="/paths" className={buttonClass('primary', 'lg', 'shrink-0')}>
+                {path ? 'Choose what is next' : 'Choose your path'}
+                <ArrowRight aria-hidden size={16} strokeWidth={2} />
+              </Link>
+            )}
           </div>
-        ) : (
-          <p className="text-muted">
-            Every path you started is done.{' '}
-            <Link href="/plan?edit" className="text-fg underline underline-offset-4">
-              Set a new goal
-            </Link>
-            .
-          </p>
         )}
       </section>
       <PracticeLine />

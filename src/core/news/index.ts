@@ -11,3 +11,4 @@ export * from './dates';
 export * from './rollup';
 export * from './merge';
 export * from './brief';
+export * from './edition';

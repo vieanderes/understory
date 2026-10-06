@@ -16,7 +16,7 @@ test.describe('practice by topic', () => {
       'false',
     );
     await page.getByText('5 min', { exact: true }).click();
-    const start = page.getByRole('link', { name: /^Start · about \d+ questions?/ });
+    const start = page.getByRole('link', { name: 'Start', exact: true });
     await expect(start).toHaveAttribute('href', '/practise/session/5?topics=python');
     await start.click();
     await expect(page).toHaveURL(/\/practise\/session\/5\?topics=python$/);
@@ -31,13 +31,13 @@ test.describe('practice by topic', () => {
 
   test('keeps the coding tests and part checks one tap away', async ({ page }) => {
     await page.goto('/practise');
-    await page.getByRole('link', { name: 'Sit a timed coding test' }).click();
+    await page.getByRole('link', { name: 'Open coding tests' }).click();
     await expect(page).toHaveURL('/practise/online-test');
     await expect(
       page.getByRole('link', { name: /Practice test 4: one task in four levels/ }),
     ).toBeVisible();
     await page.goBack();
-    await page.getByText('Check one part').click();
+    await page.getByText('Choose a part').click();
     await expect(page.getByTestId('practise-part')).toHaveCount(7);
   });
 });

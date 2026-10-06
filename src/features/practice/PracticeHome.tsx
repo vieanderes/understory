@@ -1,9 +1,8 @@
 'use client';
 
-import { ArrowRight, Check, ChevronRight, Timer } from 'lucide-react';
+import { ArrowRight, Check, ChevronDown, ListChecks, Timer } from 'lucide-react';
 import Link from 'next/link';
 import { useMemo, useState } from 'react';
-import { PageHead } from '@/components/layout/PageHead';
 import { buttonClass } from '@/components/ui/Button';
 import { Segmented } from '@/components/ui/Segmented';
 import {
@@ -14,8 +13,8 @@ import {
   type SessionMinutes,
 } from '@/core/practice';
 import { INTERESTS, type Interest } from '@/core/profile/interests';
+import { topicCounts, type TopicCount } from '@/core/practice/topic-counts';
 import { useCatalog } from '@/features/catalog/useCatalog';
-import { Title } from '@/features/motion/Title';
 import { useProgress } from '@/features/store/StoreProvider';
 import { cn } from '@/lib/cn';
 import { currentDevice } from './device';
@@ -34,19 +33,17 @@ const LENGTHS = [
 ] as const;
 type Length = (typeof LENGTHS)[number]['value'];
 
-const CHIP = cn(
-  'rounded-full inline-flex h-5 items-center gap-0.5 border px-2 text-sm font-medium select-none',
-  'transition-press active:scale-98 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent',
-);
-
-function Chip({
+/** A topic as a compact tile: its name and what it has waiting, on one line. */
+function TopicTile({
   pressed,
   onClick,
-  children,
+  label,
+  meta,
 }: {
   pressed: boolean;
   onClick: () => void;
-  children: string;
+  label: string;
+  meta: string;
 }) {
   return (
     <button
@@ -54,17 +51,24 @@ function Chip({
       aria-pressed={pressed}
       onClick={onClick}
       className={cn(
-        CHIP,
+        'rounded-control transition-press flex min-h-5 items-center gap-1 border px-1.5 py-0.5 text-left select-none active:scale-98',
+        'focus-visible:outline-accent focus-visible:outline-2 focus-visible:outline-offset-2',
         pressed
-          ? 'bg-fg text-bg border-fg'
-          : 'border-border text-muted hover:text-fg hover:border-border-strong',
+          ? 'border-fg bg-raised text-fg'
+          : 'border-border text-fg hover:border-border-strong hover:bg-raised',
       )}
     >
-      {pressed ? <Check aria-hidden size={16} strokeWidth={2} /> : null}
-      {children}
+      {pressed ? (
+        <Check aria-hidden size={16} strokeWidth={2} className="shrink-0" />
+      ) : null}
+      <span className="min-w-0 flex-1 text-sm font-medium">{label}</span>
+      <span className="t-figure text-muted shrink-0 text-sm">{meta}</span>
     </button>
   );
 }
+
+const metaOf = ({ due, fresh }: TopicCount) =>
+  due > 0 ? `${due} due` : fresh > 0 ? `${fresh} new` : '';
 
 /**
  * Practice asks one question: what to practise today. Topics and a length, then one button.
@@ -102,6 +106,12 @@ export function PracticeHome({ parts }: { parts: PracticePart[] }) {
     return { session: build(INTERESTS), topics: INTERESTS };
   }, [catalog, ready, state, minutes, topics]);
 
+  const counts = useMemo(
+    () => (catalog && ready ? topicCounts(state, catalog, new Date()) : null),
+    [catalog, ready, state],
+  );
+  const allDue = counts ? INTERESTS.reduce((sum, id) => sum + counts[id].due, 0) : 0;
+
   const count = preview?.session.items.length ?? sessionSize(minutes);
   const due = preview?.session.items.filter((i) => i.source === 'due').length ?? 0;
   const href = sessionHref(minutes, preview?.topics ?? topics);
@@ -110,99 +120,131 @@ export function PracticeHome({ parts }: { parts: PracticePart[] }) {
     setPicked(topics.includes(id) ? topics.filter((t) => t !== id) : [...topics, id]);
 
   return (
-    <div className="flex flex-col gap-6">
-      <PageHead label="Practice" title={<Title>What do you want to practise today?</Title>} />
+    <div className="flex max-w-3xl flex-col gap-6 md:pt-4">
+      <header className="flex flex-col gap-1">
+        <h1 className="t-title" data-arrive="title">
+          Practice
+        </h1>
+        <p data-arrive="rise" className="text-muted text-lg">
+          Choose topics and a length. What you are about to forget comes first.
+        </p>
+      </header>
 
-      <section
-        aria-label="Today's practice"
-        data-arrive="rise"
-        className="bg-surface border-border rounded-panel grid grid-cols-4 gap-x-4 gap-y-4 border p-2 sm:p-3 md:grid-cols-12 md:p-4"
-      >
-        <fieldset className="col-span-4 flex min-w-0 flex-col gap-1 md:col-span-12 xl:col-span-8">
-          <legend className="t-label pb-1">Topics</legend>
-          <div className="flex flex-wrap gap-1">
-            <Chip pressed={topics.length === 0} onClick={() => setPicked([])}>
-              Everything
-            </Chip>
+      <section aria-label="Today's practice" data-arrive="rise" className="flex flex-col gap-2">
+        <div role="group" aria-labelledby="practise-title" className="flex flex-col gap-1">
+          <h2 id="practise-title" className="font-semibold">
+            Topics
+          </h2>
+          <div className="grid grid-cols-2 gap-1 lg:grid-cols-3">
+            <TopicTile
+              pressed={topics.length === 0}
+              onClick={() => setPicked([])}
+              label="Everything"
+              meta={allDue > 0 ? `${allDue} due` : ''}
+            />
             {INTERESTS.map((id) => (
-              <Chip key={id} pressed={topics.includes(id)} onClick={() => toggle(id)}>
-                {topicLabel(id)}
-              </Chip>
+              <TopicTile
+                key={id}
+                pressed={topics.includes(id)}
+                onClick={() => toggle(id)}
+                label={topicLabel(id)}
+                meta={counts ? metaOf(counts[id]) : ''}
+              />
             ))}
           </div>
-        </fieldset>
+        </div>
 
-        <div className="col-span-4 grid min-w-0 grid-cols-1 items-end gap-x-4 gap-y-2 md:col-span-12 lg:grid-cols-2 xl:col-span-4 xl:grid-cols-1">
-          <Segmented label="Length" options={LENGTHS} value={length} onChange={setLength} />
-          {count > 0 ? (
-            <Link href={href} className={buttonClass('primary', 'lg', 'w-full')}>
-              <span>
-                Start · about <span className="t-figure">{count}</span>{' '}
+        <div className="bg-surface border-border rounded-panel mt-1 flex flex-col gap-2 border p-2 sm:flex-row sm:items-center sm:gap-3">
+          <Segmented
+            label="Length"
+            hideLabel
+            options={LENGTHS}
+            value={length}
+            onChange={setLength}
+            className="sm:w-30"
+          />
+          <p className="min-w-0 flex-1 text-sm" aria-live="polite">
+            {count === 0 ? (
+              <span className="text-muted">Nothing to practise in these topics yet.</span>
+            ) : (
+              <>
+                <span className="t-figure font-medium">{count}</span>{' '}
                 {count === 1 ? 'question' : 'questions'}
-              </span>
+                <span className="text-muted">
+                  {due > 0 ? `, ${due} due first` : ', with the answers explained'}
+                </span>
+              </>
+            )}
+          </p>
+          {count > 0 ? (
+            <Link href={href} className={buttonClass('primary', 'lg', 'shrink-0')}>
+              Start
               <ArrowRight aria-hidden size={16} strokeWidth={2} />
             </Link>
           ) : (
-            <Link href="/learn" className={buttonClass('primary', 'lg', 'w-full')}>
+            <Link href="/paths" className={buttonClass('primary', 'lg', 'shrink-0')}>
               Go to lessons
               <ArrowRight aria-hidden size={16} strokeWidth={2} />
             </Link>
           )}
-          <p className="text-muted text-sm empty:hidden lg:col-span-2 xl:col-span-1" aria-live="polite">
-            {count === 0 ? (
-              'Nothing to practise in these topics yet.'
-            ) : due > 0 ? (
-              <>
-                <span className="t-figure text-fg">{due}</span> due, they come first.
-              </>
-            ) : null}
-          </p>
         </div>
       </section>
 
-      <ul aria-label="More practice" className="rule-b flex flex-col md:max-w-3xl">
-        <li className="rule-t">
+      <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+        <section className="border-border rounded-panel flex flex-col gap-2 border p-2 sm:p-3">
+          <Timer aria-hidden size={24} strokeWidth={2} className="text-muted" />
+          <div className="flex flex-col gap-0.5">
+            <h2 className="text-lg font-semibold">Timed coding tests</h2>
+            <p className="text-muted text-sm">
+              Sit a test like the real ones: a clock, hidden tests and a report afterwards.
+            </p>
+          </div>
           <Link
             href="/practise/online-test"
-            className="group flex min-h-6 items-center gap-2 py-1 transition-colors duration-150 ease-out"
+            className={buttonClass('secondary', 'md', 'mt-auto w-fit')}
           >
-            <Timer aria-hidden size={20} strokeWidth={2} className="text-muted shrink-0" />
-            <span className="group-hover:text-accent min-w-0 flex-1 font-medium transition-colors duration-150 ease-out">
-              Sit a timed coding test
-            </span>
-            <ChevronRight aria-hidden size={16} strokeWidth={2} className="text-muted shrink-0" />
+            Open coding tests
+            <ArrowRight aria-hidden size={16} strokeWidth={2} />
           </Link>
-        </li>
-        <li className="rule-t">
-          <details className="group">
-            <summary className="flex min-h-6 cursor-pointer list-none items-center gap-2 py-1 font-medium">
-              <Check aria-hidden size={20} strokeWidth={2} className="text-muted shrink-0" />
-              <span className="min-w-0 flex-1">Check one part</span>
-              <ChevronRight
+        </section>
+
+        <section className="border-border rounded-panel flex flex-col gap-2 border p-2 sm:p-3">
+          <ListChecks aria-hidden size={24} strokeWidth={2} className="text-muted" />
+          <div className="flex flex-col gap-0.5">
+            <h2 className="text-lg font-semibold">Check one part</h2>
+            <p className="text-muted text-sm">
+              A checkpoint mixes a whole part. A test-out lets you skip what you know.
+            </p>
+          </div>
+          <details className="group mt-auto">
+            <summary
+              className={buttonClass('secondary', 'md', 'w-fit cursor-pointer list-none')}
+            >
+              Choose a part
+              <ChevronDown
                 aria-hidden
                 size={16}
                 strokeWidth={2}
-                className="text-muted shrink-0 transition-transform duration-150 ease-out group-open:rotate-90"
+                className="transition-transform duration-150 ease-out group-open:rotate-180"
               />
             </summary>
-            <ol className="flex flex-col pb-1">
+            <ol className="flex flex-col pt-2">
               {parts.map((part) => (
                 <li
                   key={part.id}
                   data-testid="practise-part"
-                  className="rule-t flex flex-wrap items-center gap-x-2 gap-y-0.5 py-1 sm:pl-5"
+                  className="rule-t flex flex-wrap items-center justify-between gap-x-2 gap-y-0.5 py-1"
                 >
-                  <span className="min-w-0 basis-full text-sm sm:flex-1 sm:basis-auto">
+                  <span className="min-w-0 text-sm">
                     <span className="t-figure text-faint">{part.number}</span> {part.title}
                   </span>
-                  <span className="-ml-2 flex gap-1 sm:ml-0">
+                  <span className="flex gap-0.5">
                     <Link
                       href={`/practise/checkpoint/${part.id}`}
                       aria-label={`Checkpoint, ${CHECKPOINT_MINUTES} min, ${part.title}`}
                       className={buttonClass('quiet', 'md')}
                     >
                       Checkpoint
-                      <span className="t-figure text-muted">{CHECKPOINT_MINUTES} min</span>
                     </Link>
                     <Link
                       href={`/practise/test-out/${part.id}`}
@@ -210,15 +252,14 @@ export function PracticeHome({ parts }: { parts: PracticePart[] }) {
                       className={buttonClass('quiet', 'md')}
                     >
                       Test out
-                      <span className="t-figure text-muted">{TEST_OUT_MINUTES} min</span>
                     </Link>
                   </span>
                 </li>
               ))}
             </ol>
           </details>
-        </li>
-      </ul>
+        </section>
+      </div>
     </div>
   );
 }

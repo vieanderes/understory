@@ -1,11 +1,13 @@
-import { HomeScreen, type CourseOutline } from '@/features/paths/HomeScreen';
+import { HomeScreen, type CourseOutline, type NewsBrief } from '@/features/paths/HomeScreen';
 import { getManifest, getPaths, getPlanCatalog } from '@/lib/content';
+import { getLatestDay } from '@/lib/news';
 
 export default async function HomePage() {
-  const [paths, manifest, catalog] = await Promise.all([
+  const [paths, manifest, catalog, day] = await Promise.all([
     getPaths(),
     getManifest(),
     getPlanCatalog(),
+    getLatestDay(),
   ]);
   const partOf = new Map(
     manifest.parts.flatMap((part) =>
@@ -25,5 +27,12 @@ export default async function HomePage() {
       })),
     ),
   };
-  return <HomeScreen paths={paths} course={course} catalog={catalog} />;
+  // Only what Home shows travels to the client: the date and the headlines.
+  const news: NewsBrief | null = day
+    ? {
+        date: day.date,
+        items: day.items.map(({ id, title, topics }) => ({ id, title, topics })),
+      }
+    : null;
+  return <HomeScreen paths={paths} course={course} catalog={catalog} news={news} />;
 }

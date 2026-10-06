@@ -254,7 +254,7 @@ test.describe('the milestone', () => {
 
     await page.goto('/');
     // Home leads with where the learner is now: the next lesson, one click away.
-    await expect(page.getByRole('heading', { name: 'Pick up where you left off' })).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Your next step' })).toBeVisible();
     await expect(page.getByRole('link', { name: /Continue · \d+ min/ })).toBeVisible();
 
     await page.goto('/learn');

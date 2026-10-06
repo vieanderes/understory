@@ -79,7 +79,8 @@ function TickRow({
  * they are.
  */
 function Preview({ kind, names }: { kind: string; names: readonly string[] }) {
-  const glimpse = preview(names);
+  // Lesson titles run long; two of them and the count still fit two lines on a phone.
+  const glimpse = preview(names, kind === 'Lessons' ? 2 : 3);
   return (
     <span className="text-muted line-clamp-2 text-sm">
       <span className="font-medium">{kind}: </span>

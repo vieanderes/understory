@@ -1,8 +1,9 @@
 import { bandFit, DEFAULT_TARGET_BAND, expectedSuccess } from '@/core/mastery/difficulty';
 import type { ProgressState } from '@/core/progress/reducer';
+import { matchesInterests, type Interest } from '@/core/profile/interests';
 import { retrievability } from '@/core/scheduling/fsrs';
 import { mulberry32, shuffle, type Rng } from '@/core/util/rng';
-import type { Catalog, CatalogSkillItem } from './catalog';
+import type { Catalog, CatalogRecallCard, CatalogSkillItem } from './catalog';
 
 /*
  * Session composition (LEARNING-SCIENCE.md B2). Deterministic for a given seed, so
@@ -12,7 +13,7 @@ import type { Catalog, CatalogSkillItem } from './catalog';
 
 export type SessionMinutes = 5 | 10 | 20 | 45;
 export type DeviceKind = 'phone' | 'desktop';
-export type SessionItemSource = 'due' | 'interleave' | 'probe';
+export type SessionItemSource = 'due' | 'interleave' | 'probe' | 'first-look';
 
 export interface SessionItem {
   readonly source: SessionItemSource;
@@ -29,6 +30,8 @@ export interface BuildSessionInput {
   readonly minutes: SessionMinutes;
   readonly device: DeviceKind;
   readonly seed: number;
+  /** Topics the learner chose for today. Empty or absent means the whole course. */
+  readonly topics?: readonly Interest[];
 }
 
 export interface SessionResult {
@@ -166,6 +169,7 @@ function interleave(
 }
 
 export function buildSession(input: BuildSessionInput): SessionResult {
+  if (input.topics && input.topics.length > 0) return buildTopicSession(input, input.topics);
   const { state, catalog, now, minutes, device, seed } = input;
   const rng = mulberry32(seed);
   const size = sessionSize(minutes);
@@ -232,4 +236,157 @@ export function buildSession(input: BuildSessionInput): SessionResult {
     return { items: [], nextDueDate: earliestFutureDue(state, now, usedCardKeys) };
   }
   return { items, nextDueDate: earliestFutureDue(state, now, usedCardKeys) };
+}
+
+/*
+ * Practice by topic (LEARNING-SCIENCE.md B2, "Practice by topic"). The learner picks what to
+ * practise today, whether or not the lessons are done. Due items of those topics come first,
+ * up to the usual due share; then first looks at lessons not taken yet, which works as a
+ * pretest before the lesson; then more due items, then mixed practice of lessons already done.
+ */
+
+/** Step types that stand on their own: read, pick or arrange, each with feedback that
+ * explains the answer. Labs, sandboxes, written code and traces need the lesson around them. */
+export const FIRST_LOOK_TYPES: ReadonlySet<string> = new Set([
+  'multiple-choice',
+  'predict-output',
+  'fill-blank',
+  'parsons',
+  'bug-hunt',
+]);
+
+/** A first pass takes this many items from each lesson, so a session reaches several. */
+const FIRST_LOOK_PER_LESSON = 2;
+
+const CARD_KEY_LESSON = /^(?:lesson|skill):([^#]+)#/;
+
+function lessonOfCardKey(cardKey: string): string | undefined {
+  return CARD_KEY_LESSON.exec(cardKey)?.[1];
+}
+
+/** Takes from each queue in turn until all are empty. */
+function roundRobin<T>(queues: readonly (readonly T[])[]): T[] {
+  const out: T[] = [];
+  const longest = Math.max(0, ...queues.map((q) => q.length));
+  for (let i = 0; i < longest; i += 1) {
+    for (const queue of queues) {
+      const next = queue[i];
+      if (next !== undefined) out.push(next);
+    }
+  }
+  return out;
+}
+
+interface FirstLook {
+  readonly cardKey: string;
+  readonly concept: string;
+}
+
+/**
+ * One topic's first looks, in course order: the earliest untaken lesson first, its easiest
+ * step and a recall card, then the next lesson. Whatever a lesson has left comes after every
+ * lesson has had its turn. Catalog arrays keep the course order, so a lesson's place is
+ * where its first item stands.
+ */
+function firstLooksFor(
+  topic: Interest,
+  state: ProgressState,
+  catalog: Catalog,
+  device: DeviceKind,
+): FirstLook[] {
+  const fresh = (lessonId: string) =>
+    !state.completedLessons.has(lessonId) && matchesInterests(lessonId, [topic]);
+  const byLesson = new Map<string, { skills: CatalogSkillItem[]; recalls: CatalogRecallCard[] }>();
+  const entry = (lessonId: string) => {
+    let found = byLesson.get(lessonId);
+    if (!found) {
+      found = { skills: [], recalls: [] };
+      byLesson.set(lessonId, found);
+    }
+    return found;
+  };
+  for (const item of catalog.skillItems) {
+    if (!fresh(item.lessonId) || !FIRST_LOOK_TYPES.has(item.type)) continue;
+    if (excludesTyping(device, item.type) || state.cards[skillCardKey(item)]) continue;
+    entry(item.lessonId).skills.push(item);
+  }
+  for (const card of catalog.recallCards) {
+    if (!fresh(card.lessonId) || state.cards[recallCardKey(card)]) continue;
+    entry(card.lessonId).recalls.push(card);
+  }
+
+  const perLesson = [...byLesson.values()].map(({ skills, recalls }) =>
+    roundRobin<FirstLook>([
+      [...skills]
+        .sort((a, b) => a.difficulty - b.difficulty)
+        .map((i) => ({ cardKey: skillCardKey(i), concept: i.concept })),
+      recalls.map((c) => ({ cardKey: recallCardKey(c), concept: c.concept })),
+    ]),
+  );
+  return [
+    ...perLesson.flatMap((items) => items.slice(0, FIRST_LOOK_PER_LESSON)),
+    ...perLesson.flatMap((items) => items.slice(FIRST_LOOK_PER_LESSON)),
+  ];
+}
+
+export function recallCardKey(card: CatalogRecallCard): string {
+  return `lesson:${card.lessonId}#${card.cardId}`;
+}
+
+function buildTopicSession(input: BuildSessionInput, topics: readonly Interest[]): SessionResult {
+  const { state, catalog, now, minutes, device } = input;
+  const size = sessionSize(minutes);
+  const used = new Set<string>();
+  const take = <T extends { cardKey: string }>(pool: readonly T[], count: number): T[] => {
+    const out: T[] = [];
+    for (const item of pool) {
+      if (out.length >= count) break;
+      if (used.has(item.cardKey)) continue;
+      used.add(item.cardKey);
+      out.push(item);
+    }
+    return out;
+  };
+  const inTopics = (cardKey: string) => {
+    const lessonId = lessonOfCardKey(cardKey);
+    return lessonId !== undefined && matchesInterests(lessonId, topics);
+  };
+
+  const due = dueByLowestRetrievability(state, now).filter((d) => inTopics(d.cardKey));
+  const dueFirst = take(due, Math.round(size * DUE_SHARE));
+  const firstLooks = take(
+    roundRobin(topics.map((topic) => firstLooksFor(topic, state, catalog, device))),
+    size - dueFirst.length,
+  );
+  const dueMore = take(due, size - dueFirst.length - firstLooks.length);
+
+  const left = size - dueFirst.length - firstLooks.length - dueMore.length;
+  const done = catalog.skillItems.filter(
+    (i) =>
+      state.completedLessons.has(i.lessonId) &&
+      matchesInterests(i.lessonId, topics) &&
+      !excludesTyping(device, i.type),
+  );
+  const concepts = [...new Set(done.map((i) => i.concept))].sort(
+    (a, b) => (state.concepts[a]?.p ?? 0) - (state.concepts[b]?.p ?? 0),
+  );
+  const practice = take(
+    interleave(
+      concepts.map((c) =>
+        rankByBandFit(
+          done.filter((i) => i.concept === c),
+          state.thetaByModule,
+          catalog,
+        ),
+      ),
+    ).map((i) => ({ cardKey: skillCardKey(i), concept: i.concept })),
+    left,
+  );
+
+  const items: SessionItem[] = [
+    ...[...dueFirst, ...dueMore].map((d) => ({ source: 'due' as const, ...d })),
+    ...firstLooks.map((f) => ({ source: 'first-look' as const, ...f })),
+    ...practice.map((p) => ({ source: 'interleave' as const, ...p })),
+  ];
+  return { items, nextDueDate: earliestFutureDue(state, now, used) };
 }

@@ -107,6 +107,18 @@ actions, the illusion of competence from rereading, split attention, seductive d
   bug-hunt (tap the line), ai-review (tap the flaw and pick the reason), recall, and
   explain-back by voice or text.
 - **Closing screen:** items strengthened, one calibration line, next due date, and "Done".
+- **Practice by topic.** The learner may choose topics for today (the profile interests,
+  `src/core/profile`), whether or not the lessons are done. The session then holds, within
+  those topics only: due items, lowest R first, up to the 60% due share; then first looks at
+  lessons not taken yet, interleaved across the chosen topics; then more due items; then
+  mixed practice of lessons already done. A first look is a recall card or a step that stands
+  on its own (multiple-choice, predict-output, fill-blank, Parsons, bug-hunt), never one
+  already seen. Each topic starts at its earliest untaken lesson, with that lesson's easiest
+  step and a recall card, so one session touches several lessons. Every first look shows its
+  answer and feedback, so a wrong guess still teaches: a failed attempt before the lesson
+  improves learning of the answer once it is given (the pretesting effect; Richland, Kornell
+  and Kao 2009 [V]). With no topics chosen, the session is the composition above.
+  `buildSession({ topics })`, source `first-look`.
 
 ### B3. 45 minutes, desktop
 

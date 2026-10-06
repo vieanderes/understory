@@ -6,6 +6,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { buttonClass } from '@/components/ui/Button';
 import { Figure } from '@/components/ui/Figure';
 import type { CompiledLesson } from '@/core/content/compiled';
+import type { Interest } from '@/core/profile/interests';
 import { buildPathExam, type ExamItem } from '@/core/exam';
 import { calibrationGap } from '@/core/gamification';
 import {
@@ -52,7 +53,12 @@ interface Plan {
   nextDueDate: string | null;
 }
 
-const SOURCE_LABEL = { due: 'Due', interleave: 'Mixed in', probe: 'Probe' } as const;
+const SOURCE_LABEL = {
+  due: 'Due',
+  interleave: 'Mixed in',
+  probe: 'Probe',
+  'first-look': 'First look',
+} as const;
 
 /**
  * What kind of session: open practice across the course, or a finite mixed review of one
@@ -60,7 +66,7 @@ const SOURCE_LABEL = { due: 'Due', interleave: 'Mixed in', probe: 'Probe' } as c
  * exam: the test-out's length and pass mark over the path's required lessons.
  */
 export type SessionKind =
-  | { kind: 'practice'; minutes: SessionMinutes }
+  | { kind: 'practice'; minutes: SessionMinutes; topics?: readonly Interest[] }
   | { kind: 'checkpoint'; partId: string }
   | { kind: 'test-out'; partId: string }
   | { kind: 'exam'; path: PathSummary; onRetake: () => void };
@@ -115,7 +121,15 @@ export function SessionRunner({ session }: { session: SessionKind }) {
       : part
         ? buildCheckpoint({ state, catalog, concepts: part.concepts, now, minutes, device, seed })
         : session.kind === 'practice'
-          ? buildSession({ state, catalog, now, minutes, device, seed })
+          ? buildSession({
+              state,
+              catalog,
+              now,
+              minutes,
+              device,
+              seed,
+              ...(session.topics ? { topics: session.topics } : {}),
+            })
           : { items: [], nextDueDate: null };
     const sessionId = uuidv7(now.getTime(), { next: () => Math.random() });
     // The plan is derived from external state (the log and the index) exactly once.
@@ -228,7 +242,7 @@ export function SessionRunner({ session }: { session: SessionKind }) {
         : `/learn#part-${session.partId}`;
   const heading =
     session.kind === 'practice'
-      ? `Review · ${minutes} min`
+      ? `Practice · ${minutes} min`
       : session.kind === 'exam'
         ? `Final exam · ${session.path.name}`
         : `${session.kind === 'checkpoint' ? 'Checkpoint' : 'Test out'} · ${part?.title ?? ''}`;
@@ -289,7 +303,12 @@ export function SessionRunner({ session }: { session: SessionKind }) {
               <p className="t-label">{heading}</p>
               <Title id="closing-title">
                 {plan.items.length === 0 ? (
-                  session.kind === 'practice' ? (
+                  session.kind === 'practice' && (session.topics?.length ?? 0) > 0 ? (
+                    <>
+                      Nothing here yet.{' '}
+                      <span className="text-muted">These topics have no items to practise.</span>
+                    </>
+                  ) : session.kind === 'practice' ? (
                     <>
                       Nothing due.{' '}
                       <span className="text-muted">

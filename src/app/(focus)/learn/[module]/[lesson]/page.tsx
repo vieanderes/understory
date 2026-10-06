@@ -48,7 +48,7 @@ export default async function LessonPage({ params }: Props) {
       paths={onPaths}
       lesson={lesson}
       moduleTitle={courseModule?.title ?? ''}
-      exitHref="/learn"
+      exitHref="/paths"
       solutionsUrl={solutionsFile ? `/content/v1/${solutionsFile}` : undefined}
       next={
         nextRoute && nextLesson

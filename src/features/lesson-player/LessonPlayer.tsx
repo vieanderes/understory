@@ -2,7 +2,7 @@
 
 import { BookOpen, X } from 'lucide-react';
 import Link from 'next/link';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { AskScoutButton } from '@/features/tutor/StudyAssistant';
 import { dockTutorTrigger, setTutorOpen, setTutorScope } from '@/features/tutor/tutor-store';
 import { stepText } from '@/features/tutor/step-text';
@@ -33,6 +33,23 @@ interface LessonPlayerProps {
 
 type Stage = 'opening' | 'steps' | 'recall' | 'summary';
 
+const noSubscribe = () => () => undefined;
+
+/**
+ * The page the lesson was opened from, when it was one of ours and not another lesson or a
+ * session: the place a learner expects Close to take them back to.
+ */
+function sameSiteReferrer(): string | null {
+  try {
+    const from = new URL(document.referrer);
+    if (from.origin !== window.location.origin) return null;
+    if (/^\/(learn\/[^/]+\/|practise\/session|start)/.test(from.pathname)) return null;
+    return `${from.pathname}${from.search}`;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * A lesson from its opening to its closing screen: why it matters, the steps in
  * order, the recall cards, then a clear stopping point. It fills the screen: no places,
@@ -49,7 +66,9 @@ export function LessonPlayer({
   const pathId = usePathParam();
   const onThisPath = paths.find((p) => p.id === pathId);
   const next = onThisPath ? onThisPath.next : courseNext;
-  const exit = onThisPath ? `/paths/${onThisPath.id}` : exitHref;
+  const cameFrom = useSyncExternalStore(noSubscribe, sameSiteReferrer, () => null);
+  // Back to where the lesson was opened: Learn on its path, else the page before, else Learn.
+  const exit = onThisPath ? `/paths?path=${onThisPath.id}` : (cameFrom ?? exitHref);
   const store = useStore();
   const { state } = useProgress();
   const mode = state.modeByModule[lesson.moduleId] ?? 'guided';

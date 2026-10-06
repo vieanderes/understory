@@ -114,23 +114,32 @@ and every prompt goes into your report.
 
 ### It runs on your own Claude
 
-Scout has no key of its own and no bill to pass on. It uses the Claude you already have,
-connected one of three ways:
+Scout has no key of its own and no bill to pass on. It uses the Claude you already have.
+Open Scout's connection settings, answer "Where do you use Claude?", and follow two or
+three steps:
 
-- **Claude Code on your machine.** Nothing to set up. Run Understory locally (`pnpm dev`)
-  with Claude Code logged in, and pick "Your Claude account, here" in Scout.
-- **Your Claude account, through MCP.** Connect once. In Claude Code:
+- **Claude app**, on the web, desktop or phone. Add `<site>/api/mcp` as a custom connector
+  once, then send Claude "Keep answering my Understory questions, code ABCD-EFGH". From then
+  on you just ask in Scout: Claude listens and answers by itself, and Scout shows "Claude is
+  listening". The web and phone apps need a deployed site; they cannot reach localhost.
+- **Claude Code**, with the Understory plugin. Questions arrive in your terminal session
+  by themselves, and nothing is spent while it waits:
 
   ```sh
-  claude mcp add --transport http understory <site>/api/mcp
+  claude plugin marketplace add vieanderes/understory && claude plugin install understory@understory
+  claude --dangerously-load-development-channels plugin:understory@understory
   ```
 
-  Or, in Claude on the web, desktop or phone, add `<site>/api/mcp` as a custom connector
-  (this needs a deployed site; the Claude apps cannot reach localhost). Then ask in Scout
-  and tell Claude the pairing code Scout shows.
+  Then send "Connect Understory at <site>, code ABCD-EFGH". Channels are a research preview,
+  so Claude Code asks you to confirm this one until it is on Anthropic's list.
 
-- **Your Anthropic API key.** Paste it into Scout. It stays in your browser, and the server
-  passes each request on without storing the key.
+- **Claude Code on this machine.** Running Understory yourself (`pnpm dev`) with Claude Code
+  logged in? Pick "Claude Code on this machine": nothing to set up.
+- **An API key.** No Claude plan? Paste an Anthropic key into Scout. It stays in your
+  browser, and the server passes each request on without storing it.
+
+Whichever you pick, Scout asks you to press Allow the first time, so only your Claude can
+read your tab.
 
 The details, including the shared store a serverless host needs for MCP, are in
 [`ONLINE-TEST.md`](docs/ONLINE-TEST.md), section 6.

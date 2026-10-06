@@ -198,17 +198,32 @@ or the box on the intro page, only decides whether it opens by itself at the sta
 message goes into the transcript the report shows, as the reviewer would read it. Three
 providers sit behind `src/core/ports/assistant.ts`:
 
-1. **Your Claude account, through MCP.** No API key. Connect your Claude app to the
-   simulator's MCP endpoint once, then ask in the panel and tell Claude to answer (with the
-   pairing code the panel shows). Claude reads the task, your code and the last output
-   through tools and replies through `reply`; the answer appears in the panel.
-   - Claude Code: `claude mcp add --transport http understory <site>/api/mcp`.
+1. **Your Claude account, through MCP.** No API key. Connect Claude to the simulator's MCP
+   endpoint once and send it one message, "Keep answering my Understory questions, code
+   ABCD-EFGH". Claude then listens: it calls `wait_for_question`, which holds for up to 45
+   seconds until the learner asks in the panel and returns the question with the page, the
+   code and the last output; Claude answers through `reply` and waits again. The panel shows
+   "Claude is listening" while it checks in. It stops when the learner says so, or when the
+   tab has been quiet for an hour: the panel says "still open" at most once a minute
+   (`GET /api/assistant/bridge?open=1`), and an ended session stops it at once. The older
+   one-question tools (`get_pending_question` and the rest) still work.
    - Claude on the web, desktop or phone: Settings, Connectors, Add custom connector, with
      `<site>/api/mcp`. This needs the deployed site: claude.ai cannot reach localhost.
+   - Claude Code, with a server: `claude mcp add --transport http understory <site>/api/mcp`.
+   - Claude Code, with the Understory plugin, a [channel](https://code.claude.com/docs/en/channels-reference)
+     in `integrations/claude-code/`: questions are pushed into the session, so Claude spends
+     nothing while it waits. Install it once with
+     `claude plugin marketplace add vieanderes/understory && claude plugin install understory@understory`,
+     start with `claude --dangerously-load-development-channels plugin:understory@understory`,
+     and send "Connect Understory at <site>, code ABCD-EFGH". During the research preview
+     a channel outside Anthropic's allowlist needs that flag and a confirmation, and Team
+     and Enterprise plans must turn channels on. The plugin has no dependencies; it is a
+     client of the same `/api/mcp`, so the same locks below apply.
    - The pending question and the replies live in a bridge store. On one long-running
      server (`pnpm dev`, the VPS) memory is enough. On Vercel set `UPSTASH_REDIS_REST_URL`
      and `UPSTASH_REDIS_REST_TOKEN` (or Vercel's Redis integration's `KV_REST_API_URL` and
-     `KV_REST_API_TOKEN`), so every serverless instance sees the same sessions.
+     `KV_REST_API_TOKEN`), so every serverless instance sees the same sessions. A listening
+     Claude costs about one read every 1.5 seconds while it waits.
    - Pick **No sign-in** when adding the connector, then press **Allow** in the panel
      when Claude first uses the code. See "How it stays safe" below.
 2. **Your API key.** Kept in this browser; each request goes to `/api/assistant`, which

@@ -517,6 +517,12 @@ type WithStore = typeof globalThis & { [KEY]?: BridgeStore };
 
 export function getBridgeStore(): BridgeStore {
   const scope = globalThis as WithStore;
-  scope[KEY] ??= new BridgeStore({ backend: backendFromEnv() });
-  return scope[KEY];
+  // Typed loosely: after a reload it may be an instance of the previous class.
+  const kept = scope[KEY] as { backend?: SessionBackend & KeyValue } | undefined;
+  // After a hot reload in development the kept store is the old class: rebuild it around
+  // the same backend, so the code is new and the sessions are not lost.
+  if (!(kept instanceof BridgeStore)) {
+    scope[KEY] = new BridgeStore({ backend: kept?.backend ?? backendFromEnv() });
+  }
+  return scope[KEY]!;
 }

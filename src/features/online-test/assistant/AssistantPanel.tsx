@@ -49,13 +49,16 @@ import {
   readPairing,
   refreshMcpStatus,
   rotatePairing,
+  claudeClientStore,
   useApiKey,
+  useClaudeClient,
   useLocalCliAvailability,
   useMcpStatus,
   useModel,
   useOrigin,
   usePairing,
   useProvider,
+  type ClaudeClient,
 } from './prefs';
 
 /*
@@ -92,12 +95,6 @@ export interface AssistantPanelProps {
    */
   inAppLinks?: InAppLinks;
 }
-
-const PROVIDER_LABEL: Record<AssistantProviderId, string> = {
-  'api-key': 'Your API key',
-  'claude-cli': 'Claude Code on this machine',
-  mcp: 'Your Claude account',
-};
 
 const MODEL_LABEL: Record<AssistantModel, string> = {
   'claude-sonnet-5-5': 'Sonnet 5.5',
@@ -195,30 +192,42 @@ function Step({ n, title, children }: { n: number; title: string; children: Reac
   );
 }
 
-const PROVIDER_HINT: Record<AssistantProviderId, string> = {
-  mcp: 'Connect the Claude app once. Works on web, desktop and phone.',
-  'claude-cli': 'Uses the account logged in to Claude Code. Nothing to set up.',
-  'api-key': 'An Anthropic key, kept in this browser.',
+/**
+ * The ways to reach Claude, as the learner thinks of them: where they use Claude. The Claude
+ * app and Claude Code share one connection (MCP) and differ only in how it is set up.
+ */
+type Choice = ClaudeClient | 'claude-cli' | 'api-key';
+
+const CHOICES: Record<Choice, { label: string; hint: string }> = {
+  app: { label: 'Claude app', hint: 'Web, desktop or phone. Connect once, then just ask here.' },
+  code: { label: 'Claude Code', hint: 'Your questions arrive in your terminal by themselves.' },
+  'claude-cli': {
+    label: 'Claude Code on this machine',
+    hint: 'Already signed in on this computer. Nothing to set up.',
+  },
+  'api-key': { label: 'An API key', hint: 'No Claude plan? Pay per question with your own key.' },
 };
 
 function ProviderChoice({
-  provider,
+  choice,
   cliAvailable,
   disabled,
   onChange,
 }: {
-  provider: AssistantProviderId;
+  choice: Choice;
   cliAvailable: boolean;
   disabled: boolean;
-  onChange: (id: AssistantProviderId) => void;
+  onChange: (choice: Choice) => void;
 }) {
   const name = useId();
-  const options: AssistantProviderId[] = cliAvailable
-    ? ['mcp', 'claude-cli', 'api-key']
-    : ['mcp', 'api-key'];
+  // Where nothing needs setting up, that comes first and is the one to pick.
+  const options: Choice[] = cliAvailable
+    ? ['claude-cli', 'app', 'code', 'api-key']
+    : ['app', 'code', 'api-key'];
+  const recommended = options[0];
   return (
     <fieldset disabled={disabled} className="flex min-w-0 flex-col gap-1">
-      <legend className="t-label mb-1">Assistant</legend>
+      <legend className="t-label mb-1">Where do you use Claude?</legend>
       <div className="border-border rounded-panel divide-border flex flex-col divide-y border">
         {options.map((id) => (
           <label
@@ -234,7 +243,7 @@ function ProviderChoice({
               type="radio"
               name={name}
               value={id}
-              checked={provider === id}
+              checked={choice === id}
               onChange={() => onChange(id)}
               className="peer sr-only"
             />
@@ -247,9 +256,14 @@ function ProviderChoice({
             >
               <span className="bg-fg transition-press size-1 scale-0 rounded-full group-has-checked:scale-100" />
             </span>
-            <span className="flex min-w-0 flex-col">
-              <span className="text-sm font-medium">{PROVIDER_LABEL[id]}</span>
-              <span className="text-muted text-sm text-pretty">{PROVIDER_HINT[id]}</span>
+            <span className="flex min-w-0 flex-1 flex-col">
+              <span className="flex items-baseline justify-between gap-1">
+                <span className="text-sm font-medium">{CHOICES[id].label}</span>
+                {id === recommended ? (
+                  <span className="text-muted shrink-0 text-sm">Recommended</span>
+                ) : null}
+              </span>
+              <span className="text-muted text-sm text-pretty">{CHOICES[id].hint}</span>
             </span>
           </label>
         ))}
@@ -258,12 +272,26 @@ function ProviderChoice({
   );
 }
 
+/** The message that starts a listening Claude, the same in every Claude app. */
+export const listenMessage = (code: string) =>
+  `Keep answering my Understory questions, code ${code}`;
+
+/** The plugin's install, start and connect lines for Claude Code. */
+export const PLUGIN_INSTALL =
+  'claude plugin marketplace add vieanderes/understory && claude plugin install understory@understory';
+export const PLUGIN_START =
+  'claude --dangerously-load-development-channels plugin:understory@understory';
+export const connectMessage = (origin: string, code: string) =>
+  `Connect Understory at ${origin}, code ${code}`;
+
 function ProviderSetup({
   provider,
+  client,
   status,
   onEdit,
 }: {
   provider: AssistantProviderId;
+  client: ClaudeClient;
   /** The Claude app's connection, for MCP. */
   status: McpStatus;
   /** Typing a key makes the provider ready; the setup stays open until closed. */
@@ -353,7 +381,19 @@ function ProviderSetup({
   // Claude Code and Claude Desktop's local connections, not for the web or phone apps.
   const local = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:|\/|$)/.test(origin);
   const formatted = pairing ? formatPairingCode(pairing) : '';
-  const prompt = `Answer my Understory question, code ${formatted}`;
+  const state = status.listening
+    ? 'Claude is listening. Ask here, and the answer comes back by itself.'
+    : status.allowed
+      ? `Claude connected at ${clockTime(status.allowed.at)}, but is not listening now. Send it the message again.`
+      : 'Not connected yet. It takes a minute, once.';
+  const allowStep = (n: number) => (
+    <Step n={n} title="Press Allow here">
+      <p className="text-muted text-sm text-pretty">
+        Allow appears in this panel when Claude first uses the code. Only the Claude you allow can
+        read this tab.
+      </p>
+    </Step>
+  );
   return (
     <div className="flex flex-col gap-3">
       <div className="flex flex-col gap-1">
@@ -377,43 +417,79 @@ function ProviderSetup({
             <RefreshCw aria-hidden size={16} strokeWidth={2} />
           </button>
         </div>
-        <p className="text-muted text-sm text-pretty" aria-live="polite">
-          {status.allowed
-            ? `Claude connected at ${clockTime(status.allowed.at)}. Keep the code to yourself.`
-            : 'No Claude app connected yet. Keep the code to yourself; it works only in this tab.'}
+        <p className="text-muted flex items-start gap-1 text-sm text-pretty" aria-live="polite">
+          <span
+            aria-hidden
+            className={cn(
+              'mt-1 size-1 shrink-0 rounded-full',
+              status.listening ? 'bg-success' : 'bg-faint',
+            )}
+          />
+          <span>{state} The code works only in this tab; keep it to yourself.</span>
         </p>
       </div>
-      <ol aria-label="Connect your Claude app" className="flex flex-col gap-3">
-        <Step n={1} title={local ? 'Add Understory to Claude Code' : 'Add Understory to Claude'}>
-          {local ? (
-            <>
-              <p className="text-muted text-sm text-pretty">
-                Run this once. The Claude web and phone apps need the deployed site, not localhost.
-              </p>
-              <CopyField value={command} label="Copy command" />
-            </>
-          ) : (
-            <>
-              <p className="text-muted text-sm text-pretty">
-                In Settings, Connectors, add a custom connector with this URL, and choose No
-                sign-in.
-              </p>
-              <CopyField value={endpoint} label="Copy connector URL" />
-              <p className="text-muted text-sm">Or in Claude Code:</p>
-              <CopyField value={command} label="Copy command" />
-            </>
-          )}
-        </Step>
-        <Step n={2} title="Ask here, then tell Claude">
-          <CopyField value={prompt} label="Copy the message for Claude" />
-        </Step>
-        <Step n={3} title="Allow Claude here">
-          <p className="text-muted text-sm text-pretty">
-            The first time Claude uses the code, Allow appears in this panel. Only the Claude you
-            allow can read this tab.
-          </p>
-        </Step>
-      </ol>
+      {client === 'code' ? (
+        <ol aria-label="Connect Claude Code" className="flex flex-col gap-3">
+          <Step n={1} title="Install the Understory plugin, once">
+            <CopyField value={PLUGIN_INSTALL} label="Copy the install command" />
+          </Step>
+          <Step n={2} title="Start Claude Code with it">
+            <CopyField value={PLUGIN_START} label="Copy the start command" />
+            <p className="text-muted text-sm text-pretty">
+              Claude Code asks you to confirm, because channels are a preview and Understory is not
+              on Anthropic’s list yet. Choose I am using this for local development.
+            </p>
+          </Step>
+          <Step n={3} title="Send Claude this">
+            <CopyField
+              value={connectMessage(origin, formatted)}
+              label="Copy the message for Claude"
+            />
+          </Step>
+          {allowStep(4)}
+          <li>
+            <details className="group/plain text-sm">
+              <summary className="text-muted hover:text-fg cursor-pointer list-none">
+                No plugin? Add Understory as a server instead
+              </summary>
+              <div className="mt-1 flex flex-col gap-1">
+                <CopyField value={command} label="Copy command" />
+                <p className="text-muted text-pretty">Then send Claude:</p>
+                <CopyField value={listenMessage(formatted)} label="Copy the message" />
+              </div>
+            </details>
+          </li>
+        </ol>
+      ) : (
+        <ol aria-label="Connect your Claude app" className="flex flex-col gap-3">
+          <Step n={1} title="Add Understory to Claude, once">
+            {local ? (
+              <>
+                <p className="text-muted text-sm text-pretty">
+                  This copy runs on your computer, which the Claude web and phone apps cannot reach.
+                  Add it to Claude Code or Claude Desktop:
+                </p>
+                <CopyField value={command} label="Copy command" />
+              </>
+            ) : (
+              <>
+                <p className="text-muted text-sm text-pretty">
+                  In Claude, open Settings, then Connectors, and add a custom connector with this
+                  address. Choose No sign-in.
+                </p>
+                <CopyField value={endpoint} label="Copy connector URL" />
+              </>
+            )}
+          </Step>
+          <Step n={2} title="Send Claude this">
+            <CopyField value={listenMessage(formatted)} label="Copy the message for Claude" />
+            <p className="text-muted text-sm text-pretty">
+              Claude then waits for your questions. Keep that chat open and ask here.
+            </p>
+          </Step>
+          {allowStep(3)}
+        </ol>
+      )}
       <SafetyNote />
     </div>
   );
@@ -433,6 +509,7 @@ export function AssistantPanel({
   inAppLinks,
 }: AssistantPanelProps) {
   const storedProvider = useProvider();
+  const client = useClaudeClient();
   const cli = useLocalCliAvailability();
   const apiKey = useApiKey();
   const pairing = usePairing();
@@ -526,10 +603,14 @@ export function AssistantPanel({
 
   const connected =
     provider === 'mcp'
-      ? 'Claude via MCP'
+      ? mcpStatus.listening
+        ? 'Claude is listening'
+        : CHOICES[client].label
       : provider === 'claude-cli'
         ? 'Claude on this machine'
         : 'Your API key';
+  // For a Claude app, green means it is listening: a question gets an answer by itself.
+  const live = provider === 'mcp' ? mcpStatus.listening : ready;
 
   const empty = transcript.length === 0 && !busy;
   const lastReply = transcript.findLastIndex((message) => message.role === 'assistant');
@@ -630,9 +711,10 @@ export function AssistantPanel({
                   </span>
                   {waitingOnApp ? (
                     <span className="text-faint text-pretty">
-                      Waiting for your Claude app. Tell it to answer code{' '}
-                      {formatPairingCode(pairing.code)}. It gives up after {MCP_TIMEOUT_MS / 60_000}{' '}
-                      minutes.
+                      {mcpStatus.listening
+                        ? 'Claude has the question.'
+                        : `Waiting for Claude. If it is not listening yet, send it: ${listenMessage(formatPairingCode(pairing.code))}.`}{' '}
+                      It gives up after {MCP_TIMEOUT_MS / 60_000} minutes.
                     </span>
                   ) : null}
                 </div>
@@ -671,16 +753,22 @@ export function AssistantPanel({
           </div>
           <div className="mt-2 flex flex-col gap-3">
             <ProviderChoice
-              provider={provider}
+              choice={provider === 'mcp' ? client : provider}
               cliAvailable={cli === 'available'}
               disabled={busy}
-              onChange={(id) => {
-                providerStore.set(id);
+              onChange={(choice) => {
+                if (choice === 'app' || choice === 'code') {
+                  claudeClientStore.set(choice);
+                  providerStore.set('mcp');
+                } else {
+                  providerStore.set(choice);
+                }
                 setError(null);
               }}
             />
             <ProviderSetup
               provider={provider}
+              client={client}
               status={mcpStatus}
               onEdit={() => setSetupChoice((choice) => choice ?? true)}
             />
@@ -750,7 +838,7 @@ export function AssistantPanel({
             >
               <span
                 aria-hidden
-                className={cn('size-1 shrink-0 rounded-full', ready ? 'bg-success' : 'bg-warning')}
+                className={cn('size-1 shrink-0 rounded-full', live ? 'bg-success' : 'bg-warning')}
               />
               <span className="truncate">{connected}</span>
               <ChevronDown

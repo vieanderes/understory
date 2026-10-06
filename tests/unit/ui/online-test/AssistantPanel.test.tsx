@@ -101,8 +101,8 @@ describe('AssistantPanel', () => {
     // A Claude account through MCP is the default; a key is chosen explicitly.
     // The connection sits behind a chip; setup opens on demand.
     await user.click(screen.getByRole('button', { name: /Assistant settings/ }));
-    expect(screen.getByRole('radio', { name: /Your Claude account/ })).toBeChecked();
-    await user.click(screen.getByRole('radio', { name: /Your API key/ }));
+    expect(screen.getByRole('radio', { name: /^Claude app/ })).toBeChecked();
+    await user.click(screen.getByRole('radio', { name: /An API key/ }));
     expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled();
     const key = screen.getByLabelText('Anthropic API key');
     await user.type(key, 'sk-ant-123');
@@ -212,8 +212,8 @@ describe('AssistantPanel', () => {
       />,
     );
     await user.click(screen.getByRole('button', { name: /Assistant settings/ }));
-    await user.click(screen.getByRole('radio', { name: /Your API key/ }));
-    await user.click(screen.getByRole('radio', { name: /Your Claude account/ }));
+    await user.click(screen.getByRole('radio', { name: /An API key/ }));
+    await user.click(screen.getByRole('radio', { name: /^Claude app/ }));
     expect(window.localStorage.getItem('understory:assistant:provider')).toBe('mcp');
     expect(ids.at(-1)).toBe('mcp');
 
@@ -223,7 +223,12 @@ describe('AssistantPanel', () => {
     const [code = '', secret = ''] = stored.split(':');
     expect(screen.getByText(`${code.slice(0, 4)}-${code.slice(4)}`)).toBeInTheDocument();
     expect(document.body.textContent).not.toContain(secret);
-    expect(screen.getByText(/No Claude app connected yet/)).toBeInTheDocument();
+    expect(screen.getByText(/Not connected yet/)).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        `Keep answering my Understory questions, code ${code.slice(0, 4)}-${code.slice(4)}`,
+      ),
+    ).toBeInTheDocument();
 
     // A new code replaces the old one at once.
     await user.click(screen.getByRole('button', { name: 'New code' }));
@@ -238,6 +243,32 @@ describe('AssistantPanel', () => {
       ),
     ).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Copy command' })).toBeInTheDocument();
+  });
+
+  it('gives Claude Code its own steps: the plugin, the start command and one message', async () => {
+    const user = userEvent.setup();
+    render(<Harness createPort={() => controllablePort().port} />);
+    await user.click(screen.getByRole('button', { name: /Assistant settings/ }));
+    await user.click(screen.getByRole('radio', { name: /^Claude Code\s*Your questions/ }));
+    expect(window.localStorage.getItem('understory:assistant:provider')).toBe('mcp');
+    expect(window.localStorage.getItem('understory:assistant:claude-client')).toBe('code');
+    const steps = screen.getByRole('list', { name: 'Connect Claude Code' });
+    expect(
+      within(steps).getByText(/claude plugin install understory@understory/),
+    ).toBeInTheDocument();
+    expect(
+      within(steps).getByText(
+        'claude --dangerously-load-development-channels plugin:understory@understory',
+      ),
+    ).toBeInTheDocument();
+    const [code = ''] = (window.sessionStorage.getItem('understory:assistant:pairing') ?? '').split(
+      ':',
+    );
+    expect(
+      within(steps).getByText(
+        `Connect Understory at ${window.location.origin}, code ${code.slice(0, 4)}-${code.slice(4)}`,
+      ),
+    ).toBeInTheDocument();
   });
 
   it('offers the local Claude account only when the server says it is available', async () => {

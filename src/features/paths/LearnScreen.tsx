@@ -114,6 +114,13 @@ export function LearnScreen({
 
   return (
     <div className="flex flex-col gap-4">
+      <Link
+        href="/progress?scope=path"
+        className="text-muted hover:text-fg inline-flex min-h-5 w-fit items-center gap-0.5 text-sm font-medium underline-offset-4 hover:underline"
+      >
+        Progress on this path
+        <ArrowRight aria-hidden size={16} strokeWidth={2} />
+      </Link>
       <details className="group">
         <summary className="text-muted hover:text-fg rounded-control inline-flex min-h-5 cursor-pointer items-center gap-0.5 text-sm font-medium transition-colors duration-150 ease-out">
           Switch path

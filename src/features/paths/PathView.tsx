@@ -6,6 +6,7 @@ import { useMemo } from 'react';
 import { buttonClass } from '@/components/ui/Button';
 import { InlineCode } from '@/components/ui/InlineCode';
 import { ProgressLine } from '@/components/ui/ProgressLine';
+import { rowAction, rowArrow, rowItem, rowList } from '@/components/ui/rows';
 import { formatMinutes } from '@/core/insight';
 import { bestTestScores } from '@/core/online-test/path-tests';
 import type { PathLesson, PathSummary, PathTest } from '@/lib/content';
@@ -14,28 +15,35 @@ import { certificateHref, examHref, formatLocalDate, percent } from '@/features/
 import { usePathExam } from '@/features/exam/usePathExam';
 import { useProgress } from '@/features/store/StoreProvider';
 import { stageSessionHref } from '@/features/practice/topics';
-import { usePathProgress } from './usePathProgress';
+import { usePathProgress, type PathProgress } from './usePathProgress';
 import { onPath } from './links';
 
 /** Tests shown in a stage before the rest fold away. */
 const TESTS_SHOWN = 3;
 
 /**
- * One path: the promise and the one next step first, then the stages in order, each with its
- * lessons and the tests that check it. The side column holds what the path leaves you able to
- * do; how to answer and how you know you are ready fold away, so the lessons stay the spine.
+ * One path: the promise, then one panel with the one next step, then the stages as plain
+ * lists, each with its lessons and a quiet "Try it" group. What the path leaves you able to
+ * do, how to answer and how you know you are ready fold away at the foot, so the lessons
+ * stay the spine.
  *
- * `embedded` drops the breadcrumb where Learn already frames the path. A `custom` path is one
- * the learner built from chapters: it has no track lecture, final exam or readiness notes.
+ * `embedded` drops the breadcrumb where Learn already frames the path, and adds the link to
+ * its progress. `tools` sit beside the title and `drawer` opens under it (Learn's path
+ * switcher). A `custom` path is one the learner built from chapters: it has no track
+ * lecture, final exam or readiness notes.
  */
 export function PathView({
   path,
   embedded = false,
   custom = false,
+  tools,
+  drawer,
 }: {
   path: PathSummary;
   embedded?: boolean;
   custom?: boolean;
+  tools?: React.ReactNode;
+  drawer?: React.ReactNode;
 }) {
   const progress = usePathProgress(path.lessonIds);
   const { status, state } = useProgress();
@@ -46,208 +54,129 @@ export function PathView({
     const score = best[test.key];
     return score === undefined ? undefined : `Best ${score}%`;
   };
-  const lessons = path.stages.flatMap((stage) => stage.lessons);
-  const next = lessons.find((l) => l.id === progress.nextId);
-  const started = progress.done > 0;
-  // Lessons are numbered through the whole path, so each stage starts where the last ended.
-  const offsets = path.stages.map((_, i) =>
-    path.stages.slice(0, i).reduce((sum, stage) => sum + stage.lessons.length, 0),
-  );
 
   return (
-    <div className="grid grid-cols-4 gap-x-4 gap-y-6 md:grid-cols-12">
-      <header className="col-span-4 flex flex-col gap-3 md:col-span-12 lg:col-span-8">
-        {embedded ? null : (
-          <nav aria-label="Breadcrumb" className="t-label">
-            <Link href="/library" className="hover:text-fg transition-colors duration-150 ease-out">
-              Library
-            </Link>
-          </nav>
-        )}
-        <h1 className="t-title" data-arrive="title">
-          {path.title}
-        </h1>
-        <p data-arrive="rise" className="text-muted prose-measure text-lg">
-          {path.promise}
-        </p>
-        <div data-arrive="rise" className="flex flex-wrap items-center gap-1 pt-1">
-          {next?.href ? (
-            <Link href={onPath(next.href, path.id)} className={buttonClass('primary')}>
-              {started ? 'Continue' : 'Start the path'}
-            </Link>
-          ) : (
-            <span className="text-muted">Every lesson on this path is done.</span>
+    <div className="flex flex-col gap-6">
+      <div className="flex flex-col gap-4">
+        <header className="flex flex-col gap-2">
+          {embedded ? null : (
+            <nav aria-label="Breadcrumb" className="t-label">
+              <Link
+                href="/library"
+                className="hover:text-fg transition-colors duration-150 ease-out"
+              >
+                Library
+              </Link>
+            </nav>
           )}
-          {custom ? null : (
-            <Link href={`/lectures/tracks/${path.id}`} className={buttonClass('quiet')}>
-              <BookOpen aria-hidden size={16} strokeWidth={2} />
-              Read as a lecture
-            </Link>
-          )}
-        </div>
-        {next ? (
-          <p className="text-muted text-sm">
-            Next: <InlineCode text={next.title} /> · {next.minutes} min
-          </p>
-        ) : null}
-      </header>
-
-      <aside className="col-span-4 md:col-span-12 lg:col-span-4">
-        <div className="bg-raised border-border rounded-panel shadow-edge flex flex-col gap-2 border p-2 md:p-3">
-          <div className="flex items-baseline justify-between gap-2">
-            <p className="t-figure text-lg font-semibold">
-              {progress.done}
-              <span className="text-muted font-normal">/{progress.total}</span>
-            </p>
-            <p className="t-label">about {formatMinutes(path.minutes)}</p>
+          <div className="flex flex-col gap-1 lg:flex-row lg:items-end lg:justify-between lg:gap-4">
+            <div className="flex min-w-0 flex-col gap-1">
+              <h1 className="t-title" data-arrive="title">
+                {path.title}
+              </h1>
+              <p data-arrive="rise" className="text-muted prose-measure text-lg">
+                {path.promise}
+              </p>
+            </div>
+            {custom && !tools ? null : (
+              <div className="-ml-2 flex shrink-0 flex-wrap items-center lg:-mr-2 lg:ml-0">
+                {custom ? null : (
+                  <Link
+                    href={`/lectures/tracks/${path.id}`}
+                    className={buttonClass('quiet', 'md', 'text-muted hover:text-fg')}
+                  >
+                    <BookOpen aria-hidden size={16} strokeWidth={2} />
+                    Read as a lecture
+                  </Link>
+                )}
+                {tools}
+              </div>
+            )}
           </div>
-          <ProgressLine
-            value={progress.total ? progress.done / progress.total : 0}
-            label={`${progress.done} of ${progress.total} lessons done`}
-          />
-          {path.outcomes.length > 0 ? (
-            <>
-              <h2 className="pt-1 text-sm font-semibold">At the end you can</h2>
-              <ul className="flex flex-col gap-1 text-sm">
-                {path.outcomes.map((outcome) => (
-                  <li key={outcome} className="text-muted flex gap-1">
-                    <Check
-                      aria-hidden
-                      size={16}
-                      strokeWidth={2}
-                      className="text-fg mt-0.5 shrink-0"
-                    />
-                    {outcome}
-                  </li>
-                ))}
-              </ul>
-            </>
-          ) : null}
-        </div>
-      </aside>
+        </header>
 
-      <div className="col-span-4 flex flex-col gap-4 md:col-span-12 lg:col-span-8">
+        {drawer}
+
+        <NextStep path={path} progress={progress} embedded={embedded} custom={custom} />
+      </div>
+
+      <section aria-labelledby="stages-title" className="flex flex-col">
+        <h2 id="stages-title" className="t-section rule-b pb-1">
+          The stages
+        </h2>
         <ol data-arrive="stagger" className="flex flex-col">
           {path.stages.map((stage, stageIndex) => {
             const minutes = stage.lessons.reduce((sum, l) => sum + l.minutes, 0);
             const done = stage.lessons.filter((l) => progress.isDone(l.id)).length;
-            const before = path.stages[stageIndex - 1]?.lessons.at(-1);
             return (
-              <li key={stage.title} className="flex flex-col">
-                <section aria-label={stage.title} className="flex flex-col">
-                  <div className="flex gap-2">
-                    <Rail
-                      above={
-                        stageIndex === 0
-                          ? 'none'
-                          : before && progress.isDone(before.id)
-                            ? 'done'
-                            : 'todo'
-                      }
-                      below={
-                        stage.lessons[0] && progress.isDone(stage.lessons[0].id) ? 'done' : 'todo'
-                      }
-                    >
-                      <span
-                        aria-hidden
-                        className={cn(
-                          'rounded-inner size-2 rotate-45 border-2',
-                          done === stage.lessons.length
-                            ? 'bg-fg border-fg'
-                            : 'bg-surface border-border-strong',
-                        )}
-                      />
-                    </Rail>
-                    <div className="flex min-w-0 flex-1 flex-col gap-0.5 pt-1 pb-2">
-                      <div className="flex items-baseline justify-between gap-2">
-                        <h2 className="t-section">{stage.title}</h2>
-                        <p className="t-label t-figure shrink-0">
+              <li key={stage.title} className={cn(stageIndex > 0 && 'rule-t')}>
+                <section aria-label={stage.title} className="flex flex-col gap-2 py-3">
+                  <div className="flex flex-col gap-0.5">
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="flex min-w-0 flex-wrap items-baseline gap-x-1.5 gap-y-0.5">
+                        <span className="t-figure text-faint text-sm">
+                          {String(stageIndex + 1).padStart(2, '0')}
+                        </span>
+                        <h3 className="t-section">{stage.title}</h3>
+                        <span className="t-figure text-muted text-sm">
                           {done}/{stage.lessons.length} · {formatMinutes(minutes)}
-                        </p>
+                        </span>
                       </div>
-                      <p className="text-muted prose-measure">{stage.why}</p>
-                      {stage.artifact ? (
-                        <p className="text-sm">
-                          <span className="text-muted">You leave with </span>
-                          {stage.artifact.charAt(0).toLowerCase() + stage.artifact.slice(1)}
-                        </p>
-                      ) : null}
                       {stage.lectureHref ? (
                         <Link
                           href={stage.lectureHref}
                           aria-label={`Read as a lecture: ${stage.title}`}
-                          className="text-muted hover:text-fg rounded-control -ml-0.5 inline-flex h-5 items-center gap-1 self-start px-0.5 text-sm font-medium transition-colors duration-150 ease-out"
+                          title="Read as a lecture"
+                          className="text-muted hover:text-fg hover:bg-raised rounded-control -my-1 -mr-1 inline-flex size-5 shrink-0 items-center justify-center gap-1 text-sm font-medium transition-colors duration-150 ease-out md:w-auto md:px-1"
                         >
                           <BookOpen aria-hidden size={16} strokeWidth={2} />
-                          Read as a lecture
+                          <span className="hidden md:inline">Lecture</span>
                         </Link>
                       ) : null}
                     </div>
+                    <p className="text-muted prose-measure">{stage.why}</p>
                   </div>
-                  <ol className="flex flex-col">
-                    {stage.lessons.map((lesson, i) => {
-                      const last =
-                        stageIndex === path.stages.length - 1 && i === stage.lessons.length - 1;
-                      return (
-                        <PathLessonRow
-                          key={lesson.id}
-                          pathId={path.id}
-                          lesson={lesson}
-                          number={(offsets[stageIndex] ?? 0) + i + 1}
-                          done={progress.isDone(lesson.id)}
-                          next={lesson.id === progress.nextId}
-                          above={progress.isDone(lesson.id) ? 'done' : 'todo'}
-                          below={
-                            last
-                              ? progress.isDone(lesson.id)
-                                ? 'done'
-                                : 'todo'
-                              : progress.isDone(lesson.id) &&
-                                  (stage.lessons[i + 1]
-                                    ? progress.isDone(stage.lessons[i + 1]!.id)
-                                    : true)
-                                ? 'done'
-                                : 'todo'
-                          }
-                        />
-                      );
-                    })}
+                  <ol className="-mx-1 flex flex-col">
+                    {stage.lessons.map((lesson) => (
+                      <PathLessonRow
+                        key={lesson.id}
+                        pathId={path.id}
+                        lesson={lesson}
+                        done={progress.isDone(lesson.id)}
+                        next={lesson.id === progress.nextId}
+                      />
+                    ))}
                   </ol>
                   {stage.optional.length > 0 ? (
-                    <div className="flex gap-2">
-                      <Rail above="todo" below="todo" />
-                      <Fold
-                        className="min-w-0 flex-1 pb-2"
-                        label={`If you have time · ${stage.optional.length} ${
-                          stage.optional.length === 1 ? 'lesson' : 'lessons'
-                        }`}
-                      >
-                        <ul className="border-border rounded-panel divide-border mt-1 divide-y overflow-hidden border">
-                          {stage.optional.map((lesson) => (
-                            <OptionalRow
-                              key={lesson.id}
-                              pathId={path.id}
-                              lesson={lesson}
-                              done={progress.isDone(lesson.id)}
-                            />
-                          ))}
-                        </ul>
-                      </Fold>
-                    </div>
+                    <Fold
+                      label={`If you have time · ${stage.optional.length} ${
+                        stage.optional.length === 1 ? 'lesson' : 'lessons'
+                      }`}
+                    >
+                      <ol className="-mx-1 flex flex-col pt-0.5">
+                        {stage.optional.map((lesson) => (
+                          <PathLessonRow
+                            key={lesson.id}
+                            pathId={path.id}
+                            lesson={lesson}
+                            done={progress.isDone(lesson.id)}
+                            next={false}
+                            optional
+                          />
+                        ))}
+                      </ol>
+                    </Fold>
                   ) : null}
                   {stage.lessons.length > 0 ? (
-                    <div className="flex gap-2">
-                      <Rail above="todo" below="todo" />
-                      <StageTests
-                        stage={stage.title}
-                        practice={stageSessionHref([
-                          ...stage.lessons.map((l) => l.id),
-                          ...stage.optional.map((l) => l.id),
-                        ])}
-                        tests={stage.tests ?? []}
-                        result={testResult}
-                      />
-                    </div>
+                    <StageTests
+                      stage={stage.title}
+                      practice={stageSessionHref([
+                        ...stage.lessons.map((l) => l.id),
+                        ...stage.optional.map((l) => l.id),
+                      ])}
+                      tests={stage.tests ?? []}
+                      result={testResult}
+                    />
                   ) : null}
                 </section>
               </li>
@@ -257,126 +186,183 @@ export function PathView({
             <FinalStop path={path} lessonsDone={progress.ready && progress.nextId === undefined} />
           )}
         </ol>
-        {path.practice.length > 0 ? (
-          <section aria-labelledby="practice-title" className="flex flex-col gap-2">
-            <div className="flex flex-col gap-0.5">
-              <h2 id="practice-title" className="t-section">
-                Practise it for real
-              </h2>
-              <p className="text-muted">
-                Alongside the lessons, in order. The lessons teach; this is where it sticks.
-              </p>
-            </div>
-            <ol className="border-border rounded-panel divide-border divide-y overflow-hidden border">
-              {path.practice.map((item, i) => (
-                <li key={item.href + item.label}>
-                  <Link
-                    href={item.href}
-                    className="group hover:bg-raised flex items-start gap-2 p-2 transition-colors duration-150 ease-out md:p-3"
-                  >
-                    <span className="t-figure text-muted w-3 shrink-0 pt-0.5 text-sm">{i + 1}</span>
-                    <span className="min-w-0 flex-1">
-                      <span className="block font-medium">{item.label}</span>
-                      <span className="text-muted block text-sm">{item.text}</span>
-                    </span>
-                    <ArrowRight
-                      aria-hidden
-                      size={16}
-                      strokeWidth={2}
-                      className="text-faint group-hover:text-fg mt-0.5 shrink-0 transition-transform duration-150 ease-out group-hover:translate-x-0.5"
-                    />
-                  </Link>
-                </li>
-              ))}
-            </ol>
-          </section>
-        ) : null}
-        {custom ? null : <Readiness path={path} />}
-      </div>
+      </section>
 
-      {!custom && path.shapes.length > 0 ? (
-        <aside className="col-span-4 md:col-span-12 lg:col-span-4">
-          <Fold label="How to answer" className="rule-t pt-1 lg:sticky lg:top-4" heading>
-            <dl className="flex flex-col gap-2 pt-1">
-              {path.shapes.map((shape) => (
-                <div key={shape.label} className="rule-t flex flex-col gap-0.5 pt-2">
-                  <dt className="text-sm font-semibold">{shape.label}</dt>
-                  <dd className="text-muted text-sm">{shape.text}</dd>
-                </div>
-              ))}
-            </dl>
-            {path.method.length > 0 ? (
-              <>
-                <h2 className="pt-2 text-sm font-semibold">Each lesson</h2>
-                <ol className="text-muted flex list-decimal flex-col gap-0.5 pl-2 text-sm">
-                  {path.method.map((step) => (
-                    <li key={step}>{step}</li>
-                  ))}
-                </ol>
-              </>
-            ) : null}
-          </Fold>
-        </aside>
+      {path.practice.length > 0 ? (
+        <section aria-labelledby="practice-title" className="flex flex-col gap-2">
+          <div className="flex flex-col gap-0.5">
+            <h2 id="practice-title" className="t-section">
+              Practise it for real
+            </h2>
+            <p className="text-muted">Alongside the lessons, in order.</p>
+          </div>
+          <ol className={rowList()}>
+            {path.practice.map((item, i) => (
+              <li key={item.href + item.label} className={rowItem}>
+                <Link href={item.href} className={rowAction('items-start')}>
+                  <span className="t-figure text-faint w-2 shrink-0 pt-0.5 text-sm">{i + 1}</span>
+                  <span className="flex min-w-0 flex-1 flex-col">
+                    <span className="font-medium">{item.label}</span>
+                    <span className="text-muted text-sm">{item.text}</span>
+                  </span>
+                  <ArrowRight
+                    aria-hidden
+                    size={16}
+                    strokeWidth={2}
+                    className={cn(rowArrow, 'mt-0.5')}
+                  />
+                </Link>
+              </li>
+            ))}
+          </ol>
+        </section>
       ) : null}
+
+      {custom ? null : <AboutPath path={path} />}
     </div>
   );
 }
 
 /**
+ * The one raised surface on the page: the next lesson, named, with the button that opens it
+ * and how far along the path is. Once every lesson is done it points at the final exam.
+ */
+function NextStep({
+  path,
+  progress,
+  embedded,
+  custom,
+}: {
+  path: PathSummary;
+  progress: PathProgress;
+  embedded: boolean;
+  custom: boolean;
+}) {
+  const stage = path.stages.find((s) => s.lessons.some((l) => l.id === progress.nextId));
+  const next = stage?.lessons.find((l) => l.id === progress.nextId);
+  const started = progress.done > 0;
+  const left = path.stages
+    .flatMap((s) => s.lessons)
+    .filter((l) => !progress.isDone(l.id))
+    .reduce((sum, l) => sum + l.minutes, 0);
+  const exam = !next && !custom;
+  return (
+    <section
+      aria-label="Next step"
+      data-arrive="rise"
+      className="bg-surface border-border rounded-panel shadow-edge flex flex-col gap-3 border p-2 md:p-3"
+    >
+      <div className="flex flex-col gap-2 lg:flex-row lg:items-center lg:gap-4">
+        <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+          <p className="t-label">
+            {next && stage
+              ? `${started ? 'Next' : 'Start here'} · ${stage.title}`
+              : 'All lessons done'}
+          </p>
+          <p className="text-lg font-semibold">
+            {next ? <InlineCode text={next.title} /> : 'Every lesson on this path is done'}
+          </p>
+          {next?.objective ? (
+            <p className="text-muted text-sm">
+              <InlineCode text={next.objective} />
+            </p>
+          ) : exam ? (
+            <p className="text-muted text-sm">The final exam is the last step.</p>
+          ) : null}
+        </div>
+        {next?.href ? (
+          <Link
+            href={onPath(next.href, path.id)}
+            className={buttonClass('primary', 'lg', 'shrink-0')}
+          >
+            {started ? 'Continue' : 'Start'} · {next.minutes} min
+            <ArrowRight aria-hidden size={16} strokeWidth={2} />
+          </Link>
+        ) : exam ? (
+          <Link href={examHref(path.id)} className={buttonClass('primary', 'lg', 'shrink-0')}>
+            Take the final exam
+            <ArrowRight aria-hidden size={16} strokeWidth={2} />
+          </Link>
+        ) : null}
+      </div>
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+        <ProgressLine
+          value={progress.total ? progress.done / progress.total : 0}
+          label={`${progress.done} of ${progress.total} lessons done`}
+          className="min-w-20 flex-1"
+        />
+        <p className="t-figure text-muted text-sm">
+          {progress.done}/{progress.total} lessons
+          {left > 0 ? ` · ${formatMinutes(left)} left` : ''}
+        </p>
+        {embedded ? (
+          <Link
+            href="/progress?scope=path"
+            className="text-muted hover:text-fg inline-flex min-h-5 items-center gap-0.5 text-sm font-medium transition-colors duration-150 ease-out"
+          >
+            Progress on this path
+            <ArrowRight aria-hidden size={16} strokeWidth={2} />
+          </Link>
+        ) : null}
+      </div>
+    </section>
+  );
+}
+
+/**
  * The route's last stop, after the last stage: the final exam and the certificate it earns.
- * Open from the start. Once every lesson is done it becomes the one next step on the page.
+ * Open from the start, and quiet: the panel above points here once every lesson is done.
  */
 function FinalStop({ path, lessonsDone }: { path: PathSummary; lessonsDone: boolean }) {
   const exam = usePathExam(path.id);
   const pct = exam.best ? percent(exam.best.right, exam.best.total) : undefined;
   return (
-    <li className="flex gap-2">
-      <Rail above={lessonsDone ? 'done' : 'todo'} below="none">
-        <span
-          aria-hidden
-          className={cn(
-            'flex size-3 shrink-0 items-center justify-center rounded-full border-2',
-            exam.passed ? 'bg-fg text-bg border-fg' : 'bg-surface border-border-strong text-faint',
-          )}
-        >
-          {exam.passed ? <Check size={12} strokeWidth={3} /> : <Award size={12} strokeWidth={2} />}
-        </span>
-      </Rail>
-      <section
-        aria-labelledby="final-stop-title"
-        className="flex min-w-0 flex-1 flex-col gap-1 pt-1 pb-2"
-      >
-        <div className="flex items-baseline justify-between gap-2">
-          <h2 id="final-stop-title" className="t-section">
-            Final exam and certificate
-          </h2>
-          <p className="t-label t-figure shrink-0">
-            {exam.passed ? 'Certified' : pct !== undefined ? `Best ${pct}%` : '20 min'}
+    <li className="rule-t">
+      <section aria-labelledby="final-stop-title" className="flex flex-col gap-2 py-3">
+        <div className="flex flex-col gap-0.5">
+          <div className="flex flex-wrap items-baseline gap-x-1.5 gap-y-0.5">
+            <span aria-hidden className="text-faint self-center">
+              {exam.passed ? (
+                <Check size={16} strokeWidth={2} />
+              ) : (
+                <Award size={16} strokeWidth={2} />
+              )}
+            </span>
+            <h3 id="final-stop-title" className="t-section">
+              Final exam and certificate
+            </h3>
+            <span className="t-figure text-muted text-sm">
+              {exam.passed ? 'Certified' : pct !== undefined ? `Best ${pct}%` : '20 min'}
+            </span>
+          </div>
+          <p className="text-muted prose-measure">
+            {exam.firstPass
+              ? `Passed on ${formatLocalDate(exam.firstPass.localDate)} with ${percent(exam.firstPass.right, exam.firstPass.total)}%.`
+              : pct !== undefined
+                ? `Best so far ${pct}%. 80% passes and earns the certificate.`
+                : lessonsDone
+                  ? 'Questions from every stage, mixed. 80% passes and earns the certificate.'
+                  : 'Questions from every stage, mixed. 80% passes. Open now, best after the lessons.'}
           </p>
         </div>
-        <p className="text-muted prose-measure">
-          {exam.firstPass
-            ? `Passed on ${formatLocalDate(exam.firstPass.localDate)} with ${percent(exam.firstPass.right, exam.firstPass.total)}%.`
-            : pct !== undefined
-              ? `Best so far ${pct}%. 80% passes and earns the certificate.`
-              : 'Questions from every stage, mixed. 80% passes and earns the certificate. Open now, best after the lessons.'}
-        </p>
-        <div className="flex flex-wrap gap-1 pt-1">
+        <div className="-ml-2 flex flex-wrap">
           {exam.passed ? (
             <>
-              <Link href={certificateHref(path.id)} className={buttonClass('secondary', 'md')}>
+              <Link href={certificateHref(path.id)} className={buttonClass('quiet', 'md')}>
                 See the certificate
+                <ArrowRight aria-hidden size={16} strokeWidth={2} />
               </Link>
-              <Link href={examHref(path.id)} className={buttonClass('quiet', 'md')}>
+              <Link
+                href={examHref(path.id)}
+                className={buttonClass('quiet', 'md', 'text-muted hover:text-fg')}
+              >
                 Sit it again
               </Link>
             </>
           ) : (
-            <Link
-              href={examHref(path.id)}
-              className={buttonClass(lessonsDone ? 'primary' : 'secondary', 'md')}
-            >
+            <Link href={examHref(path.id)} className={buttonClass('quiet', 'md')}>
               Sit the final exam
+              <ArrowRight aria-hidden size={16} strokeWidth={2} />
             </Link>
           )}
         </div>
@@ -385,127 +371,74 @@ function FinalStop({ path, lessonsDone }: { path: PathSummary; lessonsDone: bool
   );
 }
 
-type Segment = 'done' | 'todo' | 'none';
-
-const SEGMENT: Record<Segment, string> = {
-  done: 'bg-fg',
-  todo: 'bg-border-strong',
-  none: 'bg-transparent',
-};
-
 /**
- * The line a path is drawn on. Each row carries its own piece of it: the part above its node
- * and the part below. Ink where the lessons on both ends are done, a hairline elsewhere.
+ * A lesson as a plain row: a circle marker, the title and its minutes. Done is a filled
+ * circle and muted text, next is the accent ring on a tinted row, later a hairline ring,
+ * and an optional lesson a dashed one.
  */
-function Rail({
-  above,
-  below,
-  children,
-}: {
-  above: Segment;
-  below: Segment;
-  children?: React.ReactNode;
-}) {
-  return (
-    <span aria-hidden className="flex w-3 shrink-0 flex-col items-center">
-      <span className={cn('h-1.5 w-0.5 shrink-0 rounded-full', SEGMENT[above])} />
-      {children ?? <span className={cn('h-0.5 w-0.5', SEGMENT[below])} />}
-      <span className={cn('min-h-1 w-0.5 flex-1 rounded-full', SEGMENT[below])} />
-    </span>
-  );
-}
-
 function PathLessonRow({
   pathId,
   lesson,
-  number,
   done,
   next,
-  above,
-  below,
+  optional = false,
 }: {
   pathId: string;
   lesson: PathLesson;
-  number: number;
   done: boolean;
   next: boolean;
-  above: Segment;
-  below: Segment;
+  optional?: boolean;
 }) {
   const body = (
     <>
-      <span className="flex min-w-0 flex-1 flex-col">
-        <span className={cn('font-medium', done && 'text-muted', next && 'text-accent')}>
-          <InlineCode text={lesson.title} />
-        </span>
-        {lesson.objective ? (
-          <span className="text-muted text-sm">
-            <InlineCode text={lesson.objective} />
-          </span>
-        ) : null}
+      <span
+        aria-hidden
+        className={cn(
+          'flex size-2 shrink-0 items-center justify-center rounded-full',
+          done
+            ? 'bg-fg text-bg'
+            : next
+              ? 'border-accent border-2'
+              : cn('border-border-strong border', optional && 'border-dashed'),
+        )}
+      >
+        {done ? <Check size={12} strokeWidth={3} /> : null}
       </span>
-      <span className="t-label t-figure shrink-0">
-        {done ? 'Done' : next ? 'Next' : lesson.href ? `${lesson.minutes} min` : 'Soon'}
+      <span
+        className={cn(
+          'min-w-0 flex-1',
+          done ? 'text-muted' : next ? 'font-semibold' : 'font-medium',
+        )}
+      >
+        <InlineCode text={lesson.title} />
+      </span>
+      <span className={cn('t-figure shrink-0 text-sm', next ? 'text-fg' : 'text-muted')}>
+        {done
+          ? 'Done'
+          : next
+            ? `Next · ${lesson.minutes} min`
+            : lesson.href
+              ? `${lesson.minutes} min`
+              : 'Soon'}
       </span>
     </>
   );
-  const row =
-    'rounded-control flex min-w-0 flex-1 items-start gap-2 px-1.5 py-1.5 transition-colors duration-150 ease-out';
+  const row = cn(
+    'rounded-control flex min-h-5 items-center gap-1.5 px-1 py-1',
+    next && 'bg-accent-tint',
+  );
   return (
-    <li className="flex gap-2">
-      <Rail above={above} below={below}>
-        <span
-          aria-hidden
-          className={cn(
-            'flex size-3 shrink-0 items-center justify-center rounded-full border-2 text-sm',
-            done
-              ? 'bg-fg text-bg border-fg'
-              : next
-                ? 'border-accent text-accent bg-surface'
-                : 'border-border-strong text-faint bg-surface',
-          )}
-        >
-          {done ? <Check size={12} strokeWidth={3} /> : <span className="t-figure">{number}</span>}
-        </span>
-      </Rail>
+    <li>
       {lesson.href ? (
         <Link
           href={onPath(lesson.href, pathId)}
-          className={cn(row, next ? 'bg-accent-tint' : 'hover:bg-raised')}
+          className={cn(row, 'transition-press active:scale-98', !next && 'hover:bg-raised')}
         >
           {body}
         </Link>
       ) : (
         <div className={row}>{body}</div>
       )}
-    </li>
-  );
-}
-
-function OptionalRow({
-  pathId,
-  lesson,
-  done,
-}: {
-  pathId: string;
-  lesson: PathLesson;
-  done: boolean;
-}) {
-  return (
-    <li>
-      {lesson.href ? (
-        <Link
-          href={onPath(lesson.href, pathId)}
-          className="hover:bg-raised flex items-start justify-between gap-2 px-2 py-1.5 transition-colors duration-150 ease-out"
-        >
-          <span className={cn('min-w-0', done ? 'text-muted' : 'font-medium')}>
-            <InlineCode text={lesson.title} />
-          </span>
-          <span className="t-label t-figure shrink-0">
-            {done ? 'Done' : `${lesson.minutes} min`}
-          </span>
-        </Link>
-      ) : null}
     </li>
   );
 }
@@ -526,11 +459,11 @@ function Fold({
   children: React.ReactNode;
 }) {
   return (
-    <details className={cn('group', className)}>
+    <details className={cn('group/fold', className)}>
       <summary
         className={cn(
           'hover:text-fg rounded-control flex cursor-pointer list-none items-center gap-1 transition-colors duration-150 ease-out',
-          heading ? 'min-h-5 justify-between' : 'text-muted h-5 text-sm font-medium',
+          heading ? 'min-h-6 justify-between' : 'text-muted h-5 w-fit text-sm font-medium',
         )}
       >
         {heading ? <h2 className="t-section">{label}</h2> : null}
@@ -539,7 +472,7 @@ function Fold({
           size={16}
           strokeWidth={2}
           className={cn(
-            'shrink-0 transition-transform duration-150 ease-out group-open:rotate-180',
+            'shrink-0 transition-transform duration-150 ease-out group-open/fold:rotate-180',
             heading && 'text-muted order-last',
           )}
         />
@@ -553,9 +486,8 @@ function Fold({
 /**
  * What a stage offers beyond its lessons: practice of the stage, the labs that show its
  * mechanisms moving, and the timed tests that check it. None is needed to finish the path,
- * but each is the way to make the stage stick, so the group says so plainly and stays
- * quiet: no accent, which marks the next lesson. Practice comes first, labs before tests,
- * the order a learner would reach for them.
+ * so the group stays quiet: hairline rows, no accent, which marks the next lesson. Practice
+ * comes first, labs before tests, the order a learner would reach for them.
  */
 function StageTests({
   stage,
@@ -576,24 +508,19 @@ function StageTests({
   const rest = ordered.slice(TESTS_SHOWN);
   const restNoun = rest.every((t) => t.kind === 'training') ? 'tasks' : 'more';
   return (
-    <section aria-label={`Try it: ${stage}`} className="flex min-w-0 flex-1 flex-col gap-1 pb-2">
-      <div className="flex flex-wrap items-baseline justify-between gap-x-2 pt-1">
-        <h3 className="font-semibold whitespace-nowrap">Try it</h3>
-        <p className="t-label shrink-0">Optional · recommended</p>
+    <section aria-label={`Try it: ${stage}`} className="flex flex-col gap-1 pt-1">
+      <div className="flex flex-wrap items-baseline justify-between gap-x-2">
+        <h4 className="text-sm font-semibold">Try it</h4>
+        <p className="t-label">Optional · recommended</p>
       </div>
-      <ul className="border-border rounded-panel divide-border divide-y overflow-hidden border">
-        <li>
-          <Link
-            href={practice}
-            className="hover:bg-raised flex items-start justify-between gap-2 px-2 py-1.5 transition-colors duration-150 ease-out"
-          >
-            <span className="flex min-w-0 flex-col">
+      <ul className={rowList()}>
+        <li className={rowItem}>
+          <Link href={practice} className={rowAction('items-start')}>
+            <span className="flex min-w-0 flex-1 flex-col">
               <span className="font-medium">Practise this stage</span>
-              <span className="text-muted text-sm">
-                Questions from these lessons, done or not, the fading ones first
-              </span>
+              <span className="text-muted text-sm">Questions from these lessons</span>
             </span>
-            <span className="t-label t-figure shrink-0">10 min</span>
+            <span className="t-figure text-muted shrink-0 text-sm">10 min</span>
           </Link>
         </li>
         {shown.map((test) => (
@@ -602,7 +529,7 @@ function StageTests({
       </ul>
       {rest.length > 0 ? (
         <Fold label={restNoun === 'tasks' ? `${rest.length} more tasks` : `${rest.length} more`}>
-          <ul className="border-border rounded-panel divide-border mt-1 divide-y overflow-hidden border">
+          <ul className={rowList('pt-0.5')}>
             {rest.map((test) => (
               <TestRow key={test.key} test={test} result={result(test)} />
             ))}
@@ -615,18 +542,13 @@ function StageTests({
 
 function TestRow({ test, result }: { test: PathTest; result: string | undefined }) {
   return (
-    <li>
-      <Link
-        href={test.href}
-        className="hover:bg-raised flex items-start justify-between gap-2 px-2 py-1.5 transition-colors duration-150 ease-out"
-      >
-        <span className="flex min-w-0 flex-col">
+    <li className={rowItem}>
+      <Link href={test.href} className={rowAction('items-start')}>
+        <span className="flex min-w-0 flex-1 flex-col">
           <span className={cn('font-medium', result === 'Done' && 'text-muted')}>{test.title}</span>
           <span className="text-muted text-sm">
             {test.kind === 'lab' ? (
-              <>
-                <span className="t-label">Lab</span> · {test.detail}
-              </>
+              <>Lab · {test.detail}</>
             ) : (
               <>
                 {test.detail ? `${test.detail} · ` : ''}
@@ -635,7 +557,12 @@ function TestRow({ test, result }: { test: PathTest; result: string | undefined 
             )}
           </span>
         </span>
-        <span className={cn('t-label t-figure shrink-0', result && result !== 'Done' && 'text-fg')}>
+        <span
+          className={cn(
+            't-figure shrink-0 text-sm',
+            result && result !== 'Done' ? 'text-fg' : 'text-muted',
+          )}
+        >
           {result ?? `${test.minutes} min`}
         </span>
       </Link>
@@ -644,15 +571,26 @@ function TestRow({ test, result }: { test: PathTest; result: string | undefined 
 }
 
 /**
- * How you know you are done, without the app: checks to run on yourself, the piece of work
- * that proves the path, and an honest line on what it leaves out. Folded: it matters at the
- * end, not on every visit.
+ * What the path leaves you able to do, how to answer, how you know you are done without
+ * the app, and an honest line on what it leaves out. Folded: it matters at the start and
+ * the end, not on every visit.
  */
-function Readiness({ path }: { path: PathSummary }) {
-  const { readyWhen, proof, coverage } = path;
-  if (readyWhen.length === 0 && !proof && !coverage) return null;
+function AboutPath({ path }: { path: PathSummary }) {
+  const { outcomes, readyWhen, proof, coverage, shapes, method } = path;
   return (
-    <div className="flex flex-col">
+    <div className="rule-b flex flex-col">
+      {outcomes.length > 0 ? (
+        <Fold label="At the end you can" heading className="rule-t py-1">
+          <ul className="flex flex-col gap-1 pt-1 pb-2">
+            {outcomes.map((outcome) => (
+              <li key={outcome} className="flex gap-1">
+                <Check aria-hidden size={16} strokeWidth={2} className="mt-0.5 shrink-0" />
+                {outcome}
+              </li>
+            ))}
+          </ul>
+        </Fold>
+      ) : null}
       {readyWhen.length > 0 || proof ? (
         <Fold label="You are ready when" heading className="rule-t py-1">
           <div className="flex flex-col gap-3 pt-1 pb-2">
@@ -672,7 +610,7 @@ function Readiness({ path }: { path: PathSummary }) {
               </ul>
             ) : null}
             {proof ? (
-              <div className="bg-raised border-border rounded-panel shadow-edge flex flex-col gap-1 border p-2 md:p-3">
+              <div className="flex flex-col gap-1">
                 <h3 className="font-semibold">
                   Prove it: {proof.title.charAt(0).toLowerCase() + proof.title.slice(1)}
                 </h3>
@@ -686,8 +624,30 @@ function Readiness({ path }: { path: PathSummary }) {
           </div>
         </Fold>
       ) : null}
+      {shapes.length > 0 ? (
+        <Fold label="How to answer" heading className="rule-t py-1">
+          <dl className="grid grid-cols-1 gap-x-4 gap-y-2 pt-1 pb-2 md:grid-cols-2">
+            {shapes.map((shape) => (
+              <div key={shape.label} className="flex flex-col gap-0.5">
+                <dt className="font-medium">{shape.label}</dt>
+                <dd className="text-muted text-sm">{shape.text}</dd>
+              </div>
+            ))}
+          </dl>
+          {method.length > 0 ? (
+            <div className="flex flex-col gap-0.5 pb-2">
+              <h3 className="font-medium">Each lesson</h3>
+              <ol className="text-muted flex list-decimal flex-col gap-0.5 pl-2 text-sm">
+                {method.map((step) => (
+                  <li key={step}>{step}</li>
+                ))}
+              </ol>
+            </div>
+          ) : null}
+        </Fold>
+      ) : null}
       {coverage ? (
-        <Fold label="What it covers" heading className="rule-t rule-b py-1">
+        <Fold label="What it covers" heading className="rule-t py-1">
           <dl className="grid grid-cols-1 gap-2 pt-1 pb-2 text-sm sm:grid-cols-3">
             {(
               [

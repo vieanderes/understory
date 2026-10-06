@@ -1,4 +1,6 @@
+import { BookOpen } from 'lucide-react';
 import Link from 'next/link';
+import { buttonClass } from '@/components/ui/Button';
 import type { CompiledCapstoneSolution } from '@/core/content/compiled';
 import type { LessonLecture } from '@/core/lecture';
 import type { LectureChapter } from '@/lib/content';
@@ -177,7 +179,18 @@ export function ChapterRow({
           </p>
         </div>
       </div>
-      {actions ? <div className="relative z-10 flex shrink-0 gap-1">{actions}</div> : null}
+      {/* Read says the chapter opens here, in the app; the PDF beside it is the copy to keep. */}
+      <div className="relative z-10 flex shrink-0 gap-1">
+        <Link
+          href={`/lectures/${chapter.slug}`}
+          aria-label={`Read ${chapter.title}`}
+          className={buttonClass('quiet', 'md')}
+        >
+          <BookOpen aria-hidden size={16} strokeWidth={2} />
+          Read
+        </Link>
+        {actions}
+      </div>
     </div>
   );
 }

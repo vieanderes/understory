@@ -1,3 +1,4 @@
+import { BookOpen } from 'lucide-react';
 import { AudioPlayer } from '@/features/lecture/AudioPlayer';
 import type { Metadata } from 'next';
 import Link from 'next/link';
@@ -88,7 +89,15 @@ export default async function LecturesPage() {
                 </Link>
                 <p className="text-muted text-sm">{track.summary}</p>
               </div>
-              <div className="relative z-10 shrink-0">
+              <div className="relative z-10 flex shrink-0 gap-1">
+                <Link
+                  href={`/lectures/tracks/${track.id}`}
+                  aria-label={`Read ${track.title}`}
+                  className={buttonClass('quiet', 'md')}
+                >
+                  <BookOpen aria-hidden size={16} strokeWidth={2} />
+                  Read
+                </Link>
                 <PdfButton
                   scope={{ kind: 'track', id: track.id }}
                   title={track.title}

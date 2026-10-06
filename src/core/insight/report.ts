@@ -429,7 +429,11 @@ export function chaptersNotStarted(
   scope: ProgressScope,
 ): ChapterToStart[] {
   const isDone = isLessonDone(state, catalog.parts);
-  return catalog.modules.flatMap((chapter) => {
+  const order = [...new Set(scope.lessonIds.map((id) => catalog.lessons[id]?.moduleId))];
+  const chapters = catalog.modules
+    .filter((m) => order.includes(m.id))
+    .sort((a, b) => order.indexOf(a.id) - order.indexOf(b.id));
+  return chapters.flatMap((chapter) => {
     const lessons = scope.lessonIds.flatMap((id) => {
       const lesson = catalog.lessons[id];
       return lesson?.moduleId === chapter.id ? [{ id, lesson }] : [];
@@ -551,19 +555,19 @@ export function workOn(input: WorkOnInput): WorkItem[] {
 
   const weak = views
     .filter((v) => (v.state === 'practised' || v.state === 'introduced') && !v.dueNow)
-    .sort((a, b) => a.mastery - b.mastery)
-    .slice(0, 2);
+    .sort((a, b) => a.mastery - b.mastery);
+  const revisits = new Set<string>();
   for (const v of weak) {
+    if (revisits.size === 2) break;
     const teaching =
       scope.lessonIds.find((id) => catalog.lessons[id]?.concepts.includes(v.id)) ??
       Object.keys(catalog.lessons).find((id) => catalog.lessons[id]?.concepts.includes(v.id));
     const lesson = teaching ? catalog.lessons[teaching] : undefined;
-    items.push({
-      kind: 'weak',
-      title: v.title,
-      href: lesson ? lessonHref(lesson) : practiceHref(topicOf(scope, v.moduleId)),
-      mastery: v.mastery,
-    });
+    const href = lesson ? lessonHref(lesson) : practiceHref(topicOf(scope, v.moduleId));
+    // Two weak concepts of one lesson are one thing to do.
+    if (revisits.has(href)) continue;
+    revisits.add(href);
+    items.push({ kind: 'weak', title: v.title, href, mastery: v.mastery });
   }
 
   if (scope.timedTests) {

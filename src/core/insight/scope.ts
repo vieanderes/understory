@@ -49,13 +49,21 @@ export interface ScopeInput {
 /** Interests whose learners sit timed coding tests. */
 const TESTED_INTERESTS: ReadonlySet<Interest> = new Set(['algorithms', 'interviews']);
 
+/** The parts' lessons in journey order, woven ones where they are met, then any others. */
+function courseOrder(catalog: CatalogFile): string[] {
+  const ids = new Set(catalog.parts.flatMap((part) => part.lessons));
+  for (const id of Object.keys(catalog.lessons)) ids.add(id);
+  return [...ids].filter((id) => id in catalog.lessons);
+}
+
 function scopeOf(
   catalog: CatalogFile,
   fields: Omit<ProgressScope, 'lessonIds' | 'conceptIds' | 'partIds'>,
   keep: (lessonId: string) => boolean,
   concepts?: readonly string[],
+  order: readonly string[] = courseOrder(catalog),
 ): ProgressScope {
-  const lessonIds = Object.keys(catalog.lessons).filter(keep);
+  const lessonIds = order.filter((id) => id in catalog.lessons && keep(id));
   const taught = new Set(
     concepts ?? lessonIds.flatMap((id) => catalog.lessons[id]?.concepts ?? []),
   );
@@ -100,6 +108,8 @@ export function progressScopes(input: ScopeInput): ProgressScope[] {
           timedTests: path.timedTests,
         },
         (id) => lessons.has(id),
+        undefined,
+        path.lessonIds,
       ),
     );
   }

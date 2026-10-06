@@ -21,14 +21,15 @@ describe('progressScopes', () => {
     expect(scopes.map((s) => s.id)).toEqual(['all', 'part-code', 'part-data']);
     const all = scopes[0]!;
     expect(all.label).toBe('Everything');
-    expect(all.lessonIds).toEqual(Object.keys(course.lessons));
+    // Course order is the parts' order, a woven lesson where it is met.
+    expect(all.lessonIds).toEqual(['js.scope', 'cs.big-o', 'js.closures', 'db.joins', 'db.index']);
     expect(all.conceptIds).toHaveLength(course.concepts.length);
     expect(all.partIds).toEqual(['code', 'data']);
     expect(all.timedTests).toBe(true);
     expect(all.topic).toBeUndefined();
   });
 
-  it('puts the current path first and counts only its published lessons, in course order', () => {
+  it('puts the current path first and counts only its published lessons, in its own order', () => {
     const scopes = progressScopes({
       catalog: course,
       path: interviews,

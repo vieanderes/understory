@@ -371,12 +371,30 @@ describe('workOn', () => {
       href: '/practise/session/10?topics=typescript',
     });
     expect(items[1]).toMatchObject({ count: 1, href: '/practise/session/10?topics=typescript' });
-    expect(items[2]).toMatchObject({ title: 'Lesson closures', first: false });
+    expect(items[2]).toMatchObject({ title: 'Lesson big-o', first: false });
     expect(items[3]).toMatchObject({ title: 'Big O', mastery: 0.2, href: '/learn/cs/big-o' });
   });
 
   it('narrows practice to the topic of the scope, else to none', () => {
     const views = withViews(view('db.joins', 'gap'));
+    const twice = {
+      ...course,
+      lessons: {
+        ...course.lessons,
+        'db.joins': { ...course.lessons['db.joins']!, concepts: ['db.joins', 'db.index'] },
+      },
+    };
+    const sameLesson = workOn({
+      catalog: twice,
+      state: reduce([
+        event('2026-10-01T10:00:00Z', 'lesson_completed', { lessonId: 'db.joins' }),
+        event('2026-10-01T10:00:00Z', 'lesson_completed', { lessonId: 'db.index' }),
+      ]),
+      scope: scope('part-data'),
+      views: withViews(view('db.joins', 'practised'), view('db.index', 'practised')),
+      tests: [],
+    });
+    expect(sameLesson.filter((i) => i.kind === 'weak')).toHaveLength(1);
     const topic = scopes.find((s) => s.id === 'topic-backend')!;
     expect(workOn({ catalog: course, state: empty, scope: topic, views, tests: [] })[0]!.href).toBe(
       '/practise/session/10?topics=backend',
@@ -457,8 +475,8 @@ describe('workOn', () => {
     ]);
     const items = workOn({ catalog: course, state, scope: all, views: unseen, tests: [] });
     expect(items.map((i) => [i.kind, i.title])).toEqual([
-      ['lesson', 'Lesson closures'],
-      ['chapter', 'Computer science'],
+      ['lesson', 'Lesson big-o'],
+      ['chapter', 'Databases'],
     ]);
   });
 });

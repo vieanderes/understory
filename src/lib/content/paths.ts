@@ -1,13 +1,17 @@
 import { fastTrackSchema, TRACKS_DIR } from '@/core/content/notes';
+import { resolveStageTest, type PathTest } from '@/core/online-test/path-tests';
 import { readYaml } from './fs';
 import { getManifest } from './loaders';
 import { getTrackIds } from './lectures';
+import { getOnlineTestIndex } from './online-tests';
 
 /**
  * A path: one goal, a few stages, at most about 25 lessons, and a clear finish. Paths are
  * the front door of the app; the full course is the library behind them. A path is written
  * as a track in `content/tracks/<id>.yaml`, so its lecture, PDF and audio come for free.
  */
+export type { PathTest };
+
 export interface PathLesson {
   id: string;
   title: string;
@@ -25,6 +29,10 @@ export interface PathStage {
   lessons: PathLesson[];
   /** Worth doing if there is time; never counted towards finishing the path. */
   optional: PathLesson[];
+  /** Timed tests that check the stage, easiest first. Optional, recommended. */
+  tests?: PathTest[];
+  /** The stage as a lecture: a stage of the path's lecture, or a chapter's. */
+  lectureHref?: string;
 }
 
 export interface PathSummary {
@@ -51,9 +59,10 @@ export interface PathSummary {
 }
 
 async function readPath(id: string): Promise<PathSummary> {
-  const [plan, manifest] = await Promise.all([
+  const [plan, manifest, index] = await Promise.all([
     readYaml(`${TRACKS_DIR.replace(/^content\//, '')}/${id}.yaml`, fastTrackSchema),
     getManifest(),
+    getOnlineTestIndex(),
   ]);
   const lessons = new Map(
     manifest.modules.flatMap((module) =>
@@ -72,12 +81,15 @@ async function readPath(id: string): Promise<PathSummary> {
   const lesson = (lessonId: string): PathLesson =>
     lessons.get(lessonId) ?? { id: lessonId, title: lessonId, objective: '', minutes: 0, href: null };
 
-  const stages = plan.days.map((day) => ({
+  const stages = plan.days.map((day, i) => ({
     title: day.title,
     why: day.why,
     ...(day.artifact ? { artifact: day.artifact } : {}),
     lessons: day.must.map(lesson),
     optional: day.should.map(lesson),
+    tests: day.tests.map((ref) => resolveStageTest(ref, index, lesson)),
+    // The anchor FastTrackView gives each stage of the track lecture.
+    lectureHref: `/lectures/tracks/${id}#day-${i + 1}`,
   }));
   const required = stages.flatMap((stage) => stage.lessons);
   return {

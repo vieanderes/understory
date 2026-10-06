@@ -4,7 +4,12 @@ import type { Issue, RawCatalog, RawLesson } from '../../src/core/content/catalo
 import { allLessons } from '../../src/core/content/catalog';
 import type { CodeChallengeStep } from '../../src/core/content/schema';
 import { challengeVariants, languageLabel } from '../../src/core/content/twin';
-import { validateFastTrack, validateLectures } from '../../src/core/content/notes-check';
+import {
+  validateFastTrack,
+  validateLectures,
+  validateTestsOnPaths,
+  type OnlineTestIds,
+} from '../../src/core/content/notes-check';
 import { validateCatalog, validateOutline } from '../../src/core/content/validate';
 import { contentRoot, loadRawCatalog, loadTracks } from '../../src/lib/content/fs';
 import { loadOutline, readInterestLessonIds } from '../../src/lib/content/outline';
@@ -108,6 +113,28 @@ function sqlSteps(catalog: RawCatalog) {
   );
 }
 
+/** The preset and task ids in content/online-tests, by folder name; none in a fixture tree. */
+function readOnlineTestIds(root: string): OnlineTestIds | undefined {
+  const dir = path.join(root, 'content/online-tests');
+  if (!fs.existsSync(dir)) return undefined;
+  const list = (sub: string) =>
+    fs.existsSync(path.join(dir, sub))
+      ? fs.readdirSync(path.join(dir, sub), { withFileTypes: true })
+      : [];
+  return {
+    presets: new Set(
+      list('tests')
+        .filter((entry) => entry.isFile() && entry.name.endsWith('.yaml'))
+        .map((entry) => entry.name.replace(/\.yaml$/, '')),
+    ),
+    tasks: new Set(
+      list('tasks')
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => entry.name),
+    ),
+  };
+}
+
 /**
  * The playground gate runs by default: it needs no runner, only jsdom, and it is what
  * tells an author that a checklist cannot be passed.
@@ -124,13 +151,19 @@ export async function checkContent(
   const unreadable = readIssues.some((issue) => issue.severity === 'error');
   const outline = loadOutline(root);
   const tracks = loadTracks(root);
+  const onlineTests = readOnlineTestIds(root ?? contentRoot());
+  const plans = Object.values(tracks.tracks);
   const ruleIssues = [
     ...validateCatalog(catalog),
     ...validateLectures(catalog),
     ...tracks.issues,
-    ...Object.values(tracks.tracks).flatMap((track) =>
-      validateFastTrack(catalog, track.path, track.data),
-    ),
+    ...plans.flatMap((track) => validateFastTrack(catalog, track.path, track.data, onlineTests)),
+    ...(onlineTests && plans.length > 0
+      ? validateTestsOnPaths(
+          plans.map((track) => track.data),
+          onlineTests,
+        )
+      : []),
     ...validateOutline({
       catalog,
       ...(outline.outline ? { outline: outline.outline } : {}),

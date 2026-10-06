@@ -169,13 +169,27 @@ export function validateLectures(catalog: RawCatalog): Issue[] {
 }
 
 /** The fast track names real lessons with notes, each once, and real parts for capstones. */
-export function validateFastTrack(catalog: RawCatalog, path: string, plan: FastTrack): Issue[] {
+/** The ids a stage test may name: presets and training tasks in content/online-tests. */
+export interface OnlineTestIds {
+  presets: ReadonlySet<string>;
+  tasks: ReadonlySet<string>;
+}
+
+const NO_ONLINE_TESTS: OnlineTestIds = { presets: new Set(), tasks: new Set() };
+
+export function validateFastTrack(
+  catalog: RawCatalog,
+  path: string,
+  plan: FastTrack,
+  onlineTests: OnlineTestIds = NO_ONLINE_TESTS,
+): Issue[] {
   const withNotes = new Map(
     allLessons(catalog).map(({ lesson }) => [lesson.data.id, lesson.notes !== undefined]),
   );
   const partIds = new Set((catalog.course?.data.parts ?? []).map((part) => part.id));
   const guideIds = new Set(Object.keys(catalog.course?.guides ?? {}));
   const seen = new Set<string>();
+  const seenTests = new Set<string>();
   const issue = (rule: string, where: string, message: string): Issue => ({
     severity: 'error',
     rule,
@@ -205,5 +219,50 @@ export function validateFastTrack(catalog: RawCatalog, path: string, plan: FastT
     ...(day.capstone === undefined || partIds.has(day.capstone)
       ? []
       : [issue('fast-track-unknown-part', day.title, `No part has the id "${day.capstone}".`)]),
+    ...day.tests.flatMap((ref) => {
+      const found: Issue[] = [];
+      const [kind, id] =
+        'test' in ref ? ['test', ref.test] : 'task' in ref ? ['task', ref.task] : ['lesson', ref.lesson];
+      if (kind === 'test' && !onlineTests.presets.has(id)) {
+        found.push(issue('fast-track-unknown-test', day.title, `No preset test has the id "${id}".`));
+      } else if (kind === 'task' && !onlineTests.tasks.has(id)) {
+        found.push(issue('fast-track-unknown-task', day.title, `No training task has the id "${id}".`));
+      } else if (kind === 'lesson' && !withNotes.has(id)) {
+        found.push(issue('fast-track-unknown-lesson', day.title, `No lesson has the id "${id}".`));
+      }
+      const key = `${kind}:${id}`;
+      if (seenTests.has(key)) {
+        found.push(issue('fast-track-duplicate-test', day.title, `"${id}" is listed twice. Keep one.`));
+      }
+      seenTests.add(key);
+      return found;
+    }),
   ])];
+}
+
+/**
+ * Every timed test belongs to at least one path stage, so the paths stay the front door to
+ * all of them. A warning, so a new task can land before it finds its stage.
+ */
+export function validateTestsOnPaths(
+  plans: readonly FastTrack[],
+  onlineTests: OnlineTestIds,
+): Issue[] {
+  const refs = plans.flatMap((plan) => plan.days.flatMap((day) => day.tests));
+  const placed = new Set(refs.map((ref) => ('test' in ref ? `test:${ref.test}` : 'task' in ref ? `task:${ref.task}` : '')));
+  const warn = (message: string): Issue => ({
+    severity: 'warning',
+    rule: 'online-test-off-path',
+    path: 'content/tracks',
+    where: 'tests',
+    message,
+  });
+  return [
+    ...[...onlineTests.presets]
+      .filter((id) => !placed.has(`test:${id}`))
+      .map((id) => warn(`No path stage lists the test "${id}".`)),
+    ...[...onlineTests.tasks]
+      .filter((id) => !placed.has(`task:${id}`))
+      .map((id) => warn(`No path stage lists the training task "${id}".`)),
+  ];
 }

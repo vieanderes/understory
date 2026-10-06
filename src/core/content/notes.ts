@@ -90,6 +90,29 @@ export const NOTES_FILE = 'notes.yaml';
 export const CAPSTONES_DIR = 'content/capstones';
 
 /**
+ * A timed test a path stage recommends: a preset in the coding simulator, one training task
+ * in it, or an assessment lesson. Exactly one key, so a typo in the key fails the schema and
+ * a typo in the id fails the validator.
+ */
+export const stageTestSchema = z.union([
+  z.strictObject({
+    test: z.string().min(1).describe('A preset id from content/online-tests/tests.'),
+    guided: z
+      .literal(true)
+      .optional()
+      .describe('Suggest sitting it in guided mode, with the coach.'),
+  }),
+  z.strictObject({
+    task: z.string().min(1).describe('A task id from content/online-tests/tasks, sat as training.'),
+  }),
+  z.strictObject({
+    lesson: z.string().min(1).describe('The id of an assessment lesson, such as a levelled mock.'),
+  }),
+]);
+
+export type StageTestRef = z.infer<typeof stageTestSchema>;
+
+/**
  * `content/tracks/<id>.yaml`: a fast track, a condensed reading plan across the course for one
  * goal, such as an interview loop or a language refresher. Each lesson in it shows as its key
  * idea, its remember list, its interview answers and its top mistakes (plus its depth sections
@@ -160,6 +183,13 @@ export const fastTrackSchema = z.strictObject({
           .boolean()
           .optional()
           .describe('Also print each lesson\'s depth sections, with their code.'),
+        tests: z
+          .array(stageTestSchema)
+          .max(20)
+          .default([])
+          .describe(
+            'Timed tests that check this stage, easiest first. Optional: never counted towards finishing.',
+          ),
       }),
     )
     .min(1),

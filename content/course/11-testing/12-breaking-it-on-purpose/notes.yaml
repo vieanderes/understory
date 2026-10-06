@@ -1,0 +1,187 @@
+summary: >-
+  A load test asks whether your service meets its targets on a normal busy day. That's one
+  question of several. A stress test pushes well past normal to see how the service
+  degrades. A spike test jumps from quiet to busy in seconds, faster than new capacity can
+  arrive. A soak test holds ordinary load for hours, so problems that build with time get
+  the time they need. The script barely changes between them; the shape of the load is
+  the test.
+
+
+  Traffic isn't the only thing that breaks a service. Every vendor, database and model API
+  you call will one day be slow, return errors, hang or drop the connection. **Fault
+  injection** makes those failures happen on purpose, in a unit test or through a proxy on
+  the network, so you can watch your timeouts, retries and fallbacks do their job instead
+  of trusting that they would.
+
+
+  A **chaos experiment** takes fault injection to the running system. You write down the
+  steady state, predict it holds while one thing breaks, limit who could be hurt, and set a
+  condition that stops the run. Reach for these once the basic load test passes and the
+  service has users who would notice an outage. Don't start with production chaos on a
+  system that has never had its timeouts tested in a unit test.
+remember:
+  - A stress test finds how the service degrades past normal, a spike test whether it survives a sudden jump, and a soak test what builds up over hours.
+  - Fault injection must cover all four dependency failures, slow, error, no reply and a dropped connection, because each takes a different path through your code.
+  - A quick `500` is the polite failure; the hang is what takes services down, and only a fault longer than your timeout tests it.
+  - A chaos experiment writes down the steady state, the hypothesis, one fault, the blast radius and an abort condition before it starts.
+  - Start chaos in staging, then on a small slice of production, and widen the slice only while the hypothesis holds.
+  - Load test an LLM-backed endpoint against a stub of the provider, and use a small real run to learn the provider's limits and check your 429 handling.
+  - Keep fault schedules deterministic, a fixed list or a seeded generator, so a failing run can be replayed exactly.
+sections:
+  - title: Shaping stress, spike and soak runs in k6
+    body: |-
+      For public traffic, use an open model: an arrival-rate executor starts requests on
+      schedule whatever the server does. A ramp of VUs slows its own sending as the server
+      slows, which softens a spike into a gentle slope. This script is a spike, with an
+      abort written into it:
+
+      ```js
+      import http from "k6/http";
+
+      export const options = {
+        scenarios: {
+          spike: {
+            executor: "ramping-arrival-rate",
+            startRate: 5,
+            timeUnit: "1s",
+            preAllocatedVUs: 50,
+            maxVUs: 500,
+            stages: [
+              { duration: "10s", target: 300 },
+              { duration: "1m", target: 300 },
+              { duration: "10s", target: 0 },
+            ],
+          },
+        },
+        thresholds: {
+          http_req_failed: [{ threshold: "rate<0.05", abortOnFail: true, delayAbortEval: "30s" }],
+        },
+      };
+
+      export default function () {
+        http.get("http://localhost:8090/showings/today");
+      }
+      ```
+
+      `k6 inspect` on this file prints the parsed options, a quick way to check a scenario
+      before you spend an hour running it.
+
+      Each shape has its own thing to watch. In a stress run, watch whether errors come back
+      fast: a service that sheds load with quick `503`s degrades well, one where every
+      request times out does not. In a spike, watch the first two minutes: autoscaling lag,
+      connection pools growing, caches filling. In a soak, the latency numbers may look fine
+      for hours. Watch the server instead: memory that only goes up, open connections that
+      never fall back, queue depth, disk use. A soak that ends with flat memory is the
+      result you wanted.
+  - title: Fault injection at three layers
+    body: |-
+      **In process.** Wrap the client, as the lesson's challenge does. It's fast,
+      deterministic and runs in every CI build. Pair it with fake timers so a 30-second hang
+      costs nothing. Its blind spot: it only fails where you put the wrapper, and it never
+      tests the real socket and timeout code.
+
+      **On the network.** A proxy such as Toxiproxy sits between your app and the dependency.
+      You point the app at the proxy and add toxics through its HTTP API, on port 8474 by
+      default:
+
+      ```bash
+      curl -X POST localhost:8474/proxies \
+        -d '{"name":"nutrition","listen":"0.0.0.0:21212","upstream":"nutrition.internal:443"}'
+      curl -X POST localhost:8474/proxies/nutrition/toxics \
+        -d '{"type":"latency","toxicity":0.5,"attributes":{"latency":3000,"jitter":500}}'
+      ```
+
+      That delays half the connections by about three seconds. `timeout` stops all data and
+      closes the connection after a delay, or never closes it if the delay is 0, which is
+      the hang. `reset_peer` resets the TCP connection. `bandwidth` limits throughput. To
+      take the service down entirely, disable the proxy. Your real HTTP client, connection
+      pool and timeouts now meet the fault.
+
+      **In the platform.** Chaos tools at the infrastructure level stop instances, cut
+      network routes between zones or fill disks. They test what neither layer above can:
+      failover, health checks and the runbook. They also carry the biggest blast radius, so
+      they come last.
+  - title: Load testing an endpoint that calls a model
+    body: |-
+      A recipe assistant that calls a model API has two capacities: yours, and the
+      provider's. Providers cap requests per minute and tokens per minute, and answer `429`
+      past the cap, usually with a `retry-after` header saying how many seconds to wait.
+      Some count input and output tokens separately, and some refill the allowance
+      continuously rather than once a minute, so a burst can be refused even when the
+      minute's total looks small.
+
+      Load testing against the real API mostly measures that cap, and every request costs
+      money. So split the work. For your own capacity, point the service at a stub that
+      answers in the model's usual time with a canned reply, and returns `429` with
+      `retry-after` past a limit you choose. Now you can test queueing, timeouts and
+      backoff at a hundred requests a second for nothing.
+
+      Then run a small, budgeted test against the real provider. It answers different
+      questions: what your real limits are, how many tokens a typical request uses, whether
+      your client honours `retry-after` or hammers the API, and what a user sees when the
+      allowance runs out. A good answer is a queue with a clear wait, or a fallback, not a
+      raw provider error.
+
+      Streaming replies change the numbers you gate on. The time to the first token is what
+      a user feels, and the total time grows with the length of the answer.
+pitfalls:
+  - '**Injecting only the polite failure.** A quick `500` exercises the error branch, not the timeout. Add a fault that never answers and assert the fallback arrives within your deadline.'
+  - '**A fault shorter than the timeout.** A 1.5-second delay against a 2-second timeout tests nothing. Make the slow fault longer than every timeout on the path.'
+  - '**Random faults with no seed.** A failure you can''t replay can''t be debugged. Use a fixed schedule or a seeded generator and log the seed.'
+  - '**Calling a soak test done because latency stayed flat.** Leaks show in memory, connections and queue depth first. Record server metrics across the whole run.'
+  - '**Chaos without an abort.** A person watching a dashboard is too slow. Write the abort into the tool, as a threshold or a guard, before the run starts.'
+  - '**Load testing a paid model API at full scale.** It measures the provider''s limit and runs up a bill. Stub the provider for capacity, and keep real runs small.'
+verify:
+  - lens: tests
+    check: Each fallback has a test where the dependency never answers, and it asserts the fallback arrives within the timeout.
+  - lens: breaks
+    check: The slowest injected fault is longer than every timeout on the path, including retries stacked behind it.
+  - lens: scales
+    check: A spike from quiet to peak in seconds stays within the error budget while new capacity starts.
+  - lens: leaks
+    check: Recorded faults, logs and captures from a production chaos run hold no customer data beyond what normal logs keep.
+  - lens: confuses
+    check: Every chaos run names its steady state, fault, blast radius and abort in one file the on-call engineer can read.
+interview:
+  - question: What's the difference between a load test, a stress test, a spike test and a soak test?
+    answer: >-
+      They're the same script with different load shapes, each answering a different
+      question. A load test holds expected traffic and asks whether we meet our targets; it's
+      the release gate. A stress test goes well past normal and asks how we degrade: fast
+      `503`s are good, timeouts everywhere are not. A spike test jumps to peak in seconds and
+      asks whether autoscaling, caches and pools cope before they've grown. A soak test holds
+      normal load for hours and asks what accumulates: memory, connections, queue depth,
+      disk. I'd use an arrival-rate executor for the spike, because VU ramps soften it. The
+      trade-off is cost: soaks and stress runs need a production-like environment, so they
+      run before releases, not on every merge.
+  - question: How would you test that your service survives a dependency going down?
+    answer: >-
+      Inject each way it fails, at the cheapest layer that can show it. Unit tests wrap the
+      client and inject a `500`, a slow reply, a reply that never comes and a dropped
+      connection, with fake timers, and assert the fallback or the error the user sees. Then
+      an integration test puts a proxy such as Toxiproxy between the service and the
+      dependency, so the real HTTP client, pool and timeouts meet a latency or timeout
+      toxic. Finally a chaos experiment in staging, then a small slice of production, with a
+      steady state and an abort. The hang is the case people skip, and it's the one that
+      exhausts threads and connections and spreads the outage upstream.
+  - question: How do you run a chaos experiment safely in production?
+    answer: >-
+      Make it a measurement with guard rails. First, write the steady state as numbers the
+      service already reports, such as search p95 under 400 ms and errors under 1%. Then the
+      hypothesis: it holds while the vendor adds three seconds. Inject one fault, to a small
+      slice, say 1% of traffic or one instance, during working hours with the owning team
+      present. Automate the abort, for example errors above 5% for a minute, so the tool
+      stops the fault, not a person. Widen the slice only while the hypothesis holds. If it
+      fails, you've found a weakness at the cost of a few slow requests, and you fix it
+      before running again. Never start in production with a fault that staging hasn't
+      survived.
+  - question: How would you load test a feature that calls an LLM provider?
+    answer: >-
+      Separate my capacity from the provider's. For my service, I'd stub the provider with
+      realistic latency, a canned reply and `429`s with `retry-after` past a set rate, then
+      load test queueing, timeouts and backoff at full scale for free. Separately, a small
+      budgeted run against the real API tells me the real requests and tokens per minute,
+      the token count of a typical request, and whether my client honours `retry-after`.
+      I'd gate on time to first token for streamed replies, and on what users see at the
+      limit: a queue or a fallback, never a raw provider error. Prompt caching can raise
+      capacity where cached tokens don't count against the limit.

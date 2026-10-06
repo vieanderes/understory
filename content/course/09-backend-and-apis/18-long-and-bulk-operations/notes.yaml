@@ -1,0 +1,181 @@
+summary: >-
+  Three request shapes break the simple "one request, one quick answer" model. Some work is
+  too slow for one request: zipping an album, rendering a report, re-indexing a catalogue.
+  Some requests carry hundreds of items, and some change only part of a document. Each has
+  a standard answer, and each goes wrong in a predictable way when it's improvised.
+
+
+  Slow work is accepted with `202` and a **status URL** the client polls until the job ends,
+  in success or failure. A **bulk endpoint** reports on each item, so one bad row neither
+  sinks the good ones nor hides behind an overall success. A partial update picks a format
+  on purpose: **JSON Merge Patch** for "change these fields", **JSON Patch** when you need
+  array edits, explicit nulls or a conditional, all-or-nothing change.
+
+
+  These notes add the life of a job resource, the three bulk designs and when each fits, and
+  JSON Patch in practice. Reach for `202` when work can outlast a proxy's timeout. Reach for
+  per-item results when items are independent. Keep plain `PUT` when the client always has
+  the whole document anyway.
+remember:
+  - A `202 Accepted` means the work is queued, not done, and it should point to where the client can check on it.
+  - A polling client stops on success and on failure, waits as long as `Retry-After` says, and gives up after a stated time.
+  - A bulk endpoint returns one result per item, keyed by index or client id, plus counts, so a partial failure can't hide.
+  - '`207 Multi-Status` is still a 2xx, so a client that only checks `response.ok` will miss failed items.'
+  - A multi-row insert is one statement, so a single constraint violation fails the whole batch unless you handle clashes per row.
+  - In JSON Merge Patch, `null` deletes a field and an array is replaced whole.
+  - JSON Patch is a list of operations applied atomically, and a `test` operation makes the change conditional.
+  - Put an idempotency key on the `POST` that starts a job, so a retried submit doesn't start the work twice.
+sections:
+  - title: A job resource from start to finish
+    body: |-
+      The status URL names a **job resource**. It has a small state machine: `queued`,
+      `running`, then `succeeded` or `failed`. It only ever moves forward. Each state
+      decides what the status URL answers:
+
+      ```ts
+      type Job =
+        | { id: number; status: 'queued' | 'running'; progress?: number }
+        | { id: number; status: 'succeeded'; resultUrl: string }
+        | { id: number; status: 'failed'; error: string };
+
+      function statusResponse(job: Job) {
+        if (job.status === 'succeeded') {
+          return { status: 303, headers: { Location: job.resultUrl }, body: job };
+        }
+        if (job.status === 'failed') return { status: 200, headers: {}, body: job };
+        return { status: 200, headers: { 'Retry-After': '5' }, body: job };
+      }
+
+      console.log(statusResponse({ id: 81, status: 'running', progress: 40 }).headers);
+      // { 'Retry-After': '5' }
+      console.log(statusResponse({ id: 81, status: 'succeeded', resultUrl: '/files/81.zip' }).status);
+      // 303
+      ```
+
+      A failed job still answers `200`. The request for its status worked; the job is what
+      failed, and the body says so. Some APIs answer the finished job with `200` and a
+      `resultUrl` instead of `303`. Both work, as long as the docs say which.
+
+      Three details make it production-ready. Keep finished jobs for a stated time, say a
+      day, and answer `404` after that. Let a client cancel with `DELETE /exports/81`, which
+      moves a queued job to a `cancelled` state. And make the starting `POST` idempotent with
+      a key, because a user who double-clicks "Export" shouldn't zip the album twice.
+
+      Polling is simple and survives every network. If clients want to know sooner, send a
+      webhook when the job ends. Keep the status URL anyway: webhooks get lost, and the
+      status URL is the truth.
+  - title: Three bulk designs, and when each fits
+    body: |-
+      **All or nothing.** Wrap every item in one transaction. One bad item rejects the lot,
+      usually with `400` or `422` and a list of what was wrong. It fits when items depend on
+      each other: an order and its lines, a timetable where every lesson needs a free room.
+      The client retries the corrected batch and never wonders what got in.
+
+      **Per item.** Process each item on its own and report each result:
+
+      ```json
+      {
+        "summary": { "created": 498, "failed": 2 },
+        "results": [
+          { "index": 0, "id": "sku-1001", "status": 201 },
+          { "index": 37, "status": 422, "detail": "Missing SKU" },
+          { "index": 212, "id": "sku-2040", "status": 409, "detail": "SKU already in stock" }
+        ]
+      }
+      ```
+
+      It fits independent items, like stock rows or contacts. Key each result by the item's
+      position or, better, by a client-supplied id, so the client can match them without
+      relying on order. Make each item idempotent too, so the client can resend only the
+      failed ones safely.
+
+      **Async bulk.** For thousands of items, combine both lessons: accept the file with
+      `202`, process it as a job, and let the finished job link to a results file. The
+      request no longer has to fit within a timeout, and the results can be downloaded later.
+
+      Whatever the design, cap the batch size and answer `413 Content Too Large` above it.
+      An uncapped bulk endpoint is a single request that can hold a database for minutes.
+  - title: JSON Patch in practice
+    body: |-
+      A JSON Patch document is an array of operations. Each has an `op` and a `path`, a
+      **JSON Pointer** into the document:
+
+      ```http
+      PATCH /plants/12
+      Content-Type: application/json-patch+json
+      If-Match: "v7"
+
+      [
+        { "op": "test", "path": "/price", "value": 8 },
+        { "op": "replace", "path": "/price", "value": 9 },
+        { "op": "add", "path": "/tags/-", "value": "pet-safe" },
+        { "op": "remove", "path": "/care/light" }
+      ]
+      ```
+
+      The `-` at the end of `/tags/-` means "after the last element", so this appends a tag,
+      which Merge Patch can't do. The other operations are `move` and `copy`. A `/` inside
+      a key is written `~1`, and a `~` is written `~0`.
+
+      Operations run in order, and if one fails, the whole patch fails. Here the `test`
+      guards the change: if someone else already changed the price, the patch is refused
+      instead of overwriting their work. An `If-Match` header with an ETag does the same
+      for the whole document.
+
+      Merge Patch has two blind spots. It can't set a field to `null`, because `null` means
+      delete. And it can't change one element of an array: it must send the whole array,
+      racing anyone else who edited it. When neither matters, Merge Patch is shorter and
+      easier to read, which is why it's the common choice for settings and profile forms.
+
+      Neither format is idempotent by itself. Replaying `add` to `/tags/-` appends a second
+      copy. Guard retries with a `test`, an ETag or an idempotency key.
+pitfalls:
+  - '**Polling only for success.** A loop that waits for `succeeded` spins for ever on a failed job. Handle `failed`, and give up after a deadline.'
+  - '**Doing the work in the handler and returning `202` afterwards.** If the handler blocks until the job ends, it still times out. Queue the work, return `202` at once, and do it in a worker.'
+  - '**Trusting the top-level status of a bulk reply.** `207` and `200` both pass `response.ok`. Read the per-item results and the counts every time.'
+  - '**Replacing a per-row loop with one multi-row insert.** It is faster until one row violates a constraint and the whole statement fails. Handle clashes per row, for example with `ON CONFLICT` or a per-row fallback.'
+  - '**Sending a Merge Patch to add to a list.** The array is replaced whole, so the other items vanish. Send the full new array, or use JSON Patch with `/-`.'
+  - '**Using `null` in a Merge Patch to mean "empty".** It deletes the field. If the field must exist with a null value, use JSON Patch `replace`.'
+verify:
+  - lens: breaks
+    check: Fake a job that ends in `failed` and confirm the client stops polling and shows the error.
+  - lens: scales
+    check: Cap the bulk batch size and answer `413` above it, so one request can't hold the database for minutes.
+  - lens: confuses
+    check: Document whether a finished job answers `303` or `200` with a link, and whether bulk replies use `200` or `207`.
+  - lens: tests
+    check: Send a bulk file where one valid row clashes in the database, and assert the other rows are saved and that row reports `409`.
+  - lens: breaks
+    check: Send a Merge Patch with an array and a `null`, and confirm the stored document matches RFC 7396, not a deep merge.
+interview:
+  - question: Design an endpoint that generates a large report.
+    answer: >-
+      Accept the request with `202` and a status URL, and do the work in a worker. The `POST`
+      takes an idempotency key, so a double-click starts one job. It answers `202` with the
+      job's URL in `Location` and the body, plus `Retry-After`. The status URL shows
+      `queued`, `running` with progress, then `succeeded` with a link to the file, or `failed`
+      with a reason. Clients poll at the `Retry-After` pace, and can register a webhook if
+      they'd rather be told. Finished jobs are kept for a day and the file sits in object
+      storage behind a short-lived signed link. The trade-off is more moving parts than a
+      synchronous endpoint, which is only worth it once the work can outlast a proxy timeout
+      or a user's patience.
+  - question: A bulk endpoint gets 1,000 items and three are invalid. What do you return?
+    answer: >-
+      It depends on whether the items are independent. If they are, process the 997 and
+      return one result per item, keyed by index or client id, with counts. That reply goes
+      out as `200`, or `207` if the API has chosen that convention. The client can then fix
+      and resend only the three, which is safe if each item is idempotent. If the items
+      depend on each other, such as an order and its lines, run one transaction and reject the
+      whole batch with `422` and the three errors. The mistake to avoid is a top-level `201`
+      that hides failures, or a `500` because one row broke a multi-row insert. Whichever
+      you choose, cap the batch size and document the behaviour.
+  - question: When would you use JSON Patch over JSON Merge Patch?
+    answer: >-
+      When I need to edit inside an array, set an explicit `null`, or make the change
+      conditional. Merge Patch sends a partial document: fields to set, `null` to delete,
+      arrays replaced whole. It's readable and covers most profile and settings forms. JSON
+      Patch sends operations with JSON Pointer paths, so `add` to `/tags/-` appends without
+      resending the list, and a `test` first refuses the change if the value moved. The whole
+      list applies atomically. The cost is that clients must build operation lists and
+      servers must implement pointer handling carefully. So I default to Merge Patch and offer
+      JSON Patch where arrays or concurrent edits matter.

@@ -1,0 +1,172 @@
+summary: >-
+  Most real code calls something it doesn't own: a courier, a payment provider, a weather
+  feed. Tests that call those services for real are slow, flaky, cost money and can send
+  real messages. Tests that fake them by hand drift away from what the service really sends.
+  This lesson is about faking other services honestly.
+
+
+  **HTTP mocking** with a tool such as MSW answers outgoing requests inside the test
+  process, so the code under test keeps its real `fetch` or SDK and needs no seams. **Recorded
+  fixtures** make the fake answers real: record a response from the vendor's sandbox, scrub
+  the personal data and secrets out, and keep checking fresh recordings against a strict
+  schema so drift shows up as a red build. For what you do own, such as your database or
+  your message broker, don't fake at all: **Testcontainers** starts the real thing in a
+  throwaway container.
+
+
+  Reach for HTTP mocking for every third-party API in unit and integration tests. Reach for
+  contract tests instead when the other side is a team that will run them. Keep a handful
+  of tests against the real sandbox, run on a schedule, as the final check that your fakes
+  still tell the truth.
+remember:
+  - Fake what you don't own at the network layer, and run what you do own for real.
+  - MSW intercepts requests in the test process, so the code under test needs no injected client.
+  - Make unhandled requests fail the test, or a missing handler quietly calls the real service.
+  - Override a handler per test with `server.use`, and reset with `server.resetHandlers()` in `afterEach`.
+  - A recorded fixture is scrubbed of names, emails, phone numbers and tokens before it is committed, and a CI scan checks every fixture.
+  - Fresh recordings, checked against a strict schema on a schedule, are what catch a vendor's API drifting.
+  - Testcontainers gives each run a real database or broker on a random port, and every machine running the tests needs Docker.
+sections:
+  - title: Where to put the fake
+    body: |-
+      There are three places to cut a call to another service, and each hides something
+      different.
+
+      **At your own interface.** Lesson 5's stub: `checkout(order, payments, mail)` takes a
+      `payments` object, and the test passes a fake one. Fast and clear, but the real HTTP
+      client, its headers, its error handling and its JSON parsing never run.
+
+      **At the network.** MSW lets the real client run, all the way to the moment the request
+      would leave the process, and answers there. Your retry logic, your timeout handling and
+      your parsing of a `503` all run for real. This is the right default for code that calls
+      a third-party API.
+
+      **At the vendor's sandbox.** Nothing is faked. Use it sparingly, on a schedule, because
+      sandboxes are slow, rate-limited and sometimes down.
+
+      MSW's per-test override is what makes failure paths cheap to test:
+
+      ```ts
+      import { http, HttpResponse, delay } from 'msw';
+
+      test('gives up after the courier times out', async () => {
+        server.use(
+          http.get('https://api.courier.example/parcels/:id', async () => {
+            await delay(10_000);
+            return HttpResponse.json({ status: 'in_transit' });
+          }),
+        );
+        expect(await trackParcel('P-17', { timeoutMs: 100 })).toBe('unknown');
+      });
+      ```
+
+      Handlers added with `server.use` are tried before the ones given to `setupServer`, so
+      the override wins for that test. `server.resetHandlers()` in `afterEach` puts the
+      defaults back, so the next test can't inherit a broken courier.
+  - title: Recording, scrubbing and re-recording
+    body: |-
+      A fixture's life has three steps, and skipping any of them causes a classic incident.
+
+      **Record** from the vendor's sandbox, never from production, with a script you can
+      rerun. Save only the parts a test needs: the status and the body. Request headers are
+      where tokens live, so leave them out.
+
+      **Scrub** before writing the file. Replace names, emails, phone numbers and addresses
+      with stable placeholders, so the same customer in two parcels stays the same customer.
+      Keep the type and shape: an email becomes `user-1@example.com`, not `REDACTED`, or the
+      schema check fails for the wrong reason. Then add a test that reads every fixture file
+      and fails on anything that looks like a token or a real email domain. That test is
+      the safety net when the scrubber misses a field the vendor added.
+
+      **Re-record** on a schedule, nightly or weekly, and parse each fresh recording with
+      the same strict schema your tests rely on:
+
+      ```ts
+      const Parcel = z.object({
+        id: z.string(),
+        status: z.enum(['in_transit', 'out_for_delivery', 'delivered']),
+      });
+      const result = Parcel.safeParse(fresh);
+      if (!result.success) throw new Error(z.prettifyError(result.error));
+      ```
+
+      A failure names the field and the value that changed. That's a day's warning before
+      your users find the blank label. If a token ever does reach git, deleting the file is
+      not enough: it stays in history, so rotate the token.
+  - title: Real dependencies with Testcontainers
+    body: |-
+      Testcontainers is a library that drives Docker from your test code. You ask for an
+      image, it starts a container, waits until the service inside is ready, and tells you
+      where to connect.
+
+      ```ts
+      import { PostgreSqlContainer } from '@testcontainers/postgresql';
+      import pg from 'pg';
+
+      const container = await new PostgreSqlContainer('postgres:17-alpine').start();
+      const db = new pg.Client({ connectionString: container.getConnectionUri() });
+      await db.connect();
+      await db.query('CREATE TABLE loans (id serial PRIMARY KEY, book_id int NOT NULL UNIQUE)');
+      await db.query('INSERT INTO loans (book_id) VALUES (7)');
+      await db.query('INSERT INTO loans (book_id) VALUES (7)').catch((e) => console.log(e.message));
+      // duplicate key value violates unique constraint "loans_book_id_key"
+      await db.end();
+      await container.stop();
+      ```
+
+      With the image already pulled, that whole script took about three and a half seconds.
+      The first pull takes longer, which is why CI caches images.
+
+      Pin the image to the major version you run in production. A test against PostgreSQL
+      17 that passes tells you little about a production database on 15. Start one container
+      per test file or per run, run migrations once, and isolate tests with transactions
+      that roll back. A library also removes containers left behind by a crashed run, so a
+      killed test process doesn't leak databases on the CI machine.
+pitfalls:
+  - '**Letting unhandled requests through.** MSW only warns by default, so a test with a missing handler calls the real service and passes or fails by luck. Set the unhandled option to error in the shared setup.'
+  - '**Committing the raw recording.** Request headers and response bodies carry tokens and customers'' details. Scrub before writing, leave headers out, and scan every fixture in CI.'
+  - '**A loose schema on the fixture check.** `z.string()` for a status accepts every new value the vendor invents. Use enums and required fields where you rely on them, so drift fails loudly.'
+  - '**Treating fixtures as permanent truth.** A recording shows one day of the API. Re-record on a schedule, or the fakes slowly become fiction.'
+  - '**Mocking your own database.** A fake array never raises a unique violation or runs a join. Run the real engine in a container, as you would in production.'
+verify:
+  - lens: leaks
+    check: Scan every committed fixture for bearer tokens, API keys and real email domains, because a recording script can copy secrets from headers.
+  - lens: breaks
+    check: Set unhandled requests to fail in the shared test setup, or a missing handler sends test traffic to the real vendor.
+  - lens: tests
+    check: Run a scheduled job that re-records from the sandbox and parses each response with the strict schema the fixtures use.
+  - lens: confuses
+    check: Keep scrubbed placeholders stable and typed, so a reader sees the same customer in two parcels and an email still looks like one.
+  - lens: scales
+    check: Start one container per test file or run, not per test, and isolate tests with rolled-back transactions.
+interview:
+  - question: How do you test code that depends on a third-party API?
+    answer: >-
+      I fake it at the network layer and keep the fakes honest. In unit and integration
+      tests, MSW answers outgoing requests, so the real client, retries and parsing all run.
+      Unhandled requests fail the test. The default responses come from recordings of the
+      vendor's sandbox, scrubbed of personal data and tokens. Per-test overrides cover the
+      failure paths: a `503`, a timeout, a malformed body. To catch drift, a scheduled job
+      re-records from the sandbox and validates each response against a strict schema. I
+      don't rely on contract tests here, because a third-party vendor won't run my contract
+      in their build. The trade-off is a day's lag: the nightly job finds a change after the
+      vendor ships it, not before.
+  - question: When would you use Testcontainers instead of a mock?
+    answer: >-
+      For anything I own and whose behaviour my code depends on, such as the database, a
+      cache or a broker. A mock of Postgres can't enforce a unique constraint, run my SQL or
+      roll back a transaction, so it hides exactly the bugs I care about. Testcontainers
+      starts the same engine and version as production in a throwaway container, on a random
+      port, in a few seconds once the image is cached. I start one per run, migrate once, and
+      wrap each test in a rolled-back transaction. The cost is that every developer machine
+      and CI runner needs Docker, and the suite is slower than pure unit tests, so those
+      tests sit in the integration layer, not everywhere.
+  - question: A recorded test fixture leaked an API token into the repository. What do you do, and how do you stop it happening again?
+    answer: >-
+      First, rotate the token, because deleting the file doesn't remove it from git history,
+      and anyone with a clone already has it. Then check the vendor's logs for use of the old
+      token. To prevent a repeat, I'd change the recorder to save only status and body,
+      never request headers, and scrub sensitive fields with typed placeholders before
+      writing. Then I'd add a CI test that scans every fixture for token patterns and real
+      email domains, plus a secret scanner on the repository. The scan matters most, because
+      the scrubber only knows the fields it was told about, and vendors add new ones.

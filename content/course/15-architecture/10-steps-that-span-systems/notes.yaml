@@ -1,0 +1,229 @@
+summary: >-
+  A business process often touches systems you don't own: a card provider, a courier, an
+  email service. No database transaction reaches them, so "all or nothing" can't come from
+  `ROLLBACK`. A **saga** replaces it. The process runs as a list of local steps, each
+  committed on its own, and each step that can be undone has a **compensation**. When a
+  later step fails, the saga runs the compensations of the finished steps, newest first.
+
+
+  That only works if the saga itself survives crashes. So its progress is stored, each
+  step is idempotent so a repeat is harmless, and a reconciliation job looks for anything
+  stuck. You can write that bookkeeping yourself as a status column, or hand it to a
+  **durable workflow engine**, which records every activity's result and replays your
+  workflow code after a crash. Replay is why workflow code must be deterministic.
+
+
+  Reach for a saga when one user action must change several systems and a half-done
+  result is worse than an undone one. Don't reach for one when a single database can hold
+  the whole change: there, a transaction is simpler and gives you isolation too.
+remember:
+  - A database transaction can't undo a call to another system, so a cross-system process undoes its steps with compensations.
+  - Compensations run newest first, only for steps that finished, and never for the step that failed.
+  - A step with no undo, such as sending an email, goes after every step that can fail.
+  - Every step and every compensation must be idempotent, because a crash after the work and before the save repeats it.
+  - A compensation that fails is retried, then left for reconciliation or a person, never silently dropped.
+  - A durable workflow engine records each activity's result and replays the workflow code, so a crash at step 4 resumes at step 4.
+  - Workflow code must take the same path on every replay, so clocks, random values and network calls go through activities or the engine's own APIs.
+  - Sagas give up isolation, so other code can see a half-finished process and must treat it as pending.
+sections:
+  - title: Ordering the steps, and the point of no return
+    body: |-
+      Not every step can be undone, and not every step may fail. A useful way to order a
+      saga sorts its steps into three kinds, a split described in Chris Richardson's
+      *Microservices Patterns*.
+
+      - **Compensatable** steps come first. Each has an undo: free the oven slot, release
+        the card hold, cancel the courier.
+      - One **pivot** step comes next. Once it succeeds, the saga will finish. Capturing
+        the payment is a common pivot.
+      - **Retriable** steps come last. They have no undo, so they must succeed eventually,
+        and the saga retries them until they do. The confirmation email is one.
+
+      ```ts
+      const cakeOrder = [
+        { name: 'reserve-oven', kind: 'compensatable', run: ovens.reserve, undo: ovens.free },
+        { name: 'hold-card', kind: 'compensatable', run: cards.hold, undo: cards.release },
+        { name: 'book-courier', kind: 'compensatable', run: couriers.book, undo: couriers.cancel },
+        { name: 'capture-payment', kind: 'pivot', run: cards.capture },
+        { name: 'send-confirmation', kind: 'retriable', run: mail.sendConfirmation },
+      ];
+      ```
+
+      The lesson's review step broke this rule: a step with no undo moved in front of one
+      that can fail. Writing the kind next to each step makes that move visible in review.
+
+      Two more choices hide here. First, a compensation is a business action, not a
+      technical one. Cancelling a courier an hour before pickup may cost a fee, so the
+      "undo" may be a partial one, and product people should agree what it is. Second,
+      reorder for cheap undos. A card **hold** is cheap to release, while a captured
+      payment needs a refund, so hold early and capture at the pivot.
+  - title: A saga's state in your own database
+    body: |-
+      Without an engine, the saga's progress is a row. The status moves forward one step
+      at a time, and a guarded `UPDATE` makes each move happen once, even if two workers
+      race for it.
+
+      ```sql
+      CREATE TABLE cake_orders (
+        id bigint PRIMARY KEY,
+        status text NOT NULL DEFAULT 'new'
+          CHECK (status IN ('new', 'oven_reserved', 'card_held', 'courier_booked',
+                            'confirmed', 'compensating', 'cancelled')),
+        updated_at timestamptz NOT NULL DEFAULT now()
+      );
+
+      -- After reserving the oven slot for order 41:
+      UPDATE cake_orders SET status = 'oven_reserved', updated_at = now()
+      WHERE id = 41 AND status = 'new'
+      RETURNING id;
+      ```
+
+      Run against PostgreSQL, the first `UPDATE` returns order 41 and the second returns
+      no row, because the status has already moved on. A worker that gets no row knows
+      someone else took that step.
+
+      Write the step's own effect in the same transaction where it lives in this
+      database, such as the oven slot row. For an outside call, the order is: make the
+      call with an idempotency key derived from the order id, such as `41:book-courier`,
+      then save the new status. A crash between the two repeats the call, and the key
+      makes the repeat harmless.
+
+      To find stuck orders, ask for anything unfinished that hasn't moved lately:
+
+      ```sql
+      SELECT id, status FROM cake_orders
+      WHERE status NOT IN ('confirmed', 'cancelled')
+        AND updated_at < now() - interval '1 hour';
+      ```
+
+      With order 42 left at `card_held` three hours ago, this returns order 42. A worker
+      then resumes it from its status, or starts compensating.
+  - title: How replay works, in thirty lines
+    body: |-
+      A durable engine is less magic than it looks. Here's the core idea, runnable with
+      `npx tsx replay.mts`. Each call to the outside world goes through `call`, which
+      either returns a recorded result or runs the work and records it.
+
+      ```ts
+      type History = { activity: string; result: unknown }[];
+
+      function makeContext(history: History) {
+        let position = 0;
+        return async function call<T>(activity: string, fn: () => Promise<T>): Promise<T> {
+          const recorded = history[position];
+          position += 1;
+          if (recorded) {
+            if (recorded.activity !== activity) {
+              throw new Error(`non-determinism: history has ${recorded.activity}, code asked for ${activity}`);
+            }
+            return recorded.result as T;
+          }
+          const result = await fn();
+          history.push({ activity, result });
+          return result;
+        };
+      }
+
+      let ran: string[] = [];
+      const work = (name: string) => async () => { ran.push(name); return `${name}-ok`; };
+
+      async function cakeOrder(call: ReturnType<typeof makeContext>, crashAfter?: number) {
+        const steps = ['reserveOven', 'holdCard', 'bookCourier', 'sendConfirmation'];
+        for (const [i, step] of steps.entries()) {
+          await call(step, work(step));
+          if (crashAfter === i + 1) throw new Error('worker died');
+        }
+      }
+
+      const history: History = [];
+      await cakeOrder(makeContext(history), 3).catch((e) => console.log(e.message));
+      console.log(ran); // [ 'reserveOven', 'holdCard', 'bookCourier' ]
+      ran = [];
+      await cakeOrder(makeContext(history));
+      console.log(ran); // [ 'sendConfirmation' ]
+      ```
+
+      The second run executes the same function from the top, yet only the fourth step
+      does real work. The first three return their recorded results. If the code asked
+      for a different activity at some position, the check throws, which is the
+      non-determinism error from the lesson's bug hunt.
+
+      Real engines add much more: the history lives in a database, activities are retried
+      under a policy, timers are durable, and the history is written before the next step
+      is scheduled. But the rule falls straight out of this sketch. Anything that could
+      differ between runs, such as the clock, a random id or a fetched price, must come
+      from the history, so it has to pass through the engine.
+  - title: Choosing between a status column and an engine
+    body: |-
+      A hand-written state machine is fine for a short saga with three or four steps,
+      run by one team. You own all of it: the table, the workers, the retries, the
+      timeouts and the stuck-order query. Everything is visible in SQL, and there's no new
+      infrastructure.
+
+      An engine starts to pay when processes are long or many. Long means waiting: a
+      courier confirms tomorrow, a person approves next week, a retry backs off for an
+      hour. Durable timers and waits for outside signals are tedious to build well, and an
+      engine gives you them as ordinary-looking code. Many means dozens of process types,
+      where the same bookkeeping would otherwise be rewritten in each.
+
+      The engine has its own costs. It's another system to run, or to pay for. Workflow
+      code follows rules that surprise people, so reviewers must know them. And changing
+      workflow code while old runs are in flight needs care: a run started under the old
+      code replays against the new code, and a reordered step no longer matches its
+      history. Engines offer versioning features for this, and you'll use them on any
+      workflow that lives longer than a deploy.
+
+      Whichever you pick, keep reconciliation. Engines make crashes survivable, but they
+      can't see a courier that cancelled on its side, or a card hold your code never
+      recorded. A daily comparison of your records with each provider's is what finds
+      those.
+pitfalls:
+  - '**Compensating the step that failed.** Adding a step to the done list before running it means its undo runs too, cancelling something that never happened, or worse, an earlier booking with the same reference. Record a step as done only after it succeeds.'
+  - '**Letting one failed undo stop the rest.** A single `try` around the whole compensation loop leaves every older step in place when the newest undo throws. Give each undo its own `try`, retry it, and record what stayed stuck.'
+  - '**Non-idempotent compensations.** A release that runs twice after a crash can release someone else''s hold or log a second cancellation fee. Key compensations by order and step, just like the forward steps.'
+  - '**Saving the status before the outside call.** It looks safer, but a crash after the save skips the call while the status claims it happened. Call first with an idempotency key, then save.'
+  - '**Reading the clock or the network in workflow code.** It works until a worker restarts mid-run and replay takes a different branch. Get values through activities or the engine''s replay-safe APIs.'
+  - '**Treating a saga as invisible.** Other features see the half-done order. Show it as pending and don''t let other work depend on it until the saga ends.'
+verify:
+  - lens: breaks
+    check: Make each step fail in turn in a test, and assert that exactly the finished steps were compensated, newest first.
+  - lens: breaks
+    check: Kill the worker between an outside call and its status save, restart it, and assert the call took effect only once.
+  - lens: tests
+    check: Assert that no step without an undo, such as an email, runs before a step that can still fail.
+  - lens: scales
+    check: Alert on orders that sit in one unfinished status longer than the slowest step should take, and count them on a dashboard.
+  - lens: confuses
+    check: Label each saga step as compensatable, pivot or retriable in the code, so a reviewer can see when one moves.
+interview:
+  - question: How do you keep data consistent across services without a distributed transaction?
+    answer: >-
+      With a saga: a sequence of local transactions, each paired with a compensating
+      action, run newest first when a later step fails. I order the steps so the
+      compensatable ones come first, then a pivot that commits the business, such as
+      capturing payment, then steps that can only be retried, such as the email. Progress
+      is stored, either as a status column with guarded updates or in a workflow engine,
+      and every step carries an idempotency key so a crash can repeat it safely. The
+      trade-off is isolation: other code sees intermediate states, so they're shown as
+      pending. I'd add a reconciliation job that compares our records with each provider's,
+      because sagas make drift rare, not impossible.
+  - question: What does a durable workflow engine such as Temporal actually do?
+    answer: >-
+      It makes ordinary-looking code survive crashes by recording an event history. Calls to
+      the outside world are activities: the engine schedules them, retries them under a
+      policy, and stores each result. If the worker dies, another one runs the workflow
+      function again from the start, and each activity that's already in the history
+      returns its stored result instead of running. So the code resumes where it stopped.
+      The price is determinism: the replay must make the same calls in the same order, so
+      clocks, random values and I/O go through activities or engine APIs. Changing
+      workflow code while runs are in flight needs the engine's versioning support.
+  - question: A compensation fails. What now?
+    answer: >-
+      Retry it, because most failures are transient, and compensations are written to be
+      idempotent so retrying is safe. Back off between attempts. If it still fails, don't
+      drop it and don't stop the other compensations. Record the step as stuck, carry on
+      undoing the older steps, and raise it to a person or a reconciliation job with
+      enough context to finish by hand. A compensation is a business promise, such as
+      releasing a customer's card hold, so a silent failure is a real harm. The design
+      lesson is to prefer steps whose undo is cheap and reliable, such as a hold rather than
+      a capture.

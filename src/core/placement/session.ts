@@ -126,6 +126,19 @@ export function answerPlacement(
 }
 
 /**
+ * Takes back the last answer: the ladder is replayed from the start without it, so the
+ * same item comes back on the rung it was asked on. The answer event already recorded
+ * stays in the log as a fact; the result is built from the session, which no longer has it.
+ */
+export function undoPlacement(session: PlacementSession, topRung: number): PlacementSession {
+  if (session.answers.length === 0) return session;
+  const answers = session.answers.slice(0, -1);
+  let ladder = initialLadderState(START_RUNG[session.startedAs], topRung);
+  for (const a of answers) ladder = stepLadder(ladder, a.correct, topRung);
+  return { ...session, ladder, answers };
+}
+
+/**
  * B5 rates items `800 + 200 * d` for difficulty 1 to 5, within a module. A module whose
  * band is the final rung starts in the middle of that scale (d 3). Each rung the band
  * sits below the final rung adds a step, each rung above takes one away, clamped to the

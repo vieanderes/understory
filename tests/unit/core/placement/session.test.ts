@@ -6,6 +6,7 @@ import {
   START_RUNG,
   startPlacement,
   thetaForBand,
+  undoPlacement,
   type PlacementRungSpec,
   type PlacementSession,
 } from '@/core/placement';
@@ -194,5 +195,31 @@ describe('thetaForBand', () => {
     expect(thetaForBand(4, 1)).toBe(1800);
     expect(thetaForBand(4, 5)).toBe(1200);
     expect(thetaForBand(4, 10)).toBe(1000);
+  });
+});
+
+describe('undoPlacement', () => {
+  it('takes back the last answer and shows that item again, on the ladder as it was', () => {
+    let session = startPlacement('new');
+    session = answer(session, true);
+    const before = session;
+    const asked = currentPlacementItem(session, RUNGS);
+    session = answer(session, false);
+    const undone = undoPlacement(session, RUNGS.length);
+    expect(undone).toEqual(before);
+    expect(currentPlacementItem(undone, RUNGS)).toEqual(asked);
+  });
+
+  it('reopens a finished ladder', () => {
+    let session = startPlacement('new');
+    for (const correct of [true, true, false, true, true, false])
+      session = answer(session, correct);
+    expect(session.ladder.done).toBe(true);
+    expect(undoPlacement(session, RUNGS.length).ladder.done).toBe(false);
+  });
+
+  it('changes nothing before the first answer', () => {
+    const start = startPlacement('new');
+    expect(undoPlacement(start, RUNGS.length)).toEqual(start);
   });
 });

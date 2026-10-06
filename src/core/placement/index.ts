@@ -11,6 +11,7 @@ export {
   placementOutcome,
   START_RUNG,
   startPlacement,
+  undoPlacement,
   thetaForBand,
   type CurrentPlacementItem,
   type PlacementAnswer,

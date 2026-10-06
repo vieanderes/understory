@@ -1,4 +1,4 @@
-import { z } from 'zod';
+import * as z from '@/core/zod';
 import { DEFAULT_SCENARIO_ID, SCENARIO_IDS, type ScenarioId } from '@/core/labs/event-loop-stepper';
 
 /** What a lesson may set: `{ scenario: 'async-await', value: 3, hideSwitcher: true }`. */

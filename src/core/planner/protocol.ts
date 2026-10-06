@@ -1,4 +1,4 @@
-import { z } from 'zod';
+import * as z from '@/core/zod';
 
 /*
  * Scout's structured replies while it plans a path with the learner (docs/ONLINE-TEST.md,

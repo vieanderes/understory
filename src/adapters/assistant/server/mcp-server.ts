@@ -1,6 +1,6 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
-import { z } from 'zod';
+import * as z from '@/core/zod';
 import { NAVIGATION_RULES, PLANNER_RULES, type AssistantContext } from '@/core/ports/assistant';
 import { pairingCodeSchema } from '../pairing';
 import {

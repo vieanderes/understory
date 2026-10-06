@@ -36,9 +36,10 @@ holds state and priorities only, so keep it short and current.
 - **iOS.** The Swift reducer ignores `path_exam_attempted`. The app plays a challenge's main
   language only, has no SQL or React previews yet, and phone editing has not been checked on
   hardware.
-- **Performance.** The lesson route ships about 284 KB of JavaScript against a 170 KB target;
-  zod on the client is about 110 KB of it. Move client-side parsing to a lighter schema or to
-  build time.
+- **Performance.** The lesson route ships about 339 KB of JavaScript (gzip, with the app
+  pages it prefetches) against a 170 KB target. zod's locales are gone since zod comes
+  through `src/core/zod.ts`; the rest of zod is about 32 KB of it. Move client-side parsing
+  to a lighter schema or to build time.
 - **Tests.** `tests/e2e/code-challenge.spec.ts`, "the solution is fetched only on request",
   has failed once on mobile with "Response has been disposed": await the body inside the
   response handler. The editor test `typecheck.test.tsx` has an intermittent jsdom

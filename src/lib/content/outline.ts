@@ -10,7 +10,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { parse } from 'yaml';
-import { z } from 'zod';
+import * as z from '@/core/zod';
 import type { Issue } from '@/core/content/catalog';
 import type { ManifestLesson, ManifestModule } from '@/core/content/compiled';
 import { journeyOrder, OUTLINE_PATH, outlineSchema, slugOfDir } from '@/core/content/outline';

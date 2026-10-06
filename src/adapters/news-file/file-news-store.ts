@@ -1,6 +1,6 @@
 import { mkdir, readdir, readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import type { z } from 'zod';
+import type * as z from '@/core/zod';
 import {
   isoDateSchema,
   mergeDay,

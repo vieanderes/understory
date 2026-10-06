@@ -1,4 +1,4 @@
-import { z } from 'zod';
+import * as z from '@/core/zod';
 import { argSpecSchema } from './generate';
 import { TASK_LANGUAGES } from './signature';
 import { VALUE_TYPES } from './values';

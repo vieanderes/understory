@@ -1,4 +1,4 @@
-import { z } from 'zod';
+import * as z from '@/core/zod';
 import { allLessons, allModules } from './catalog';
 import type { IdsLock, RawCatalog } from './catalog';
 import { withFallbacks } from './fields';

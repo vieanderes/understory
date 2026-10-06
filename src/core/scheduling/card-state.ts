@@ -1,4 +1,4 @@
-import { z } from 'zod';
+import * as z from '@/core/zod';
 
 /*
  * A plain-JSON mirror of ts-fsrs's `Card`, so it can travel inside a `review_graded`

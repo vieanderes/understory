@@ -29,8 +29,13 @@ const BUDGET = {
    * 29 September 2026: Scout AI is on every lesson. Its trigger, store and page guide load
    * with the route; the panel and its providers stay lazy. Measured 358 KB. The next saving
    * is loading the page guide with the panel.
+   *
+   * 7 October 2026: it had crept to 399 KB. Most of the excess was zod's locales: zod's `z`
+   * namespace re-exports every language's messages, and Turbopack keeps a namespace whole.
+   * zod now comes through src/core/zod.ts, named re-exports Turbopack can shake, and an
+   * ESLint rule keeps it that way. Measured 338.5 KB; the ceiling is that plus 5%.
    */
-  lesson: 366 * KB,
+  lesson: 356 * KB,
   /** CodeMirror, the editor and the code step around it. Measured 144 KB, 185 KB on 2026-09-25. */
   editor: 220 * KB,
   /** The sandbox runner and sucrase, on the first run. Measured 54 KB. */

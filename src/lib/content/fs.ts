@@ -10,7 +10,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { LineCounter, parseDocument } from 'yaml';
 import type { Document } from 'yaml';
-import type { z } from 'zod';
+import type * as z from '@/core/zod';
 import { COURSE_DIR, COURSE_PATH, LOCK_PATH } from '@/core/content/catalog';
 import type {
   IdsLock,

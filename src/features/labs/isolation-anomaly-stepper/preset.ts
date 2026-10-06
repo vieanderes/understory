@@ -1,4 +1,4 @@
-import { z } from 'zod';
+import * as z from '@/core/zod';
 import {
   DEFAULT_SCENARIO_ID,
   LEVELS,

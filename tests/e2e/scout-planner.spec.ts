@@ -112,9 +112,10 @@ test('plan a path with Scout, change the draft and save it to Learn', async ({ p
 
   await expect(page).toHaveURL(/\/paths\?path=own-[a-z0-9]{8}$/);
   await expect(page.getByRole('heading', { level: 1 })).toHaveText('Code from zero, gently');
-  await expect(page.getByText('Small programs that calculate and decide.')).toBeVisible();
-  await expect(page.getByRole('region', { name: 'Calculating' })).toBeVisible();
-  await expect(page.getByText(/About \d+ weeks? at 2 h a week/)).toBeVisible();
+  const learn = page.getByRole('main');
+  await expect(learn.getByText('Small programs that calculate and decide.')).toBeVisible();
+  await expect(learn.getByRole('region', { name: 'Calculating', exact: true })).toBeVisible();
+  await expect(learn.getByText(/About \d+ weeks? at 2 h a week/)).toBeVisible();
 
   // The next question shows Scout the saved draft, edits included. On a phone the sheet
   // closed to show the path, so it opens again.
@@ -130,7 +131,10 @@ test('the planner passes axe in both themes, with no sideways scroll', async ({ 
   await stubScout(page);
   const scout = await openPlanner(page);
   await scout.getByRole('button', { name: 'Curiosity' }).click();
-  await scout.getByRole('button', { name: 'Send' }).click();
+  await scout
+    .getByRole('group', { name: /What brings you here/ })
+    .getByRole('button', { name: 'Send' })
+    .click();
   await scout.getByRole('button', { name: 'Draft it now' }).click();
   await scout.getByRole('button', { name: 'Open draft' }).click();
   expect(await page.evaluate(() => document.documentElement.scrollWidth - innerWidth)).toBe(0);

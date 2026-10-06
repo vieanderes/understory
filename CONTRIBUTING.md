@@ -93,7 +93,7 @@ Read [`docs/DESIGN.md`](docs/DESIGN.md) and [`docs/MOTION.md`](docs/MOTION.md).
   on a visitor's behalf, and never store a learner's key on the server.
 - Scout stays out of anything that measures the learner: timed tests, checkpoints, test-outs
   and placement.
-- In plan mode Scout's structure travels as `scout-ask` and `scout-path` blocks
+- Scout's structure travels as `scout-ask`, `scout-path` and `scout-plan` blocks
   (`src/core/planner/protocol.ts`). Anything shown about a draft (lessons, minutes, weeks,
   gaps) is counted from the course in `src/core/planner/`, never read from the reply. A new
   block kind needs a schema there, a renderer in `src/features/tutor/planner/` and a line in

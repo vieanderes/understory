@@ -235,7 +235,8 @@ export function LessonPlayer({
               setResults((all) => [...all.filter((r) => r.stepId !== result.stepId), result])
             }
             onContinue={advance}
-            {...(index > 0 ? { onBack: () => setIndex(index - 1) } : {})}
+            // Back from the first step returns to the lesson's opening, so Back is always there.
+            onBack={() => (index > 0 ? setIndex(index - 1) : setStage('opening'))}
           />
         ) : null}
 

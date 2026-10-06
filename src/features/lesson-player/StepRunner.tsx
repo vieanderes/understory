@@ -2,6 +2,7 @@
 
 import { ChevronLeft } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { cn } from '@/lib/cn';
 import { Button } from '@/components/ui/Button';
 import type { CompiledStep } from '@/core/content/compiled';
 import { gradePlayground, gradeRun, gradeStep, type Answer, type Grade } from '@/core/grading';
@@ -267,8 +268,8 @@ export function StepRunner({
         )}
       </section>
 
-      {/* Back stands alone on the left. How sure sits beside Check, where it is set just
-          before checking; on a phone it takes its own row above the buttons. */}
+      {/* Back stands alone on the left. Then Skip, How sure and Check: how sure is set just
+          before checking, so it sits right beside Check; on a phone it takes its own row. */}
       <ActionBar className="flex-wrap gap-y-1 sm:flex-nowrap">
         {onBack ? (
           <Button variant="quiet" onClick={onBack} aria-label="Previous step" title="Previous step">
@@ -277,6 +278,13 @@ export function StepRunner({
           </Button>
         ) : null}
         <div className="ml-auto flex items-center gap-2 max-sm:contents">
+          {scored && phase === 'answering' ? (
+            // Any question can wait: nothing in Understory is locked, and a skipped step
+            // simply earns nothing until it is answered.
+            <Button variant="quiet" onClick={onContinue} className="max-sm:ml-auto">
+              Skip for now
+            </Button>
+          ) : null}
           {scored && phase === 'answering' && step.type !== 'explain-back' ? (
             <ConfidenceControl
               value={confidence}
@@ -284,22 +292,20 @@ export function StepRunner({
               className="max-sm:order-first max-sm:w-full sm:min-w-36"
             />
           ) : null}
-          <div className="flex items-center gap-1 max-sm:ml-auto">
+          <div
+            className={cn(
+              'flex items-center gap-1',
+              !(scored && phase === 'answering') && 'max-sm:ml-auto',
+            )}
+          >
             {!scored ? (
               <Button variant="primary" onClick={onContinue}>
                 Continue
               </Button>
             ) : phase === 'answering' ? (
-              <>
-                {/* Any question can wait: nothing in Understory is locked, and a skipped
-                    step simply earns nothing until it is answered. */}
-                <Button variant="quiet" onClick={onContinue}>
-                  Skip for now
-                </Button>
-                <Button variant="primary" onClick={check} disabled={!canCheck}>
-                  Check
-                </Button>
-              </>
+              <Button variant="primary" onClick={check} disabled={!canCheck}>
+                Check
+              </Button>
             ) : canRetry ? (
               <>
                 <Button variant="quiet" onClick={showAnswer}>

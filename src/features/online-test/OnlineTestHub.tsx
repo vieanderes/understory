@@ -184,6 +184,47 @@ export interface LessonTest {
 type Preset = OnlineTestIndex['presets'][number];
 
 /** The first test not sat yet, in the course's order; once all are sat, the weakest one. */
+/** The tests by what they are for, in the order a learner would meet them. */
+const GROUPS: { title: string; modes: readonly Preset['mode'][] }[] = [
+  { title: 'Start here', modes: ['demo'] },
+  { title: 'Short screens', modes: ['screen'] },
+  { title: 'With the AI assistant', modes: ['ai'] },
+  { title: 'Full mocks', modes: ['mock'] },
+];
+
+/** A test as a hairline row: its name and what it is, then its size and your best score. */
+function TestRow({
+  href,
+  title,
+  summary,
+  meta,
+  result,
+}: {
+  href: string;
+  title: string;
+  summary: string;
+  meta: string;
+  result: string | undefined;
+}) {
+  return (
+    <li className="rule-t">
+      <Link
+        href={href}
+        className="hairline-row group flex items-start gap-2 py-1.5 transition-colors duration-150 ease-out"
+      >
+        <span className="flex min-w-0 flex-1 flex-col gap-0.5">
+          <span className="font-medium">{title}</span>
+          <span className="text-muted text-sm">{summary}</span>
+        </span>
+        <span className="flex shrink-0 flex-col items-end gap-0.5">
+          <span className="t-figure text-muted text-sm">{meta}</span>
+          {result ? <span className="t-figure text-sm font-semibold">Best {result}</span> : null}
+        </span>
+      </Link>
+    </li>
+  );
+}
+
 function nextTest(presets: readonly Preset[], best: ReadonlyMap<string, number>) {
   return (
     presets.find((p) => !best.has(p.id)) ??
@@ -342,50 +383,42 @@ export function OnlineTestHub({
         </section>
       ) : null}
 
-      <section aria-labelledby="all-title" className="flex flex-col gap-1">
+      <section aria-labelledby="all-title" className="flex flex-col gap-4">
         <h2 id="all-title" className="t-section">
           All tests
         </h2>
-        <ul className="rule-b flex flex-col">
-          {index.presets.map((preset) => (
-            <li key={preset.id} className="rule-t">
-              <Link
-                href={testHref(preset.id)}
-                className="group flex min-h-6 flex-wrap items-center gap-x-2 py-1"
-              >
-                <span className="group-hover:text-accent min-w-0 flex-1 font-medium transition-colors duration-150 ease-out">
-                  {preset.title}
-                </span>
-                <span className="text-muted t-figure text-sm">
-                  {preset.minutes} min · {preset.tasks.length}{' '}
-                  {preset.tasks.length === 1 ? 'task' : 'tasks'}
-                  {preset.assistant ? ' · AI' : ''}
-                </span>
-                <span className="t-figure w-5 text-right text-sm font-semibold">
-                  {best.has(preset.id) ? `${best.get(preset.id)}%` : ''}
-                </span>
-              </Link>
-            </li>
-          ))}
-          {lessonTests.map((test) => (
-            <li key={test.id} className="rule-t">
-              <Link
-                href={test.href}
-                className="group flex min-h-6 flex-wrap items-center gap-x-2 py-1"
-              >
-                <span className="group-hover:text-accent min-w-0 flex-1 font-medium transition-colors duration-150 ease-out">
-                  {test.title}
-                </span>
-                <span className="text-muted t-figure text-sm">
-                  {test.minutes} min · {test.note}
-                </span>
-                <span className="t-figure w-5 text-right text-sm font-semibold">
-                  {state.completedLessons.has(test.id) ? 'Done' : ''}
-                </span>
-              </Link>
-            </li>
-          ))}
-        </ul>
+        {GROUPS.map((group) => {
+          const presets = index.presets.filter((p) => group.modes.includes(p.mode));
+          const lessons = group.modes.includes('mock') ? lessonTests : [];
+          if (presets.length + lessons.length === 0) return null;
+          return (
+            <section key={group.title} aria-label={group.title} className="flex flex-col">
+              <h3 className="t-label pb-1">{group.title}</h3>
+              <ul className="rule-b flex flex-col">
+                {presets.map((preset) => (
+                  <TestRow
+                    key={preset.id}
+                    href={testHref(preset.id)}
+                    title={preset.title}
+                    summary={preset.summary}
+                    meta={`${preset.minutes} min · ${preset.tasks.length} ${preset.tasks.length === 1 ? 'task' : 'tasks'}`}
+                    result={best.has(preset.id) ? `${best.get(preset.id)}%` : undefined}
+                  />
+                ))}
+                {lessons.map((test) => (
+                  <TestRow
+                    key={test.id}
+                    href={test.href}
+                    title={test.title}
+                    summary={test.note}
+                    meta={`${test.minutes} min · 1 task`}
+                    result={state.completedLessons.has(test.id) ? 'Done' : undefined}
+                  />
+                ))}
+              </ul>
+            </section>
+          );
+        })}
       </section>
 
       <div className="rule-b flex flex-col">

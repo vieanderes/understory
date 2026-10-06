@@ -1,6 +1,17 @@
 'use client';
 
-import { ArrowRight, Award, BookOpen, Check, ChevronDown, Square } from 'lucide-react';
+import {
+  ArrowRight,
+  Award,
+  BookOpen,
+  Check,
+  ChevronDown,
+  FlaskConical,
+  Repeat2,
+  Square,
+  Timer,
+  type LucideIcon,
+} from 'lucide-react';
 import Link from 'next/link';
 import { useMemo } from 'react';
 import { buttonClass } from '@/components/ui/Button';
@@ -508,65 +519,91 @@ function StageTests({
   const rest = ordered.slice(TESTS_SHOWN);
   const restNoun = rest.every((t) => t.kind === 'training') ? 'tasks' : 'more';
   return (
-    <section aria-label={`Try it: ${stage}`} className="flex flex-col gap-1 pt-1">
-      <div className="flex flex-wrap items-baseline justify-between gap-x-2">
-        <h4 className="text-sm font-semibold">Try it</h4>
-        <p className="t-label">Optional · recommended</p>
-      </div>
-      <ul className={rowList()}>
-        <li className={rowItem}>
-          <Link href={practice} className={rowAction('items-start')}>
-            <span className="flex min-w-0 flex-1 flex-col">
-              <span className="font-medium">Practise this stage</span>
-              <span className="text-muted text-sm">Questions from these lessons</span>
-            </span>
-            <span className="t-figure text-muted shrink-0 text-sm">10 min</span>
-          </Link>
-        </li>
+    <section aria-label={`Try it: ${stage}`} className="flex flex-col gap-0.5 pt-1">
+      <p className="t-label">
+        Try it <span className="text-faint">· optional, recommended</span>
+      </p>
+      <ol className="-mx-1 flex flex-col">
+        <TryRow
+          href={practice}
+          icon={Repeat2}
+          title="Practise this stage"
+          detail="Questions from these lessons"
+          meta="10 min"
+        />
         {shown.map((test) => (
           <TestRow key={test.key} test={test} result={result(test)} />
         ))}
-      </ul>
+      </ol>
       {rest.length > 0 ? (
         <Fold label={restNoun === 'tasks' ? `${rest.length} more tasks` : `${rest.length} more`}>
-          <ul className={rowList('pt-0.5')}>
+          <ol className="-mx-1 flex flex-col">
             {rest.map((test) => (
               <TestRow key={test.key} test={test} result={result(test)} />
             ))}
-          </ul>
+          </ol>
         </Fold>
       ) : null}
     </section>
   );
 }
 
-function TestRow({ test, result }: { test: PathTest; result: string | undefined }) {
+/**
+ * One thing to try, drawn like a lesson row so the stage reads as one list: an icon where
+ * the lesson's circle sits, the title, a muted note, and the time or best score on the right.
+ */
+function TryRow({
+  href,
+  icon: Icon,
+  title,
+  detail,
+  meta,
+  strong = false,
+  muted = false,
+}: {
+  href: string;
+  icon: LucideIcon;
+  title: string;
+  detail: string;
+  meta: string;
+  strong?: boolean;
+  muted?: boolean;
+}) {
   return (
-    <li className={rowItem}>
-      <Link href={test.href} className={rowAction('items-start')}>
-        <span className="flex min-w-0 flex-1 flex-col">
-          <span className={cn('font-medium', result === 'Done' && 'text-muted')}>{test.title}</span>
-          <span className="text-muted text-sm">
-            {test.kind === 'lab' ? (
-              <>Lab · {test.detail}</>
-            ) : (
-              <>
-                {test.detail ? `${test.detail} · ` : ''}
-                <span className="t-figure">up to {test.xp} XP</span>
-              </>
-            )}
-          </span>
+    <li>
+      <Link
+        href={href}
+        className="rounded-control hover:bg-raised transition-press flex min-h-5 items-center gap-1.5 px-1 py-1 active:scale-98"
+      >
+        <span aria-hidden className="text-muted flex size-2 shrink-0 items-center justify-center">
+          <Icon size={16} strokeWidth={2} />
+        </span>
+        <span className="flex min-w-0 flex-1 flex-wrap items-baseline gap-x-1.5">
+          <span className={cn('font-medium', muted && 'text-muted')}>{title}</span>
+          <span className="text-muted text-sm">{detail}</span>
         </span>
         <span
-          className={cn(
-            't-figure shrink-0 text-sm',
-            result && result !== 'Done' ? 'text-fg' : 'text-muted',
-          )}
+          className={cn('t-figure shrink-0 text-sm', strong ? 'text-fg font-medium' : 'text-muted')}
         >
-          {result ?? `${test.minutes} min`}
+          {meta}
         </span>
       </Link>
     </li>
+  );
+}
+
+function TestRow({ test, result }: { test: PathTest; result: string | undefined }) {
+  const lab = test.kind === 'lab';
+  return (
+    <TryRow
+      href={test.href}
+      icon={lab ? FlaskConical : Timer}
+      title={test.title}
+      detail={lab ? 'Lab' : `${test.detail ? `${test.detail} · ` : ''}up to ${test.xp} XP`}
+      meta={result ? (result === 'Done' ? 'Done' : `Best ${result}`) : `${test.minutes} min`}
+      strong={Boolean(result && result !== 'Done')}
+      muted={result === 'Done'}
+    />
   );
 }
 

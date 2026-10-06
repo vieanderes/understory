@@ -96,6 +96,7 @@ sections:
 
       ```ts
       const RETRYABLE = new Set([408, 429, 500, 502, 503, 504]);
+      const IDEMPOTENT = new Set(['GET', 'HEAD', 'PUT', 'DELETE']);
       const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
       // Retry-After is either whole seconds or an HTTP date.
@@ -107,18 +108,26 @@ sections:
         return Number.isNaN(date) ? undefined : Math.max(0, date - Date.now());
       }
 
+      // A write may have landed before the failure, so repeat it only if the provider can dedupe it.
+      function safeToRepeat(init: RequestInit): boolean {
+        const method = (init.method ?? 'GET').toUpperCase();
+        return IDEMPOTENT.has(method) || new Headers(init.headers).has('idempotency-key');
+      }
+
       export async function fetchWithRetry(
         url: string,
         init: RequestInit,
         { attempts = 3, baseMs = 200, capMs = 5_000 } = {},
       ): Promise<Response> {
+        const repeatable = safeToRepeat(init);
         for (let attempt = 1; ; attempt++) {
           let response: Response | undefined;
           let failure: unknown;
           try {
             response = await fetch(url, init);
-            if (!RETRYABLE.has(response.status)) return response;
+            if (!repeatable || !RETRYABLE.has(response.status)) return response;
           } catch (error) {
+            if (!repeatable) throw error;
             failure = error; // network error or timeout
           }
           // Full jitter: a random wait up to the exponential ceiling, so clients spread out.
@@ -137,7 +146,8 @@ sections:
       Against a test server, a route that fails twice with 503 then succeeds returns 200 on
       the third request. A `400` returns at once, because repeating a bad request gives the
       same answer. A `429` with `Retry-After: 60` returns immediately rather than holding
-      the user for a minute.
+      the user for a minute. A `POST` without an `Idempotency-Key` header gets its `503`
+      back after one try.
 
       The hard rule is **idempotency**. Retrying a `GET` is safe. Retrying a `POST` that
       charges a card might charge twice, because the first attempt may have succeeded before

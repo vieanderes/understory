@@ -18,7 +18,8 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
 
 export default async function SignalMonthPage({ params }: Props) {
   const { month } = await params;
-  const digest = await getMonth(month);
+  const [digest, dates] = await Promise.all([getMonth(month), listDates()]);
   if (!digest) notFound();
-  return <SignalDigestView digest={digest} />;
+  const months = [...new Set(dates.map((date) => date.slice(0, 7)))];
+  return <SignalDigestView digest={digest} periods={months} />;
 }

@@ -4,7 +4,7 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { FileNewsStore } from '@/adapters/news-file';
 import type { NewsDay, NewsItem } from '@/core/news';
-import { getDay, getLatestDay, getMonth, getWeek, listDates } from '@/lib/news';
+import { getDay, getLatestDay, getMonth, getWeek, listDates, listEditions } from '@/lib/news';
 
 function item(id: string, score: number, topic: string): NewsItem {
   return {
@@ -58,6 +58,7 @@ describe('news getters', () => {
     expect(await getWeek('2026-W38')).toBeNull();
     expect(await getMonth('2026-09')).toBeNull();
     expect(await listDates()).toEqual([]);
+    expect(await listEditions()).toEqual([]);
   });
 
   it('read what the pipeline wrote', async () => {
@@ -77,6 +78,21 @@ describe('news getters', () => {
     const month = await getMonth('2026-09');
     expect(month?.itemCount).toBe(2);
     expect((await getMonth('2026-08'))?.days).toEqual(['2026-08-31']);
+  });
+
+  it('list every edition newest first with its lead story', async () => {
+    const store = new FileNewsStore(root);
+    await store.putDay(day('2026-09-15', [item('00000000000000a1', 2, 'databases')]));
+    await store.putDay(
+      day('2026-09-17', [
+        item('00000000000000a2', 3, 'databases'),
+        item('00000000000000a3', 1, 'security'),
+      ]),
+    );
+    expect(await listEditions()).toEqual([
+      { date: '2026-09-17', lead: 'Story 00000000000000a2', count: 2 },
+      { date: '2026-09-15', lead: 'Story 00000000000000a1', count: 1 },
+    ]);
   });
 
   it('treat malformed route params as not found', async () => {

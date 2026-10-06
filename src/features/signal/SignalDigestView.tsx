@@ -1,106 +1,108 @@
 import Link from 'next/link';
+import { neighbours, weekRange } from '@/core/news';
+import { PageHead } from '@/components/layout/PageHead';
 import type { NewsDigest } from '@/lib/news';
-import { getSignalContext } from './data';
-import { formatMonth, formatShort, isoWeekOf } from './format';
-import { SignalItem } from './SignalItem';
-import { SignalNav } from './SignalNav';
 import { Title } from '@/features/motion/Title';
+import { getStoryContext } from './data';
+import { formatMonth, formatShort, formatWeekday } from './format';
+import { PeriodLinks, type PeriodLink } from './PeriodLinks';
+import { StoryList } from './StoryList';
 
-export async function SignalDigestView({ digest }: { digest: NewsDigest }) {
-  const { topicLabels, lessons } = await getSignalContext();
+interface SignalDigestViewProps {
+  digest: NewsDigest;
+  /** Every week or month key that has news, newest first, for earlier and later. */
+  periods: string[];
+}
+
+const periodLabel = (isWeek: boolean, key: string) =>
+  isWeek ? `Week of ${formatShort(weekRange(key)?.from ?? key)}` : formatMonth(key);
+
+export async function SignalDigestView({ digest, periods }: SignalDigestViewProps) {
+  const { topicLabels, lessons } = await getStoryContext(digest.topItems);
   const isWeek = digest.period === 'week';
+  const base = isWeek ? '/signal/week' : '/signal/month';
   const title = isWeek
     ? `${formatShort(digest.from)} to ${formatShort(digest.to)}`
     : formatMonth(digest.key);
-  const lastDay = digest.days.at(-1) ?? digest.to;
+  const { earlier, later } = neighbours(periods, digest.key);
   const max = Math.max(1, ...digest.topicCounts.map((t) => t.count));
 
-  return (
-    <div className="flex flex-col gap-4">
-      <header className="flex flex-col gap-2">
-        <p className="t-label">News · {isWeek ? `Week ${digest.key.slice(-2)}` : 'Month'}</p>
-        <Title>{title}</Title>
-        <p className="text-muted prose-measure">
-          <span className="t-figure">{digest.itemCount}</span> stories over{' '}
-          <span className="t-figure">{digest.days.length}</span>{' '}
-          {digest.days.length === 1 ? 'day' : 'days'}. The top stories are below.
-        </p>
-        <SignalNav
-          current={isWeek ? 'week' : 'month'}
-          dayHref={`/signal/${lastDay}`}
-          weekHref={`/signal/week/${isoWeekOf(lastDay)}`}
-          monthHref={`/signal/month/${lastDay.slice(0, 7)}`}
-        />
-      </header>
+  const links: PeriodLink[] = [
+    ...(earlier
+      ? [
+          {
+            href: `${base}/${earlier}`,
+            label: periodLabel(isWeek, earlier),
+            arrow: 'left' as const,
+          },
+        ]
+      : []),
+    ...(later
+      ? [{ href: `${base}/${later}`, label: periodLabel(isWeek, later), arrow: 'right' as const }]
+      : []),
+    { href: '/signal/archive', label: 'All editions' },
+  ];
 
-      <section
-        data-arrive="rise"
-        aria-labelledby="topics-title"
-        className="grid grid-cols-4 gap-x-4 gap-y-3 md:grid-cols-12"
-      >
-        <div className="col-span-4 md:col-span-7">
-          <h2 id="topics-title" className="t-label rule-t pt-2">
-            {isWeek ? 'Topics this week' : 'Topics this month'}
+  return (
+    <div className="flex flex-col gap-6 md:gap-8">
+      <PageHead
+        label={isWeek ? 'News · The week' : 'News · The month'}
+        title={<Title>{title}</Title>}
+        actions={<PeriodLinks label={isWeek ? 'Other weeks' : 'Other months'} links={links} />}
+      />
+
+      <div className="grid grid-cols-4 gap-x-4 gap-y-6 md:grid-cols-12">
+        <section
+          aria-labelledby="top-stories"
+          className="col-span-4 flex min-w-0 flex-col gap-1 md:col-span-12 lg:col-span-8"
+        >
+          <h2 id="top-stories" className="t-label">
+            {isWeek ? 'Top stories of the week' : 'Top stories of the month'}
           </h2>
-          <ul className="flex flex-col gap-1 pt-2">
-            {digest.topicCounts.map((t) => (
-              <li key={t.topic} className="grid grid-cols-12 items-center gap-2 text-sm">
-                <span className="col-span-6 truncate md:col-span-5">
-                  {topicLabels.get(t.topic) ?? t.topic}
-                </span>
-                {/* A bar is one mark per value, flat, in ink. Its length is the count. */}
-                <span className="col-span-5 md:col-span-6" aria-hidden>
-                  <span
-                    className="bg-fg block h-0.5 rounded-full"
-                    style={{ width: `${Math.round((t.count / max) * 100)}%` }}
-                  />
-                </span>
-                <span className="t-figure col-span-1 text-right">{t.count}</span>
-              </li>
-            ))}
-          </ul>
-        </div>
-        {digest.threads.length > 0 ? (
-          <div className="col-span-4 md:col-span-5">
-            <h2 className="t-label rule-t pt-2">Topics that kept coming up</h2>
-            <ul className="flex flex-col gap-1 pt-2 text-sm">
-              {digest.threads.map((thread) => (
-                <li key={thread.topic} className="flex justify-between gap-2">
-                  <span>{topicLabels.get(thread.topic) ?? thread.topic}</span>
-                  <span className="t-figure text-muted">{thread.days} days</span>
+          <StoryList items={digest.topItems} topicLabels={topicLabels} lessons={lessons} />
+        </section>
+
+        <aside className="col-span-4 flex min-w-0 flex-col gap-6 md:col-span-8 lg:col-span-4 xl:col-span-3 xl:col-start-10">
+          <section aria-labelledby="topics-title" className="flex flex-col gap-1">
+            <h2 id="topics-title" className="t-label rule-t pt-3">
+              Topics
+            </h2>
+            <ul className="flex flex-col gap-1">
+              {digest.topicCounts.map((t) => (
+                <li key={t.topic} className="grid grid-cols-12 items-center gap-1 text-sm">
+                  <span className="col-span-7 truncate">{topicLabels[t.topic] ?? t.topic}</span>
+                  {/* A bar is one mark per value, flat, in ink. Its length is the count. */}
+                  <span className="col-span-4" aria-hidden>
+                    <span
+                      className="bg-fg block h-0.5 rounded-full"
+                      style={{ width: `${Math.round((t.count / max) * 100)}%` }}
+                    />
+                  </span>
+                  <span className="t-figure col-span-1 text-right">{t.count}</span>
                 </li>
               ))}
             </ul>
-          </div>
-        ) : null}
-      </section>
+          </section>
 
-      <div className="flex flex-col gap-6">
-        {digest.topItems.map((item, i) => (
-          <SignalItem
-            key={item.id}
-            item={item}
-            index={i + 1}
-            topicLabels={topicLabels}
-            lessons={lessons}
-          />
-        ))}
+          <nav aria-labelledby="days-title" className="flex flex-col gap-1">
+            <h2 id="days-title" className="t-label rule-t pt-3">
+              Daily editions
+            </h2>
+            <ul className="flex flex-wrap gap-x-3">
+              {digest.days.map((date) => (
+                <li key={date}>
+                  <Link
+                    href={`/signal/${date}`}
+                    className="hover:text-muted decoration-border-strong flex h-5 items-center text-sm font-medium underline underline-offset-4 transition-colors duration-150 ease-out"
+                  >
+                    {formatWeekday(date)}
+                  </Link>
+                </li>
+              ))}
+            </ul>
+          </nav>
+        </aside>
       </div>
-
-      <nav
-        aria-label="Days in this period"
-        className="rule-t flex flex-wrap gap-x-3 pt-2 text-sm font-medium"
-      >
-        {digest.days.map((date) => (
-          <Link
-            key={date}
-            href={`/signal/${date}`}
-            className="flex h-5 items-center underline underline-offset-4"
-          >
-            {formatShort(date)}
-          </Link>
-        ))}
-      </nav>
     </div>
   );
 }

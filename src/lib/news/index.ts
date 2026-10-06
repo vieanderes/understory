@@ -81,3 +81,20 @@ export async function getMonth(yyyyMm: string): Promise<NewsDigest | null> {
 export async function listDates(): Promise<IsoDate[]> {
   return store().listDates();
 }
+
+/** One line per edition, for the archive and the Home teaser. */
+export interface EditionSummary {
+  date: IsoDate;
+  /** The edition's first story, or null for an empty day. */
+  lead: string | null;
+  count: number;
+}
+
+/** Every edition, newest first. A few dozen small files, read once per static build. */
+export async function listEditions(): Promise<EditionSummary[]> {
+  const news = store();
+  const days = await Promise.all((await news.listDates()).map((date) => news.day(date)));
+  return days.flatMap((day) =>
+    day ? [{ date: day.date, lead: day.items[0]?.title ?? null, count: day.items.length }] : [],
+  );
+}

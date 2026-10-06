@@ -7,10 +7,18 @@ const DAY = new Intl.DateTimeFormat('en-GB', {
 });
 const SHORT = new Intl.DateTimeFormat('en-GB', { day: 'numeric', month: 'short', timeZone: 'UTC' });
 const MONTH = new Intl.DateTimeFormat('en-GB', { month: 'long', year: 'numeric', timeZone: 'UTC' });
+const WEEKDAY = new Intl.DateTimeFormat('en-GB', {
+  weekday: 'short',
+  day: 'numeric',
+  month: 'short',
+  timeZone: 'UTC',
+});
 
 const at = (isoDate: string) => new Date(`${isoDate}T00:00:00Z`);
 
 export const formatDay = (isoDate: string) => DAY.format(at(isoDate));
+/** `Mon 5 Oct`, for archive rows. */
+export const formatWeekday = (isoDate: string) => WEEKDAY.format(at(isoDate)).replace(',', '');
 export const formatShort = (isoDate: string) => SHORT.format(at(isoDate));
 export const formatMonth = (yyyyMm: string) => MONTH.format(at(`${yyyyMm}-01`));
 

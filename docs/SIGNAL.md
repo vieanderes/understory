@@ -160,6 +160,31 @@ are matched by keyword. It states nothing that is not in the item or in `interes
 `CURRICULUM.md` and is written ahead of the lessons. The app should show a link only when the
 id resolves in the content manifest.
 
+## Reading it in the app
+
+| Route                   | What it shows                                                     |
+| ----------------------- | ----------------------------------------------------------------- |
+| `/signal`               | The latest edition. The title is the date.                        |
+| `/signal/[date]`        | One edition, with Earlier and Later and the last week's editions. |
+| `/signal/archive`       | Every edition, newest first, a week to a group.                   |
+| `/signal/week/[week]`   | A week's top stories and topics, with the weeks either side.      |
+| `/signal/month/[month]` | The same for a month.                                             |
+
+- **The info button** beside the title opens a disclosure: where stories come from, how a
+  day is picked, how briefs are written, and the feeds, grouped as `content/feeds.yaml`
+  lays them out (`src/lib/news/sources.ts` reads its `# --- Group ---` rules). Change that
+  copy when the pipeline changes.
+- **A story** shows its headline, one line on what happened, why it matters and the source.
+  Concepts and lessons fold behind "Learn more". The line under the headline drops the
+  extractive frame that only repeats the title, and falls back to the source's excerpt.
+  An extractive "why it matters" is shown once per edition, since it is shared by topic.
+  The rules are `src/core/news/edition.ts`.
+- **Interests.** Stories on a topic the learner follows (`profile_set`, `newsTopicRank`)
+  come first; the rest keep the edition's order.
+- **Read state.** Opening a day records `news_read` for that date once. The archive shows
+  unopened editions in a heavier weight with an ink dot. `useNewsRead` and `useTodayUnread`
+  in `src/features/signal/useNewsRead.ts` expose it to the shell.
+
 ## Cost, and running without a key
 
 - One request per item, at most `--max` items (default 12, limit 20), three requests in

@@ -15,6 +15,8 @@ const ROUTES: { path: string; heading: RegExp }[] = [
   { path: '/labs', heading: /Mechanisms you can step through/ },
   { path: '/signal', heading: /\w+ \d+ \w+/ },
   { path: '/signal/week/2026-W38', heading: /Sep/ },
+  { path: '/signal/month/2026-09', heading: /September 2026/ },
+  { path: '/signal/archive', heading: /All editions/ },
   { path: '/lectures', heading: /Read it all/ },
   { path: '/lectures/tracks/ai-engineering', heading: /build and explain AI systems/ },
   { path: '/lectures/parts/senior', heading: /Senior engineer/ },

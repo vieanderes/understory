@@ -1,6 +1,6 @@
 'use client';
 
-import { X } from 'lucide-react';
+import { ChevronLeft, X } from 'lucide-react';
 import Link from 'next/link';
 import { useEffect, useRef, useState } from 'react';
 import { ActionBar } from '@/components/layout/ActionBar';
@@ -11,6 +11,7 @@ import type { CompiledPlacementItem, CompiledPlacementRung } from '@/core/conten
 import { gradeStep, type Answer } from '@/core/grading';
 import {
   answerPlacement,
+  undoPlacement,
   currentPlacementItem,
   placementOutcome,
   startPlacement,
@@ -102,6 +103,12 @@ export function PlacementRunner({ rungs, modules }: Props) {
     setSession(answerPlacement(session, rungs, { itemId: current.id, correct, confidence }));
   }
 
+  // Back takes the last answer back, or from the first question returns to the start.
+  function back() {
+    if (!session) return;
+    setSession(session.answers.length === 0 ? null : undoPlacement(session, rungs.length));
+  }
+
   const answered = session?.answers.length ?? 0;
 
   return (
@@ -134,7 +141,7 @@ export function PlacementRunner({ rungs, modules }: Props) {
         ) : finished ? (
           <Results session={session} rungs={rungs} modules={modules} />
         ) : item ? (
-          <PlacementItem key={item.id} item={item} onAnswer={answer} />
+          <PlacementItem key={item.id} item={item} onAnswer={answer} onBack={back} />
         ) : (
           <p className="t-label">Loading</p>
         )}
@@ -208,9 +215,11 @@ function Intro({
 function PlacementItem({
   item,
   onAnswer,
+  onBack,
 }: {
   item: CompiledPlacementItem;
   onAnswer: (correct: boolean, confidence: Confidence) => void;
+  onBack: () => void;
 }) {
   const [submission, setSubmission] = useState<Submission | null>(null);
   const [confidence, setConfidence] = useState<Confidence | null>(null);
@@ -262,15 +271,28 @@ function PlacementItem({
         ) : null}
       </section>
 
-      <ActionBar className="justify-between gap-2">
-        <ConfidenceControl
-          value={confidence}
-          onChange={setConfidence}
-          className="min-w-0 flex-1 sm:flex-none"
-        />
-        <Button variant="primary" onClick={next} disabled={!canAnswer}>
-          Next
+      {/* Like a lesson: Back alone on the left; how sure beside Next on the right, set just
+          before moving on. On a phone how sure takes its own row above. */}
+      <ActionBar className="flex-wrap gap-y-1 sm:flex-nowrap">
+        <Button
+          variant="quiet"
+          onClick={onBack}
+          aria-label="Previous question"
+          title="Previous question"
+        >
+          <ChevronLeft aria-hidden size={16} strokeWidth={2} />
+          <span className="max-sm:sr-only">Back</span>
         </Button>
+        <div className="ml-auto flex items-center gap-2 max-sm:contents">
+          <ConfidenceControl
+            value={confidence}
+            onChange={setConfidence}
+            className="max-sm:order-first max-sm:w-full"
+          />
+          <Button variant="primary" onClick={next} disabled={!canAnswer} className="max-sm:ml-auto">
+            Next
+          </Button>
+        </div>
       </ActionBar>
     </>
   );

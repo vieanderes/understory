@@ -185,15 +185,10 @@ for (const scheme of ['light', 'dark'] as const) {
   });
 }
 
-test('Coding tests is a place in the navigation', async ({ page }) => {
-  await page.goto('/');
-  await page
-    .getByRole('navigation', { name: 'Primary' })
-    .getByRole('link', { name: 'Coding tests' })
-    .first()
-    .click();
+test('the coding tests are on the shelf in the Library', async ({ page }) => {
+  await page.goto('/library');
+  await page.getByRole('link', { name: /Coding tests/ }).click();
   await expect(page).toHaveURL(HUB);
-  await expect(page.getByRole('heading', { name: 'AI-assisted coding simulator' })).toBeVisible();
 });
 
 test('guided mode walks a task and fills the assistant with its prompt', async ({ page }) => {
@@ -215,17 +210,18 @@ test('guided mode walks a task and fills the assistant with its prompt', async (
   await expect(page.getByLabel('Ask the assistant')).toHaveValue(/Without solving it/);
 });
 
-test('a plan is made in three questions and leads Home with a step for today', async ({ page }) => {
+test('a plan is made in five questions and leads Home with a step for today', async ({ page }) => {
   await page.goto('/plan?goal=from-zero');
-  await expect(page.getByRole('heading', { name: 'How much time do you have?' })).toBeVisible();
-  await page.getByRole('radio', { name: '7 h' }).check({ force: true });
+  await expect(page.getByRole('heading', { name: 'What are you interested in?' })).toBeVisible();
+  await page.getByRole('button', { name: /Next/ }).click();
+  await page.getByRole('button', { name: /Next/ }).click();
+  await expect(page.getByRole('heading', { name: 'How much time a day?' })).toBeVisible();
+  await page.getByRole('radio', { name: '45 min' }).check({ force: true });
   await page.getByRole('button', { name: /Next/ }).click();
   await page.getByRole('button', { name: /Next/ }).click();
   await expect(page.getByRole('heading', { name: 'Your plan' })).toBeVisible();
-  await page.getByRole('button', { name: 'Start this plan' }).click();
-  await expect(page.getByRole('heading', { level: 1 })).toHaveText('Learn to code from zero');
-  await expect(page.getByText(/^Today/)).toBeVisible();
-  await page.goto('/');
+  await page.getByRole('button', { name: 'Start', exact: true }).click();
+  await expect(page).toHaveURL('/');
   await expect(page.getByRole('heading', { name: 'Your next step' })).toBeVisible();
   await expect(page.getByRole('link', { name: /Start · \d+ min/ })).toBeVisible();
 });

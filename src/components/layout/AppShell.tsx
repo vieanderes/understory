@@ -1,21 +1,21 @@
-import type { NavPath } from './nav';
 import { PhoneBar, Sidebar, TabBar } from './PrimaryNav';
 
 /**
  * The frame around every learner-facing page. On desktop, a rail on the ground and the page
  * on a raised panel beside it, the way a tool sits on a desk. On phones, a slim bar above and
- * four places in a tab bar below, so `main` keeps clear of it.
+ * the four places in a tab bar below, so `main` keeps clear of it. `latestNews` is the date
+ * of the newest edition, so News can say when it has not been read.
  */
 export function AppShell({
   children,
-  paths = [],
+  latestNews,
 }: {
   children: React.ReactNode;
-  paths?: readonly NavPath[];
+  latestNews?: string;
 }) {
   return (
     <div className="bg-bg text-fg flex min-h-dvh">
-      <Sidebar paths={paths} />
+      <Sidebar latestNews={latestNews} />
       <div className="flex min-w-0 flex-1 flex-col md:py-1 md:pr-1">
         <PhoneBar />
         <main
@@ -24,7 +24,7 @@ export function AppShell({
         >
           <div className="frame">{children}</div>
         </main>
-        <TabBar />
+        <TabBar latestNews={latestNews} />
       </div>
     </div>
   );

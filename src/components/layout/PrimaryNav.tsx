@@ -1,28 +1,72 @@
 'use client';
 
-import { Newspaper, Settings } from 'lucide-react';
+import { Settings } from 'lucide-react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import { Wordmark } from '@/components/brand/Logo';
 import { ThemeToggle } from '@/components/theme/ThemeToggle';
-import { pathExamResult } from '@/core/exam';
 import { useProgress } from '@/features/store/StoreProvider';
 import { cn } from '@/lib/cn';
-import { isCurrent, MORE, PLACES, type NavPath } from './nav';
+import { isCurrent, LIBRARY, PLACES, type Place } from './nav';
 
 const item =
   'rounded-control flex h-4 items-center gap-1 px-1 text-sm font-medium transition-colors duration-150 ease-out';
 
-/**
- * Desktop: a quiet rail on the ground, beside the page. Three layers, each drawn its own
- * way so they never read as one list: the four places (icon rows), your learning paths (each
- * with its route and what is done, set in from the edge), and the rest (small text links at
- * the foot, beside settings and the theme). Where you are is a lifted row, not a colour.
- */
-export function Sidebar({ paths }: { paths: readonly NavPath[] }) {
-  const pathname = usePathname();
+const utility =
+  'hover:text-fg hover:bg-raised rounded-control inline-flex size-5 items-center justify-center transition-colors duration-150 ease-out';
+
+/** True once the store has loaded and today's edition has not been opened. */
+function useNewsUnread(latestNews: string | undefined): boolean {
   const { status, state } = useProgress();
-  const isDone = (id: string) => status === 'ready' && state.completedLessons.has(id);
+  return status === 'ready' && latestNews !== undefined && !state.newsRead.has(latestNews);
+}
+
+/** A small dot beside News while today's edition is unread. Said in words for screen readers. */
+function UnreadDot({ className }: { className?: string }) {
+  return (
+    <>
+      <span aria-hidden className={cn('bg-fg size-1 rounded-full', className)} />
+      <span className="sr-only">, new edition</span>
+    </>
+  );
+}
+
+function RailLink({
+  place,
+  current,
+  unread,
+}: {
+  place: Place;
+  current: boolean;
+  unread?: boolean;
+}) {
+  const { href, label, icon: Icon, hint } = place;
+  return (
+    <Link
+      href={href}
+      title={hint}
+      aria-current={current ? 'page' : undefined}
+      className={cn(
+        item,
+        current ? 'bg-raised text-fg shadow-edge' : 'text-muted hover:text-fg hover:bg-raised',
+      )}
+    >
+      <Icon aria-hidden size={16} strokeWidth={2} />
+      <span className="flex-1">{label}</span>
+      {unread ? <UnreadDot /> : null}
+    </Link>
+  );
+}
+
+/**
+ * Desktop: a quiet rail on the ground, beside the page. The four places at the top; the
+ * library, settings and the theme at the foot, drawn smaller, so they read as utilities you
+ * reach for, not places you choose between. Where you are is a lifted row, not a colour.
+ */
+export function Sidebar({ latestNews }: { latestNews?: string }) {
+  const pathname = usePathname();
+  const unread = useNewsUnread(latestNews);
+  const onLibrary = isCurrent(pathname, LIBRARY.href);
   return (
     <aside className="sticky top-0 hidden h-dvh w-30 shrink-0 flex-col gap-4 px-1.5 py-2 md:flex print:hidden">
       <Link
@@ -33,91 +77,36 @@ export function Sidebar({ paths }: { paths: readonly NavPath[] }) {
         <Wordmark />
       </Link>
       <nav aria-label="Primary" className="flex flex-col gap-0.5">
-        {PLACES.map(({ href, label, icon: Icon, hint }) => {
-          const current = isCurrent(pathname, href);
-          return (
-            <Link
-              key={href}
-              href={href}
-              title={hint}
-              aria-current={current ? 'page' : undefined}
-              className={cn(
-                item,
-                current
-                  ? 'bg-raised text-fg shadow-edge'
-                  : 'text-muted hover:text-fg hover:bg-raised',
-              )}
-            >
-              <Icon aria-hidden size={16} strokeWidth={2} />
-              {label}
-            </Link>
-          );
-        })}
+        {PLACES.map((place) => (
+          <RailLink
+            key={place.href}
+            place={place}
+            current={isCurrent(pathname, place.href)}
+            unread={place.href === '/signal' && unread}
+          />
+        ))}
       </nav>
-      {paths.length > 0 ? (
-        <nav
-          aria-labelledby="rail-paths"
-          className="rule-t flex min-h-0 flex-col gap-0.5 overflow-y-auto pt-2"
-        >
-          <p id="rail-paths" className="text-faint px-1 pb-0.5 text-sm font-medium tracking-tight">
-            Learning paths
-          </p>
-          {paths.map((path) => {
-            const href = `/paths/${path.id}`;
-            const current = pathname === href || pathname.startsWith(`${href}/`);
-            const ids = path.stages.flatMap((s) => s.lessonIds);
-            const done = ids.filter(isDone).length;
-            const finished = ids.length > 0 && done === ids.length;
-            const certified = status === 'ready' && pathExamResult(state.pathExams[path.id]).passed;
-            return (
-              <Link
-                key={path.id}
-                href={href}
-                aria-current={current ? 'page' : undefined}
-                className={cn(
-                  item,
-                  current
-                    ? 'bg-raised text-fg shadow-edge'
-                    : 'text-muted hover:text-fg hover:bg-raised',
-                )}
-              >
-                <span className="min-w-0 flex-1 truncate">{path.name}</span>
-                <span className="t-figure text-faint shrink-0">
-                  {certified ? 'Certified' : finished ? 'Done' : `${done}/${ids.length}`}
-                </span>
-              </Link>
-            );
-          })}
-        </nav>
-      ) : null}
       <div className="mt-auto flex flex-col gap-1">
-        <nav aria-label="More" className="flex flex-col gap-0.5">
-          {MORE.map(({ href, label, icon: Icon, hint }) => {
-            const current = isCurrent(pathname, href);
-            return (
-              <Link
-                key={href}
-                href={href}
-                title={hint}
-                aria-current={current ? 'page' : undefined}
-                className={cn(
-                  item,
-                  'font-normal',
-                  current ? 'bg-raised text-fg' : 'text-faint hover:text-fg hover:bg-raised',
-                )}
-              >
-                <Icon aria-hidden size={16} strokeWidth={2} />
-                {label}
-              </Link>
-            );
-          })}
-        </nav>
+        <Link
+          href={LIBRARY.href}
+          title={LIBRARY.hint}
+          aria-current={onLibrary ? 'page' : undefined}
+          className={cn(
+            item,
+            'font-normal',
+            onLibrary ? 'bg-raised text-fg' : 'text-muted hover:text-fg hover:bg-raised',
+          )}
+        >
+          <LIBRARY.icon aria-hidden size={16} strokeWidth={2} />
+          {LIBRARY.label}
+        </Link>
         <div className="rule-t flex items-center gap-0.5 pt-1">
           <Link
             href="/settings"
             aria-label="Settings"
             title="Settings"
-            className="text-muted hover:text-fg hover:bg-raised rounded-control inline-flex size-5 items-center justify-center transition-colors duration-150 ease-out"
+            aria-current={isCurrent(pathname, '/settings') ? 'page' : undefined}
+            className={cn(utility, 'text-muted')}
           >
             <Settings aria-hidden size={20} strokeWidth={2} />
           </Link>
@@ -128,17 +117,13 @@ export function Sidebar({ paths }: { paths: readonly NavPath[] }) {
   );
 }
 
-const utility =
-  'hover:text-fg hover:bg-raised rounded-control inline-flex size-5 items-center justify-center transition-colors duration-150 ease-out';
-
 /**
- * Phone: a slim bar with the mark and the utilities. News sits here rather than in the tab
- * bar: a sixth tab would crowd the five places, and a daily edition is something you check,
- * like an inbox, not a place you work in. Concept map and Labs are reached from Home.
+ * Phone: a slim bar with the mark and the utilities: the library, named, so it is found
+ * without guessing at an icon; then settings and the theme.
  */
 export function PhoneBar() {
   const pathname = usePathname();
-  const onNews = isCurrent(pathname, '/signal');
+  const onLibrary = isCurrent(pathname, LIBRARY.href);
   return (
     <header className="rule-b bg-bg sticky top-0 z-20 md:hidden print:hidden">
       <div className="frame flex h-7 items-center justify-between gap-2">
@@ -147,18 +132,24 @@ export function PhoneBar() {
         </Link>
         <div className="flex items-center gap-0.5">
           <Link
-            href="/signal"
-            aria-label="News"
-            title="News"
-            aria-current={onNews ? 'page' : undefined}
-            className={cn(utility, onNews ? 'bg-raised text-fg shadow-edge' : 'text-muted')}
+            href={LIBRARY.href}
+            title={LIBRARY.hint}
+            aria-current={onLibrary ? 'page' : undefined}
+            className={cn(
+              'rounded-control inline-flex h-5 items-center gap-0.5 px-1 text-sm font-medium transition-colors duration-150 ease-out',
+              onLibrary
+                ? 'bg-raised text-fg shadow-edge'
+                : 'text-muted hover:text-fg hover:bg-raised',
+            )}
           >
-            <Newspaper aria-hidden size={20} strokeWidth={2} />
+            <LIBRARY.icon aria-hidden size={20} strokeWidth={2} />
+            {LIBRARY.label}
           </Link>
           <Link
             href="/settings"
             aria-label="Settings"
             title="Settings"
+            aria-current={isCurrent(pathname, '/settings') ? 'page' : undefined}
             className={cn(utility, 'text-muted')}
           >
             <Settings aria-hidden size={20} strokeWidth={2} />
@@ -171,18 +162,18 @@ export function PhoneBar() {
 }
 
 /**
- * Phone: five places in the thumb zone, clear of the home indicator. Where you are is a
- * pill behind the icon, filled with the hairline tone so it reads in both themes, not a
- * rule on the edge: the bar stays quiet and the place reads at a glance.
+ * Phone: the four places in the thumb zone, clear of the home indicator. Where you are is a
+ * pill behind the icon, filled with the hairline tone so it reads in both themes.
  */
-export function TabBar() {
+export function TabBar({ latestNews }: { latestNews?: string }) {
   const pathname = usePathname();
+  const unread = useNewsUnread(latestNews);
   return (
     <nav
       aria-label="Primary"
-      className="rule-t bg-bg pb-safe fixed inset-x-0 bottom-0 z-20 grid grid-cols-5 md:hidden print:hidden"
+      className="rule-t bg-bg pb-safe fixed inset-x-0 bottom-0 z-20 grid grid-cols-4 md:hidden print:hidden"
     >
-      {PLACES.map(({ href, label, short, icon: Icon }) => {
+      {PLACES.map(({ href, label, icon: Icon }) => {
         const current = isCurrent(pathname, href);
         return (
           <Link
@@ -199,14 +190,17 @@ export function TabBar() {
             <span
               aria-hidden
               className={cn(
-                'transition-press inline-flex h-4 w-7 items-center justify-center rounded-full',
+                'transition-press relative inline-flex h-4 w-7 items-center justify-center rounded-full',
                 current ? 'bg-border text-fg' : 'group-active:bg-raised',
               )}
             >
               <Icon size={20} strokeWidth={2} />
+              {href === '/signal' && unread ? (
+                <span className="bg-fg absolute top-0.5 right-1.5 size-1 rounded-full" />
+              ) : null}
             </span>
-            <span aria-hidden={short ? true : undefined}>{short ?? label}</span>
-            {short ? <span className="sr-only">{label}</span> : null}
+            <span>{label}</span>
+            {href === '/signal' && unread ? <span className="sr-only">, new edition</span> : null}
           </Link>
         );
       })}

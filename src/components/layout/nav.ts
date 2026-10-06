@@ -1,14 +1,4 @@
-import {
-  BookOpen,
-  FlaskConical,
-  Route,
-  House,
-  Layers,
-  Newspaper,
-  Repeat2,
-  SquareTerminal,
-  type LucideIcon,
-} from 'lucide-react';
+import { GraduationCap, House, Library, Newspaper, Repeat2, type LucideIcon } from 'lucide-react';
 
 export interface Place {
   href: string;
@@ -16,51 +6,41 @@ export interface Place {
   icon: LucideIcon;
   /** What the place is for, in a few words, for the rail's title and screen readers. */
   hint: string;
-  /** A shorter label for the phone tab bar, where five places share the width. */
-  short?: string;
 }
 
 /**
- * The five places. Learning paths are what you work through; Review keeps it; Coding tests
- * rehearse the timed, AI-assisted assessment employers send first; the library is where you
- * look things up. The phone tab bar holds exactly these five.
+ * The four places, one job each: Home says what to do today, Learn is your path, Practice
+ * keeps it and rehearses tests, News is the daily edition. Everything else is the library,
+ * a utility beside Settings: always there, never a decision you have to make.
  */
 export const PLACES: readonly Place[] = [
-  { href: '/', label: 'Home', icon: House, hint: 'Your next lesson' },
-  { href: '/paths', label: 'Paths', icon: Route, hint: 'Learning paths: work through a goal' },
-  { href: '/practise', label: 'Review', icon: Repeat2, hint: 'Keep what you learnt' },
+  { href: '/', label: 'Home', icon: House, hint: 'What to do today' },
+  { href: '/paths', label: 'Learn', icon: GraduationCap, hint: 'Your path, step by step' },
+  { href: '/practise', label: 'Practice', icon: Repeat2, hint: 'Practise topics and sit tests' },
   {
-    href: '/practise/online-test',
-    label: 'Coding tests',
-    short: 'Tests',
-    icon: SquareTerminal,
-    hint: 'AI-assisted coding simulator: timed tests, scored like the real ones',
+    href: '/signal',
+    label: 'News',
+    icon: Newspaper,
+    hint: "Today's edition and every earlier one",
   },
-  { href: '/learn', label: 'Library', icon: BookOpen, hint: 'Every lesson and lecture' },
 ];
 
-/** Useful, but not where the work happens: one step further out. */
-export const MORE: readonly Place[] = [
-  { href: '/map', label: 'Concept map', icon: Layers, hint: 'What you know, concept by concept' },
-  { href: '/signal', label: 'News', icon: Newspaper, hint: 'What changed this week' },
-  { href: '/labs', label: 'Labs', icon: FlaskConical, hint: 'Mechanisms to step through' },
-];
+export const LIBRARY: Place = {
+  href: '/library',
+  label: 'Library',
+  icon: Library,
+  hint: 'Every path, lesson, lecture, lab and test',
+};
 
-/** A learning path as the rail lists it: enough to link to it and draw its route. */
-export interface NavPath {
-  id: string;
-  name: string;
-  stages: { title: string; lessonIds: string[] }[];
-}
+/** Pages the library holds. They light up the library, not a place. */
+const LIBRARY_ROUTES = ['/library', '/lectures', '/labs', '/map', '/decisions'];
 
 export function isCurrent(pathname: string, href: string): boolean {
   if (href === '/') return pathname === '/';
-  if (href === '/learn') return pathname === '/learn' || pathname.startsWith('/lectures');
-  // The simulator lives under /practise but is its own place.
-  const simulator = '/practise/online-test';
-  if (href === '/practise') {
+  if (href === LIBRARY.href) {
     return (
-      (pathname === href || pathname.startsWith(`${href}/`)) && !pathname.startsWith(simulator)
+      pathname === '/learn' ||
+      LIBRARY_ROUTES.some((r) => pathname === r || pathname.startsWith(`${r}/`))
     );
   }
   return pathname === href || pathname.startsWith(`${href}/`);

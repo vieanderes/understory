@@ -101,6 +101,13 @@ export interface AssistantPanelProps {
   renderReply?: (text: string, reply: ReplyState) => ReactNode;
   /** Replaces the greeting and the starters of an empty conversation. */
   renderEmpty?: (actions: PanelActions) => ReactNode;
+  /**
+   * A question the page asked for the learner (Scout's askTutor). It is sent as soon as a
+   * provider is ready, or put in the question box while the learner sets one up.
+   */
+  queued?: string | null;
+  /** Hands the queued question over once, so it is never asked twice. */
+  takeQueued?: () => string | null;
 }
 
 /** What a custom reply or empty state can do: ask, or put the learner in the question box. */
@@ -231,10 +238,7 @@ function Step({ n, title, children }: { n: number; title: string; children: Reac
 type Choice = ClaudeClient | 'claude-cli' | 'api-key';
 
 const CHOICES: Record<Choice, { label: string; hint: string }> = {
-  app: {
-    label: 'Claude app',
-    hint: 'Web, desktop or phone. Connect once, then just ask here.',
-  },
+  app: { label: 'Claude app', hint: 'Web, desktop or phone. Connect once, then just ask here.' },
   code: {
     label: 'Claude Code',
     hint: 'Works now with one command. A plugin that needs even less is coming.',
@@ -243,10 +247,7 @@ const CHOICES: Record<Choice, { label: string; hint: string }> = {
     label: 'Claude Code on this machine',
     hint: 'Already signed in on this computer. Nothing to set up.',
   },
-  'api-key': {
-    label: 'An API key',
-    hint: 'No Claude plan? Pay per question with your own key.',
-  },
+  'api-key': { label: 'An API key', hint: 'No Claude plan? Pay per question with your own key.' },
 };
 
 function ProviderChoice({
@@ -551,6 +552,8 @@ export function AssistantPanel({
   inAppLinks,
   renderReply,
   renderEmpty,
+  queued = null,
+  takeQueued,
 }: AssistantPanelProps) {
   const storedProvider = useProvider();
   const client = useClaudeClient();
@@ -618,10 +621,7 @@ export function AssistantPanel({
 
     const abort = new AbortController();
     controller.current = abort;
-    const turns = [...transcript, question].map(({ role, text: body }) => ({
-      role,
-      text: body,
-    }));
+    const turns = [...transcript, question].map(({ role, text: body }) => ({ role, text: body }));
     let reply = '';
     try {
       for await (const chunk of port.send({ turns, context }, abort.signal)) {
@@ -638,6 +638,21 @@ export function AssistantPanel({
   };
 
   const stop = () => controller.current?.abort();
+
+  // A question asked from the page goes out as the panel's first act. Without a provider
+  // it waits in the question box, so it is there when setup is done. Taken on the next
+  // task, like any subscription callback, so a remount in development asks it once.
+  useEffect(() => {
+    if (!queued || busy || !takeQueued) return;
+    const timer = setTimeout(() => {
+      const question = takeQueued();
+      if (!question) return;
+      if (ready) void send(question);
+      else setDraft(question);
+    }, 0);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- send reads the latest transcript; it is not a trigger
+  }, [queued, busy, ready, takeQueued]);
 
   const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {

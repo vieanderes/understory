@@ -376,6 +376,39 @@ for (const scheme of ['light', 'dark'] as const) {
   });
 }
 
+test('explain-back: no microphone without speech recognition; Scout pushes back after Compare', async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    const scope = window as unknown as Record<string, unknown>;
+    delete scope.SpeechRecognition;
+    delete scope.webkitSpeechRecognition;
+  });
+  await openStep(page, 'explain-twenty-one', 'Explain');
+  await expect(page.getByRole('textbox', { name: 'Your explanation' })).toBeVisible();
+  await expect(button(page, 'Say it out loud')).toHaveCount(0);
+  await expect(button(page, 'Ask Scout to push back')).toHaveCount(0);
+
+  await page
+    .getByRole('textbox', { name: 'Your explanation' })
+    .fill('The field hands over a string, so plus joins the two values as text.');
+  await button(page, 'Compare').click();
+  await button(page, 'Ask Scout to push back').click();
+  const panel = page.getByRole('complementary', { name: 'Scout AI' });
+  await expect(panel).toBeVisible();
+  // The question goes out at once, or waits in the box while a provider is set up.
+  await expect
+    .poll(async () => {
+      const box = panel.getByRole('textbox', { name: 'Ask the assistant' });
+      const waiting = (await box.count()) > 0 ? await box.inputValue() : '';
+      return (
+        waiting.includes('hands over a string') ||
+        (await panel.textContent())?.includes('hands over a string')
+      );
+    })
+    .toBe(true);
+});
+
 test('parsons: a pointer drag on a desktop, Move up on a phone, reorders the program', async ({
   page,
 }, testInfo) => {

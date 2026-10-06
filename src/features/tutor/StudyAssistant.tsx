@@ -24,8 +24,11 @@ import {
   restoreHistory,
   setTutorOpen,
   settleTutorFocus,
+  takeQueuedQuestion,
+  tutorHiddenOn,
   type TutorMessage,
   useHistory,
+  useQueuedQuestion,
   useTutorDocked,
   useTutorFocusRequest,
   useTutorOpen,
@@ -51,16 +54,6 @@ const TUTOR_STARTERS = [
   'Show me a smaller example',
   'Why does this work?',
   'Give me a hint, not the answer',
-];
-
-/**
- * Pages with an assistant of their own (the coding simulator), or none on purpose: a timed
- * exam, checkpoint or test-out measures what you know without help, and print has no screen.
- */
-const HIDDEN = [
-  /^\/practise\/online-test\//,
-  /^\/practise\/(exam|checkpoint|test-out)\//,
-  /^\/print\//,
 ];
 
 const FOCUS = 'focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent';
@@ -165,6 +158,8 @@ export function StudyAssistant({
   const withheld = useTutorWithheld();
   // True only for the render in which the learner opened the panel; spent once it mounts.
   const opening = useTutorFocusRequest();
+  // A question a page asked on the learner's behalf (askTutor), waiting for the panel.
+  const queued = useQueuedQuestion();
 
   // Plan mode has one conversation, the same on every page, so planning goes on while the
   // learner looks around the course.
@@ -204,6 +199,11 @@ export function StudyAssistant({
     if (open) settleTutorFocus();
   }, [open]);
 
+  // A question asked from the page is a question about the page: it goes to Ask mode.
+  useEffect(() => {
+    if (queued && planning) setScoutMode('ask');
+  }, [queued, planning]);
+
   // In a lesson Scout tutors the step on screen; anywhere else it guides: which option on
   // the page fits, where to start, what each part is for.
   const guide = useMemo(() => (scope ? null : pageGuide(pathname)), [scope, pathname]);
@@ -236,7 +236,7 @@ export function StudyAssistant({
     if (window.innerWidth < 768) setTutorOpen(false);
   }, []);
 
-  if (withheld || HIDDEN.some((pattern) => pattern.test(pathname))) return null;
+  if (withheld || tutorHiddenOn(pathname)) return null;
 
   const close = () => setTutorOpen(false);
 
@@ -396,6 +396,8 @@ export function StudyAssistant({
                     {...(latestNews ? { latestNews } : {})}
                     onFollowLink={followLink}
                     context={context}
+                    queued={queued}
+                    takeQueued={takeQueuedQuestion}
                     transcript={history}
                     onMessage={(message) => appendMessage(key, message)}
                     {...(guide

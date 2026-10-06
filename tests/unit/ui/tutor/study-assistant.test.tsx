@@ -11,8 +11,16 @@ vi.stubGlobal(
 
 const { Markdown, parseBlocks } = await import('@/features/online-test/assistant/Markdown');
 const { StudyAssistant } = await import('@/features/tutor/StudyAssistant');
-const { appendMessage, readHistory, setTutorOpen, setTutorScope, withholdTutor } =
-  await import('@/features/tutor/tutor-store');
+const {
+  appendMessage,
+  askTutor,
+  readHistory,
+  setTutorOpen,
+  setTutorScope,
+  takeQueuedQuestion,
+  tutorHiddenOn,
+  withholdTutor,
+} = await import('@/features/tutor/tutor-store');
 const { stepText } = await import('@/features/tutor/step-text');
 
 describe('Markdown replies', () => {
@@ -28,12 +36,7 @@ describe('Markdown replies', () => {
       'quote',
       'code',
     ]);
-    expect(blocks.at(-1)).toEqual({
-      kind: 'code',
-      language: 'py',
-      text: 'x = 1',
-      closed: false,
-    });
+    expect(blocks.at(-1)).toEqual({ kind: 'code', language: 'py', text: 'x = 1', closed: false });
     expect(blocks[3]).toMatchObject({ kind: 'code', closed: true });
   });
 
@@ -66,12 +69,7 @@ describe('step text for the tutor', () => {
   it('collects the prose of a step and leaves the answers out', () => {
     const text = stepText({
       prompt: { md: 'Count the votes.', html: '' },
-      options: [
-        {
-          text: { md: 'A Map', html: '' },
-          feedback: { md: 'Right', html: '' },
-        },
-      ],
+      options: [{ text: { md: 'A Map', html: '' }, feedback: { md: 'Right', html: '' } }],
       solution: { md: 'THE ANSWER', html: '' },
       starterCode: 'function count() {}',
     });
@@ -158,5 +156,39 @@ describe('StudyAssistant', () => {
     // Withholding closed the panel, so the corner button comes back, not an open panel.
     expect(screen.getByRole('button', { name: 'Ask Scout AI' })).toBeInTheDocument();
     expect(screen.queryByRole('complementary', { name: 'Scout AI' })).not.toBeInTheDocument();
+  });
+
+  it('opens to ask a question a page queued, once', async () => {
+    setTutorScope({ key: 'js.coercion', title: 'Coercion', onScreen: 'Explain it.' });
+    await act(async () => {
+      render(<StudyAssistant />);
+    });
+    await act(async () => {
+      askTutor('Push back on my explanation.');
+    });
+    expect(screen.getByRole('complementary', { name: 'Scout AI' })).toBeInTheDocument();
+    // Sent at once with a provider ready; waiting in the question box while one is set up.
+    await vi.waitFor(() => {
+      const asked = readHistory('js.coercion').some(
+        (message) => message.text === 'Push back on my explanation.',
+      );
+      const waiting =
+        (screen.queryByRole('textbox', { name: 'Ask the assistant' }) as HTMLTextAreaElement | null)
+          ?.value === 'Push back on my explanation.';
+      expect(asked || waiting).toBe(true);
+    });
+    expect(takeQueuedQuestion()).toBeNull();
+  });
+});
+
+describe('tutor routes', () => {
+  it('keeps Scout out of timed tests, the simulator and print, and in lessons', () => {
+    expect(tutorHiddenOn('/practise/exam/javascript')).toBe(true);
+    expect(tutorHiddenOn('/practise/checkpoint/js-1')).toBe(true);
+    expect(tutorHiddenOn('/practise/test-out/js')).toBe(true);
+    expect(tutorHiddenOn('/practise/online-test/demo')).toBe(true);
+    expect(tutorHiddenOn('/print/lesson')).toBe(true);
+    expect(tutorHiddenOn('/learn/javascript/maps')).toBe(false);
+    expect(tutorHiddenOn('/practise/review')).toBe(false);
   });
 });

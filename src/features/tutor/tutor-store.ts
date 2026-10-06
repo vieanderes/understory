@@ -244,6 +244,55 @@ export function useTutorWithheld(): boolean {
   );
 }
 
+/**
+ * Pages with an assistant of their own (the coding simulator), or none on purpose: a timed
+ * exam, checkpoint or test-out measures what you know without help, and print has no screen.
+ */
+const HIDDEN_ROUTES = [
+  /^\/practise\/online-test\//,
+  /^\/practise\/(exam|checkpoint|test-out)\//,
+  /^\/print\//,
+];
+
+export function tutorHiddenOn(pathname: string): boolean {
+  return HIDDEN_ROUTES.some((pattern) => pattern.test(pathname));
+}
+
+/** Whether Scout can be asked on this page: not withheld by a test, not a hidden route. */
+export function useTutorAvailable(pathname: string | null): boolean {
+  const held = useTutorWithheld();
+  return !held && !tutorHiddenOn(pathname ?? '');
+}
+
+/*
+ * A question a page asks on the learner's behalf, at their click: the panel opens and sends
+ * it as its first act. Kept until the panel takes it, so it survives the lazy panel loading.
+ */
+let queued: string | null = null;
+
+/** Opens Scout and has it ask this question, as if the learner had typed it. */
+export function askTutor(question: string): void {
+  queued = question;
+  notifyUi();
+  setTutorOpen(true);
+}
+
+/** The panel has the question: it is asked once, not again on the next open. */
+export function takeQueuedQuestion(): string | null {
+  const question = queued;
+  queued = null;
+  if (question !== null) notifyUi();
+  return question;
+}
+
+export function useQueuedQuestion(): string | null {
+  return useSyncExternalStore(
+    subscribeUi,
+    () => queued,
+    () => null,
+  );
+}
+
 function subscribeUi(onChange: () => void): () => void {
   uiListeners.add(onChange);
   return () => uiListeners.delete(onChange);

@@ -40,7 +40,7 @@ import {
 import { cn } from '@/lib/cn';
 import { useAssistantDraft } from '../assistant-draft';
 import { clockTime, ConnectionRequest, SafetyNote } from './ConnectionSafety';
-import { Markdown } from './Markdown';
+import { Markdown, type InAppLinks } from './Markdown';
 import {
   keyStore,
   modelStore,
@@ -86,6 +86,11 @@ export interface AssistantPanelProps {
   thinkingMark?: ReactNode;
   /** Focus the question box on open: the panel was opened to ask something. */
   autoFocus?: boolean;
+  /**
+   * Lets replies link to pages of the app, for Scout's directions. Left out in a test, where
+   * a link away would leave the timed task.
+   */
+  inAppLinks?: InAppLinks;
 }
 
 const PROVIDER_LABEL: Record<AssistantProviderId, string> = {
@@ -124,8 +129,8 @@ function errorText(error: unknown): string {
 }
 
 /** Replies are Markdown: code blocks highlighted, lists and emphasis kept (Markdown.tsx). */
-function ReplyText({ text }: { text: string }) {
-  return <Markdown text={text} />;
+function ReplyText({ text, links }: { text: string; links?: InAppLinks }) {
+  return <Markdown text={text} {...(links ? { links } : {})} />;
 }
 
 function CopyButton({ value, label }: { value: string; label: string }) {
@@ -425,6 +430,7 @@ export function AssistantPanel({
   greeting = 'How can I help with this task?',
   thinkingMark,
   autoFocus = false,
+  inAppLinks,
 }: AssistantPanelProps) {
   const storedProvider = useProvider();
   const cli = useLocalCliAvailability();
@@ -589,7 +595,7 @@ export function AssistantPanel({
               <li key={`${index}-${message.at}`} className="group/reply flex flex-col gap-0.5">
                 <div className="min-w-0 break-words">
                   <p className="sr-only">Assistant</p>
-                  <ReplyText text={message.text} />
+                  <ReplyText text={message.text} {...(inAppLinks ? { links: inAppLinks } : {})} />
                 </div>
                 <div
                   className={cn(
@@ -609,7 +615,7 @@ export function AssistantPanel({
             <li className="flex flex-col gap-1">
               {streaming ? (
                 <div className="min-w-0 break-words" aria-live="polite" aria-busy="true">
-                  <ReplyText text={streaming} />
+                  <ReplyText text={streaming} {...(inAppLinks ? { links: inAppLinks } : {})} />
                 </div>
               ) : (
                 <div

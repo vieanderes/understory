@@ -2,7 +2,8 @@
  * What Scout says away from a lesson. There is no step to explain on these pages, so Scout
  * is a guide: it helps choose where to start and what each option is for. Each page names
  * itself, says what it offers (sent to the model as the screen) and suggests the questions
- * people ask there. The first matching pattern wins.
+ * people ask there. The first matching pattern wins. Where everything else is comes from
+ * app-guide.ts, which travels with every question.
  */
 
 export interface PageGuide {
@@ -18,12 +19,12 @@ const GUIDES: ReadonlyArray<readonly [RegExp, PageGuide]> = [
     {
       title: 'Home',
       offers:
-        'The front door. A learner can make a plan in 30 seconds (pick a goal, answer two questions, get phases with a step for today) or just start coding. Goals: learn to code from zero, refresh fundamentals, learn a second language, build and ship full-stack, become an AI engineer, get ready for coding interviews, prepare for senior and system design rounds, stay sharp.',
+        'Home answers what to do today: the next step, practice that is due and today’s news. A first visit offers the setup, five questions, or just starting to code.',
       starters: [
-        'Which goal fits me?',
+        'What should I do today?',
         'I have never coded. Where do I start?',
-        'Plan or just start coding?',
-        'How much time does this take a week?',
+        'Where is the news?',
+        'How do I change my goal?',
       ],
     },
   ],
@@ -32,11 +33,11 @@ const GUIDES: ReadonlyArray<readonly [RegExp, PageGuide]> = [
     {
       title: 'Your plan',
       offers:
-        'The learner’s plan: phases toward their goal, with one step for today. They can change the goal or the weekly time.',
+        'The setup and the plan it makes. Five questions: goal, interests, starting point, time a day, and news on Home. The plan is phases toward the goal with one step for today.',
       starters: [
+        'Which goal fits me?',
         'What should I do today?',
-        'Can I change my goal later?',
-        'What if I miss a week?',
+        'Can I change my answers later?',
       ],
     },
   ],
@@ -45,38 +46,60 @@ const GUIDES: ReadonlyArray<readonly [RegExp, PageGuide]> = [
     {
       title: 'A learning path',
       offers:
-        'One learning path: its goal, its stages and the lessons in each stage, with progress.',
+        'One learning path: its goal, its stages with lessons and tests, and progress. It ends with a final exam and a certificate.',
       starters: [
         'Is this path right for me?',
         'Can I skip what I already know?',
-        'What will I be able to build at the end?',
+        'How do I make this my current path?',
       ],
     },
   ],
   [
     /^\/paths/,
     {
-      title: 'Paths',
+      title: 'Learn',
       offers:
-        'The learning paths: Start coding, JavaScript / TypeScript, Python, Algorithms, AI engineering, AI coding tests and Interview skills. Each is a goal with stages of lessons.',
+        'Learn: the current path with its stages, lessons, tests and lectures. Switch path lists all seven paths and Build your own path, where you choose parts, chapters or lessons.',
       starters: [
-        'Which path should I start with?',
-        'Can I follow two paths at once?',
-        'How do paths and the course fit together?',
+        'Which path should I follow?',
+        'How do I switch path?',
+        'Can I build my own path?',
+        'Where is the whole course?',
       ],
+    },
+  ],
+  [
+    /^\/learn\/build/,
+    {
+      title: 'Build your own path',
+      offers:
+        'Choose whole parts, chapters or single lessons from the course and save them as your own path on Learn.',
+      starters: ['How many lessons should I pick?', 'Can I change my path later?'],
     },
   ],
   [
     /^\/learn/,
     {
-      title: 'Library',
+      title: 'The course',
       offers:
-        'The whole course: seven parts and 370 lessons, each part ending with a checkpoint, a small project and a milestone. Nothing is locked. Also lectures to read and fast tracks.',
+        'The whole course in the Library: every lesson in seven parts, with search. Each part ends with a checkpoint, a small project and a milestone. Nothing is locked.',
       starters: [
         'Where should I start?',
         'Can I skip ahead to a later part?',
         'What is a checkpoint for?',
-        'Lessons, lectures or a fast track?',
+      ],
+    },
+  ],
+  [
+    /^\/library/,
+    {
+      title: 'Library',
+      offers:
+        'Everything beside the four places: the course, coding tests, lectures, labs, the concept map, the news archive, decision records, find your level and every learning path.',
+      starters: [
+        'What is in the Library?',
+        'Lessons, lectures or labs?',
+        'How do I find my level?',
       ],
     },
   ],
@@ -97,7 +120,7 @@ const GUIDES: ReadonlyArray<readonly [RegExp, PageGuide]> = [
     {
       title: 'Coding tests',
       offers:
-        'The AI-assisted coding simulator: timed tests like a real online assessment, with a built-in assistant whose conversation the reviewer reads, and a report afterwards.',
+        'Timed coding tests, part of Practice: every test, training tasks, custom tests and past results. Each runs in a simulator with a built-in assistant whose conversation the reviewer reads, and ends with a report.',
       starters: [
         'Which test should I try first?',
         'How is a test scored?',
@@ -108,13 +131,23 @@ const GUIDES: ReadonlyArray<readonly [RegExp, PageGuide]> = [
   [
     /^\/practise/,
     {
-      title: 'Review',
-      offers: 'Review brings back what is due so it sticks, and practice sets drill a topic.',
+      title: 'Practice',
+      offers:
+        'Practice: choose topics and minutes, then a mixed session that brings back what is due first. Also Sit a timed coding test, and Check one part with a checkpoint or test-out.',
       starters: [
-        'What should I review today?',
-        'How does review choose what I see?',
-        'How often should I review?',
+        'What should I practise today?',
+        'How long should a session be?',
+        'What is a test-out?',
       ],
+    },
+  ],
+  [
+    /^\/progress/,
+    {
+      title: 'Progress',
+      offers:
+        'The learner’s progress: what they know concept by concept, gaps to close and how far through the course they are.',
+      starters: ['How am I doing?', 'Which gap should I close first?'],
     },
   ],
   [
@@ -122,7 +155,7 @@ const GUIDES: ReadonlyArray<readonly [RegExp, PageGuide]> = [
     {
       title: 'Concept map',
       offers:
-        'Every concept in the course and how well the learner knows it, shown by weight: unseen, assumed, practised, solid, fluent. Gaps are marked.',
+        'Every concept in the course and how well the learner knows it: unseen, assumed, practised, solid, fluent. Gaps are marked.',
       starters: [
         'How do I read this map?',
         'Which gap should I close first?',
@@ -135,7 +168,7 @@ const GUIDES: ReadonlyArray<readonly [RegExp, PageGuide]> = [
     {
       title: 'Labs',
       offers:
-        'Interactive labs that let the learner play with how something works, such as the event loop.',
+        'Interactive labs that let the learner step through how something works, such as the event loop.',
       starters: ['Which lab should I open first?', 'How do labs fit with the lessons?'],
     },
   ],
@@ -143,16 +176,30 @@ const GUIDES: ReadonlyArray<readonly [RegExp, PageGuide]> = [
     /^\/signal/,
     {
       title: 'News',
-      offers: 'A short daily digest of news for software and AI engineers.',
-      starters: ['Why does this item matter?', 'Is any of this worth learning now?'],
+      offers:
+        'News for software and AI engineers: today’s edition, earlier editions, and week and month digests. The archive holds every edition.',
+      starters: [
+        'Why does this item matter?',
+        'Is any of this worth learning now?',
+        'Where are older editions?',
+      ],
+    },
+  ],
+  [
+    /^\/decisions/,
+    {
+      title: 'Decision records',
+      offers: 'The decision records the learner wrote for their capstone projects.',
+      starters: ['What makes a good decision record?'],
     },
   ],
   [
     /^\/settings/,
     {
       title: 'Settings',
-      offers: 'Theme, weekly goal, sync and data settings.',
-      starters: ['How do I set my weekly goal?', 'Where is my progress stored?'],
+      offers:
+        'Your goals (the five setup questions again), weekly goal, offline download, export and import of progress, decision records, and erasing everything.',
+      starters: ['How do I change my goal?', 'Where is my progress stored?', 'Where is the news?'],
     },
   ],
 ];
@@ -160,7 +207,7 @@ const GUIDES: ReadonlyArray<readonly [RegExp, PageGuide]> = [
 const FALLBACK: PageGuide = {
   title: 'Understory',
   offers: 'A page in Understory, a course from a first line of code to production systems.',
-  starters: ['Where should I start?', 'What can I do on this page?', 'How do I see my progress?'],
+  starters: ['Where should I start?', 'What can I do on this page?', 'What should I do next?'],
 };
 
 export function pageGuide(pathname: string): PageGuide {

@@ -41,3 +41,17 @@ test('a learner chooses two paths and switches between them with tabs', async ({
   await page.reload();
   await expect(page.getByRole('heading', { level: 1 })).toHaveText(/Python/);
 });
+
+test('closing a lesson opened from a path returns to Learn on that path', async ({ page }) => {
+  await page.goto('/learn/javascript/values-types-coercion?path=javascript-typescript');
+  await page.locator('html[data-hydrated="true"]').waitFor();
+  await page.getByRole('link', { name: 'Leave lesson' }).click();
+  await expect(page).toHaveURL(/\/paths\?path=javascript-typescript$/);
+});
+
+test('Learn finds any lesson in the course', async ({ page }) => {
+  await page.goto('/paths');
+  await page.locator('html[data-hydrated="true"]').waitFor();
+  await page.getByRole('searchbox', { name: 'Find a lesson' }).fill('closures');
+  await expect(page.getByRole('link', { name: /Variables, scope and closures/ })).toBeVisible();
+});

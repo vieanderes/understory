@@ -15,6 +15,7 @@ import type { PathSummary } from '@/lib/content';
 import { cn } from '@/lib/cn';
 import { CHOSEN_PATH, chosenPathIds, chosenPaths, currentPath, togglePath } from './current';
 import { CUSTOM_PATH_ID, customPathSummary, type CourseTree } from './custom';
+import { FindLesson } from './FindLesson';
 import { PathView } from './PathView';
 
 /** The tick a path row carries: an empty box, or ink with the path's place in the order. */
@@ -270,6 +271,7 @@ function Learn({
             </Link>
           ) : null}
         </header>
+        <FindLesson tree={tree} />
         <PathPicker
           paths={paths}
           titleId="pick-title"
@@ -309,6 +311,7 @@ function Learn({
   return (
     <div className="flex max-w-5xl flex-col gap-4 md:pt-2">
       {chosen.length > 1 ? <PathTabs paths={chosen} shown={path.id} isDone={isDone} /> : null}
+      <FindLesson tree={tree} />
       <PathView
         path={path}
         embedded

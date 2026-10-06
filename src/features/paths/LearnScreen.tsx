@@ -345,7 +345,7 @@ function Learn({
               className="flex flex-col gap-2"
             >
               <h2 id="switch-title" className="t-section">
-                Choose one or more paths
+                Choose your paths
               </h2>
               <PathPicker paths={paths} titleId="switch-title" />
             </section>

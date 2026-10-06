@@ -6,9 +6,9 @@ import { cn } from '@/lib/cn';
  * 1 px rule rather than a box. Two columns on wide screens, one on a phone.
  */
 
-/** The list: rows in one column, two from `md`. */
+/** The list: rows in one column, two from `lg`, where the column is wide enough. */
 export const rowList = (className?: string) =>
-  cn('grid grid-cols-1 gap-x-4 md:grid-cols-2', className);
+  cn('grid grid-cols-1 gap-x-4 lg:grid-cols-2', className);
 
 /** One cell of the list: the rule above it. */
 export const rowItem = 'border-border border-t';

@@ -1,4 +1,5 @@
 import { LIBRARY, PLACES } from '@/components/layout/nav';
+import { REPO_URL } from '@/lib/site';
 
 /*
  * Scout's map of Understory, sent with every question in a lesson or on a page, so "where is
@@ -100,6 +101,7 @@ export function buildAppGuide({
     `${LIBRARY.label} (${LIBRARY.href}): ${LIBRARY.hint.toLowerCase()}. On desktop at the foot of the left rail; on a phone the "${LIBRARY.label}" link in the top bar. It holds ${LIBRARY_SHELVES.map(([label, href]) => `${label} (${href})`).join(', ')}.`,
     `Settings (${SETTINGS_HREF}): the gear icon beside ${LIBRARY.label}. Goals (/plan?edit asks the five setup questions again), weekly goal, offline download, export and import progress, erase everything.`,
     'Setup (/plan): five questions: goal, interests, starting point, time a day, news on Home.',
+    `GitHub (${REPO_URL}): the branch icon beside Settings, at the foot of the rail on desktop and in the top bar on a phone, opens Understory's code, issues and how to contribute, in a new tab.`,
     'Lessons, sessions and tests open full screen with one way back. Scout AI opens with its button or Command or Ctrl and J, and is off in timed tests, checkpoints and test-outs.',
     'Plan mode: the Plan switch at the top of this Scout panel (also "Plan a path with Scout" on Learn and in the builder). Scout asks what the learner is learning for and how much time they have, drafts a path of chapters or single lessons with its own name, and the learner changes it and saves it to Learn. A learner keeps several own paths, each with its own name.',
     '',

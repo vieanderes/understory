@@ -1,10 +1,11 @@
 'use client';
 
-import { ChartColumn, Settings } from 'lucide-react';
+import { ChartColumn, GitBranch, Settings } from 'lucide-react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import { Wordmark } from '@/components/brand/Logo';
 import { ThemeToggle } from '@/components/theme/ThemeToggle';
+import { REPO_URL } from '@/lib/site';
 import { ProgressLine } from '@/components/ui/ProgressLine';
 import { useOverview } from '@/features/catalog/useOverview';
 import { chosenPathIds, CHOSEN_PATH } from '@/features/paths/current';
@@ -206,6 +207,16 @@ export function Sidebar({ paths = [] }: { paths?: readonly RailPath[] }) {
           >
             <Settings aria-hidden size={20} strokeWidth={2} />
           </Link>
+          <a
+            href={REPO_URL}
+            target="_blank"
+            rel="noopener noreferrer"
+            aria-label="Understory on GitHub"
+            title="Understory on GitHub: the code, issues and how to contribute"
+            className={cn(utility, 'text-muted')}
+          >
+            <GitBranch aria-hidden size={20} strokeWidth={2} />
+          </a>
           <ThemeToggle />
         </div>
       </div>
@@ -250,6 +261,16 @@ export function PhoneBar() {
           >
             <Settings aria-hidden size={20} strokeWidth={2} />
           </Link>
+          <a
+            href={REPO_URL}
+            target="_blank"
+            rel="noopener noreferrer"
+            aria-label="Understory on GitHub"
+            title="Understory on GitHub: the code, issues and how to contribute"
+            className={cn(utility, 'text-muted')}
+          >
+            <GitBranch aria-hidden size={20} strokeWidth={2} />
+          </a>
           <ThemeToggle />
         </div>
       </div>

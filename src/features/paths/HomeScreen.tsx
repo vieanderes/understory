@@ -273,7 +273,7 @@ export function HomeScreen({
   // The next step: the next lesson of the path the learner is on (one they chose or built
   // first, else their plan's, else the one with most done); else the course's next lesson.
   const all =
-    ready && state.customPath ? [customPathSummary(tree, state.customPath), ...paths] : paths;
+    ready && state.customPath ? [customPathSummary(tree, state.customPath, paths), ...paths] : paths;
   const path = currentPath(all, planState, isDone, state.settings[CHOSEN_PATH]);
   const pathNext = path ? nextOnPath(path, isDone) : undefined;
   const begun = path ? path.lessonIds.some(isDone) : false;

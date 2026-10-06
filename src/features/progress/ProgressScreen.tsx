@@ -75,7 +75,7 @@ export function ProgressScreen(props: ProgressScreenProps) {
     if (!ready) return null;
     const isDone = (id: string) => state.completedLessons.has(id);
     const paths = state.customPath
-      ? [customPathSummary(tree, state.customPath), ...written]
+      ? [customPathSummary(tree, state.customPath, written), ...written]
       : written;
     const path = currentPath(paths, planState, isDone, state.settings[CHOSEN_PATH]);
     return progressScopes({

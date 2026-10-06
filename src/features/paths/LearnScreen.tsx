@@ -241,7 +241,7 @@ function Learn({
   const isDone = (id: string) => state.completedLessons.has(id);
   // A path the learner built sits first, as one of theirs.
   const paths = state.customPath
-    ? [customPathSummary(tree, state.customPath), ...written]
+    ? [customPathSummary(tree, state.customPath, written), ...written]
     : written;
   const setting = state.settings[CHOSEN_PATH];
   const chosen = chosenPaths(paths, setting);

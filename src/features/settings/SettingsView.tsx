@@ -128,7 +128,7 @@ export function SettingsView() {
         title="Weekly goal"
         note="XP comes only from shown skill and recall. A missed week spends a rest week; you earn one for every four weeks met."
       >
-        <div className="w-full sm:w-60">
+        <div className="w-full max-w-60">
           <Segmented<GoalTier>
             label="Weekly goal in XP"
             hideLabel

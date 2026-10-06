@@ -75,7 +75,7 @@ export default async function LessonLecturePage({ params }: Props) {
           aria-label="On this page"
           className="lecture-screen-only hidden lg:col-span-3 lg:col-start-10 lg:block"
         >
-          <div className="sticky top-12 flex flex-col gap-1">
+          <div className="contents-rail sticky top-12 flex flex-col gap-1">
             <p className="t-label">On this page</p>
             <ol className="flex flex-col">
               {lectureOutline(lecture).map((entry) => (

@@ -79,7 +79,7 @@ export default async function ChapterLecturePage({ params }: Props) {
           aria-label="Lessons in this chapter"
           className="lecture-screen-only col-span-4 md:col-span-3"
         >
-          <div className="flex flex-col gap-1 md:sticky md:top-12">
+          <div className="contents-rail flex flex-col gap-1 md:sticky md:top-12">
             <p className="t-label">In this chapter</p>
             <ol className="flex flex-col">
               {lessons.map((lesson, i) => (

@@ -68,7 +68,7 @@ export default async function TrackPage({ params }: Props) {
 
       <div className="grid grid-cols-4 gap-x-4 gap-y-6 md:grid-cols-12">
         <nav aria-label="Days" className="lecture-screen-only col-span-4 md:col-span-3">
-          <div className="flex flex-col gap-1 md:sticky md:top-12">
+          <div className="contents-rail flex flex-col gap-1 md:sticky md:top-12">
             <p className="t-label">Stages</p>
             <ol className="flex flex-col">
               {days.map((day, i) => (

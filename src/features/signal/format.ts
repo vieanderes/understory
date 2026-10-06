@@ -27,6 +27,21 @@ const SHORT_MONTHS = [
   'Dec',
 ];
 const SHORT_DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+const MONTHS = [
+  'January',
+  'February',
+  'March',
+  'April',
+  'May',
+  'June',
+  'July',
+  'August',
+  'September',
+  'October',
+  'November',
+  'December',
+];
+const DAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
 
 const at = (isoDate: string) => new Date(`${isoDate}T00:00:00Z`);
 
@@ -39,6 +54,17 @@ export function formatShort(isoDate: string): string {
 /** `Mon 5 Oct`, for archive rows. */
 export const formatWeekday = (isoDate: string) =>
   `${SHORT_DAYS[at(isoDate).getUTCDay()]} ${formatShort(isoDate)}`;
+/** `5 October`, by hand for the same reason, for the picker's labels. */
+export function formatDayMonth(isoDate: string): string {
+  const date = at(isoDate);
+  return `${date.getUTCDate()} ${MONTHS[date.getUTCMonth()]}`;
+}
+/** `Monday 5 October`. */
+export const formatWeekdayLong = (isoDate: string) =>
+  `${DAYS[at(isoDate).getUTCDay()]} ${formatDayMonth(isoDate)}`;
+/** `October 2026`. */
+export const formatMonthName = (yyyyMm: string) =>
+  `${MONTHS[Number(yyyyMm.slice(5, 7)) - 1]} ${yyyyMm.slice(0, 4)}`;
 export const formatMonth = (yyyyMm: string) => MONTH.format(at(`${yyyyMm}-01`));
 
 export function hostOf(url: string): string {

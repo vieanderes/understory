@@ -3,7 +3,7 @@
 import { ArrowUpRight, ChevronDown } from 'lucide-react';
 import Link from 'next/link';
 import { useId, useMemo, useState } from 'react';
-import { orderByInterest, storySummary, withoutRepeatedWhy } from '@/core/news';
+import { orderByInterest, storyLead, withoutRepeatedWhy } from '@/core/news';
 import { cn } from '@/lib/cn';
 import type { NewsItem } from '@/lib/news';
 import { hostOf } from './format';
@@ -63,7 +63,7 @@ function Story({
   const [open, setOpen] = useState(false);
   const moreId = useId();
   const headingId = `item-${item.id}`;
-  const summary = storySummary(item);
+  const lead = storyLead(item);
   const topic = item.topics[0];
   const concepts = item.brief?.keyConcepts ?? [];
   const related = (item.brief?.relatedLessons ?? []).flatMap((id) => lessons[id] ?? []);
@@ -90,8 +90,8 @@ function Story({
           <span className="sr-only"> (opens in a new tab)</span>
         </a>
       </h2>
-      {summary ? <p className="text-muted prose-measure break-words">{summary}</p> : null}
-      {why ? (
+      <p className="text-muted prose-measure break-words">{lead.text}</p>
+      {why && lead.from !== 'why' ? (
         <p className="prose-measure text-sm">
           <span className="font-medium">Why it matters. </span>
           <span className="text-muted">{why}</span>

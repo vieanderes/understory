@@ -273,6 +273,42 @@ What is left: someone who can read the learner's Claude chat, and gets the learn
 press Allow for them, within the session. The panel shows the time of every request and
 of the allowed connection, and New code ends it all.
 
+### Planning a path
+
+Scout's panel has two modes, **Ask** (tutor in a lesson, guide elsewhere) and **Plan**. In
+plan mode (`mode: 'planner'`) Scout talks a learning path through with the learner, drafts it,
+and the learner saves it as one of their own paths. The code is in `src/core/planner/`
+(rules, test first) and `src/features/tutor/planner/` (the panel); the rules Scout follows are
+`PLANNER_RULES` in `src/core/ports/assistant.ts`.
+
+- **One protocol for all three providers.** MCP's `reply` carries text only, so structure
+  travels as fenced JSON blocks in the Markdown: `scout-ask` (a question, 2 to 8 options,
+  single or several) and `scout-path` (name, two other names, summary, minutes a week,
+  deadline, up to 12 stages of lesson ids). The panel draws them as chips and a draft card;
+  an unclosed block while streaming shows "Drafting your path", never raw JSON. A block that
+  fails its zod schema is dropped and the prose still reads.
+- **The model is not trusted with facts.** Lesson ids are checked against the course,
+  unknown and repeated ones are dropped (the card says how many), names are cleaned to the
+  house style (`cleanPathName`), and minutes, weeks, prerequisites the path leaves out
+  (gaps) and lessons placed before what they build on are all counted from the course
+  (`draftFacts`, `pathPace`), never read from the reply.
+- **The course comes from the server.** `/api/planner/course` is a static file built with the
+  site: the course for the panel's drafts, and Scout's compact text of it (about 90k
+  characters: every lesson's id, title, minutes, level, objective and the prerequisites
+  beyond the lesson just above, plus the written paths' stages). The API-key route sends it
+  as a cached system block and allows 8192 output tokens for a path; the local CLI route puts
+  it on stdin; over MCP, `get_course` returns it, and `get_task` in plan mode carries the
+  rules and says to call it once. The routes read it from their own origin
+  (`adapters/assistant/server/planner-course.ts`), so no function reads content files.
+- **What the tab sends** is the `planner` field of the context (at most 16k characters, fenced
+  as `learner-plan` over MCP): today's date, the setup answers, lessons done per chapter, the
+  learner's other paths, and the draft as they see it, hand edits included, so a refinement
+  starts from their version.
+- **Saving** records `custom_path_set` v2 (`pathId`, `name`, `lessonIds`, `stages`, `summary`,
+  `pace`, `origin: 'scout'`) and puts the path first on Learn. Saving again from the same
+  conversation updates the same path; "Plan again with Scout" on an own path's page opens a
+  fresh conversation seeded with it.
+
 ## 6a. Guided mode
 
 A coach beside the IDE that walks one task along the path a strong candidate takes. Switch it

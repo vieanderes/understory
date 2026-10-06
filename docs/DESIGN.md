@@ -90,7 +90,12 @@ semantic tokens only, so a palette change is a change to that one file.
   lessons put the question across the top, then code left and answers right on one top
   edge; keyboard shortcuts and a command menu. Scout AI opens as a column beside the page,
   never over it: from lg on a focus screen, from xl in the shell (below that it floats as a
-  card), and it stays open across steps and pages until closed.
+  card), and it stays open across steps and pages until closed. Its header switches **Ask**
+  and **Plan**. In plan mode Scout's questions are chips (rounded, ink when picked, never the
+  accent), a draft is one bordered card with the name, the stages, the size line in mono and
+  Save path as the primary action, and Open draft replaces the conversation with the draft
+  view inside the same column, settling in with `scout-view`. A lesson the path builds on but
+  leaves out is a knowledge gap, so it is the one thing in the draft drawn in the accent.
 - **Phone**: the four places in a bottom tab bar in the thumb zone, clear of the home
   indicator (`.pb-safe`), the Library (named) and Settings in the top bar;
   the primary action sits low; code and question share one viewport; session step types

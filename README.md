@@ -16,11 +16,6 @@
 </p>
 
 <p align="center">
-  <a href="https://understory-khaki-ten.vercel.app"><strong>Open Understory in your browser</strong></a>
-  · free, no account, nothing to install
-</p>
-
-<p align="center">
   <a href="#a-note-before-you-start">Why this exists</a> ·
   <a href="#meet-scout-your-ai-tutor">Scout AI</a> ·
   <a href="#start-here">Start here</a> ·
@@ -117,6 +112,28 @@ instead of covering it, so the lesson and the answer stay side by side; on a pho
 as a sheet. In the coding simulator the same assistant plays the one employers switch on,
 and every prompt goes into your report.
 
+### Plan a path with Scout
+
+Not sure which path fits, or none fits quite? Switch Scout to **Plan** (or choose "Plan a
+path with Scout" on Learn) and talk it through. Scout starts with what brings you here,
+whatever it is: interviews coming up, a new career, your current work, a project of your own,
+school, a coding test, or plain curiosity. Then it asks only what changes the plan: what you
+already know, how much time you have and by when, which kinds of interviews or what you want
+to build. Each question comes with answers to tap, and you can always type your own.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/scout-planner-dark.png">
+  <img alt="Scout in plan mode beside Learn. The learner tapped two reasons and a weekly time, and Scout drafted a named path of two stages, with its size, how many weeks it takes at that pace, a missing lesson it builds on marked in the accent, and Save path." src="docs/assets/readme/scout-planner-light.png" width="100%">
+</picture>
+
+After a few questions Scout drafts the path: whole chapters where a chapter fits, single
+lessons where only part of one does, in stages with a reason each, sized to your weeks, and
+with a name of its own and two others to pick from. Open the draft to rename it, take out a
+lesson or a stage, or add the lessons it builds on that you have not done yet. Ask for
+changes ("shorter", "more practice", "add system design") and Scout redrafts from the version
+you are looking at. Save puts it on Learn as one of your paths, beside any others. Lesson ids,
+minutes and gaps are checked against the course, never taken from the model on trust.
+
 ### It runs on your own Claude
 
 Scout has no key of its own and no bill to pass on. It uses the Claude you already have.
@@ -150,9 +167,6 @@ The details, including the shared store a serverless host needs for MCP, are in
 
 ## Start here
 
-[Open Understory](https://understory-khaki-ten.vercel.app) and start. Everything runs in your
-browser, and your progress stays on your device.
-
 The first visit asks five short questions, most answered with one tap: what you want (learn
 it all, a first job, refresh and then specialise, AI engineering, interviews, or just the
 news), which topics you care about, where you are starting from, how much time you have each
@@ -162,8 +176,10 @@ in Settings.
 
 Then choose one or more learning paths. Each is three or four stages of lessons from the
 full course, and ends in a timed final exam and a certificate. Follow several at once and
-switch between them with tabs on Learn, or build your own path: pick whole parts, open one to
-choose individual chapters, or go down to single lessons.
+switch between them with tabs on Learn. Or make paths of your own, as many as you like, each
+with its own name: [plan one with Scout](#plan-a-path-with-scout), or build one by hand,
+picking whole parts, single chapters or just the lessons you want. An own path can be planned
+again, edited or removed from its page on Learn.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/learn-dark.png">

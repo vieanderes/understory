@@ -507,6 +507,15 @@ every day. The code is `src/core/plan/`, the screens `src/features/plan/` at `/p
   either side, so one quiet day does not read as failure.
 - **Derived, so it follows the content.** Progress counts completed lessons, best test scores
   and passed exams. When the catalogue changes, the plan changes with it; the answers stay.
+- **Paths planned with Scout.** A plan answers fixed questions; planning with Scout is a
+  conversation for reasons the questions do not cover (a project, school, a particular kind of
+  interview). Scout asks one question at a time and only what it cannot see, because each
+  extra question is a cost before any learning. A draft names what it builds on and the
+  learner has not done (a gap), drawn as a knowledge gap and offered as one tap, but never
+  forced: prerequisites are advice, never a lock, and a learner who knows the idea from
+  elsewhere should not be sent back to it. Pace is shown in weeks at the learner's own minutes
+  a week, and against a deadline as the minutes a week it would need, so a plan that does not
+  fit says so before the learner commits to it.
 
 ## Sources
 

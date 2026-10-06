@@ -9,6 +9,7 @@ import type {
   Rich,
 } from '../content/compiled';
 import type { FigureId } from '../content/figures';
+import { VERIFY_LENSES, type VerifyLens } from '../content/lenses';
 import type { Language, Reference } from '../content/schema';
 
 /*
@@ -108,12 +109,36 @@ export interface LessonLecture {
   deeper: CompiledNotesSection[];
   deepDive?: Rich;
   pitfalls: Rich[];
+  /** Before you ship: the notes' checks, grouped by lens in VERIFY_LENSES order. */
+  verify: VerifyGroup[];
   interview: { question: Rich; answer: Rich }[];
   /** What people say a term is, and what it actually means. */
   terms: { term: string; say: string; means: Rich }[];
   flashcards: { id: string; front: Rich; back: Rich }[];
   references: Reference[];
   hasNotes: boolean;
+}
+
+export interface VerifyGroup {
+  lens: VerifyLens;
+  label: string;
+  checks: Rich[];
+}
+
+export const VERIFY_LENS_LABEL: Record<VerifyLens, string> = {
+  breaks: 'What breaks',
+  scales: 'What scales',
+  confuses: 'What confuses',
+  leaks: 'What leaks',
+  tests: 'How to test it',
+};
+
+/** The checks under each lens, lenses in their fixed order and empty ones left out. */
+export function verifyGroups(checks: readonly { lens: VerifyLens; check: Rich }[]): VerifyGroup[] {
+  return VERIFY_LENSES.flatMap((lens) => {
+    const under = checks.filter((item) => item.lens === lens).map((item) => item.check);
+    return under.length === 0 ? [] : [{ lens, label: VERIFY_LENS_LABEL[lens], checks: under }];
+  });
 }
 
 const shown = (code: string | undefined, html: string | undefined, language?: Language) =>
@@ -348,6 +373,7 @@ export function buildLessonLecture(
   const deeper = notes?.sections ?? [];
   const pitfalls = notes?.pitfalls ?? [];
   const interview = notes?.interview ?? [];
+  const verify = verifyGroups(notes?.verify ?? []);
   const terms = notes?.terms ?? [];
   const flashcards = lesson.recall.map(({ id, front, back }) => ({ id, front, back }));
 
@@ -358,6 +384,10 @@ export function buildLessonLecture(
     deeper.reduce((sum, section) => sum + readingWords(section.body.md), 0) +
     (lesson.deepDive ? readingWords(lesson.deepDive.md) : 0) +
     pitfalls.reduce((sum, line) => sum + readingWords(line.md), 0) +
+    verify.reduce(
+      (sum, group) => sum + group.checks.reduce((n, check) => n + readingWords(check.md), 0),
+      0,
+    ) +
     interview.reduce(
       (sum, qa) => sum + readingWords(qa.question.md) + readingWords(qa.answer.md),
       0,
@@ -386,6 +416,7 @@ export function buildLessonLecture(
     deeper,
     ...(lesson.deepDive ? { deepDive: lesson.deepDive } : {}),
     pitfalls,
+    verify,
     interview,
     terms,
     flashcards,

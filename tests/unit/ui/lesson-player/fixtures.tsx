@@ -36,7 +36,7 @@ export function codeHtml(code: string): string {
   return `<pre class="shiki understory" tabindex="0"><code>${lines}</code></pre>`;
 }
 
-const choice = (text: string, feedback: string, correct = false): CompiledChoice => ({
+export const choice = (text: string, feedback: string, correct = false): CompiledChoice => ({
   text: { md: text, html: escape(text) },
   feedback: rich(feedback),
   ...(correct ? { correct: true } : {}),

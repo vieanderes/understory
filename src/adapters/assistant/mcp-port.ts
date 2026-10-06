@@ -134,16 +134,37 @@ export interface McpStatus {
   request: BridgeConnection | null;
   /** When the app last used a tool with this code. */
   agentSeenAt: number | null;
+  /** The allowed app is waiting for questions (wait_for_question), so asking is enough. */
+  listening: boolean;
   /** Another tab holds this code: the panel makes a new one. */
   taken: boolean;
   /** The server cannot pair at all (no shared store), so the setup steps would not work. */
   unavailable: boolean;
 }
 
+/**
+ * A listening app checks in at least every 45 seconds (LISTEN_MS on the server), so seen
+ * within 90 counts as listening, with room for one slow call.
+ */
+export const LISTENING_WITHIN_MS = 90_000;
+
+/** Whether the allowed app is listening for questions right now. */
+export function isClaudeListening(
+  status: Pick<McpStatus, 'allowed' | 'agentSeenAt'>,
+  now: number,
+): boolean {
+  return (
+    status.allowed !== null &&
+    status.agentSeenAt !== null &&
+    now - status.agentSeenAt < LISTENING_WITHIN_MS
+  );
+}
+
 export const NO_MCP_STATUS: McpStatus = {
   allowed: null,
   request: null,
   agentSeenAt: null,
+  listening: false,
   taken: false,
   unavailable: false,
 };
@@ -152,9 +173,12 @@ export const NO_MCP_STATUS: McpStatus = {
 export async function fetchMcpStatus(
   pairing: Pairing,
   fetcher: typeof fetch = (...args) => fetch(...args),
+  /** Also tell the server the tab is still open, for an app that keeps listening. */
+  open = false,
 ): Promise<McpStatus | undefined> {
   try {
-    const response = await fetcher(`${BRIDGE}?since=${Number.MAX_SAFE_INTEGER}`, {
+    const query = `since=${Number.MAX_SAFE_INTEGER}${open ? '&open=1' : ''}`;
+    const response = await fetcher(`${BRIDGE}?${query}`, {
       headers: pairingHeaders(pairing),
       cache: 'no-store',
     });
@@ -165,10 +189,11 @@ export async function fetchMcpStatus(
       agentSeenAt: number | null;
       connection: { allowed: BridgeConnection | null; request: BridgeConnection | null };
     };
+    const seen = { allowed: body.connection.allowed, agentSeenAt: body.agentSeenAt };
     return {
-      allowed: body.connection.allowed,
+      ...seen,
       request: body.connection.request,
-      agentSeenAt: body.agentSeenAt,
+      listening: isClaudeListening(seen, Date.now()),
       taken: false,
       unavailable: false,
     };

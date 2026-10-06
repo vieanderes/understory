@@ -9,8 +9,13 @@ const bridge = await import('@/app/api/assistant/bridge/route');
 const { getBridgeStore } = await import('@/adapters/assistant/server/bridge-store');
 const { MCP_INSTRUCTIONS, handleMcpRequest } =
   await import('@/adapters/assistant/server/mcp-server');
-const { createMcpPort, fetchMcpStatus, decideMcpConnection } =
-  await import('@/adapters/assistant/mcp-port');
+const {
+  createMcpPort,
+  fetchMcpStatus,
+  decideMcpConnection,
+  isClaudeListening,
+  LISTENING_WITHIN_MS,
+} = await import('@/adapters/assistant/mcp-port');
 
 const ORIGIN = 'http://localhost:3000';
 
@@ -23,6 +28,8 @@ const address = () => `10.9.${Math.floor(clientN / 250) % 250}.${clientN++ % 250
 
 /** How long a tool call waits for Allow in these tests. */
 let approvalWaitMs = 2000;
+/** How long wait_for_question listens in these tests. */
+let listenMs = 2000;
 
 /** Routes fetches to the handlers, as the Next server would, with fast approval polling. */
 async function appFetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
@@ -35,7 +42,13 @@ async function appFetch(input: string | URL | Request, init?: RequestInit): Prom
   );
   const path = new URL(request.url).pathname;
   if (path === '/api/mcp') {
-    return handleMcpRequest(request, { approvalWaitMs, pollMs: 5, client });
+    return handleMcpRequest(request, {
+      approvalWaitMs,
+      pollMs: 5,
+      listenMs,
+      listenPollMs: 5,
+      client,
+    });
   }
   if (path === '/api/assistant/bridge') {
     return request.method === 'POST' ? bridge.POST(request) : bridge.GET(request);
@@ -110,11 +123,12 @@ const RPC_HEADERS = {
 
 afterEach(async () => {
   approvalWaitMs = 2000;
+  listenMs = 2000;
   await Promise.all(clients.splice(0).map((client) => client.close()));
 });
 
 describe('MCP server at /api/mcp', () => {
-  it('introduces itself with instructions and lists the five tools', async () => {
+  it('introduces itself with instructions and lists the six tools', async () => {
     const client = await connect();
     expect(client.getInstructions()).toBe(MCP_INSTRUCTIONS);
     expect(MCP_INSTRUCTIONS).toContain('get_pending_question');
@@ -125,6 +139,7 @@ describe('MCP server at /api/mcp', () => {
       'get_task',
       'get_test_output',
       'reply',
+      'wait_for_question',
     ]);
     for (const tool of tools) expect(tool.inputSchema.required).toContain('code');
   });
@@ -192,6 +207,83 @@ describe('MCP server at /api/mcp', () => {
       await client.callTool({ name: 'get_pending_question', arguments: { code } }),
     );
     expect(after).toContain('No question is waiting');
+  });
+});
+
+describe('listening with wait_for_question', () => {
+  /** A tab with a session, allowed for this client, the way the panel sets it up. */
+  async function allowedTab(code: string) {
+    const pair = pairing(code);
+    expect((await tab(pair, { type: 'context', context: CONTEXT })).ok).toBe(true);
+    const client = await connect();
+    await Promise.all([
+      client.callTool({ name: 'get_task', arguments: { code } }),
+      answerRequest(pair, true),
+    ]);
+    return { pair, client };
+  }
+
+  it('hands over a question asked while it waits, with the page, the code and the test run', async () => {
+    const { pair, client } = await allowedTab('WAKE2345');
+    const listening = client.callTool({
+      name: 'wait_for_question',
+      arguments: { code: pair.code },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await tab(pair, {
+      type: 'ask',
+      turns: [{ role: 'user', text: 'Why does it fail on an empty array?' }],
+      context: { ...CONTEXT, output: 'FAIL: expected 0, got undefined' },
+    });
+    const question = textOf(await listening);
+    expect(question).toContain('Why does it fail on an empty array?');
+    expect(question).toContain('<untrusted source="learner-question">');
+    expect(question).toContain(CONTEXT.code);
+    expect(question).toContain('expected 0, got undefined');
+    expect(question).toContain('Longest run');
+    expect(question).toContain('call wait_for_question again');
+  });
+
+  it('marks the app as seen, so the panel can say it is listening', async () => {
+    const { pair, client } = await allowedTab('SEEN3456');
+    listenMs = 30;
+    await client.callTool({ name: 'wait_for_question', arguments: { code: pair.code } });
+    const status = await fetchMcpStatus(pair, fetcher);
+    expect(status).toBeDefined();
+    expect(isClaudeListening(status!, Date.now())).toBe(true);
+    expect(isClaudeListening(status!, Date.now() + LISTENING_WITHIN_MS)).toBe(false);
+  });
+
+  it('returns after a while with nothing asked, so the app calls again', async () => {
+    const { pair, client } = await allowedTab('QUET2345');
+    listenMs = 40;
+    const idle = textOf(
+      await client.callTool({ name: 'wait_for_question', arguments: { code: pair.code } }),
+    );
+    expect(idle).toContain('No new question yet');
+  });
+
+  it('tells the app to stop when the tab ends its session', async () => {
+    const { pair, client } = await allowedTab('ENDS2345');
+    const listening = client.callTool({
+      name: 'wait_for_question',
+      arguments: { code: pair.code },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await tab(pair, { type: 'end' });
+    expect(textOf(await listening)).toContain('Stop listening');
+  });
+
+  it('still needs Allow: an app the learner has not allowed hears nothing', async () => {
+    const pair = pairing('DENY3456');
+    await tab(pair, { type: 'context', context: CONTEXT });
+    const client = await connect();
+    const [refused] = await Promise.all([
+      client.callTool({ name: 'wait_for_question', arguments: { code: pair.code } }),
+      answerRequest(pair, false),
+    ]);
+    expect(refused.isError).toBe(true);
+    expect(textOf(refused)).toContain('refused this connection');
   });
 });
 

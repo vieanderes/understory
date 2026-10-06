@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { EXPLAIN_BACK_AUDIENCES, EXPLAIN_BACK_KINDS } from './explain-back';
 import { FIGURE_IDS } from './figures';
 import { idSchema, localIdSchema, moduleIdSchema } from './ids';
 import { PYTHON_PACKAGES } from '../running/python-packages';
@@ -189,6 +190,17 @@ const lineHunt = {
   lines: z.array(line).min(1).max(3).describe('The line or lines at fault.'),
   reasons: z.array(choiceSchema).min(2).max(5).describe('Why that line is wrong.'),
   fix: z.string().optional().describe('The corrected code, shown after the step.'),
+  verify: z
+    .strictObject({
+      question: markdown(
+        'One question of 20 words or fewer: how you would prove the fix, or what it could regress.',
+      ),
+      choices: z.array(choiceSchema).min(2).max(4),
+    })
+    .optional()
+    .describe(
+      'A follow-up asked with the reason: how to verify the fix. Exactly one choice is right, and each has feedback.',
+    ),
 };
 
 export const bugHuntStepSchema = z.strictObject({
@@ -203,6 +215,8 @@ export const flawClassSchema = z.enum([
   'hallucinated-api',
   'edge-case',
   'performance',
+  'data-exposure',
+  'regression',
 ]);
 
 /** Plausible AI-written code with exactly one seeded flaw (Shen and Tamkin 2026). */
@@ -291,6 +305,18 @@ export const explainBackStepSchema = z.strictObject({
     .array(text('One point a good explanation makes.'))
     .length(3, 'The rubric has three points. The self-grade is how many were made.'),
   modelAnswer: markdown('A good explanation in under 80 words.'),
+  audience: z
+    .enum(EXPLAIN_BACK_AUDIENCES)
+    .optional()
+    .describe(
+      'Who the learner explains it to. Absent means teammate. Vary it across a chapter.',
+    ),
+  kind: z
+    .enum(EXPLAIN_BACK_KINDS)
+    .optional()
+    .describe(
+      'Absent means explain: why it happens. decide: defend a choice and its trade-off. risk: what could go wrong and how you would check.',
+    ),
 });
 
 /** The sources a playground can hold: a web page's three, and a React component file. */

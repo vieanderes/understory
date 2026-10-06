@@ -192,14 +192,25 @@ function compilePortable(step: PortableStep, ctx: Context): CompiledPortableStep
       };
     }
     case 'bug-hunt':
-    case 'ai-review':
+    case 'ai-review': {
+      // Taken out before the spread, so the authored shape cannot leak into the result type.
+      const { verify, ...rest } = step;
       return {
-        ...step,
+        ...rest,
         codeHtml: render.code(step.code, step.language),
         prompt: rich(step.prompt, ctx),
         reasons: compileChoices(step.reasons, ctx),
         ...(step.fix === undefined ? {} : { fixHtml: render.code(step.fix, step.language) }),
+        ...(verify === undefined
+          ? {}
+          : {
+              verify: {
+                question: rich(verify.question, ctx),
+                choices: compileChoices(verify.choices, ctx),
+              },
+            }),
       };
+    }
     case 'code-challenge': {
       // Built field by field: the file names are an authoring detail, and the solution
       // must not reach the lesson file even as a name.
@@ -361,6 +372,11 @@ function compileNotes(notes: LessonNotes, ctx: Context): CompiledNotes {
             say,
             means: inlineRich(means, ctx),
           })),
+        }),
+    ...(notes.verify === undefined
+      ? {}
+      : {
+          verify: notes.verify.map(({ lens, check }) => ({ lens, check: inlineRich(check, ctx) })),
         }),
   };
 }

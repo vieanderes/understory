@@ -7,6 +7,14 @@ import { explainStep, renderStep } from './fixtures';
 const TEXT = 'The field gives a string so plus joins the text';
 
 describe('ExplainBackStep', () => {
+  it('names who the explanation is for above the prompt', () => {
+    const { unmount } = renderStep(ExplainBackStep, explainStep);
+    expect(screen.getByText('Explain it to a teammate')).toBeInTheDocument();
+    unmount();
+    renderStep(ExplainBackStep, { ...explainStep, audience: 'reviewer', kind: 'decide' });
+    expect(screen.getByText('Defend the choice to a reviewer')).toBeInTheDocument();
+  });
+
   it('counts words live and keeps Compare off until something is written', async () => {
     const user = userEvent.setup();
     const view = renderStep(ExplainBackStep, explainStep);

@@ -313,6 +313,82 @@ describe('gradeStep: bug-hunt / ai-review', () => {
   });
 });
 
+describe('gradeStep: bug-hunt / ai-review with a verify follow-up', () => {
+  const step: BugHuntStep = {
+    type: 'bug-hunt',
+    id: 'bug-verify',
+    concept: 'js.async',
+    difficulty: 3,
+    code: 'await Promise.all(items.map(fetchOne));',
+    language: 'js',
+    prompt: 'Find the bug.',
+    lines: [1],
+    reasons: [
+      { text: 'Runs sequentially', feedback: 'Not quite.' },
+      { text: 'Missing await', correct: true, feedback: 'Right.' },
+    ],
+    verify: {
+      question: 'Which test proves the fix?',
+      choices: [
+        {
+          text: 'A test with two slow fetches',
+          correct: true,
+          feedback: 'Yes: it shows they overlap.',
+        },
+        { text: 'A snapshot test', feedback: 'A snapshot cannot see timing.' },
+      ],
+    },
+  };
+  const answer = (lines: number[], reasonIndex: number, verifyIndex?: number) =>
+    gradeStep(step, {
+      type: 'bug-hunt',
+      lines,
+      reasonIndex,
+      ...(verifyIndex === undefined ? {} : { verifyIndex }),
+    });
+
+  it('is fully correct only when the hunt and the verify answer are both right', () => {
+    const grade = answer([1], 1, 0);
+    expect(grade.correct).toBe(true);
+    expect(grade.score).toBe(1);
+    expect(grade.feedback).toEqual([
+      { kind: 'reason', message: 'Right.' },
+      { kind: 'verify', message: 'Yes: it shows they overlap.' },
+    ]);
+    expect(grade.detail).toEqual({ hunt: 1, verify: true });
+  });
+
+  it('weighs the hunt at three quarters and the verify answer at one quarter', () => {
+    expect(answer([1], 1, 1)).toMatchObject({ correct: false, score: 0.75 });
+    expect(answer([1], 0, 0)).toMatchObject({ correct: false, score: 0.625 });
+    expect(answer([1], 0, 1)).toMatchObject({ correct: false, score: 0.375 });
+    expect(answer([2], 1, 0)).toMatchObject({ correct: false, score: 0.25 });
+    expect(answer([2], 1, 1)).toMatchObject({ correct: false, score: 0 });
+  });
+
+  it('counts a missing or out-of-range verify answer as wrong', () => {
+    expect(answer([1], 1)).toMatchObject({ correct: false, score: 0.75 });
+    expect(answer([1], 1, 9)).toMatchObject({ correct: false, score: 0.75 });
+    expect(answer([1], 1, 9).feedback).toEqual([{ kind: 'reason', message: 'Right.' }]);
+  });
+
+  it('ignores a verify answer on a step without a follow-up', () => {
+    const plain: BugHuntStep = { ...step };
+    delete plain.verify;
+    const grade = gradeStep(plain, {
+      type: 'bug-hunt',
+      lines: [1],
+      reasonIndex: 1,
+      verifyIndex: 1,
+    });
+    expect(grade).toEqual({
+      correct: true,
+      score: 1,
+      feedback: [{ kind: 'reason', message: 'Right.' }],
+    });
+  });
+});
+
 describe('gradeStep: explain-back', () => {
   const step: ExplainBackStep = {
     type: 'explain-back',

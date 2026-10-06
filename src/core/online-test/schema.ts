@@ -16,7 +16,10 @@ const slug = z
   .regex(/^[a-z0-9]+(-[a-z0-9]+)*$/, 'lower-case words joined by hyphens')
   .describe('A stable id: lower-case words joined by hyphens.');
 
-/** The platform's lesson families. Tasks are original; the families are the syllabus. */
+/**
+ * The platform's lesson families, then the engineering families the AI and systems chapters
+ * add. Tasks are original; the families are the syllabus.
+ */
 export const TOPICS = [
   'iterations',
   'arrays',
@@ -36,6 +39,12 @@ export const TOPICS = [
   'greedy',
   'dynamic-programming',
   'strings',
+  'api-integration',
+  'reliability',
+  'data-sync',
+  'ai-systems',
+  'agents',
+  'evals',
 ] as const;
 
 export const TOPIC_LABEL: Record<(typeof TOPICS)[number], string> = {
@@ -57,6 +66,12 @@ export const TOPIC_LABEL: Record<(typeof TOPICS)[number], string> = {
   greedy: 'Greedy algorithms',
   'dynamic-programming': 'Dynamic programming',
   strings: 'Strings',
+  'api-integration': 'API integration',
+  reliability: 'Reliability',
+  'data-sync': 'Data sync',
+  'ai-systems': 'AI systems',
+  agents: 'Agents',
+  evals: 'Evals',
 };
 
 const valueSchema = z.union([

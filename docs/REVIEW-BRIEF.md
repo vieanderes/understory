@@ -46,6 +46,15 @@ For each reference, find it. Confirm title, authors, year, venue and URL exactly
 - Code challenges: the prompt states inputs, outputs and an example; tests cover the edge
   cases the prompt names; hints form a ladder (where to look, what to notice, the first
   step) and the third hint does not contain the solution.
+- A `verify` follow-up on a bug-hunt or ai-review: the right choice would really prove the
+  fix or catch the regression, and each wrong one is a check people do run that would miss
+  this fault. Its feedback says why.
+- Explain-backs: the `audience` and `kind` fit the prompt (a `decide` prompt names the
+  choice to defend, a `risk` prompt asks what could go wrong), and the chapter does not ask
+  the same thing of the same listener every time. `pnpm content:readability` reports it.
+- The notes' "Before you ship" checks (`verify` in `notes.yaml`): each is true, specific to
+  the lesson and filed under the right lens. A `leaks` check names what is exposed; a
+  `tests` check names the test, not "add tests".
 
 ## 4. Voice and examples
 

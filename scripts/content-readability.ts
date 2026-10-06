@@ -2,7 +2,8 @@
  * Readability report. Run with `pnpm content:readability`.
  *
  * Checks every lesson against the measurable rules in docs/WRITING-GUIDE.md and prints a
- * ranked list, worst first, with a count per rule. It never fails the build: it is the
+ * ranked list, worst first, with a count per rule, then the chapters whose explain-backs all
+ * ask the same thing of the same listener (`explain-back-variety`). It never fails the build: it is the
  * working list for rewriting the existing lessons. Once they pass, these rules move into
  * `pnpm validate:content` (docs/ROADMAP.md).
  *
@@ -11,6 +12,7 @@
  */
 import { allLessons } from '../src/core/content/catalog';
 import { readabilityOf } from '../src/core/content/readability';
+import { validateExplainBackVariety } from '../src/core/content/validate';
 import { contentRoot, loadRawCatalog } from '../src/lib/content/fs';
 import { formatReport } from './lib/report';
 
@@ -53,3 +55,9 @@ for (const { lesson, issues } of perLesson) {
 }
 const clean = perLesson.filter((entry) => entry.issues.length === 0).length;
 console.log(`\n${clean} of ${perLesson.length} lessons meet every measurable rule.`);
+
+const variety = validateExplainBackVariety(catalog).filter(
+  (issue) => !only || issue.path.includes(only),
+);
+console.log(`\nExplain-back variety: ${variety.length} chapters to vary`);
+for (const issue of variety) console.log(`  ${issue.path}  ${issue.message}`);

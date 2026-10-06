@@ -95,6 +95,14 @@ describe('lessonScript', () => {
     ],
     deeper: [{ title: r('Underneath'), body: r('How.') }],
     pitfalls: [r('A mistake.')],
+    verify: [
+      { lens: 'breaks', label: 'What breaks', checks: [r('A cold start floods it.')] },
+      {
+        lens: 'tests',
+        label: 'How to test it',
+        checks: [r('Assert the refill.'), r('Expire a key.')],
+      },
+    ],
     interview: [{ question: r('Why?'), answer: r('Because.') }],
     flashcards: [{ id: 'f', front: r('Q?'), back: r('A.') }],
   } as unknown as LessonLecture;
@@ -131,6 +139,9 @@ describe('lessonScript', () => {
       'How.',
       'Common mistakes.',
       'A mistake.',
+      'Before you ship.',
+      'What breaks. A cold start floods it.',
+      'How to test it. Assert the refill. Expire a key.',
       'Interview questions.',
       'Question 1. Why?',
       'Answer. Because.',
@@ -148,6 +159,7 @@ describe('lessonScript', () => {
       blocks: [],
       deeper: [],
       pitfalls: [],
+      verify: [],
       interview: [],
       flashcards: [],
     } as LessonLecture;

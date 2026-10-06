@@ -29,7 +29,8 @@ const placementModuleId = z
 export const placementItemSchema = z.discriminatedUnion('type', [
   predictStepSchema,
   multipleChoiceStepSchema,
-  bugHuntStepSchema,
+  // A placement item is answered in one tap of a line and one reason: no verify follow-up.
+  bugHuntStepSchema.omit({ verify: true }),
 ]);
 
 export const placementRungSchema = z.strictObject({
@@ -65,7 +66,7 @@ export type PlacementFile = z.infer<typeof placementFileSchema>;
 export type CompiledPlacementItem =
   | CompiledPredictStep
   | CompiledMultipleChoiceStep
-  | CompiledBugHuntStep;
+  | Omit<CompiledBugHuntStep, 'verify'>;
 
 export interface CompiledPlacementRung {
   rung: number;

@@ -94,6 +94,28 @@ describe('checkNotes and checkCapstoneSolution', () => {
     expect(checkNotes('n.yaml', required)).toEqual([]);
   });
 
+  it('checks the before-you-ship list: voice, one sentence, at most 30 words', () => {
+    const verify: LessonNotes['verify'] = [
+      { lens: 'breaks', check: 'A cold cache sends every request to the database at once.' },
+      { lens: 'tests', check: 'Expire one key in a test and assert the next read refills it.' },
+    ];
+    expect(checkNotes('n.yaml', { ...notes, verify })).toEqual([]);
+    const long = Array.from({ length: 31 }, () => 'word').join(' ') + '.';
+    const issues = checkNotes('n.yaml', {
+      ...notes,
+      verify: [
+        { lens: 'leaks', check: 'Keys can leak!' },
+        { lens: 'scales', check: long },
+        { lens: 'confuses', check: 'Name the key. Then name the value.' },
+      ],
+    });
+    expect(issues.map((issue) => [issue.where, issue.rule])).toEqual([
+      ['verify 1', 'lecture-exclamation'],
+      ['verify 2', 'notes-verify-long'],
+      ['verify 3', 'notes-verify-sentences'],
+    ]);
+  });
+
   it('checks every part of a capstone solution', () => {
     expect(checkCapstoneSolution('c.yaml', solution)).toEqual([]);
     const issues = checkCapstoneSolution('c.yaml', {
@@ -143,6 +165,23 @@ describe('schemas', () => {
     expect(lessonNotesSchema.safeParse(notes).success).toBe(true);
     expect(capstoneSolutionSchema.safeParse({ ...solution, sections: [] }).success).toBe(false);
     expect(lessonNotesSchema.safeParse({ ...notes, extra: 1 }).success).toBe(false);
+  });
+});
+
+describe('the before-you-ship list', () => {
+  const check = (lens: string) => ({ lens, check: 'One sentence on what to check.' });
+
+  it('takes two to eight checks, each under a known lens', () => {
+    const lenses = ['breaks', 'scales', 'confuses', 'leaks', 'tests'];
+    expect(lessonNotesSchema.safeParse({ ...notes, verify: lenses.map(check) }).success).toBe(true);
+    expect(lessonNotesSchema.safeParse({ ...notes, verify: [check('breaks')] }).success).toBe(false);
+    expect(
+      lessonNotesSchema.safeParse({ ...notes, verify: Array.from({ length: 9 }, () => check('tests')) })
+        .success,
+    ).toBe(false);
+    expect(
+      lessonNotesSchema.safeParse({ ...notes, verify: [check('breaks'), check('smells')] }).success,
+    ).toBe(false);
   });
 });
 

@@ -15,6 +15,7 @@ export function lectureOutline(lecture: LessonLecture): { href: string; label: s
     ...(lecture.pitfalls.length > 0
       ? [{ href: anchor('pitfalls'), label: 'Common mistakes' }]
       : []),
+    ...(lecture.verify.length > 0 ? [{ href: anchor('ship'), label: 'Before you ship' }] : []),
     ...(lecture.interview.length > 0
       ? [{ href: anchor('interview'), label: 'Interview questions' }]
       : []),
@@ -34,7 +35,8 @@ import {
 
 /**
  * One lesson as a lecture, in the order of docs/LECTURE-BRIEF.md: the big picture, what to
- * remember, the lesson itself, depth, mistakes, interview answers, a self-test and sources.
+ * remember, the lesson itself, depth, mistakes, the checks before shipping, interview
+ * answers, a self-test and sources.
  * `level` is the heading level of the lesson title, so the same view works alone (1) and
  * inside a chapter or part (2 or 3).
  */
@@ -156,6 +158,33 @@ export function LessonLectureView({
               </li>
             ))}
           </ul>
+        </section>
+      ) : null}
+
+      {lecture.verify.length > 0 ? (
+        <section aria-labelledby={anchor('ship')} className="flex flex-col gap-3">
+          <Heading level={section} id={anchor('ship')} className="t-section rule-t pt-3">
+            Before you ship
+          </Heading>
+          <dl className="flex flex-col">
+            {lecture.verify.map((group) => (
+              <div
+                key={group.lens}
+                className="rule-b grid grid-cols-4 gap-x-4 gap-y-1 py-2 last:border-b-0 md:grid-cols-12"
+              >
+                <dt className="t-label text-fg col-span-4 md:col-span-3">{group.label}</dt>
+                <dd className="col-span-4 md:col-span-9">
+                  <ul className="flex flex-col gap-1">
+                    {group.checks.map((check, i) => (
+                      <li key={i}>
+                        <RichHtml value={check} inline />
+                      </li>
+                    ))}
+                  </ul>
+                </dd>
+              </div>
+            ))}
+          </dl>
         </section>
       ) : null}
 

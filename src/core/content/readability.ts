@@ -104,16 +104,30 @@ function textsOf(step: Step): { label: string; text: string }[] {
   if (step.type === 'playground' || step.type === 'sql') {
     (step.hints ?? []).forEach((hint, i) => add(`hints[${i}]`, hint));
   }
+  for (const { key, list } of choiceListsOf(step)) {
+    list.forEach((c, i) => {
+      add(`${key}[${i}].text`, c.text);
+      add(`${key}[${i}].feedback`, c.feedback);
+    });
+  }
+  if (step.type === 'bug-hunt' || step.type === 'ai-review') add('verify.question', step.verify?.question);
+  return out;
+}
+
+type ChoiceLike = { text: string; feedback: string; correct?: boolean };
+
+/** The lists of choices a learner reads in a step, a verify follow-up's among them. */
+function choiceListsOf(step: Step): { key: string; list: ChoiceLike[] }[] {
+  const s = step as Record<string, unknown>;
+  const lists: { key: string; list: ChoiceLike[] }[] = [];
   for (const key of ['choices', 'reasons'] as const) {
     const list = s[key];
-    if (Array.isArray(list)) {
-      list.forEach((c: { text?: string; feedback?: string }, i) => {
-        add(`${key}[${i}].text`, c.text);
-        add(`${key}[${i}].feedback`, c.feedback);
-      });
-    }
+    if (Array.isArray(list)) lists.push({ key, list: list as ChoiceLike[] });
   }
-  return out;
+  if ((step.type === 'bug-hunt' || step.type === 'ai-review') && step.verify) {
+    lists.push({ key: 'verify.choices', list: step.verify.choices });
+  }
+  return lists;
 }
 
 /** Lines of the code pane that read as sentences: several words and nothing code-like. */
@@ -150,20 +164,22 @@ function stepIssues(step: Step, path: string): Issue[] {
   }
 
   const s = step as Record<string, unknown>;
-  if (typeof s.question === 'string') {
-    const q = s.question;
+  const questions: { label: string; text: string }[] = [];
+  if (typeof s.question === 'string') questions.push({ label: 'question', text: s.question });
+  if ((step.type === 'bug-hunt' || step.type === 'ai-review') && step.verify) {
+    questions.push({ label: 'verify.question', text: step.verify.question });
+  }
+  for (const { label, text: q } of questions) {
     if (words(q) > READABILITY.questionWords) {
-      issues.push(warn(path, at('question'), 'question-long', `${words(q)} words. Ask in at most ${READABILITY.questionWords}.`));
+      issues.push(warn(path, at(label), 'question-long', `${words(q)} words. Ask in at most ${READABILITY.questionWords}.`));
     }
     if ((q.match(/\?/g) ?? []).length > 1 || /,\s*and (which|what|who|how|why|when)\b/i.test(q)) {
-      issues.push(warn(path, at('question'), 'double-question', 'This asks two things. Ask one question per step.'));
+      issues.push(warn(path, at(label), 'double-question', 'This asks two things. Ask one question per step.'));
     }
   }
 
-  for (const key of ['choices', 'reasons'] as const) {
-    const list = s[key];
-    if (!Array.isArray(list)) continue;
-    list.forEach((c: { text: string; feedback: string; correct?: boolean }, i) => {
+  for (const { key, list } of choiceListsOf(step)) {
+    list.forEach((c, i) => {
       if (words(c.text) > READABILITY.choiceWords) {
         issues.push(warn(path, at(`${key}[${i}].text`), 'choice-long', `${words(c.text)} words. Keep a choice to ${READABILITY.choiceWords}.`));
       }

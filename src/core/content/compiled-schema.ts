@@ -33,6 +33,7 @@ import {
   stepSchema,
   traceTableStepSchema,
 } from './schema';
+import { VERIFY_LENSES } from './lenses';
 
 /*
  * Runtime mirror of compiled.ts, used for two things: the JSON Schema that the iOS client
@@ -81,7 +82,15 @@ const compiledParsons = parsonsStepSchema.extend({
     .optional(),
 });
 
-const lineHunt = { codeHtml: html, prompt: richSchema, reasons: choices, fixHtml: html.optional() };
+const lineHunt = {
+  codeHtml: html,
+  prompt: richSchema,
+  reasons: choices,
+  fixHtml: html.optional(),
+  verify: z
+    .strictObject({ question: richSchema, choices: z.array(compiledChoiceSchema).min(2).max(4) })
+    .optional(),
+};
 
 const compiledBugHunt = bugHuntStepSchema.extend(lineHunt);
 const compiledAiReview = aiReviewStepSchema.extend(lineHunt);
@@ -180,7 +189,13 @@ export const compiledPlacementSchema = z.strictObject({
       rung: z.int(),
       moduleBand: z.array(z.string()),
       concepts: z.array(z.string()),
-      items: z.array(z.discriminatedUnion('type', [compiledPredict, compiledMultipleChoice, compiledBugHunt])),
+      items: z.array(
+        z.discriminatedUnion('type', [
+          compiledPredict,
+          compiledMultipleChoice,
+          compiledBugHunt.omit({ verify: true }),
+        ]),
+      ),
     }),
   ),
 });
@@ -226,6 +241,9 @@ export const compiledLectureExtrasSchema = z.strictObject({
       interview: z.array(z.strictObject({ question: richSchema, answer: richSchema })).optional(),
       terms: z
         .array(z.strictObject({ term: z.string(), say: z.string(), means: richSchema }))
+        .optional(),
+      verify: z
+        .array(z.strictObject({ lens: z.enum(VERIFY_LENSES), check: richSchema }))
         .optional(),
     })
     .optional(),

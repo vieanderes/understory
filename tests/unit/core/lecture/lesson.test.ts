@@ -187,6 +187,11 @@ const extras: CompiledLectureExtras = {
     sections: [{ title: r('Underneath'), body: r('How it works.') }],
     pitfalls: [r('A mistake.')],
     interview: [{ question: r('Why?'), answer: r('Because.') }],
+    verify: [
+      { lens: 'tests', check: r('Assert the refill.') },
+      { lens: 'breaks', check: r('A cold start floods it.') },
+      { lens: 'tests', check: r('Expire a key first.') },
+    ],
   },
   solutions: {
     fill: [{ code: 'let x = 1', html: '<pre>let x = 1</pre>', language: 'js' }],
@@ -283,6 +288,18 @@ describe('buildLessonLecture', () => {
     expect(lecture.flashcards).toEqual([{ id: 'card', front: r('Q?'), back: r('A.') }]);
     expect(lecture.deepDive?.md).toBe('More depth.');
     expect(lecture.readingMinutes).toBeGreaterThanOrEqual(1);
+  });
+
+  it('groups the before-you-ship checks by lens, in the lens order', () => {
+    expect(lecture.verify).toEqual([
+      { lens: 'breaks', label: 'What breaks', checks: [r('A cold start floods it.')] },
+      {
+        lens: 'tests',
+        label: 'How to test it',
+        checks: [r('Assert the refill.'), r('Expire a key first.')],
+      },
+    ]);
+    expect(buildLessonLecture(lesson).verify).toEqual([]);
   });
 
   it('falls back to the opening and the recap without notes', () => {

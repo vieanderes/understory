@@ -83,6 +83,36 @@ describe('readabilityOf', () => {
     expect(found).toContain('readability-feedback-long');
   });
 
+  it('holds a verify follow-up to the question, choice and feedback limits', () => {
+    const l = lesson();
+    const long = Array.from({ length: READABILITY.questionWords + 1 }, () => 'word').join(' ') + '?';
+    Object.assign(l.steps[2] as object, {
+      verify: {
+        question: long,
+        choices: [
+          choice('one two three four five six seven eight nine ten eleven', 'Yes.', true),
+          choice('No', 'a b c d e f g h i j k l m n o p q r s t u v w x y z.'),
+        ],
+      },
+    });
+    const found = readabilityOf(l, 'lesson.yaml');
+    const at = (rule: string) => found.filter((issue) => issue.rule === rule).map((i) => i.message);
+    expect(at('readability-question-long')[0]).toContain('verify.question');
+    expect(at('readability-choice-long')[0]).toContain('verify.choices[0].text');
+    expect(at('readability-feedback-long')[0]).toContain('verify.choices[1].feedback');
+  });
+
+  it('finds nothing in a short verify follow-up', () => {
+    const l = lesson();
+    Object.assign(l.steps[2] as object, {
+      verify: {
+        question: 'Which test proves the fix?',
+        choices: [choice('A price of zero', 'Yes: it shows the gap.', true), choice('No test', 'A fix needs proof.')],
+      },
+    });
+    expect(readabilityOf(l, 'lesson.yaml')).toEqual([]);
+  });
+
   it('flags the feedback template once it repeats past the allowance', () => {
     const l = lesson();
     const step = l.steps[1] as { choices: ReturnType<typeof choice>[] };

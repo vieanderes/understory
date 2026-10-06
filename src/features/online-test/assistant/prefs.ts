@@ -27,6 +27,7 @@ export const KEY_STORAGE = 'understory:assistant:key';
 export const PROVIDER_STORAGE = 'understory:assistant:provider';
 export const MODEL_STORAGE = 'understory:assistant:model';
 export const PAIRING_STORAGE = 'understory:assistant:pairing';
+export const CLAUDE_CLIENT_STORAGE = 'understory:assistant:claude-client';
 
 type Area = 'local' | 'session';
 
@@ -91,6 +92,7 @@ function createStringStore(key: string, area: Area): StringStore {
 export const keyStore = createStringStore(KEY_STORAGE, 'local');
 export const providerStore = createStringStore(PROVIDER_STORAGE, 'local');
 export const modelStore = createStringStore(MODEL_STORAGE, 'local');
+export const claudeClientStore = createStringStore(CLAUDE_CLIENT_STORAGE, 'local');
 // Per tab: two tabs of the simulator are two candidates as far as the app is concerned.
 const pairingStore = createStringStore(PAIRING_STORAGE, 'session');
 
@@ -114,6 +116,20 @@ export function readProvider(): AssistantProviderId {
 
 export function useProvider(): AssistantProviderId {
   return useSyncExternalStore(providerStore.subscribe, readProvider, () => DEFAULT_PROVIDER);
+}
+
+/**
+ * Which Claude the learner connects through MCP: the Claude app, or Claude Code with the
+ * Understory plugin. The connection is the same; only the steps to set it up differ.
+ */
+export type ClaudeClient = 'app' | 'code';
+
+export function readClaudeClient(): ClaudeClient {
+  return claudeClientStore.get() === 'code' ? 'code' : 'app';
+}
+
+export function useClaudeClient(): ClaudeClient {
+  return useSyncExternalStore(claudeClientStore.subscribe, readClaudeClient, () => 'app');
 }
 
 export function readModel(): AssistantModel {
@@ -172,6 +188,9 @@ export function rotatePairing(): void {
  * learner asking first.
  */
 const STATUS_POLL_MS = 2000;
+/** How often the panel tells the server the tab is still open: one small write a minute. */
+const OPEN_EVERY_MS = 60_000;
+let lastOpenAt = 0;
 let status: McpStatus = NO_MCP_STATUS;
 let statusKey = '';
 const statusListeners = new Set<() => void>();
@@ -183,7 +202,9 @@ async function pollStatus() {
   if (document.visibilityState === 'visible') {
     const pairing = readPairing();
     const key = `${pairing.code}:${pairing.secret}`;
-    const next = await fetchMcpStatus(pairing);
+    const open = Date.now() - lastOpenAt >= OPEN_EVERY_MS;
+    if (open) lastOpenAt = Date.now();
+    const next = await fetchMcpStatus(pairing, undefined, open);
     if (next && readPairing() === pairing) {
       // A code another tab took is no use here: this tab moves to a fresh one.
       if (next.taken) rotatePairing();

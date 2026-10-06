@@ -1,8 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import type { Issue, RawCatalog } from '@/core/content/catalog';
 import { EM_DASH, termHash, withdrawnSettingTermsIn } from '@/core/content/style';
-import { RULES, validateCatalog } from '@/core/content/validate';
-import type { CodeChallengeStep, PlaygroundStep, SqlStep } from '@/core/content/schema';
+import { RULES, validateCatalog, validateExplainBackVariety } from '@/core/content/validate';
+import type {
+  CodeChallengeStep,
+  ExplainBackStep,
+  PlaygroundStep,
+  SqlStep,
+} from '@/core/content/schema';
 import {
   lessonOf,
   moduleOf,
@@ -460,6 +465,34 @@ describe('choice rules', () => {
       for (const reason of stepOf(lessonOf(c), type).reasons) reason.correct = true;
     });
     expect(only(issues, 'one-correct').message).toContain('2');
+  });
+
+  it.each(['bug-hunt', 'ai-review'] as const)('one-correct: a verify follow-up on a %s', (type) => {
+    const issues = issuesAfter((c) => {
+      stepOf(lessonOf(c), type).verify = {
+        question: 'Which test proves the fix?',
+        choices: [
+          { text: 'A string quantity', feedback: 'It shows the join.' },
+          { text: 'An empty cart', feedback: 'Nothing is added.' },
+        ],
+      };
+    });
+    const issue = only(issues, 'one-correct');
+    expect(issue.message).toContain('verify.choices');
+    expect(issue.message).toContain('none');
+  });
+
+  it('runs the style rules over a verify follow-up', () => {
+    const issues = issuesAfter((c) => {
+      stepOf(lessonOf(c), 'bug-hunt').verify = {
+        question: 'Which test proves the fix!',
+        choices: [
+          { text: 'A string quantity', correct: true, feedback: 'It shows the join.' },
+          { text: 'An empty cart', feedback: 'Nothing is added.' },
+        ],
+      };
+    });
+    expect(only(issues, 'style-exclamation').where).toBe('hunt-total');
   });
 
   it('one-correct: a lab checkpoint', () => {
@@ -1280,5 +1313,59 @@ describe('RULES', () => {
   it('keeps the style ratchets as warnings', () => {
     const style = RULES.filter((entry) => entry.rule.startsWith('style-'));
     expect(style.every((entry) => entry.severity === 'warning')).toBe(true);
+  });
+});
+
+describe('explain-back variety', () => {
+  /** A module of `count` lessons, each ending on an explain-back framed by `frame(i)`. */
+  function catalogOf(
+    count: number,
+    frame: (i: number) => { audience?: ExplainBackStep['audience']; kind?: ExplainBackStep['kind'] },
+  ): RawCatalog {
+    const catalog = validCatalog();
+    const chapter = moduleOf(catalog);
+    chapter.lessons = Array.from({ length: count }, (_, i) => {
+      const lesson = rawLesson();
+      lesson.data.id = `js.lesson-${i}`;
+      Object.assign(stepOf(lesson, 'explain-back'), frame(i));
+      return lesson;
+    });
+    return catalog;
+  }
+
+  it('warns when more than two thirds of six or more explain-backs share a frame', () => {
+    const issues = validateExplainBackVariety(catalogOf(6, () => ({})));
+    expect(issues).toHaveLength(1);
+    expect(issues[0]).toMatchObject({
+      severity: 'warning',
+      rule: 'explain-back-variety',
+      path: 'content/course/03-javascript/module.yaml',
+    });
+    expect(issues[0]?.message).toContain('6 of 6');
+    expect(issues[0]?.message).toContain('teammate');
+  });
+
+  it('reads an absent audience and kind as teammate and explain', () => {
+    const issues = validateExplainBackVariety(
+      catalogOf(6, (i) => (i < 5 ? {} : { audience: 'teammate', kind: 'explain' })),
+    );
+    expect(issues[0]?.message).toContain('6 of 6');
+  });
+
+  it('is quiet when the frames vary or the module is small', () => {
+    expect(validateExplainBackVariety(catalogOf(5, () => ({})))).toEqual([]);
+    const varied = (i: number) =>
+      i % 3 === 0 ? {} : i % 3 === 1 ? { audience: 'newcomer' as const } : { kind: 'risk' as const };
+    expect(validateExplainBackVariety(catalogOf(9, varied))).toEqual([]);
+    // Exactly two thirds is still enough variety.
+    expect(
+      validateExplainBackVariety(catalogOf(6, (i) => (i < 4 ? {} : { kind: 'decide' as const }))),
+    ).toEqual([]);
+  });
+
+  it('is not part of the normal validation run', () => {
+    expect(rulesOf(validateCatalog(catalogOf(6, () => ({}))))).not.toContain(
+      'explain-back-variety',
+    );
   });
 });

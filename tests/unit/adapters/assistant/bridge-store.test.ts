@@ -8,6 +8,7 @@ import {
   MemoryBackend,
   RedisRestBackend,
   sharedStoreMissing,
+  TAB_OPEN_MS,
 } from '@/adapters/assistant/server/bridge-store';
 import {
   createPairingCode,
@@ -246,6 +247,7 @@ describe('BridgeStore backends', () => {
     expect(upstash.commands).toEqual([
       ['GET', `understory:bridge:${CODE}`],
       ['SET', `understory:bridge:${CODE}`, expect.any(String), 'PX', 5000],
+      ['SET', `understory:tab:${CODE}`, expect.any(String), 'PX', TAB_OPEN_MS],
     ]);
     const failing = new RedisRestBackend(
       'https://r',
@@ -259,6 +261,30 @@ describe('BridgeStore backends', () => {
     const garbled = new RedisRestBackend('https://r', 't', (async () =>
       Response.json({ result: '{nope' })) as typeof fetch);
     expect(await garbled.load(CODE)).toBeUndefined();
+  });
+
+  it('knows the tab is open for an hour after it last said so, and peeks without saving', async () => {
+    const upstash = fakeUpstash();
+    const store = new BridgeStore({
+      backend: new RedisRestBackend('https://r', 't', upstash.fetcher),
+    });
+    expect(await store.isTabOpen(CODE)).toBe(false);
+    await store.putContext(CODE, SECRET, CONTEXT);
+    expect(await store.isTabOpen(CODE)).toBe(true);
+    upstash.commands.length = 0;
+    expect(await store.peek(CODE)).toEqual({ pending: undefined });
+    expect(upstash.commands.map(([command]) => command)).toEqual(['GET']);
+    expect(await store.peek('ZZZZ2345')).toBeNull();
+    expect(TAB_OPEN_MS).toBe(60 * 60_000);
+  });
+
+  it('lets only the tab with the secret say it is open, and forgets it when the tab ends', async () => {
+    const store = new BridgeStore();
+    await store.putContext(CODE, SECRET, CONTEXT);
+    expect(await store.tabOpen(CODE, 'f'.repeat(64))).toEqual({ ok: false, reason: 'forbidden' });
+    expect(await store.tabOpen(CODE, SECRET)).toEqual({ ok: true, value: undefined });
+    await store.end(CODE, SECRET);
+    expect(await store.isTabOpen(CODE)).toBe(false);
   });
 
   it('forgets an idle session after thirty minutes by default', () => {

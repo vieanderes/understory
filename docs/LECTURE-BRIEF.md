@@ -40,6 +40,11 @@ sections:
       two worked examples in fenced code. One to six sections, each 120 to 400 words.
 pitfalls:
   - '**The mistake in bold.** Why people make it, and the fix.'
+verify:
+  - lens: breaks
+    check: One sentence on what fails first when this idea meets real traffic or real data.
+  - lens: tests
+    check: One sentence on the test that proves it works, and what it could regress.
 interview:
   - question: What an interviewer asks, in their words.
     answer: >-
@@ -47,9 +52,30 @@ interview:
       trade-off or a "when not to". 60 to 180 words.
 ```
 
-The schema is `src/core/content/notes.ts`. `pitfalls` and `interview` are optional, but
-give every lesson in chapters 20 to 28 at least three interview questions, and every other
-lesson at least two when an interviewer would ask about the topic at all.
+The schema is `src/core/content/notes.ts`. `pitfalls`, `verify` and `interview` are
+optional, but give every lesson in chapters 20 to 28 at least three interview questions, and
+every other lesson at least two when an interviewer would ask about the topic at all.
+
+### Before you ship
+
+`verify` is the checklist a senior engineer runs before shipping code that uses the
+lesson's idea. The lecture prints it as "Before you ship", after "Common mistakes" and
+before "Interview questions", and the narration reads it in the same place. Each item has a
+`lens` and a `check`, and the lecture groups the checks by lens:
+
+| `lens`     | Printed as     | The question it answers                                  |
+| ---------- | -------------- | -------------------------------------------------------- |
+| `breaks`   | What breaks    | What could break?                                        |
+| `scales`   | What scales    | Will it hold at 10x?                                     |
+| `confuses` | What confuses  | What will confuse the next person?                       |
+| `leaks`    | What leaks     | What could this expose?                                  |
+| `tests`    | How to test it | How would you prove it works, and what could it regress? |
+
+Two to eight items. A check is one sentence of 30 words or fewer, specific to this lesson's
+idea: "A retry without a cap turns one slow dependency into a queue of retries" is a check;
+"Think about errors" is not. Use the lenses that matter for the idea, not all five every
+time, and keep the voice rules below. `pnpm lecture:check` fails a check that runs long or
+holds two sentences.
 
 ### Rules
 

@@ -133,6 +133,55 @@ describe('compileCatalog', () => {
     });
   });
 
+  describe('verify follow-ups, explain-back frames and before-you-ship checks', () => {
+    const catalog = validCatalog();
+    const raw = lessonOf(catalog);
+    stepOf(raw, 'bug-hunt').verify = {
+      question: 'Which input proves the fix?',
+      choices: [
+        { text: 'A string `"2"`', correct: true, feedback: 'It shows the join.' },
+        { text: 'The number 2', feedback: 'Numbers add already.' },
+      ],
+    };
+    Object.assign(stepOf(raw, 'explain-back'), { audience: 'reviewer', kind: 'decide' });
+    raw.notes = {
+      path: 'content/course/03-javascript/01-coercion/notes.yaml',
+      data: {
+        summary: 'Coercion turns one type into another.',
+        remember: ['One.', 'Two.', 'Three.'],
+        sections: [{ title: 'How', body: 'Like so.' }],
+        verify: [
+          { lens: 'tests', check: 'Feed a `"2"` and assert `3`.' },
+          { lens: 'breaks', check: 'Form fields are strings.' },
+        ],
+      },
+    };
+    const compiled = compileCatalog(catalog, fakeRenderer);
+    const [, framed] = lessonFile(compiled);
+
+    it('renders the verify question as Rich and its choices like any choice', () => {
+      const verify = stepIn(framed, 'bug-hunt').verify;
+      expect(verify?.question.html).toBe('<block>Which input proves the fix?</block>');
+      expect(verify?.choices[0]?.text.html).toBe('<inline>A string `"2"`</inline>');
+      expect(verify?.choices[0]?.correct).toBe(true);
+      expect(compiledLessonSchema.safeParse(framed).error?.issues).toBeUndefined();
+    });
+
+    it('carries the explain-back frame as written', () => {
+      expect(stepIn(framed, 'explain-back')).toMatchObject({ audience: 'reviewer', kind: 'decide' });
+      expect(stepIn(lesson, 'explain-back')).not.toHaveProperty('audience');
+    });
+
+    it('ships the before-you-ship checks in the lecture extras, inline', () => {
+      const entry = [...compiled.files].find(([name]) => name.startsWith('lectures/'));
+      const extras = compiledLectureExtrasSchema.parse(JSON.parse(entry?.[1] ?? '{}'));
+      expect(extras.notes?.verify).toEqual([
+        { lens: 'tests', check: { md: 'Feed a `"2"` and assert `3`.', html: '<inline>Feed a `"2"` and assert `3`.</inline>' } },
+        { lens: 'breaks', check: { md: 'Form fields are strings.', html: '<inline>Form fields are strings.</inline>' } },
+      ]);
+    });
+  });
+
   describe('a challenge with a twin', () => {
     const PY = {
       'starter.py': 'def total(xs):\n    pass\n',

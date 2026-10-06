@@ -9,7 +9,9 @@ import {
   fencesOf,
   hasRawHtml,
   proseOnly,
+  sentencesOf,
   withdrawnSettingTermsIn,
+  wordCount,
 } from './style';
 
 /*
@@ -33,6 +35,7 @@ function notesFields(notes: LessonNotes): Field[] {
       { where: `sections ${i + 1} (${section.title})`, text: section.body },
     ]),
     ...(notes.pitfalls ?? []).map((text, i) => ({ where: `pitfalls ${i + 1}`, text })),
+    ...(notes.verify ?? []).map(({ check }, i) => ({ where: `verify ${i + 1}`, text: check })),
     ...(notes.interview ?? []).flatMap((qa, i) => [
       { where: `interview ${i + 1} question`, text: qa.question },
       { where: `interview ${i + 1} answer`, text: qa.answer },
@@ -127,8 +130,33 @@ function check(path: string, fields: Field[]): Issue[] {
   );
 }
 
-export const checkNotes = (path: string, notes: LessonNotes): Issue[] =>
-  check(path, notesFields(notes));
+/** A before-you-ship check is read as one line of a checklist. */
+const VERIFY_CHECK_WORDS = 30;
+
+function verifyProblems(path: string, notes: LessonNotes): Issue[] {
+  return (notes.verify ?? []).flatMap(({ check: text }, i): Issue[] => {
+    const issue = (rule: string, message: string): Issue => ({
+      severity: 'error',
+      rule,
+      path,
+      where: `verify ${i + 1}`,
+      message,
+    });
+    const words = wordCount(proseOnly(text));
+    if (words > VERIFY_CHECK_WORDS) {
+      return [issue('notes-verify-long', `${words} words. Say the check in ${VERIFY_CHECK_WORDS} or fewer.`)];
+    }
+    if (sentencesOf(text).length > 1) {
+      return [issue('notes-verify-sentences', 'A check is one sentence. Keep the one that says what to do.')];
+    }
+    return [];
+  });
+}
+
+export const checkNotes = (path: string, notes: LessonNotes): Issue[] => [
+  ...check(path, notesFields(notes)),
+  ...verifyProblems(path, notes),
+];
 
 export const checkCapstoneSolution = (path: string, solution: CapstoneSolution): Issue[] =>
   check(path, capstoneFields(solution));

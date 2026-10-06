@@ -39,6 +39,12 @@ function choiceSpecs(list: string, choices: readonly Choice[]): FieldSpec[] {
   ]);
 }
 
+function verifySpecs(verify: { question: string; choices: readonly Choice[] } | undefined) {
+  return verify
+    ? [['verify.question', verify.question, 'markdown'] as const, ...choiceSpecs('verify.choices', verify.choices)]
+    : [];
+}
+
 function textSpecs(step: Step): FieldSpec[] {
   switch (step.type) {
     case 'prose':
@@ -62,12 +68,17 @@ function textSpecs(step: Step): FieldSpec[] {
         ),
       ];
     case 'bug-hunt':
-      return [['prompt', step.prompt, 'markdown'], ...choiceSpecs('reasons', step.reasons)];
+      return [
+        ['prompt', step.prompt, 'markdown'],
+        ...choiceSpecs('reasons', step.reasons),
+        ...verifySpecs(step.verify),
+      ];
     case 'ai-review':
       return [
         ['prompt', step.prompt, 'markdown'],
         ['request', step.request, 'plain'],
         ...choiceSpecs('reasons', step.reasons),
+        ...verifySpecs(step.verify),
       ];
     case 'code-challenge':
       return [

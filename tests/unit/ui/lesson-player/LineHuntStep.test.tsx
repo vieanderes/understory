@@ -2,7 +2,7 @@ import { screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it } from 'vitest';
 import { LineHuntStep } from '@/features/lesson-player/steps/LineHuntStep';
-import { aiReviewStep, bugHuntStep, renderStep, twoLineHuntStep } from './fixtures';
+import { aiReviewStep, bugHuntStep, choice, renderStep, rich, twoLineHuntStep } from './fixtures';
 
 const line = (n: number) => screen.getByRole('button', { name: new RegExp(`^Line ${n}:`) });
 const reason = (name: RegExp) => screen.getByRole('radio', { name });
@@ -133,5 +133,53 @@ describe('LineHuntStep', () => {
     await user.click(reason(/Number throws/));
     await user.click(screen.getByRole('button', { name: 'Check' }));
     expect(screen.queryByText(/Flaw class/)).not.toBeInTheDocument();
+  });
+
+  describe('with a verify follow-up', () => {
+    const step = {
+      ...bugHuntStep,
+      verify: {
+        question: rich('Which input proves the fix?'),
+        choices: [
+          choice('The text "abc"', 'It turns into NaN, the case the check missed.', true),
+          choice('The text "2"', 'A valid number passes before and after the fix.'),
+        ],
+      },
+    };
+
+    it('asks the verify question once a reason is picked, and reports all three', async () => {
+      const user = userEvent.setup();
+      const view = renderStep(LineHuntStep, step);
+      await user.click(line(3));
+      expect(screen.queryByText('Which input proves the fix?')).not.toBeInTheDocument();
+      await user.click(reason(/NaN == false/));
+      expect(screen.getByText('Prove the fix')).toBeInTheDocument();
+      expect(screen.getByRole('group', { name: 'Which input proves the fix?' })).toBeVisible();
+      // Not ready until the follow-up is answered too.
+      expect(view.submission()).toBeNull();
+      await user.click(reason(/abc/));
+      expect(view.submission()).toEqual({
+        type: 'bug-hunt',
+        lines: [3],
+        reasonIndex: 0,
+        verifyIndex: 0,
+      });
+      await user.click(screen.getByRole('button', { name: 'Check' }));
+      expect(view.grade()).toMatchObject({ correct: true, score: 1 });
+    });
+
+    it('calls a right hunt with a wrong check partly right, and names the check', async () => {
+      const user = userEvent.setup();
+      const view = renderStep(LineHuntStep, step, { reveal: false });
+      await user.click(line(3));
+      await user.click(reason(/NaN == false/));
+      await user.click(reason(/"2"/));
+      await user.click(screen.getByRole('button', { name: 'Check' }));
+      expect(view.grade()?.score).toBe(0.75);
+      const status = screen.getByRole('status');
+      expect(status).toHaveTextContent('Partly right');
+      expect(status).toHaveTextContent('Line 3 and the reason: right. The check is not.');
+      expect(status).toHaveTextContent('A valid number passes before and after the fix.');
+    });
   });
 });

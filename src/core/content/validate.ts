@@ -10,6 +10,7 @@ import { lockedFrame, locateRegion, parseLineRange } from './editable';
 import { editableFields } from './schema';
 import type { Choice, CodeChallengeStep, Part, PlaygroundField, Step } from './schema';
 import { challengeVariants } from './twin';
+import { explainBackFrame } from './explain-back';
 import { typecheckOf } from '../typecheck/verdict';
 import { importedPythonPackages } from '../running/python-packages';
 import {
@@ -166,7 +167,10 @@ function choiceLists(step: Step): { field: string; choices: readonly Choice[] }[
       return [{ field: 'choices', choices: step.choices }];
     case 'bug-hunt':
     case 'ai-review':
-      return [{ field: 'reasons', choices: step.reasons }];
+      return [
+        { field: 'reasons', choices: step.reasons },
+        ...(step.verify ? [{ field: 'verify.choices', choices: step.verify.choices }] : []),
+      ];
     case 'lab':
       return step.checkpoint ? [{ field: 'checkpoint.choices', choices: step.checkpoint.choices }] : [];
     default:
@@ -1097,6 +1101,45 @@ export function validateCatalog(input: RawCatalog): Issue[] {
     check(input, index).map((finding) => ({ severity, rule, ...finding })),
   );
   return [...catalogIssues, ...allLessons(input).flatMap((l) => validateLesson(l, index))];
+}
+
+// ---------------------------------------------------------------------------
+// Explain-back variety
+// ---------------------------------------------------------------------------
+
+/** Below this many explain-backs a chapter is too small to judge its mix. */
+const VARIETY_MIN_EXPLAIN_BACKS = 6;
+const VARIETY_MAX_SHARE = 2 / 3;
+
+/**
+ * A chapter whose explain-backs all ask the same thing of the same listener trains one move.
+ * Report-only for now: the course predates `audience` and `kind`, so this runs in
+ * `pnpm content:readability` and not in `validateCatalog`, where a warning fails --strict.
+ * Once the chapters vary, move it into CATALOG_RULES as a warning.
+ */
+export function validateExplainBackVariety(catalog: RawCatalog): Issue[] {
+  return allModules(catalog).flatMap((module): Issue[] => {
+    const frames = module.lessons
+      .flatMap((lesson) => withFallbacks(lesson.data.steps))
+      .filter((step) => step.type === 'explain-back')
+      .map((step) => {
+        const { audience, kind } = explainBackFrame(step);
+        return `${audience}, ${kind}`;
+      });
+    if (frames.length < VARIETY_MIN_EXPLAIN_BACKS) return [];
+    const counts = new Map<string, number>();
+    for (const frame of frames) counts.set(frame, (counts.get(frame) ?? 0) + 1);
+    const [frame, count] = [...counts].sort((a, b) => b[1] - a[1])[0] ?? ['', 0];
+    if (count <= frames.length * VARIETY_MAX_SHARE) return [];
+    return [
+      {
+        severity: 'warning',
+        rule: 'explain-back-variety',
+        path: module.path,
+        message: `${count} of ${frames.length} explain-backs ask the same thing (${frame}). Vary "audience" and "kind" across the chapter.`,
+      },
+    ];
+  });
 }
 
 /** Every rule name with its severity, for the docs and for a test that each one is covered. */

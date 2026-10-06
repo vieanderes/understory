@@ -78,6 +78,58 @@ describe('lessonSchema', () => {
     expect(lessonSchema.safeParse(input).error?.issues[0]?.message).toContain('three points');
   });
 
+  it('takes an optional audience and kind on an explain-back, from fixed lists', () => {
+    const input = validLessonInput();
+    const step = stepOfType(input, 'explain-back');
+    expect(lessonSchema.safeParse(input).success).toBe(true);
+    step.audience = 'newcomer';
+    step.kind = 'risk';
+    expect(lessonSchema.safeParse(input).success).toBe(true);
+    for (const audience of ['teammate', 'non-technical', 'reviewer', 'interviewer', 'incident']) {
+      step.audience = audience;
+      expect(lessonSchema.safeParse(input).success).toBe(true);
+    }
+    step.kind = 'decide';
+    expect(lessonSchema.safeParse(input).success).toBe(true);
+    step.audience = 'manager';
+    expect(lessonSchema.safeParse(input).success).toBe(false);
+    step.audience = 'reviewer';
+    step.kind = 'summarise';
+    expect(lessonSchema.safeParse(input).success).toBe(false);
+  });
+
+  it('takes an optional verify follow-up on a bug-hunt and an ai-review', () => {
+    const verify = {
+      question: 'Which test proves the fix?',
+      choices: [
+        { text: 'A number in a string', correct: true, feedback: 'It shows the concatenation.' },
+        { text: 'An empty list', feedback: 'Nothing gets added, so nothing shows.' },
+      ],
+    };
+    for (const type of ['bug-hunt', 'ai-review']) {
+      const input = validLessonInput();
+      stepOfType(input, type).verify = verify;
+      expect(lessonSchema.safeParse(input).success).toBe(true);
+      stepOfType(input, type).verify = { ...verify, choices: verify.choices.slice(0, 1) };
+      expect(lessonSchema.safeParse(input).success).toBe(false);
+      stepOfType(input, type).verify = {
+        ...verify,
+        choices: [...verify.choices, ...verify.choices, verify.choices[1]],
+      };
+      expect(lessonSchema.safeParse(input).success).toBe(false);
+      stepOfType(input, type).verify = { question: 'Why?', choices: verify.choices, extra: 1 };
+      expect(lessonSchema.safeParse(input).success).toBe(false);
+    }
+  });
+
+  it('knows the data-exposure and regression flaw classes', () => {
+    for (const flawClass of ['data-exposure', 'regression']) {
+      const input = validLessonInput();
+      stepOfType(input, 'ai-review').flawClass = flawClass;
+      expect(lessonSchema.safeParse(input).success).toBe(true);
+    }
+  });
+
   it('keeps difficulty between 1 and 5', () => {
     const input = validLessonInput();
     stepOfType(input, 'predict-output').difficulty = 6;

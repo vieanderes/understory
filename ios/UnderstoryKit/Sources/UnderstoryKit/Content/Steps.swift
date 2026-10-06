@@ -104,6 +104,14 @@ public struct ParsonsStep: Codable, Hashable, Sendable {
   public var checkIndent: Bool?
 }
 
+/// A follow-up on a bug-hunt or ai-review: how to prove the fix. Exactly one choice is
+/// right. Graded with the hunt (src/core/grading/grade.ts): the hunt is three quarters of
+/// the score and this answer one quarter, and full credit needs both.
+public struct VerifyFollowUp: Codable, Hashable, Sendable {
+  public var question: Rich
+  public var choices: [Choice]
+}
+
 public struct BugHuntStep: Codable, Hashable, Sendable {
   public var id: String
   public var concept: String
@@ -117,6 +125,7 @@ public struct BugHuntStep: Codable, Hashable, Sendable {
   public var reasons: [Choice]
   public var fix: String?
   public var fixHtml: String?
+  public var verify: VerifyFollowUp?
 }
 
 public struct AiReviewStep: Codable, Hashable, Sendable {
@@ -125,6 +134,8 @@ public struct AiReviewStep: Codable, Hashable, Sendable {
     case hallucinatedApi = "hallucinated-api"
     case edgeCase = "edge-case"
     case performance
+    case dataExposure = "data-exposure"
+    case regression
   }
 
   public var id: String
@@ -138,6 +149,7 @@ public struct AiReviewStep: Codable, Hashable, Sendable {
   public var reasons: [Choice]
   public var fix: String?
   public var fixHtml: String?
+  public var verify: VerifyFollowUp?
   public var request: String
   public var flawClass: FlawClass
 }
@@ -193,12 +205,23 @@ public struct CodeChallengeStep: Codable, Hashable, Sendable {
 }
 
 public struct ExplainBackStep: Codable, Hashable, Sendable {
+  /// Who the learner explains to. Absent means a teammate (src/core/content/explain-back.ts).
+  public enum Audience: String, Codable, Sendable {
+    case teammate, newcomer, reviewer, interviewer, incident
+    case nonTechnical = "non-technical"
+  }
+
+  /// explain: why it happens. decide: defend a choice. risk: what could go wrong.
+  public enum Kind: String, Codable, Sendable { case explain, decide, risk }
+
   public var id: String
   public var concept: String
   public var difficulty: Int
   public var prompt: Rich
   public var rubric: [String]
   public var modelAnswer: Rich
+  public var audience: Audience?
+  public var kind: Kind?
 }
 
 public struct LabStep: Codable, Hashable, Sendable {

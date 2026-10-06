@@ -136,10 +136,10 @@ Every step has `type` and `id`. Every step except `prose` also has `concept` and
 | `trace-table`     | `code`, `language`, `prompt`, `columns` (1 to 4), `rows` (`line`, `values`, optional `given`)                                                                                                                                                                                                                                      |
 | `fill-blank`      | `prompt`, `template` with `{{1}}` blanks, `language`, `blanks` (`key`, `answer`, optional `accept`), `bank`                                                                                                                                                                                                                        |
 | `parsons`         | `prompt`, `language`, `blocks` in the correct order (`id`, `code`, optional `indent` and `subgoal`), optional `distractors` (`id`, `code`, `feedback`), optional `checkIndent`                                                                                                                                                     |
-| `bug-hunt`        | `code`, `language`, `prompt`, `lines` (1 to 3), `reasons`, optional `fix`                                                                                                                                                                                                                                                          |
+| `bug-hunt`        | `code`, `language`, `prompt`, `lines` (1 to 3), `reasons`, optional `fix` and `verify` (see below)                                                                                                                                                                                                                                 |
 | `ai-review`       | The `bug-hunt` fields plus `request` and `flawClass`                                                                                                                                                                                                                                                                               |
 | `code-challenge`  | `prompt`, `language` (`js`, `ts`, `tsx` or `python`), `hints` (exactly 3), `starter`, `solution`, `tests` file names (optional for `ts`); for `ts`, `typecheck` and `expectStarterTypeError` (see "Type checking"); `editable` (see "Editable region"); in an assessment also `hidden`, `performance`, `timeLimitMs`, `bruteForce` |
-| `explain-back`    | `prompt`, `rubric` (exactly 3 points), `modelAnswer`                                                                                                                                                                                                                                                                               |
+| `explain-back`    | `prompt`, `rubric` (exactly 3 points), `modelAnswer`, optional `audience` and `kind` (see below)                                                                                                                                                                                                                                   |
 | `lab`             | `lab`, `intro`, optional `preset` and `checkpoint`, and a `fallback` step                                                                                                                                                                                                                                                          |
 | `incident`        | `incident` and a `fallback` step                                                                                                                                                                                                                                                                                                   |
 | `playground`      | `prompt`, `html` or `jsx`, optional `css`, `js`, `editable`, `showTree`, `checks` (1 to 8, each with optional `actions`), `solution`, `hints` (1 to 3). See "Playgrounds" below.                                                                                                                                                   |
@@ -149,8 +149,35 @@ A choice has `text`, `feedback` and, on the right one only, `correct: true`. Cho
 single line of inline markdown, because it sits inside a button. A `fallback` is any step
 except `lab` and `incident`.
 
-`flawClass` is one of `logic`, `race`, `security`, `hallucinated-api`, `edge-case` and
-`performance`.
+`flawClass` is one of `logic`, `race`, `security`, `hallucinated-api`, `edge-case`,
+`performance`, `data-exposure` (the code returns or logs more than it should) and
+`regression` (the change fixes one case and breaks one that worked).
+
+A `bug-hunt` or `ai-review` can carry a `verify` follow-up: how you would prove the fix.
+
+```yaml
+verify:
+  question: Which test would have caught this?
+  choices:
+    - text: A quantity read from a form field
+      correct: true
+      feedback: Form fields hold strings, so this shows the join.
+    - text: A quantity of zero
+      feedback: Zero adds nothing, so the join never shows.
+```
+
+The question is 20 words or fewer. Two to four choices, exactly one `correct: true`, and
+feedback on each, held to the same lengths as any choice. The player asks it once a reason
+is picked, and one Check covers all three. The hunt is three quarters of the score and the
+verify answer one quarter; full credit needs both.
+
+An `explain-back` can say who the learner explains to and what they are asked for.
+`audience` is one of `teammate` (the default), `newcomer`, `non-technical`, `reviewer`,
+`interviewer` and `incident`. `kind` is `explain` (the default: why it happens), `decide`
+(defend a choice and its trade-off) or `risk` (what could go wrong and how you would check).
+The player shows the frame above the prompt, for example "Defend the choice to a reviewer".
+`pnpm content:readability` reports a chapter with six or more explain-backs where more than
+two thirds share one audience and kind (`explain-back-variety`).
 
 ### Figures
 
@@ -768,7 +795,8 @@ predict or trace, then arrange, then fix, then write, then explain. This order f
 evidence that tracing skill precedes writing skill (Lopez et al. 2008; Xie et al. 2019).
 
 An `ai-review` step appears in every lesson from Module 3 onward. The flaw classes rotate
-through logic, race, security, a hallucinated API and an unhandled edge.
+through logic, race, security, a hallucinated API, an unhandled edge, performance, data
+exposure and a regression.
 
 ## Primary readings for the 12 most important lessons
 

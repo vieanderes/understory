@@ -178,6 +178,14 @@ export function lessonScript(lecture: LessonLecture, context?: string): string {
     parts.push('Common mistakes.');
     for (const pitfall of lecture.pitfalls) parts.push(speakMarkdown(pitfall.md));
   }
+  if (lecture.verify.length > 0) {
+    parts.push('Before you ship.');
+    for (const group of lecture.verify) {
+      parts.push(
+        [`${group.label}.`, ...group.checks.map((check) => speakMarkdown(check.md))].join(' '),
+      );
+    }
+  }
   if (lecture.interview.length > 0) {
     parts.push('Interview questions.');
     lecture.interview.forEach((qa, i) => {

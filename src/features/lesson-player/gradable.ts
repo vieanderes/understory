@@ -103,6 +103,14 @@ function portable(step: CompiledPortableStep): PortableStep {
         prompt: step.prompt.md,
         lines: step.lines,
         reasons: step.reasons.map(choice),
+        ...(step.verify
+          ? {
+              verify: {
+                question: step.verify.question.md,
+                choices: step.verify.choices.map(choice),
+              },
+            }
+          : {}),
       };
       return step.type === 'bug-hunt'
         ? { type: 'bug-hunt', ...base }
@@ -130,6 +138,8 @@ function portable(step: CompiledPortableStep): PortableStep {
         prompt: step.prompt.md,
         rubric: step.rubric,
         modelAnswer: step.modelAnswer.md,
+        ...(step.audience ? { audience: step.audience } : {}),
+        ...(step.kind ? { kind: step.kind } : {}),
       };
   }
 }

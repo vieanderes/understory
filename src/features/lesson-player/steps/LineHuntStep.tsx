@@ -20,6 +20,8 @@ const FLAW: Record<CompiledAiReviewStep['flawClass'], string> = {
   'hallucinated-api': 'Invented API',
   'edge-case': 'Edge case',
   performance: 'Performance',
+  'data-exposure': 'Data exposure',
+  regression: 'Regression',
 };
 
 const lineList = (lines: readonly number[]) =>
@@ -28,7 +30,9 @@ const lineList = (lines: readonly number[]) =>
 /**
  * bug-hunt and ai-review: find the faulty line, then say why it is faulty. Two stages on
  * purpose. The reasons would point at the line if they were on show from the start, and
- * naming the cause is what separates finding a bug from guessing at one.
+ * naming the cause is what separates finding a bug from guessing at one. A step with a
+ * verify follow-up opens a third stage once a reason is picked: how to prove the fix. All
+ * three go in one submission, so the player's single Check covers them.
  */
 export function LineHuntStep({
   step,
@@ -41,6 +45,7 @@ export function LineHuntStep({
   /** Oldest first, so a pick beyond the allowed count replaces the oldest. */
   const [picked, setPicked] = useState<readonly number[]>([]);
   const [reason, setReason] = useState<number | null>(null);
+  const [verifyPick, setVerifyPick] = useState<number | null>(null);
 
   const order = useMemo(
     () =>
@@ -50,14 +55,34 @@ export function LineHuntStep({
       ),
     [step.reasons, seed],
   );
+  const verifyOrder = useMemo(
+    () =>
+      shuffle(
+        (step.verify?.choices ?? []).map((_, i) => i),
+        // Its own stream, so the two lists are not shuffled alike.
+        mulberry32(seed + 1),
+      ),
+    [step.verify, seed],
+  );
 
   const checked = phase === 'checked';
   const allowed = step.lines.length;
 
-  function report(lines: readonly number[], reasonIndex: number | null) {
+  function report(
+    lines: readonly number[],
+    reasonIndex: number | null,
+    verifyIndex: number | null,
+  ) {
+    const ready =
+      lines.length === allowed && reasonIndex !== null && (!step.verify || verifyIndex !== null);
     onSubmissionChange(
-      lines.length === allowed && reasonIndex !== null
-        ? { type: step.type, lines: [...lines].sort((a, b) => a - b), reasonIndex }
+      ready
+        ? {
+            type: step.type,
+            lines: [...lines].sort((a, b) => a - b),
+            reasonIndex,
+            ...(step.verify && verifyIndex !== null ? { verifyIndex } : {}),
+          }
         : null,
     );
   }
@@ -67,17 +92,26 @@ export function LineHuntStep({
       ? picked.filter((n) => n !== line)
       : [...picked, line].slice(-allowed);
     setPicked(next);
-    report(next, reason);
+    report(next, reason, verifyPick);
   }
 
   function choose(index: number) {
     setReason(index);
-    report(picked, index);
+    report(picked, index, verifyPick);
+  }
+
+  function chooseVerify(index: number) {
+    setVerifyPick(index);
+    report(picked, reason, index);
   }
 
   const wrongPicks = picked.filter((n) => !step.lines.includes(n));
   const linesRight = wrongPicks.length === 0 && picked.length === allowed;
   const chosen = reason === null ? undefined : step.reasons[reason];
+  const verifyChosen =
+    verifyPick === null || !step.verify ? undefined : step.verify.choices[verifyPick];
+  const huntRight = linesRight && chosen?.correct === true;
+  const verifyRight = verifyChosen?.correct === true;
 
   const verdicts: Record<number, 'right' | 'wrong'> = {};
   if (checked) {
@@ -144,14 +178,39 @@ export function LineHuntStep({
           />
         </div>
       ) : null}
+      {step.verify && reason !== null ? (
+        <div className="step-in flex flex-col gap-1">
+          <p className="t-label">Prove the fix</p>
+          <RichText value={step.verify.question} />
+          <ChoiceList
+            legend={step.verify.question.md}
+            choices={step.verify.choices}
+            order={verifyOrder}
+            selected={verifyPick}
+            onSelect={chooseVerify}
+            checked={checked}
+            reveal={reveal}
+          />
+        </div>
+      ) : null}
       {checked && grade ? (
-        <Feedback verdict={grade.correct ? 'right' : linesRight ? 'partly' : 'wrong'}>
+        <Feedback
+          verdict={
+            grade.correct
+              ? 'right'
+              : linesRight || (step.verify && verifyRight)
+                ? 'partly'
+                : 'wrong'
+          }
+        >
           <div className="flex flex-col gap-1">
             {grade.correct ? null : (
               <p>
-                {linesRight
-                  ? `${lineList(picked)}: right. The reason is not.`
-                  : `${lineList(wrongPicks)}: not at fault.`}
+                {huntRight
+                  ? `${lineList(picked)} and the reason: right. The check is not.`
+                  : linesRight
+                    ? `${lineList(picked)}: right. The reason is not.`
+                    : `${lineList(wrongPicks)}: not at fault.`}
                 {reveal && !linesRight
                   ? ` The fault is on ${lineList(step.lines).toLowerCase()}.`
                   : ''}
@@ -163,6 +222,9 @@ export function LineHuntStep({
              * misconception and is safe to show.
              */}
             {chosen && (reveal || !chosen.correct) ? <RichText value={chosen.feedback} /> : null}
+            {verifyChosen && (reveal || !verifyChosen.correct) ? (
+              <RichText value={verifyChosen.feedback} />
+            ) : null}
           </div>
         </Feedback>
       ) : null}

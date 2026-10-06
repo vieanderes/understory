@@ -7,7 +7,9 @@ import type {
   SqlStepChecks,
   StepType,
 } from './schema';
+import type { ExplainBackAudience, ExplainBackKind } from './explain-back';
 import type { FigureId } from './figures';
+import type { VerifyLens } from './lenses';
 import type { PythonPackage } from '../running/python-packages';
 
 /*
@@ -110,6 +112,8 @@ interface LineHunt extends Scored, Highlighted {
   reasons: CompiledChoice[];
   fix?: string;
   fixHtml?: string;
+  /** A second question, asked with the reason: how to prove the fix. One choice is right. */
+  verify?: { question: Rich; choices: CompiledChoice[] };
 }
 
 export interface CompiledBugHuntStep extends LineHunt {
@@ -119,7 +123,15 @@ export interface CompiledBugHuntStep extends LineHunt {
 export interface CompiledAiReviewStep extends LineHunt {
   type: 'ai-review';
   request: string;
-  flawClass: 'logic' | 'race' | 'security' | 'hallucinated-api' | 'edge-case' | 'performance';
+  flawClass:
+    | 'logic'
+    | 'race'
+    | 'security'
+    | 'hallucinated-api'
+    | 'edge-case'
+    | 'performance'
+    | 'data-exposure'
+    | 'regression';
 }
 
 /** The reference solution is not here. It ships in the separate solutions file. */
@@ -170,6 +182,10 @@ export interface CompiledExplainBackStep extends Scored {
   prompt: Rich;
   rubric: string[];
   modelAnswer: Rich;
+  /** Absent means a teammate (src/core/content/explain-back.ts). */
+  audience?: ExplainBackAudience;
+  /** Absent means explain: why it happens. */
+  kind?: ExplainBackKind;
 }
 
 export type CompiledPortableStep =
@@ -312,6 +328,8 @@ export interface CompiledNotes {
   interview?: { question: Rich; answer: Rich }[];
   /** What people say a term is, and what it actually means. */
   terms?: { term: string; say: string; means: Rich }[];
+  /** Before you ship: one inline check per item, each under a lens. */
+  verify?: { lens: VerifyLens; check: Rich }[];
 }
 
 /**

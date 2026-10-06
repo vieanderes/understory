@@ -156,6 +156,26 @@ every rule above and still teach nothing. These rules close that gap.
     prompt has to define something before asking, that definition belongs in a prose step
     before it.
 
+### Judgment and explaining
+
+Knowing why code works is half of the job. The other half is judging it before it ships.
+Five questions carry that judgment, and lessons from the middle of the course on keep coming
+back to them:
+
+- What could break?
+- Will it hold at 10x?
+- What will confuse the next person?
+- What could this expose?
+- How would you prove it works, and what could it regress?
+
+They are the lenses of a lecture's "Before you ship" list, and a `verify` follow-up on a
+bug-hunt asks the last one out loud.
+
+Explaining is a skill with more than one shape. Telling a newcomer why something happens is
+not defending a choice to a reviewer, and neither is warning the incident channel. So
+explain-backs vary their `audience` and their `kind` across a chapter: no single frame takes
+more than two thirds of them.
+
 ### Practise coding, not arithmetic
 
 A learner hit a step that printed `45 45`, `45 4545`, `8 45458` and asked which round went

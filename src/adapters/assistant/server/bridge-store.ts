@@ -89,6 +89,13 @@ const SWEEP_EVERY_MS = 60_000;
 /** Short, so an abandoned code stops working soon. Every push from the tab renews it. */
 export const DEFAULT_TTL_MS = 30 * 60 * 1000;
 
+/**
+ * How long an app that keeps listening goes on after the tab last said it is open. The tab
+ * says so at most once a minute while its panel is on screen, and with every question.
+ */
+export const TAB_OPEN_MS = 60 * 60 * 1000;
+const tabKey = (code: string) => `tab:${code}`;
+
 export type TabResult<T> = { ok: true; value: T } | { ok: false; reason: 'forbidden' };
 
 /** Where a connection stands with a session, from the app's side. */
@@ -307,6 +314,7 @@ export class BridgeStore {
     if (mode !== 'read') {
       session.lastSeen = this.now();
       await this.backend.save(code, session, this.ttlMs);
+      await this.backend.set(tabKey(code), String(this.now()), TAB_OPEN_MS);
     }
     return { ok: true, value };
   }
@@ -365,8 +373,36 @@ export class BridgeStore {
   /** The tab closes the session: a new code, or the learner is done. */
   async end(code: string, secret: string): Promise<TabResult<undefined>> {
     const check = await this.fromTab(code, secret, 'read', () => undefined);
-    if (check.ok) await this.backend.remove(code);
+    if (check.ok) {
+      await this.backend.remove(code);
+      await this.backend.delete(tabKey(code));
+    }
     return check;
+  }
+
+  /**
+   * The tab says it is still open. A small key of its own, so the session's expiry is left
+   * alone and an app listening for questions knows when to stop.
+   */
+  async tabOpen(code: string, secret: string): Promise<TabResult<undefined>> {
+    const check = await this.fromTab(code, secret, 'read', () => undefined);
+    if (check.ok) await this.backend.set(tabKey(code), String(this.now()), TAB_OPEN_MS);
+    return check;
+  }
+
+  /** Whether the tab has said it is open lately. */
+  async isTabOpen(code: string): Promise<boolean> {
+    return (await this.backend.get(tabKey(code))) !== undefined;
+  }
+
+  /**
+   * The waiting question without saving anything, for an app that checks every few
+   * seconds: a read costs one lookup and leaves the session's expiry alone. Null when the
+   * session is gone.
+   */
+  async peek(code: string): Promise<{ pending: BridgeQuestion | undefined } | null> {
+    const session = await this.backend.load(code);
+    return session ? { pending: session.pending } : null;
   }
 
   /** The tab polls. Read-only, so a poll does not keep an abandoned session alive. */

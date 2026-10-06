@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { VERIFY_LENSES } from './lenses';
 
 /*
  * Lecture notes: the reading layer on top of a lesson. A lesson teaches one idea per screen
@@ -32,6 +33,17 @@ export const termSchema = z.strictObject({
   means: markdown('What it actually means, precisely, in one or two sentences.'),
 });
 
+export { VERIFY_LENSES, type VerifyLens } from './lenses';
+
+export const verifyCheckSchema = z.strictObject({
+  lens: z
+    .enum(VERIFY_LENSES)
+    .describe(
+      'breaks: what fails. scales: what gives at 10x. confuses: what misleads the next reader. leaks: what it could expose. tests: how to prove it works and what it could regress.',
+    ),
+  check: text('One sentence of 30 words or fewer: the check to run, concrete to this idea.'),
+});
+
 /** `notes.yaml` beside `lesson.yaml`. */
 export const lessonNotesSchema = z.strictObject({
   summary: markdown('The big picture: what it is, why it exists and when you reach for it.'),
@@ -49,6 +61,14 @@ export const lessonNotesSchema = z.strictObject({
     .array(markdown('A mistake people make, why it happens and the fix.'))
     .max(8)
     .optional(),
+  verify: z
+    .array(verifyCheckSchema)
+    .min(2)
+    .max(8)
+    .optional()
+    .describe(
+      'Before you ship: the checklist a senior engineer runs before shipping code that uses this lesson\'s idea.',
+    ),
   interview: z
     .array(interviewAnswerSchema)
     .max(8)
@@ -84,6 +104,7 @@ export type LessonNotes = z.infer<typeof lessonNotesSchema>;
 export type NotesSection = z.infer<typeof notesSectionSchema>;
 export type InterviewAnswer = z.infer<typeof interviewAnswerSchema>;
 export type Term = z.infer<typeof termSchema>;
+export type VerifyCheck = z.infer<typeof verifyCheckSchema>;
 export type CapstoneSolution = z.infer<typeof capstoneSolutionSchema>;
 
 export const NOTES_FILE = 'notes.yaml';

@@ -3,6 +3,7 @@
 import { useId, useState } from 'react';
 import { Button } from '@/components/ui/Button';
 import type { CompiledExplainBackStep } from '@/core/content/compiled';
+import { explainBackCue } from '@/core/content/explain-back';
 import { cn } from '@/lib/cn';
 import type { StepProps } from '../contract';
 import { InlineMd } from '../parts/InlineMd';
@@ -53,7 +54,10 @@ export function ExplainBackStep({
 
   return (
     <StepLayout>
-      <RichText value={step.prompt} className="t-section" />
+      <div className="flex flex-col gap-0.5">
+        <p className="t-label">{explainBackCue(step)}</p>
+        <RichText value={step.prompt} className="t-section" />
+      </div>
       <div className="flex flex-col gap-1">
         <label htmlFor={`${countId}-text`} className="t-label">
           Your explanation

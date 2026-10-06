@@ -63,6 +63,8 @@ export interface LineHuntAnswer {
   readonly type: 'bug-hunt' | 'ai-review';
   readonly lines: readonly number[];
   readonly reasonIndex: number;
+  /** The pick in the step's verify follow-up, when it has one. */
+  readonly verifyIndex?: number;
 }
 export interface ExplainBackAnswer {
   readonly type: 'explain-back';
@@ -97,6 +99,12 @@ export type GradableStep =
 /** Partial credit for a bug-hunt or ai-review answer with the right line but the
  * wrong reason (the deliverable brief's explicit rule). */
 const RIGHT_LINE_WRONG_REASON_SCORE = 0.5;
+
+/**
+ * With a verify follow-up, finding the fault stays the main skill and proving the fix is
+ * the smaller share. Full credit needs both, so either one alone is partial credit.
+ */
+const VERIFY_WEIGHT = 0.25;
 
 // ---------------------------------------------------------------------------
 // Cell normalisation (trace-table)
@@ -222,9 +230,18 @@ function gradeLineHunt(step: BugHuntStep | AiReviewStep, answer: LineHuntAnswer)
   const reasonCorrect = reason?.correct === true;
   const feedback: FeedbackItem[] = reason ? [{ kind: 'reason', message: reason.feedback }] : [];
 
-  if (!linesMatch) return { correct: false, score: 0, feedback };
-  if (!reasonCorrect) return { correct: false, score: RIGHT_LINE_WRONG_REASON_SCORE, feedback };
-  return { correct: true, score: 1, feedback };
+  const hunt = !linesMatch ? 0 : reasonCorrect ? 1 : RIGHT_LINE_WRONG_REASON_SCORE;
+  if (!step.verify) return { correct: hunt === 1, score: hunt, feedback };
+
+  const picked =
+    answer.verifyIndex === undefined ? undefined : step.verify.choices[answer.verifyIndex];
+  const verify = picked?.correct === true;
+  return {
+    correct: hunt === 1 && verify,
+    score: hunt * (1 - VERIFY_WEIGHT) + (verify ? VERIFY_WEIGHT : 0),
+    feedback: picked ? [...feedback, { kind: 'verify', message: picked.feedback }] : feedback,
+    detail: { hunt, verify },
+  };
 }
 
 function gradeExplainBack(_step: ExplainBackStep, answer: ExplainBackAnswer): Grade {

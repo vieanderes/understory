@@ -174,7 +174,10 @@ Generator kinds (`src/core/online-test/generate.ts`):
 | `pairs`       | n, min, max    | n `[a, b]` with a ≤ b                       |
 
 - Tasks are original. Use the platform's syllabus families (`topic`), never its task text or
-  names. The examples are generic (law 10).
+  names. The examples are generic (law 10). Beyond the algorithm families, `topic` takes
+  `api-integration`, `reliability`, `data-sync`, `ai-systems`, `agents` and `evals` for
+  coding and bug-fix tasks from the later chapters (`TOPICS` in
+  `src/core/online-test/schema.ts`).
 - Titles are one CamelCase word.
 - `pnpm validate:content` runs the gates: expected values agree with the reference, Python
   agrees with TypeScript, the speed limits hold, the brute force behaves, and bug-fix limits

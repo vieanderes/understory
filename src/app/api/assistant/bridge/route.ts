@@ -16,7 +16,7 @@ import { contextSchema, errorResponse, readBody, turnSchema } from '@/adapters/a
  *   POST { type: 'context', context }           -> { ok: true }
  *   POST { type: 'decide', connection, allow }  -> { ok: true, decided }
  *   POST { type: 'end' }                        -> { ok: true }
- *   GET  ?since=3                               -> { replies, agentSeenAt, connection }
+ *   GET  ?since=3[&open=1]                      -> { replies, agentSeenAt, connection }
  * The tab polls GET for replies numbered above `since`, and for a connection to allow.
  */
 
@@ -105,11 +105,15 @@ export async function GET(request: Request) {
   if (sharedStoreMissing()) return NO_SHARED_STORE();
   const pair = credentials(request);
   if (!pair) return MALFORMED();
-  const since = Number(new URL(request.url).searchParams.get('since') ?? '0');
+  const params = new URL(request.url).searchParams;
+  const since = Number(params.get('since') ?? '0');
   if (!Number.isInteger(since) || since < 0) {
     return errorResponse('failed', 'since must be a whole number.', 400);
   }
-  const result = await getBridgeStore().repliesSince(pair.code, pair.secret, since);
+  const store = getBridgeStore();
+  const result = await store.repliesSince(pair.code, pair.secret, since);
   if (!result.ok) return forbidden(request);
+  // The panel says now and then that the tab is still open, for an app that keeps listening.
+  if (params.get('open') === '1') await store.tabOpen(pair.code, pair.secret);
   return Response.json(result.value, { headers: NO_STORE });
 }

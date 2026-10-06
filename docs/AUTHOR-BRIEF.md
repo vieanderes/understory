@@ -54,11 +54,19 @@ short sentences. The first scored step is an easy win.
    distractors, `fill-blank` with distractor tokens in the bank).
 4. **Fix and review** (`bug-hunt`; from module 3 onward at least one `ai-review`: plausible
    assistant-written code, exactly one seeded flaw, and a note in the prompt on why a quick
-   test did not catch it. Rotate `flawClass`).
+   test did not catch it. Rotate `flawClass` through all eight, `data-exposure` and
+   `regression` among them). From chapter 11 onward, give one `bug-hunt` or `ai-review` per
+   lesson a `verify` follow-up where it fits: how would you prove the fix, or what could it
+   regress. One right choice, real wrong ones (a test that cannot see the fault).
 5. **Write** (`code-challenge`, language `js` or `ts`) wherever the topic can be exercised as
    a pure function. HTML, CSS, SQL, shell and config topics have no runnable challenge yet:
    use an extra `parsons` or `fill-blank` on the real syntax instead.
-6. **Explain** (`explain-back`), last. Ask for a cause, not a definition.
+6. **Explain** (`explain-back`), last. Ask for a cause, not a definition. Vary who it is
+   for and what it asks across a chapter with `audience` (a newcomer, a reviewer, someone
+   non-technical, an interviewer, the incident channel; a teammate when absent) and `kind`
+   (`explain` why it happens, `decide` to defend a choice and its trade-off, `risk` for what
+   could go wrong and how you would check). No single frame takes more than two thirds of a
+   chapter's explain-backs.
 
 Also:
 
@@ -77,6 +85,14 @@ Also:
 - If `outline.yaml` gives your lesson a `lab`, include exactly one `lab` step with that id,
   an `intro` that says what to try and what to watch for, a `checkpoint` question, and a
   `fallback` step (any portable type) for clients without the lab.
+
+## Lecture notes
+
+When you write or touch a lesson's `notes.yaml`, follow `docs/LECTURE-BRIEF.md`. Give it a
+`verify` list, "Before you ship": two to eight one-sentence checks a senior engineer runs
+before shipping code that uses the idea, each under a lens (`breaks`, `scales`, `confuses`,
+`leaks`, `tests`). Pick the lenses the idea needs, and make each check specific enough to
+act on.
 
 ## Code
 

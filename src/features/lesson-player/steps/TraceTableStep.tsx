@@ -60,6 +60,8 @@ export function TraceTableStep({
 
   return (
     <StepLayout
+      question={<RichText value={step.prompt} className="t-section" />}
+      split="even"
       code={
         <CodeView
           html={step.codeHtml}
@@ -68,7 +70,6 @@ export function TraceTableStep({
         />
       }
     >
-      <RichText value={step.prompt} className="t-section" />
       <div
         // A wide table scrolls inside itself, never the page, and a region that scrolls
         // has to be reachable by keyboard.

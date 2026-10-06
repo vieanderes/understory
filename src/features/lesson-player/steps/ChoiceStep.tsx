@@ -41,11 +41,12 @@ export function ChoiceStep({
 
   return (
     <StepLayout
+      question={<RichText value={step.question} className="t-section" />}
       code={
         step.codeHtml ? <CodeView html={step.codeHtml} label="Code for this question" /> : undefined
       }
+      split="even"
     >
-      <RichText value={step.question} className="t-section" />
       <ChoiceList
         legend="Your answer"
         choices={step.choices}

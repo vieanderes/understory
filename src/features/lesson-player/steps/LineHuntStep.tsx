@@ -87,8 +87,9 @@ export function LineHuntStep({
 
   return (
     <StepLayout
-      code={
+      question={
         <div className="flex flex-col gap-2">
+          <RichText value={step.prompt} className="t-section" />
           {step.type === 'ai-review' ? (
             <div>
               <p className="t-label">Asked of the assistant</p>
@@ -97,36 +98,38 @@ export function LineHuntStep({
               </p>
             </div>
           ) : null}
-          <div
-            // Enter on a line picks it. The player also listens for Enter to check the
-            // answer, and would check the answer as it stood before this pick.
-            onKeyDown={(e) => {
-              if (e.key === 'Enter' && (e.target as HTMLElement).closest('.line'))
-                e.stopPropagation();
-            }}
-          >
-            {/*
-             * Keyed by phase: CodeView stamps button roles on pickable lines and never
-             * takes them back. A fresh mount after the check leaves plain, inert lines.
-             */}
-            <CodeView
-              key={phase}
-              html={step.codeHtml}
-              label={checked ? 'Code, marked' : 'Code. Pick the line at fault'}
-              picked={checked ? [] : picked}
-              verdicts={verdicts}
-              {...(checked ? {} : { onPick: pick })}
-            />
-          </div>
-          {checked ? null : (
-            <p className="t-label t-figure" aria-live="polite">
-              {picked.length} of {allowed} {allowed === 1 ? 'line' : 'lines'} picked
-            </p>
-          )}
+        </div>
+      }
+      code={
+        <div
+          // Enter on a line picks it. The player also listens for Enter to check the
+          // answer, and would check the answer as it stood before this pick.
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' && (e.target as HTMLElement).closest('.line'))
+              e.stopPropagation();
+          }}
+        >
+          {/*
+           * Keyed by phase: CodeView stamps button roles on pickable lines and never
+           * takes them back. A fresh mount after the check leaves plain, inert lines.
+           */}
+          <CodeView
+            key={phase}
+            html={step.codeHtml}
+            label={checked ? 'Code, marked' : 'Code. Pick the line at fault'}
+            picked={checked ? [] : picked}
+            verdicts={verdicts}
+            {...(checked ? {} : { onPick: pick })}
+          />
         </div>
       }
     >
-      <RichText value={step.prompt} className="t-section" />
+      {/* The answers column opens on the count, level with the code it counts lines of. */}
+      {checked ? null : (
+        <p className="t-label t-figure" aria-live="polite">
+          {picked.length} of {allowed} {allowed === 1 ? 'line' : 'lines'} picked
+        </p>
+      )}
       {picked.length > 0 ? (
         <div className="step-in flex flex-col gap-1">
           <p className="t-label">Why is it at fault</p>

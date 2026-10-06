@@ -17,9 +17,20 @@ const OPTIONS = [
 export function ConfidenceControl({
   value,
   onChange,
+  className,
 }: {
   value: Confidence | null;
   onChange: (value: Confidence) => void;
+  className?: string;
 }) {
-  return <Segmented label="How sure" options={OPTIONS} value={value} onChange={onChange} />;
+  return (
+    <Segmented
+      inline
+      label="How sure"
+      options={OPTIONS}
+      value={value}
+      onChange={onChange}
+      className={className}
+    />
+  );
 }

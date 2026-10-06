@@ -12,6 +12,7 @@ import type { Submission } from './contract';
 import { toGradable } from './gradable';
 import { recordOutcome } from './outcome';
 import { ConfidenceControl } from './parts/ConfidenceControl';
+import { ActionBar } from '@/components/layout/ActionBar';
 import { STEP_COMPONENTS } from './registry';
 import { ProseStep } from './steps/ProseStep';
 
@@ -266,59 +267,58 @@ export function StepRunner({
         )}
       </section>
 
-      <footer className="rule-t bg-bg pb-safe fixed inset-x-0 bottom-0 z-20">
-        <div className="frame flex min-h-9 flex-wrap items-end justify-between gap-2 py-2">
-          {scored && phase === 'answering' && step.type !== 'explain-back' ? (
-            <div className="w-full sm:w-36">
-              <ConfidenceControl value={confidence} onChange={setConfidence} />
-            </div>
-          ) : (
-            <span />
-          )}
-          <div className="ml-auto flex items-center gap-1">
-            {onBack ? (
-              <Button
-                variant="quiet"
-                onClick={onBack}
-                aria-label="Previous step"
-                title="Previous step"
-              >
-                <ChevronLeft aria-hidden size={16} strokeWidth={2} />
-                <span className="max-sm:sr-only">Back</span>
-              </Button>
-            ) : null}
-            {!scored ? (
-              <Button variant="primary" onClick={onContinue}>
-                Continue
-              </Button>
-            ) : phase === 'answering' ? (
-              <>
-                {/* Any question can wait: nothing in Understory is locked, and a skipped
+      {/* A phone takes two rows: how sure, then the buttons. Wider, one row. */}
+      <ActionBar className="flex-wrap justify-between gap-y-1 sm:flex-nowrap">
+        {scored && phase === 'answering' && step.type !== 'explain-back' ? (
+          <ConfidenceControl
+            value={confidence}
+            onChange={setConfidence}
+            className="w-full sm:w-auto sm:min-w-36"
+          />
+        ) : null}
+        <div className="ml-auto flex items-center gap-1">
+          {onBack ? (
+            <Button
+              variant="quiet"
+              onClick={onBack}
+              aria-label="Previous step"
+              title="Previous step"
+            >
+              <ChevronLeft aria-hidden size={16} strokeWidth={2} />
+              <span className="max-sm:sr-only">Back</span>
+            </Button>
+          ) : null}
+          {!scored ? (
+            <Button variant="primary" onClick={onContinue}>
+              Continue
+            </Button>
+          ) : phase === 'answering' ? (
+            <>
+              {/* Any question can wait: nothing in Understory is locked, and a skipped
                     step simply earns nothing until it is answered. */}
-                <Button variant="quiet" onClick={onContinue}>
-                  Skip for now
-                </Button>
-                <Button variant="primary" onClick={check} disabled={!canCheck}>
-                  Check
-                </Button>
-              </>
-            ) : canRetry ? (
-              <>
-                <Button variant="quiet" onClick={showAnswer}>
-                  Show answer
-                </Button>
-                <Button variant="primary" onClick={retry}>
-                  Try again
-                </Button>
-              </>
-            ) : (
-              <Button variant="primary" onClick={onContinue}>
-                Continue
+              <Button variant="quiet" onClick={onContinue}>
+                Skip for now
               </Button>
-            )}
-          </div>
+              <Button variant="primary" onClick={check} disabled={!canCheck}>
+                Check
+              </Button>
+            </>
+          ) : canRetry ? (
+            <>
+              <Button variant="quiet" onClick={showAnswer}>
+                Show answer
+              </Button>
+              <Button variant="primary" onClick={retry}>
+                Try again
+              </Button>
+            </>
+          ) : (
+            <Button variant="primary" onClick={onContinue}>
+              Continue
+            </Button>
+          )}
         </div>
-      </footer>
+      </ActionBar>
     </>
   );
 }

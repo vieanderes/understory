@@ -266,7 +266,7 @@ export function SessionRunner({ session }: { session: SessionKind }) {
         </div>
       </header>
 
-      <main id="content" className="frame flex-1 pt-4 pb-20">
+      <main id="content" className="frame flex-1 pt-4 pb-4">
         {failed ? (
           <p className="text-muted">
             The course index could not be loaded. Check the connection and reload.

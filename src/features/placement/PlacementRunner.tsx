@@ -3,6 +3,7 @@
 import { X } from 'lucide-react';
 import Link from 'next/link';
 import { useEffect, useRef, useState } from 'react';
+import { ActionBar } from '@/components/layout/ActionBar';
 import { Button, buttonClass } from '@/components/ui/Button';
 import { Figure } from '@/components/ui/Figure';
 import type { CompiledStep } from '@/core/content/compiled';
@@ -122,7 +123,7 @@ export function PlacementRunner({ rungs, modules }: Props) {
         </div>
       </header>
 
-      <main id="content" className="frame flex-1 pt-4 pb-20">
+      <main id="content" className="frame flex-1 pt-4 pb-4">
         {!session ? (
           <Intro
             value={startedAs}
@@ -261,16 +262,16 @@ function PlacementItem({
         ) : null}
       </section>
 
-      <footer className="rule-t bg-bg pb-safe fixed inset-x-0 bottom-0 z-20">
-        <div className="frame flex min-h-9 flex-wrap items-center justify-between gap-2 py-1">
-          <div className="w-full sm:w-36">
-            <ConfidenceControl value={confidence} onChange={setConfidence} />
-          </div>
-          <Button variant="primary" className="ml-auto" onClick={next} disabled={!canAnswer}>
-            Next
-          </Button>
-        </div>
-      </footer>
+      <ActionBar className="justify-between gap-2">
+        <ConfidenceControl
+          value={confidence}
+          onChange={setConfidence}
+          className="min-w-0 flex-1 sm:max-w-36"
+        />
+        <Button variant="primary" onClick={next} disabled={!canAnswer}>
+          Next
+        </Button>
+      </ActionBar>
     </>
   );
 }

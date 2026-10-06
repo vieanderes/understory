@@ -15,6 +15,8 @@ interface SegmentedProps<T extends string> {
   onChange: (value: T) => void;
   /** Hide the label visually when the surrounding text already names the control. */
   hideLabel?: boolean;
+  /** Label beside the control on one line, with shorter segments: for a bar short on height. */
+  inline?: boolean;
   className?: string;
 }
 
@@ -28,19 +30,24 @@ export function Segmented<T extends string>({
   value,
   onChange,
   hideLabel,
+  inline,
   className,
 }: SegmentedProps<T>) {
   const name = useId();
   const labelId = `${name}-label`;
   return (
-    <div role="radiogroup" aria-labelledby={labelId} className={className}>
-      <p id={labelId} className={cn('t-label', hideLabel && 'sr-only')}>
+    <div
+      role="radiogroup"
+      aria-labelledby={labelId}
+      className={cn(inline && 'flex items-center gap-1.5', className)}
+    >
+      <p id={labelId} className={cn('t-label shrink-0', hideLabel && 'sr-only')}>
         {label}
       </p>
       <div
         className={cn(
           'border-border rounded-control grid auto-cols-fr grid-flow-col border p-0.5',
-          !hideLabel && 'mt-1',
+          inline ? 'min-w-0 flex-1' : !hideLabel && 'mt-1',
         )}
       >
         {options.map((option) => {
@@ -49,9 +56,11 @@ export function Segmented<T extends string>({
             <label
               key={option.value}
               className={cn(
-                'rounded-inner flex h-5 cursor-pointer items-center justify-center px-1 text-sm font-medium',
+                'rounded-inner flex cursor-pointer items-center justify-center px-1 text-sm font-medium',
                 'transition-colors duration-150 ease-out has-focus-visible:outline-2 has-focus-visible:outline-offset-2',
                 'has-focus-visible:outline-accent',
+                // 32 px inline still clears the 24 px target floor.
+                inline ? 'h-4' : 'h-5',
                 checked ? 'bg-fg text-bg' : 'text-muted hover:text-fg',
               )}
             >

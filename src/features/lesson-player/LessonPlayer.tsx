@@ -6,6 +6,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { AskScoutButton } from '@/features/tutor/StudyAssistant';
 import { dockTutorTrigger, setTutorOpen, setTutorScope } from '@/features/tutor/tutor-store';
 import { stepText } from '@/features/tutor/step-text';
+import { ActionBar } from '@/components/layout/ActionBar';
 import { Button } from '@/components/ui/Button';
 import { codeSpans, InlineCode } from '@/components/ui/InlineCode';
 import type { CompiledLesson, CompiledStep } from '@/core/content/compiled';
@@ -159,7 +160,7 @@ export function LessonPlayer({
       </header>
 
       {/* Clips the sideways slide of an arriving step, so a phone never scrolls sideways. */}
-      <main id="content" className="frame flex-1 overflow-x-clip pt-4 pb-20">
+      <main id="content" className="frame flex-1 overflow-x-clip pt-4 pb-4">
         {stage === 'opening' ? (
           <section className="step-in flex max-w-3xl flex-col gap-3 py-4">
             <p className="t-label">
@@ -209,13 +210,11 @@ export function LessonPlayer({
       </main>
 
       {stage === 'opening' ? (
-        <footer className="rule-t bg-bg pb-safe fixed inset-x-0 bottom-0 z-20">
-          <div className="frame flex min-h-9 items-center justify-end py-1">
-            <Button variant="primary" onClick={() => setStage('steps')}>
-              Begin
-            </Button>
-          </div>
-        </footer>
+        <ActionBar className="justify-end">
+          <Button variant="primary" onClick={() => setStage('steps')}>
+            Begin
+          </Button>
+        </ActionBar>
       ) : null}
     </div>
   );

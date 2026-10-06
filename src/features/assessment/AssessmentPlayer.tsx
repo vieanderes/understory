@@ -3,6 +3,7 @@
 import { Keyboard, RotateCcw, X } from 'lucide-react';
 import Link from 'next/link';
 import { useEffect, useEffectEvent, useMemo, useRef, useState } from 'react';
+import { ActionBar } from '@/components/layout/ActionBar';
 import { Button } from '@/components/ui/Button';
 import { codeSpans } from '@/components/ui/InlineCode';
 import { evaluateTask, secondsLeft, toRunResult, type TaskReport } from '@/core/assessment';
@@ -322,7 +323,7 @@ export function AssessmentPlayer({
     <div className="bg-bg text-fg flex min-h-dvh flex-col">
       {header}
 
-      <main id="content" className="frame flex-1 pt-4 pb-20">
+      <main id="content" className="frame flex-1 pt-4 pb-4">
         {phase === 'idle' && !running ? (
           <section className="step-in flex max-w-3xl flex-col gap-3 py-4">
             <p className="t-label">
@@ -418,30 +419,26 @@ export function AssessmentPlayer({
       </main>
 
       {phase === 'idle' && !running ? (
-        <footer className="rule-t bg-bg pb-safe fixed inset-x-0 bottom-0 z-20">
-          <div className="frame flex min-h-9 items-center justify-end py-1">
-            <Button variant="primary" onClick={start}>
-              Start the clock
-            </Button>
-          </div>
-        </footer>
+        <ActionBar className="justify-end">
+          <Button variant="primary" onClick={start}>
+            Start the clock
+          </Button>
+        </ActionBar>
       ) : null}
 
       {phase === 'report' ? (
-        <footer className="rule-t bg-bg pb-safe fixed inset-x-0 bottom-0 z-20">
-          <div className="frame flex min-h-9 items-center justify-end gap-1 py-1">
-            <Button variant="quiet" onClick={start}>
-              <RotateCcw aria-hidden size={16} strokeWidth={2} />
-              Retake
-            </Button>
-            <Button
-              variant="primary"
-              onClick={() => setPhase(lesson.recall.length > 0 ? 'recall' : 'summary')}
-            >
-              Continue
-            </Button>
-          </div>
-        </footer>
+        <ActionBar className="justify-end">
+          <Button variant="quiet" onClick={start}>
+            <RotateCcw aria-hidden size={16} strokeWidth={2} />
+            Retake
+          </Button>
+          <Button
+            variant="primary"
+            onClick={() => setPhase(lesson.recall.length > 0 ? 'recall' : 'summary')}
+          >
+            Continue
+          </Button>
+        </ActionBar>
       ) : null}
     </div>
   );

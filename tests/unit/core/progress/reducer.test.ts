@@ -342,7 +342,28 @@ describe('applyEvent', () => {
     expect(reduce([first, second, cleared]).plan).toBeUndefined();
   });
 
-  it('keeps every online-test sitting as a fact, and grants no XP for it', () => {
+  it('keeps the latest profile, and the news editions read', () => {
+    const first = makeEvent(deps, 'profile_set', { interests: ['python'], news: true });
+    const second = makeEvent(depsFor('device-1', '2026-09-18T10:00:00Z', 'p'), 'profile_set', {
+      interests: ['ai', 'algorithms'],
+      news: false,
+    });
+    expect(reduce([second, first]).profile).toEqual({
+      interests: ['ai', 'algorithms'],
+      news: false,
+    });
+    expect(reduce([]).profile).toBeUndefined();
+
+    const read = makeEvent(deps, 'news_read', { date: '2026-10-05' });
+    const again = makeEvent(depsFor('device-1', '2026-09-18T10:00:00Z', 'n'), 'news_read', {
+      date: '2026-10-05',
+    });
+    const state = reduce([read, again]);
+    expect([...state.newsRead]).toEqual(['2026-10-05']);
+    expect(state.xpByLocalDate).toEqual({});
+  });
+
+  it('keeps every online-test sitting as a fact, and grants XP for the score', () => {
     const payload = {
       attemptId: 'a1',
       testKey: 'demo',
@@ -365,7 +386,43 @@ describe('applyEvent', () => {
     };
     const state = reduce([makeEvent(deps, 'online_test_submitted', payload)]);
     expect(state.onlineTests).toEqual([{ ...payload, localDate: '2026-09-17' }]);
-    expect(state.xpByLocalDate).toEqual({});
+    // One task scored (0.8 + 0) / 2 = 0.4 of the 20 a task is worth.
+    expect(state.xpByLocalDate).toEqual({ '2026-09-17': 8 });
+  });
+
+  it('grants no XP for sitting the same test again within a day', () => {
+    const task = {
+      taskId: 'scoreboard',
+      language: 'ts' as const,
+      type: 'coding' as const,
+      correctness: { passed: 5, total: 5 },
+      performance: { passed: 0, total: 0 },
+    };
+    const payload = (attemptId: string) => ({
+      attemptId,
+      testKey: 'screen-a',
+      title: 'Two-task test',
+      mode: 'screen' as const,
+      minutes: 90,
+      startedAt: '2026-09-17T08:00:00.000Z',
+      submittedAt: '2026-09-17T09:30:00.000Z',
+      reason: 'candidate' as const,
+      tasks: [task, { ...task, taskId: 'longest-streak' }],
+      assistantPrompts: 0,
+    });
+    const first = makeEvent(deps, 'online_test_submitted', payload('a1'));
+    const soon = makeEvent(
+      depsFor('device-1', '2026-09-17T12:00:00Z', 's'),
+      'online_test_submitted',
+      payload('a2'),
+    );
+    const later = makeEvent(
+      depsFor('device-1', '2026-09-19T12:00:00Z', 't'),
+      'online_test_submitted',
+      payload('a3'),
+    );
+    const state = reduce([first, soon, later]);
+    expect(state.xpByLocalDate).toEqual({ '2026-09-17': 40, '2026-09-19': 40 });
   });
 
   it('keeps every path exam attempt as a fact, and grants no XP for sitting it', () => {

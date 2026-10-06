@@ -272,6 +272,7 @@ There are no levels.
 | code-challenge, checked playground, sql | 15      |
 | incident                                | 25      |
 | test-out passed                         | 60      |
+| timed coding test, per task             | 20      |
 | capstone                                | 100     |
 | prose, opening the app, confidence taps | 0       |
 
@@ -286,6 +287,9 @@ There are no levels.
 - **Anti-inflation check:** 1 in 5 explain-backs is followed by a scored transfer question. If
   the transfer result disagrees with the self-grade three times running, show "Your self-grades
   run high."
+- **Timed coding tests:** each task earns 20 times the test's score (0 to 1). The same test
+  sat again within 24 hours earns nothing. Tests sit inside the path stages as optional,
+  recommended work, and this is their reward.
 - XP is derived from events and never stored, so a sync merge cannot double-award.
 
 ### Weekly goal

@@ -169,6 +169,8 @@ describe('makeEvent', () => {
         since: '2026-10-01',
       },
       plan_cleared: {},
+      profile_set: { interests: ['web', 'ai'], news: true },
+      news_read: { date: '2026-10-05' },
       online_test_submitted: {
         attemptId: 'a1',
         testKey: 'demo',

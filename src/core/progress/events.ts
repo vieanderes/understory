@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { idSchema, localIdSchema } from '@/core/content/ids';
 import { cardStateSchema, ratingSchema } from '@/core/scheduling/card-state';
+import { INTERESTS } from '@/core/profile/interests';
 import type { Clock } from '@/core/ports/clock';
 import type { IdGen } from '@/core/ports/id-gen';
 
@@ -263,6 +264,21 @@ export const planSetPayloadSchema = z
 
 export const planClearedPayloadSchema = z.strictObject({});
 
+/**
+ * What the learner said they care about, from the setup questions or Settings. The latest
+ * profile_set wins. Interests order practice topics and the news; they never hide content.
+ */
+export const profileSetPayloadSchema = z.strictObject({
+  interests: z.array(z.enum(INTERESTS)).max(INTERESTS.length),
+  /** Show today's news on Home. */
+  news: z.boolean(),
+});
+
+/** A news edition was opened. Read state is a fact, so it follows the progress file. */
+export const newsReadPayloadSchema = z.strictObject({
+  date: z.iso.date(),
+});
+
 export const sessionStartedPayloadSchema = z.strictObject({
   sessionId: z.string().min(1),
   kind: sessionKindSchema,
@@ -351,6 +367,8 @@ export const LATEST_VERSION = {
   online_test_submitted: 1,
   plan_set: 1,
   plan_cleared: 1,
+  profile_set: 1,
+  news_read: 1,
 } as const;
 
 export type EventType = keyof typeof LATEST_VERSION;
@@ -464,6 +482,17 @@ export const planClearedEventSchema = envelope(
   planClearedPayloadSchema,
 );
 
+export const profileSetEventSchema = envelope(
+  'profile_set',
+  LATEST_VERSION.profile_set,
+  profileSetPayloadSchema,
+);
+export const newsReadEventSchema = envelope(
+  'news_read',
+  LATEST_VERSION.news_read,
+  newsReadPayloadSchema,
+);
+
 export const storyEventSchema = z.discriminatedUnion('type', [
   placementAnsweredEventSchema,
   placementCompletedEventSchema,
@@ -486,6 +515,8 @@ export const storyEventSchema = z.discriminatedUnion('type', [
   onlineTestSubmittedEventSchema,
   planSetEventSchema,
   planClearedEventSchema,
+  profileSetEventSchema,
+  newsReadEventSchema,
 ]);
 
 export type StoryEvent = z.infer<typeof storyEventSchema>;

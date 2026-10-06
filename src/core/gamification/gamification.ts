@@ -18,6 +18,7 @@ export type XpKind =
   | 'code-challenge'
   | 'incident'
   | 'test-out'
+  | 'timed-task'
   | 'capstone'
   | 'none';
 
@@ -30,6 +31,8 @@ export const BASE_XP: Record<XpKind, number> = {
   'code-challenge': 15,
   incident: 25,
   'test-out': 60,
+  /** Per task of a timed coding test, scaled by its score. */
+  'timed-task': 20,
   capstone: 100,
   none: 0, // prose, opening the app, confidence taps
 };

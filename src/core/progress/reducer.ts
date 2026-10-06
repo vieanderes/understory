@@ -7,6 +7,7 @@ import {
   type GoalTier,
   type XpInput,
 } from '@/core/gamification';
+import { scoreTallies } from '@/core/online-test/score';
 import { ALPHA_BY_FAMILY, masteryOf, SOLID_THRESHOLD, type ConceptEvidence } from '@/core/mastery';
 import type { CardState } from '@/core/scheduling/card-state';
 import type { Mode, PayloadOf, StoryEvent } from './events';
@@ -19,8 +20,9 @@ import type { UnknownEvent } from './upcast';
  * set union by id").
  */
 
-/** 2: `capstoneAdrs` joined the state. 3: `pathExams`. 4: `onlineTests`. 5: `plan`. */
-export const REDUCER_VERSION = 5;
+/** 2: `capstoneAdrs` joined the state. 3: `pathExams`. 4: `onlineTests`. 5: `plan`.
+ * 6: `profile`, `newsRead`, and XP for timed tests. */
+export const REDUCER_VERSION = 6;
 
 /** A day's worth of XP by 24-hour cooldown key, so "no grinding" can be checked. One
  * day of slack either side of midnight is not modelled; a plain 24h window from the
@@ -115,6 +117,10 @@ export interface ProgressState {
   readonly onlineTests: readonly OnlineTestAttempt[];
   /** The learner's plan answers, the latest plan_set, until a plan_cleared. */
   readonly plan: PayloadOf<'plan_set'> | undefined;
+  /** The latest profile_set: interests and whether Home shows the news. */
+  readonly profile: PayloadOf<'profile_set'> | undefined;
+  /** News editions opened, by date (YYYY-MM-DD). */
+  readonly newsRead: ReadonlySet<string>;
   readonly assumedConcepts: ReadonlySet<string>;
   /** How many placement ladders were finished. A later ladder rotates its items. */
   readonly placementsCompleted: number;
@@ -145,6 +151,8 @@ export function initialProgressState(): ProgressState {
     pathExams: {},
     onlineTests: [],
     plan: undefined,
+    profile: undefined,
+    newsRead: new Set(),
     assumedConcepts: new Set(),
     placementsCompleted: 0,
     collectedReadings: new Set(),
@@ -443,12 +451,35 @@ export function applyEvent(state: ProgressState, event: StoryEvent | UnknownEven
       };
     }
 
-    case 'online_test_submitted':
-      // No XP: practice under a clock is its own reward, and the tasks are not lessons.
-      return {
+    case 'online_test_submitted': {
+      // A sitting is shown skill under a clock, so it earns XP for its score, per task. The
+      // same test again within a day earns nothing, like any other repeated item.
+      const itemKey = `online-test#${event.payload.testKey}`;
+      const xp =
+        xpFor({
+          kind: 'timed-task',
+          score: scoreTallies(event.payload.tasks),
+          wasScheduled: true,
+          challengeFirstWrongAttempt: false,
+          withinCooldown: withinCooldown(state, itemKey, event.at),
+        }) * event.payload.tasks.length;
+      const next: ProgressState = {
         ...state,
         onlineTests: [...state.onlineTests, { ...event.payload, localDate: event.localDate }],
       };
+      if (xp === 0) return next;
+      return {
+        ...next,
+        xpByLocalDate: addXp(next, event.localDate, xp),
+        lastGradedAt: { ...next.lastGradedAt, [itemKey]: event.at },
+      };
+    }
+
+    case 'profile_set':
+      return { ...state, profile: event.payload };
+
+    case 'news_read':
+      return { ...state, newsRead: new Set(state.newsRead).add(event.payload.date) };
 
     case 'plan_set':
       return { ...state, plan: event.payload };

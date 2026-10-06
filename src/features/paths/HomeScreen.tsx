@@ -97,6 +97,27 @@ function NewsToday({ news, lead = false }: { news: NewsBrief; lead?: boolean }) 
   );
 }
 
+/** The part of the day, from the learner's own clock. Home renders only in the browser. */
+function partOfDay(hour: number): string {
+  if (hour < 5) return 'Good evening';
+  if (hour < 12) return 'Good morning';
+  if (hour < 18) return 'Good afternoon';
+  return 'Good evening';
+}
+
+/**
+ * Home's masthead, like every other place: a title and one quiet line. It appears after the
+ * log is read, past the page's arrival, so it carries no arrival motion and never waits hidden.
+ */
+function Greeting({ line }: { line: string }) {
+  return (
+    <header className="flex flex-col gap-1 pt-2 md:pt-4">
+      <h1 className="t-title">{partOfDay(new Date().getHours())}.</h1>
+      <p className="text-muted text-lg">{line}</p>
+    </header>
+  );
+}
+
 /** One line for practice: what is due, and the week so far. Hidden until there is something. */
 function PracticeLine() {
   const { view } = useOverview();
@@ -235,7 +256,7 @@ export function HomeScreen({
   if (newsOnly) {
     return (
       <div className="flex flex-col gap-8">
-        <h1 className="sr-only">Home</h1>
+        <Greeting line="Today's edition, and every earlier one under News." />
         {news ? <NewsToday news={news} lead /> : null}
         <Link
           href="/plan?edit"
@@ -271,10 +292,17 @@ export function HomeScreen({
 
   return (
     <div className="flex flex-col gap-8">
-      <section aria-labelledby="home-title" className="flex flex-col gap-2 pt-2 md:pt-4">
-        <h1 id="home-title" className="t-section">
+      <Greeting
+        line={
+          path && !next
+            ? `Every lesson on ${path.name} is done.`
+            : "Your next step, what is due and today's news."
+        }
+      />
+      <section aria-labelledby="next-title" className="flex flex-col gap-2">
+        <h2 id="next-title" className="t-section">
           Your next step
-        </h1>
+        </h2>
         {usePlanCard ? (
           <TodayCard state={planState} />
         ) : (

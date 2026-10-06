@@ -18,7 +18,7 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
 
 export default async function SignalWeekPage({ params }: Props) {
   const { week } = await params;
-  const digest = await getWeek(week);
+  const [digest, dates] = await Promise.all([getWeek(week), listDates()]);
   if (!digest) notFound();
-  return <SignalDigestView digest={digest} />;
+  return <SignalDigestView digest={digest} periods={[...new Set(dates.map(isoWeekOf))]} />;
 }

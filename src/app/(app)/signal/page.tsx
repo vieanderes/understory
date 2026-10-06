@@ -1,6 +1,6 @@
 import type { Metadata } from 'next';
 import { SignalDayView } from '@/features/signal/SignalDayView';
-import { getLatestDay, listDates } from '@/lib/news';
+import { getLatestDay, listEditions } from '@/lib/news';
 import { Title } from '@/features/motion/Title';
 
 export const metadata: Metadata = {
@@ -9,7 +9,7 @@ export const metadata: Metadata = {
 };
 
 export default async function SignalPage() {
-  const [day, dates] = await Promise.all([getLatestDay(), listDates()]);
+  const [day, editions] = await Promise.all([getLatestDay(), listEditions()]);
   if (!day) {
     return (
       <div className="flex flex-col gap-2 py-4">
@@ -21,5 +21,5 @@ export default async function SignalPage() {
       </div>
     );
   }
-  return <SignalDayView day={day} dates={dates} />;
+  return <SignalDayView day={day} editions={editions} />;
 }

@@ -17,6 +17,7 @@ describe('tests on a path', () => {
     expect(stageTestKey({ test: 'demo' })).toBe('demo');
     expect(stageTestKey({ task: 'longest-streak' })).toBe('train-longest-streak');
     expect(stageTestKey({ lesson: 'interview.mock-levelled' })).toBe('interview.mock-levelled');
+    expect(stageTestKey({ lab: 'event-loop-stepper' })).toBe('lab:event-loop-stepper');
   });
 
   it('keeps the best score of each test, as a whole percentage', () => {
@@ -113,6 +114,18 @@ describe('tests on a path', () => {
       minutes: 90,
       href: '/learn/x/y',
       xp: 15,
+    });
+  });
+
+  it('resolves a lab to its page and question, with no XP of its own', () => {
+    expect(resolveStageTest({ lab: 'event-loop-stepper' }, index, lesson)).toEqual({
+      key: 'lab:event-loop-stepper',
+      kind: 'lab',
+      title: 'Event loop stepper',
+      detail: 'In what order does this code run, and why?',
+      minutes: 10,
+      href: '/labs/event-loop-stepper',
+      xp: 0,
     });
   });
 

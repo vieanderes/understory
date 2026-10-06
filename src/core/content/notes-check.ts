@@ -1,3 +1,4 @@
+import { LAB_INFO_BY_ID } from '@/core/labs/catalog';
 import { allLessons } from './catalog';
 import type { Issue, RawCatalog } from './catalog';
 import { languageSchema } from './schema';
@@ -222,11 +223,19 @@ export function validateFastTrack(
     ...day.tests.flatMap((ref) => {
       const found: Issue[] = [];
       const [kind, id] =
-        'test' in ref ? ['test', ref.test] : 'task' in ref ? ['task', ref.task] : ['lesson', ref.lesson];
+        'test' in ref
+          ? ['test', ref.test]
+          : 'task' in ref
+            ? ['task', ref.task]
+            : 'lab' in ref
+              ? ['lab', ref.lab]
+              : ['lesson', ref.lesson];
       if (kind === 'test' && !onlineTests.presets.has(id)) {
         found.push(issue('fast-track-unknown-test', day.title, `No preset test has the id "${id}".`));
       } else if (kind === 'task' && !onlineTests.tasks.has(id)) {
         found.push(issue('fast-track-unknown-task', day.title, `No training task has the id "${id}".`));
+      } else if (kind === 'lab' && !LAB_INFO_BY_ID.has(id)) {
+        found.push(issue('fast-track-unknown-lab', day.title, `No lab has the id "${id}".`));
       } else if (kind === 'lesson' && !withNotes.has(id)) {
         found.push(issue('fast-track-unknown-lesson', day.title, `No lesson has the id "${id}".`));
       }
@@ -249,7 +258,17 @@ export function validateTestsOnPaths(
   onlineTests: OnlineTestIds,
 ): Issue[] {
   const refs = plans.flatMap((plan) => plan.days.flatMap((day) => day.tests));
-  const placed = new Set(refs.map((ref) => ('test' in ref ? `test:${ref.test}` : 'task' in ref ? `task:${ref.task}` : '')));
+  const placed = new Set(
+    refs.map((ref) =>
+      'test' in ref
+        ? `test:${ref.test}`
+        : 'task' in ref
+          ? `task:${ref.task}`
+          : 'lab' in ref
+            ? `lab:${ref.lab}`
+            : '',
+    ),
+  );
   const warn = (message: string): Issue => ({
     severity: 'warning',
     rule: 'online-test-off-path',
@@ -264,5 +283,11 @@ export function validateTestsOnPaths(
     ...[...onlineTests.tasks]
       .filter((id) => !placed.has(`task:${id}`))
       .map((id) => warn(`No path stage lists the training task "${id}".`)),
+    // Labs too: a learner following a path should meet every one of them.
+    ...(onlineTests.presets.size > 0
+      ? [...LAB_INFO_BY_ID.keys()]
+          .filter((id) => !placed.has(`lab:${id}`))
+          .map((id) => warn(`No path stage lists the lab "${id}".`))
+      : []),
   ];
 }

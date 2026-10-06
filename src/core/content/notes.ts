@@ -108,6 +108,9 @@ export const stageTestSchema = z.union([
   z.strictObject({
     lesson: z.string().min(1).describe('The id of an assessment lesson, such as a levelled mock.'),
   }),
+  z.strictObject({
+    lab: z.string().min(1).describe('A lab id from src/core/labs/catalog.ts.'),
+  }),
 ]);
 
 export type StageTestRef = z.infer<typeof stageTestSchema>;

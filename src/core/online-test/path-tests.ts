@@ -1,5 +1,6 @@
 import type { StageTestRef } from '../content/notes';
 import { BASE_XP } from '../gamification/gamification';
+import { LAB_INFO_BY_ID, LAB_MINUTES } from '../labs/catalog';
 import { TOPIC_LABEL, type OnlineTestIndex } from './schema';
 import { percent, scoreTallies, type TallyFacts } from './score';
 import { trainingKey } from './spec';
@@ -13,6 +14,7 @@ import { trainingKey } from './spec';
 export function stageTestKey(ref: StageTestRef): string {
   if ('test' in ref) return ref.test;
   if ('task' in ref) return trainingKey(ref.task);
+  if ('lab' in ref) return `lab:${ref.lab}`;
   return ref.lesson;
 }
 
@@ -40,7 +42,7 @@ export function timedTestXp(tasks: number): number {
 export interface PathTest {
   /** What progress records a sitting under: a preset id, `train-<task>` or a lesson id. */
   key: string;
-  kind: 'test' | 'training' | 'lesson';
+  kind: 'test' | 'training' | 'lesson' | 'lab';
   title: string;
   /** One short line: the shape of the test, or the task's topic and difficulty. */
   detail: string;
@@ -111,6 +113,19 @@ export function resolveStageTest(
       minutes: task?.recommendedMinutes ?? 0,
       href: `/practise/online-test/${key}`,
       xp: timedTestXp(1),
+    };
+  }
+  if ('lab' in ref) {
+    // A lab is tried, not scored: it earns nothing itself, the lesson steps around it do.
+    const lab = LAB_INFO_BY_ID.get(ref.lab);
+    return {
+      key,
+      kind: 'lab',
+      title: lab?.title ?? ref.lab,
+      detail: lab?.question ?? '',
+      minutes: LAB_MINUTES,
+      href: `/labs/${ref.lab}`,
+      xp: 0,
     };
   }
   const found = lesson(ref.lesson);

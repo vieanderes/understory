@@ -44,8 +44,8 @@ const editionDate = (date: string) =>
   });
 
 /**
- * Today's edition on Home: the lead and two more headlines, the learner's topics first, and
- * whether it has been read. A glance, with the whole edition one tap away.
+ * Today's edition on Home: the lead and two more headlines, the learner's topics first. Once
+ * read it steps back into the muted tone. A glance, with the whole edition one tap away.
  */
 function NewsToday({ news, lead = false }: { news: NewsBrief; lead?: boolean }) {
   const { status, state } = useProgress();
@@ -63,10 +63,7 @@ function NewsToday({ news, lead = false }: { news: NewsBrief; lead?: boolean }) 
         <h2 id="news-title" className="t-section">
           Today&apos;s news
         </h2>
-        <p className="t-figure text-muted text-sm">
-          {editionDate(news.date)}
-          {status === 'ready' ? (read ? ' · read' : ' · new') : ''}
-        </p>
+        <p className="t-figure text-muted text-sm">{editionDate(news.date)}</p>
       </div>
       <ol className="flex flex-col">
         {shown.map((item, i) => (
@@ -175,7 +172,8 @@ export function HomeScreen({
   const anythingDone = ready && state.completedLessons.size > 0;
   const hasPlan = planState.plan !== undefined;
   const profile = ready ? state.profile : undefined;
-  const newcomer = !anythingDone && !hasPlan && !profile;
+  // A path built by hand counts as set up: the learner has said what they want.
+  const newcomer = !anythingDone && !hasPlan && !profile && !(ready && state.customPath);
   const newsOnly = !hasPlan && !anythingDone && profile !== undefined;
   const showNews = news !== null && (profile?.news ?? true);
 

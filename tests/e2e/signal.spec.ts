@@ -16,7 +16,7 @@ test('the info button explains News and Escape hands focus back', async ({ page 
   await expect(info).toBeFocused();
 });
 
-test('opening an edition marks it read in the archive', async ({ page }) => {
+test('an edition once opened steps back in the archive', async ({ page }) => {
   await page.goto('/signal/2026-10-01');
   await page.locator('html[data-hydrated="true"]').waitFor();
   await expect(page.getByRole('heading', { level: 1 })).toHaveText('Thursday 1 October');
@@ -24,8 +24,8 @@ test('opening an edition marks it read in the archive', async ({ page }) => {
   await page.goto('/signal/archive');
   await page.locator('html[data-hydrated="true"]').waitFor();
   const row = (date: RegExp) => page.getByRole('link', { name: date });
-  await expect(row(/^Thu 1 Oct/)).not.toContainText('Not read yet');
-  await expect(row(/^Fri 2 Oct/)).toContainText('Not read yet');
+  await expect(row(/^Thu 1 Oct/)).toContainText(', read');
+  await expect(row(/^Fri 2 Oct/)).not.toContainText(', read');
 });
 
 test('a story folds its concepts and lessons away until asked', async ({ page }) => {

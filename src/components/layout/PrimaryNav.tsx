@@ -5,7 +5,6 @@ import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import { Wordmark } from '@/components/brand/Logo';
 import { ThemeToggle } from '@/components/theme/ThemeToggle';
-import { useProgress } from '@/features/store/StoreProvider';
 import { cn } from '@/lib/cn';
 import { isCurrent, LIBRARY, PLACES, type Place } from './nav';
 
@@ -15,31 +14,7 @@ const item =
 const utility =
   'hover:text-fg hover:bg-raised rounded-control inline-flex size-5 items-center justify-center transition-colors duration-150 ease-out';
 
-/** True once the store has loaded and today's edition has not been opened. */
-function useNewsUnread(latestNews: string | undefined): boolean {
-  const { status, state } = useProgress();
-  return status === 'ready' && latestNews !== undefined && !state.newsRead.has(latestNews);
-}
-
-/** A small dot beside News while today's edition is unread. Said in words for screen readers. */
-function UnreadDot({ className }: { className?: string }) {
-  return (
-    <>
-      <span aria-hidden className={cn('bg-fg size-1 rounded-full', className)} />
-      <span className="sr-only">, new edition</span>
-    </>
-  );
-}
-
-function RailLink({
-  place,
-  current,
-  unread,
-}: {
-  place: Place;
-  current: boolean;
-  unread?: boolean;
-}) {
+function RailLink({ place, current }: { place: Place; current: boolean }) {
   const { href, label, icon: Icon, hint } = place;
   return (
     <Link
@@ -52,8 +27,7 @@ function RailLink({
       )}
     >
       <Icon aria-hidden size={16} strokeWidth={2} />
-      <span className="flex-1">{label}</span>
-      {unread ? <UnreadDot /> : null}
+      {label}
     </Link>
   );
 }
@@ -63,9 +37,8 @@ function RailLink({
  * library, settings and the theme at the foot, drawn smaller, so they read as utilities you
  * reach for, not places you choose between. Where you are is a lifted row, not a colour.
  */
-export function Sidebar({ latestNews }: { latestNews?: string }) {
+export function Sidebar() {
   const pathname = usePathname();
-  const unread = useNewsUnread(latestNews);
   const onLibrary = isCurrent(pathname, LIBRARY.href);
   return (
     <aside className="sticky top-0 hidden h-dvh w-30 shrink-0 flex-col gap-4 px-1.5 py-2 md:flex print:hidden">
@@ -78,12 +51,7 @@ export function Sidebar({ latestNews }: { latestNews?: string }) {
       </Link>
       <nav aria-label="Primary" className="flex flex-col gap-0.5">
         {PLACES.map((place) => (
-          <RailLink
-            key={place.href}
-            place={place}
-            current={isCurrent(pathname, place.href)}
-            unread={place.href === '/signal' && unread}
-          />
+          <RailLink key={place.href} place={place} current={isCurrent(pathname, place.href)} />
         ))}
       </nav>
       <div className="mt-auto flex flex-col gap-1">
@@ -165,9 +133,8 @@ export function PhoneBar() {
  * Phone: the four places in the thumb zone, clear of the home indicator. Where you are is a
  * pill behind the icon, filled with the hairline tone so it reads in both themes.
  */
-export function TabBar({ latestNews }: { latestNews?: string }) {
+export function TabBar() {
   const pathname = usePathname();
-  const unread = useNewsUnread(latestNews);
   return (
     <nav
       aria-label="Primary"
@@ -190,17 +157,13 @@ export function TabBar({ latestNews }: { latestNews?: string }) {
             <span
               aria-hidden
               className={cn(
-                'transition-press relative inline-flex h-4 w-7 items-center justify-center rounded-full',
+                'transition-press inline-flex h-4 w-7 items-center justify-center rounded-full',
                 current ? 'bg-border text-fg' : 'group-active:bg-raised',
               )}
             >
               <Icon size={20} strokeWidth={2} />
-              {href === '/signal' && unread ? (
-                <span className="bg-fg absolute top-0.5 right-1.5 size-1 rounded-full" />
-              ) : null}
             </span>
             <span>{label}</span>
-            {href === '/signal' && unread ? <span className="sr-only">, new edition</span> : null}
           </Link>
         );
       })}

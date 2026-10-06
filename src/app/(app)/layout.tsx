@@ -20,7 +20,7 @@ export default async function AppLayout({ children }: { children: React.ReactNod
       <RegisterServiceWorker />
       <OfflineNotice />
       <SmoothScroll />
-      <AppShell latestNews={dates[0]}>{children}</AppShell>
+      <AppShell>{children}</AppShell>
       <StudyAssistant shell paths={pathIndex(paths)} latestNews={dates[0]} />
     </StoreProvider>
   );

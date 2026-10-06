@@ -7,8 +7,8 @@ import { formatWeekday } from './format';
 import { useProgress } from '@/features/store/StoreProvider';
 
 /**
- * Editions as rows: the day, its lead story, and whether it was opened. Unread is carried
- * by weight and an ink dot, as the mastery map carries state, never by a coloured badge.
+ * Editions as rows: the day and its lead story. One already read steps back into the muted
+ * tone, so what is new reads first; there is no badge or dot to keep track of.
  */
 export function EditionList({ editions }: { editions: EditionSummary[] }) {
   // Until the log is read nothing is marked, so no row flashes bold and then settles.
@@ -16,7 +16,7 @@ export function EditionList({ editions }: { editions: EditionSummary[] }) {
   return (
     <ul className="flex flex-col">
       {editions.map((edition) => {
-        const unread = status === 'ready' && !state.newsRead.has(edition.date);
+        const read = status === 'ready' && state.newsRead.has(edition.date);
         return (
           <li key={edition.date} className="rule-t first:border-t-0">
             <Link
@@ -26,19 +26,10 @@ export function EditionList({ editions }: { editions: EditionSummary[] }) {
               <span className="t-label t-figure w-10 shrink-0 whitespace-nowrap">
                 {formatWeekday(edition.date)}
               </span>
-              <span
-                className={cn(
-                  'min-w-0 flex-1 text-sm',
-                  unread ? 'text-fg font-medium' : 'text-muted',
-                )}
-              >
+              <span className={cn('min-w-0 flex-1 text-sm', read ? 'text-muted' : 'text-fg')}>
                 {edition.lead ?? 'No stories'}
+                {read ? <span className="sr-only">, read</span> : null}
               </span>
-              <span
-                aria-hidden
-                className={cn('size-1 shrink-0 rounded-full', unread ? 'bg-fg' : 'bg-transparent')}
-              />
-              {unread ? <span className="sr-only">Not read yet</span> : null}
             </Link>
           </li>
         );

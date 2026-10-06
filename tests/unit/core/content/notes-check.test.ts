@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { RawCatalog } from '@/core/content/catalog';
 import {
   capstoneSolutionSchema,
+  fastTrackSchema,
   lessonNotesSchema,
   type CapstoneSolution,
   type LessonNotes,
@@ -13,6 +14,7 @@ import {
   lectureTextProblems,
   validateFastTrack,
   validateLectures,
+  validateTestsOnPaths,
 } from '@/core/content/notes-check';
 
 const EM = String.fromCharCode(0x2014);
@@ -176,7 +178,7 @@ describe('guides and fast tracks', () => {
       practice: [],
       guides: ['pairs', 'missing'],
       days: [
-        { title: 'Day 1', why: 'W', must: ['js.a', 'js.b', 'js.x'], should: ['js.a'], capstone: 'nowhere' },
+        { title: 'Day 1', why: 'W', must: ['js.a', 'js.b', 'js.x'], should: ['js.a'], capstone: 'nowhere', tests: [] },
       ],
     });
     expect(issues.map((issue) => issue.rule)).toEqual([
@@ -185,6 +187,59 @@ describe('guides and fast tracks', () => {
       'fast-track-unknown-lesson',
       'fast-track-duplicate',
       'fast-track-unknown-part',
+    ]);
+  });
+
+  const plan = (tests: unknown[][]) =>
+    fastTrackSchema.parse({
+      title: 'T',
+      summary: 'S',
+      method: ['Read.'],
+      days: tests.map((list, i) => ({ title: `Day ${i + 1}`, why: 'W', must: ['js.a'], tests: list })),
+    });
+  const onlineTests = { presets: new Set(['demo']), tasks: new Set(['streak']) };
+
+  it('reads a stage test as a preset, a training task or an assessment lesson', () => {
+    const parsed = plan([[{ test: 'demo', guided: true }, { task: 'streak' }, { lesson: 'js.a' }]]);
+    expect(parsed.days[0]?.tests).toEqual([
+      { test: 'demo', guided: true },
+      { task: 'streak' },
+      { lesson: 'js.a' },
+    ]);
+    expect(plan([[]]).days[0]?.tests).toEqual([]);
+    expect(() => plan([[{ key: 'demo' }]])).toThrow();
+    expect(() => plan([[{ test: 'demo', task: 'streak' }]])).toThrow();
+  });
+
+  it('names unknown and repeated stage tests', () => {
+    const tracked = plan([
+      [{ test: 'demo' }, { test: 'nope' }, { task: 'streak' }, { task: 'gone' }],
+      [{ lesson: 'js.b' }, { lesson: 'js.zzz' }, { test: 'demo' }],
+    ]);
+    const found = validateFastTrack(catalog, 't.yaml', tracked, onlineTests).filter(
+      (issue) => issue.rule !== 'fast-track-duplicate',
+    );
+    expect(found.map((issue) => [issue.rule, issue.where])).toEqual([
+      ['fast-track-unknown-test', 'Day 1'],
+      ['fast-track-unknown-task', 'Day 1'],
+      ['fast-track-unknown-lesson', 'Day 2'],
+      ['fast-track-duplicate-test', 'Day 2'],
+    ]);
+  });
+
+  it('treats every test as unknown when the simulator has no content', () => {
+    const issues = validateFastTrack(catalog, 't.yaml', plan([[{ test: 'demo' }]]));
+    expect(issues.map((issue) => issue.rule)).toEqual(['fast-track-unknown-test']);
+  });
+
+  it('warns about a test or task that no path places', () => {
+    const issues = validateTestsOnPaths([plan([[{ test: 'demo' }]])], {
+      presets: new Set(['demo', 'mock']),
+      tasks: new Set(['streak']),
+    });
+    expect(issues.map((issue) => [issue.severity, issue.rule, issue.message])).toEqual([
+      ['warning', 'online-test-off-path', 'No path stage lists the test "mock".'],
+      ['warning', 'online-test-off-path', 'No path stage lists the training task "streak".'],
     ]);
   });
 });

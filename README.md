@@ -840,7 +840,7 @@ can wait for a second pass. The full map, with the reason each chapter matters, 
 23. [Presenting your build](content/course/28-interview-challenges/23-presenting-your-build)
 24. [Mock assessment A](content/course/28-interview-challenges/24-mock-assessment-a) <sub>advanced</sub>
 25. [Mock assessment B](content/course/28-interview-challenges/25-mock-assessment-b) <sub>advanced</sub>
-26. [Mock levelled assessment](content/course/28-interview-challenges/26-mock-levelled-assessment) <sub>advanced</sub>
+26. [Practice test 4: one task in four levels](content/course/28-interview-challenges/26-mock-levelled-assessment) <sub>advanced</sub>
 27. [Mock assessment C, in Python](content/course/28-interview-challenges/27-mock-assessment-python) <sub>advanced</sub>
 28. [AI build: a production LLM client](content/course/28-interview-challenges/28-ai-build-llm-client) <sub>advanced</sub>
 29. [Tasks candidates report](content/course/28-interview-challenges/29-tasks-candidates-report) <sub>advanced</sub>

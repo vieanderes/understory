@@ -20,7 +20,7 @@ export { ContentError } from './fs';
 export { getOnlineTestIndex } from './online-tests';
 export { getPlanCatalog } from './plan-catalog';
 export { getPath, getPaths } from './paths';
-export type { PathLesson, PathStage, PathSummary } from './paths';
+export type { PathLesson, PathStage, PathSummary, PathTest } from './paths';
 export {
   findLectureChapter,
   getChapterLecture,

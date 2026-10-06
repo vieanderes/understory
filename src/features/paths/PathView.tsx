@@ -2,24 +2,49 @@
 
 import { ArrowRight, Award, BookOpen, Check, ChevronDown, Square } from 'lucide-react';
 import Link from 'next/link';
+import { useMemo } from 'react';
 import { buttonClass } from '@/components/ui/Button';
 import { InlineCode } from '@/components/ui/InlineCode';
 import { ProgressLine } from '@/components/ui/ProgressLine';
 import { formatMinutes } from '@/core/insight';
-import type { PathLesson, PathSummary } from '@/lib/content';
+import { bestTestScores } from '@/core/online-test/path-tests';
+import type { PathLesson, PathSummary, PathTest } from '@/lib/content';
 import { cn } from '@/lib/cn';
 import { certificateHref, examHref, formatLocalDate, percent } from '@/features/exam/stages';
 import { usePathExam } from '@/features/exam/usePathExam';
+import { useProgress } from '@/features/store/StoreProvider';
 import { usePathProgress } from './usePathProgress';
 import { onPath } from './links';
 
+/** Tests shown in a stage before the rest fold away. */
+const TESTS_SHOWN = 3;
+
 /**
- * One path: the promise and the one next step first, then the stages in order. The side
- * column holds what the path leaves you able to do and how to shape an answer, so the
- * lessons stay the spine of the page.
+ * One path: the promise and the one next step first, then the stages in order, each with its
+ * lessons and the tests that check it. The side column holds what the path leaves you able to
+ * do; how to answer and how you know you are ready fold away, so the lessons stay the spine.
+ *
+ * `embedded` drops the breadcrumb where Learn already frames the path. A `custom` path is one
+ * the learner built from chapters: it has no track lecture, final exam or readiness notes.
  */
-export function PathView({ path }: { path: PathSummary }) {
+export function PathView({
+  path,
+  embedded = false,
+  custom = false,
+}: {
+  path: PathSummary;
+  embedded?: boolean;
+  custom?: boolean;
+}) {
   const progress = usePathProgress(path.lessonIds);
+  const { status, state } = useProgress();
+  const best = useMemo(() => bestTestScores(state.onlineTests), [state.onlineTests]);
+  const testResult = (test: PathTest): string | undefined => {
+    if (status !== 'ready') return undefined;
+    if (test.kind === 'lesson') return state.completedLessons.has(test.key) ? 'Done' : undefined;
+    const score = best[test.key];
+    return score === undefined ? undefined : `Best ${score}%`;
+  };
   const lessons = path.stages.flatMap((stage) => stage.lessons);
   const next = lessons.find((l) => l.id === progress.nextId);
   const started = progress.done > 0;
@@ -30,12 +55,14 @@ export function PathView({ path }: { path: PathSummary }) {
 
   return (
     <div className="grid grid-cols-4 gap-x-4 gap-y-6 md:grid-cols-12">
-      <header className="col-span-4 flex flex-col gap-3 md:col-span-8">
-        <nav aria-label="Breadcrumb" className="t-label">
-          <Link href="/paths" className="hover:text-fg transition-colors duration-150 ease-out">
-            Learning paths
-          </Link>
-        </nav>
+      <header className="col-span-4 flex flex-col gap-3 md:col-span-12 lg:col-span-8">
+        {embedded ? null : (
+          <nav aria-label="Breadcrumb" className="t-label">
+            <Link href="/library" className="hover:text-fg transition-colors duration-150 ease-out">
+              Library
+            </Link>
+          </nav>
+        )}
         <h1 className="t-title" data-arrive="title">
           {path.title}
         </h1>
@@ -50,10 +77,12 @@ export function PathView({ path }: { path: PathSummary }) {
           ) : (
             <span className="text-muted">Every lesson on this path is done.</span>
           )}
-          <Link href={`/lectures/tracks/${path.id}`} className={buttonClass('quiet')}>
-            <BookOpen aria-hidden size={16} strokeWidth={2} />
-            Read as a lecture
-          </Link>
+          {custom ? null : (
+            <Link href={`/lectures/tracks/${path.id}`} className={buttonClass('quiet')}>
+              <BookOpen aria-hidden size={16} strokeWidth={2} />
+              Read as a lecture
+            </Link>
+          )}
         </div>
         {next ? (
           <p className="text-muted text-sm">
@@ -62,7 +91,7 @@ export function PathView({ path }: { path: PathSummary }) {
         ) : null}
       </header>
 
-      <aside className="col-span-4 md:col-span-4">
+      <aside className="col-span-4 md:col-span-12 lg:col-span-4">
         <div className="bg-raised border-border rounded-panel shadow-edge flex flex-col gap-2 border p-2 md:p-3">
           <div className="flex items-baseline justify-between gap-2">
             <p className="t-figure text-lg font-semibold">
@@ -96,7 +125,7 @@ export function PathView({ path }: { path: PathSummary }) {
         </div>
       </aside>
 
-      <div className="col-span-4 flex flex-col gap-4 md:col-span-8">
+      <div className="col-span-4 flex flex-col gap-4 md:col-span-12 lg:col-span-8">
         <ol data-arrive="stagger" className="flex flex-col">
           {path.stages.map((stage, stageIndex) => {
             const minutes = stage.lessons.reduce((sum, l) => sum + l.minutes, 0);
@@ -142,6 +171,16 @@ export function PathView({ path }: { path: PathSummary }) {
                           {stage.artifact.charAt(0).toLowerCase() + stage.artifact.slice(1)}
                         </p>
                       ) : null}
+                      {stage.lectureHref ? (
+                        <Link
+                          href={stage.lectureHref}
+                          className="text-muted hover:text-fg rounded-control -ml-0.5 inline-flex h-5 items-center gap-1 self-start px-0.5 text-sm font-medium transition-colors duration-150 ease-out"
+                        >
+                          <BookOpen aria-hidden size={16} strokeWidth={2} />
+                          Read as a lecture
+                          <span className="sr-only">: {stage.title}</span>
+                        </Link>
+                      ) : null}
                     </div>
                   </div>
                   <ol className="flex flex-col">
@@ -176,17 +215,12 @@ export function PathView({ path }: { path: PathSummary }) {
                   {stage.optional.length > 0 ? (
                     <div className="flex gap-2">
                       <Rail above="todo" below="todo" />
-                      <details className="group min-w-0 flex-1 pb-2">
-                        <summary className="text-muted hover:text-fg rounded-control flex h-5 cursor-pointer list-none items-center gap-1 text-sm font-medium transition-colors duration-150 ease-out">
-                          <ChevronDown
-                            aria-hidden
-                            size={16}
-                            strokeWidth={2}
-                            className="transition-transform duration-150 ease-out group-open:rotate-180"
-                          />
-                          If you have time · {stage.optional.length}{' '}
-                          {stage.optional.length === 1 ? 'lesson' : 'lessons'}
-                        </summary>
+                      <Fold
+                        className="min-w-0 flex-1 pb-2"
+                        label={`If you have time · ${stage.optional.length} ${
+                          stage.optional.length === 1 ? 'lesson' : 'lessons'
+                        }`}
+                      >
                         <ul className="border-border rounded-panel divide-border mt-1 divide-y overflow-hidden border">
                           {stage.optional.map((lesson) => (
                             <OptionalRow
@@ -197,14 +231,22 @@ export function PathView({ path }: { path: PathSummary }) {
                             />
                           ))}
                         </ul>
-                      </details>
+                      </Fold>
+                    </div>
+                  ) : null}
+                  {stage.tests && stage.tests.length > 0 ? (
+                    <div className="flex gap-2">
+                      <Rail above="todo" below="todo" />
+                      <StageTests stage={stage.title} tests={stage.tests} result={testResult} />
                     </div>
                   ) : null}
                 </section>
               </li>
             );
           })}
-          <FinalStop path={path} lessonsDone={progress.ready && progress.nextId === undefined} />
+          {custom ? null : (
+            <FinalStop path={path} lessonsDone={progress.ready && progress.nextId === undefined} />
+          )}
         </ol>
         {path.practice.length > 0 ? (
           <section aria-labelledby="practice-title" className="flex flex-col gap-2">
@@ -240,14 +282,13 @@ export function PathView({ path }: { path: PathSummary }) {
             </ol>
           </section>
         ) : null}
-        <Readiness path={path} />
+        {custom ? null : <Readiness path={path} />}
       </div>
 
-      {path.shapes.length > 0 ? (
-        <aside className="col-span-4 md:col-span-4">
-          <div className="flex flex-col gap-2 md:sticky md:top-4">
-            <h2 className="t-section">How to answer</h2>
-            <dl className="flex flex-col gap-2">
+      {!custom && path.shapes.length > 0 ? (
+        <aside className="col-span-4 md:col-span-12 lg:col-span-4">
+          <Fold label="How to answer" className="rule-t pt-1 lg:sticky lg:top-4" heading>
+            <dl className="flex flex-col gap-2 pt-1">
               {path.shapes.map((shape) => (
                 <div key={shape.label} className="rule-t flex flex-col gap-0.5 pt-2">
                   <dt className="text-sm font-semibold">{shape.label}</dt>
@@ -265,7 +306,7 @@ export function PathView({ path }: { path: PathSummary }) {
                 </ol>
               </>
             ) : null}
-          </div>
+          </Fold>
         </aside>
       ) : null}
     </div>
@@ -461,70 +502,180 @@ function OptionalRow({
 }
 
 /**
+ * A disclosure: secondary detail stays one tap away instead of filling the page. A
+ * `heading` fold names a section; a plain one is a quiet "more" under a list.
+ */
+function Fold({
+  label,
+  heading = false,
+  className,
+  children,
+}: {
+  label: string;
+  heading?: boolean;
+  className?: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <details className={cn('group', className)}>
+      <summary
+        className={cn(
+          'hover:text-fg rounded-control flex cursor-pointer list-none items-center gap-1 transition-colors duration-150 ease-out',
+          heading ? 'min-h-5 justify-between' : 'text-muted h-5 text-sm font-medium',
+        )}
+      >
+        {heading ? <h2 className="t-section">{label}</h2> : null}
+        <ChevronDown
+          aria-hidden
+          size={16}
+          strokeWidth={2}
+          className={cn(
+            'shrink-0 transition-transform duration-150 ease-out group-open:rotate-180',
+            heading && 'text-muted order-last',
+          )}
+        />
+        {heading ? null : label}
+      </summary>
+      {children}
+    </details>
+  );
+}
+
+/**
+ * The timed tests that check a stage. Never needed to finish the path, but each earns XP for
+ * its score and keeps a best score to beat, so the group says so plainly and stays quiet:
+ * no accent, which marks the next lesson.
+ */
+function StageTests({
+  stage,
+  tests,
+  result,
+}: {
+  stage: string;
+  tests: readonly PathTest[];
+  result: (test: PathTest) => string | undefined;
+}) {
+  const shown = tests.slice(0, TESTS_SHOWN);
+  const rest = tests.slice(TESTS_SHOWN);
+  const restNoun = rest.every((t) => t.kind === 'training') ? 'tasks' : 'tests';
+  return (
+    <section
+      aria-label={`Test yourself: ${stage}`}
+      className="flex min-w-0 flex-1 flex-col gap-1 pb-2"
+    >
+      <div className="flex flex-wrap items-baseline justify-between gap-x-2 pt-1">
+        <h3 className="font-semibold whitespace-nowrap">Test yourself</h3>
+        <p className="t-label shrink-0">Optional · recommended</p>
+      </div>
+      <ul className="border-border rounded-panel divide-border divide-y overflow-hidden border">
+        {shown.map((test) => (
+          <TestRow key={test.key} test={test} result={result(test)} />
+        ))}
+      </ul>
+      {rest.length > 0 ? (
+        <Fold label={`${rest.length} more ${restNoun}`}>
+          <ul className="border-border rounded-panel divide-border mt-1 divide-y overflow-hidden border">
+            {rest.map((test) => (
+              <TestRow key={test.key} test={test} result={result(test)} />
+            ))}
+          </ul>
+        </Fold>
+      ) : null}
+    </section>
+  );
+}
+
+function TestRow({ test, result }: { test: PathTest; result: string | undefined }) {
+  return (
+    <li>
+      <Link
+        href={test.href}
+        className="hover:bg-raised flex items-start justify-between gap-2 px-2 py-1.5 transition-colors duration-150 ease-out"
+      >
+        <span className="flex min-w-0 flex-col">
+          <span className={cn('font-medium', result === 'Done' && 'text-muted')}>{test.title}</span>
+          <span className="text-muted text-sm">
+            {test.detail ? `${test.detail} · ` : ''}
+            <span className="t-figure">up to {test.xp} XP</span>
+          </span>
+        </span>
+        <span className={cn('t-label t-figure shrink-0', result && result !== 'Done' && 'text-fg')}>
+          {result ?? `${test.minutes} min`}
+        </span>
+      </Link>
+    </li>
+  );
+}
+
+/**
  * How you know you are done, without the app: checks to run on yourself, the piece of work
- * that proves the path, and an honest line on what it leaves out.
+ * that proves the path, and an honest line on what it leaves out. Folded: it matters at the
+ * end, not on every visit.
  */
 function Readiness({ path }: { path: PathSummary }) {
   const { readyWhen, proof, coverage } = path;
   if (readyWhen.length === 0 && !proof && !coverage) return null;
   return (
-    <section aria-labelledby="ready-title" className="rule-t flex flex-col gap-4 pt-4">
-      {readyWhen.length > 0 ? (
-        <div className="flex flex-col gap-2">
-          <h2 id="ready-title" className="t-section">
-            You are ready when
-          </h2>
-          <ul className="flex flex-col gap-1">
-            {readyWhen.map((check) => (
-              <li key={check} className="flex gap-1">
-                <Square
-                  aria-hidden
-                  size={16}
-                  strokeWidth={2}
-                  className="text-faint mt-0.5 shrink-0"
-                />
-                <span>{check}</span>
-              </li>
-            ))}
-          </ul>
-        </div>
-      ) : null}
-      {proof ? (
-        <div className="bg-raised border-border rounded-panel shadow-edge flex flex-col gap-1 border p-2 md:p-3">
-          <h3 className="font-semibold">
-            Prove it: {proof.title.charAt(0).toLowerCase() + proof.title.slice(1)}
-          </h3>
-          <ul className="text-muted flex list-disc flex-col gap-0.5 pl-2 text-sm">
-            {proof.evidence.map((item) => (
-              <li key={item}>{item}</li>
-            ))}
-          </ul>
-        </div>
+    <div className="flex flex-col">
+      {readyWhen.length > 0 || proof ? (
+        <Fold label="You are ready when" heading className="rule-t py-1">
+          <div className="flex flex-col gap-3 pt-1 pb-2">
+            {readyWhen.length > 0 ? (
+              <ul className="flex flex-col gap-1">
+                {readyWhen.map((check) => (
+                  <li key={check} className="flex gap-1">
+                    <Square
+                      aria-hidden
+                      size={16}
+                      strokeWidth={2}
+                      className="text-faint mt-0.5 shrink-0"
+                    />
+                    <span>{check}</span>
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+            {proof ? (
+              <div className="bg-raised border-border rounded-panel shadow-edge flex flex-col gap-1 border p-2 md:p-3">
+                <h3 className="font-semibold">
+                  Prove it: {proof.title.charAt(0).toLowerCase() + proof.title.slice(1)}
+                </h3>
+                <ul className="text-muted flex list-disc flex-col gap-0.5 pl-2 text-sm">
+                  {proof.evidence.map((item) => (
+                    <li key={item}>{item}</li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
+          </div>
+        </Fold>
       ) : null}
       {coverage ? (
-        <dl className="grid grid-cols-1 gap-2 text-sm sm:grid-cols-3">
-          {(
-            [
-              ['Covers', coverage.covered],
-              ['Touches', coverage.partial],
-              ['Leaves out', coverage.outside],
-            ] as const
-          )
-            .filter(([, items]) => items.length > 0)
-            .map(([label, items]) => (
-              <div key={label} className="flex flex-col gap-0.5">
-                <dt className="t-label">{label}</dt>
-                <dd>
-                  <ul className="text-muted flex flex-col gap-0.5">
-                    {items.map((item) => (
-                      <li key={item}>{item}</li>
-                    ))}
-                  </ul>
-                </dd>
-              </div>
-            ))}
-        </dl>
+        <Fold label="What it covers" heading className="rule-t rule-b py-1">
+          <dl className="grid grid-cols-1 gap-2 pt-1 pb-2 text-sm sm:grid-cols-3">
+            {(
+              [
+                ['Covers', coverage.covered],
+                ['Touches', coverage.partial],
+                ['Leaves out', coverage.outside],
+              ] as const
+            )
+              .filter(([, items]) => items.length > 0)
+              .map(([label, items]) => (
+                <div key={label} className="flex flex-col gap-0.5">
+                  <dt className="t-label">{label}</dt>
+                  <dd>
+                    <ul className="text-muted flex flex-col gap-0.5">
+                      {items.map((item) => (
+                        <li key={item}>{item}</li>
+                      ))}
+                    </ul>
+                  </dd>
+                </div>
+              ))}
+          </dl>
+        </Fold>
       ) : null}
-    </section>
+    </div>
   );
 }

@@ -288,3 +288,24 @@ hidden test: a guide can never lead to a wrong answer.
 | Bundle                                                          | `public/content/v1/online-tests/`                                                              |
 | UI                                                              | `src/features/online-test/`                                                                    |
 | Routes                                                          | `src/app/(app)/practise/online-test/`, `src/app/(focus)/practise/online-test/`, `src/app/api/` |
+
+## 8. Tests on the paths
+
+Every preset, every training task and the levelled mock sits in at least one path stage,
+after the lessons that teach what it needs. A stage lists them under `tests` in
+`content/tracks/<id>.yaml`, easiest first:
+
+```yaml
+tests:
+  - { test: screen-a, guided: true } # a preset; guided suggests the coach
+  - { task: torn-pages } # one task as training, sat as train-torn-pages
+  - { lesson: interview.mock-levelled } # an assessment lesson
+```
+
+- Tests are optional. They never count towards finishing a path, but the stage shows them
+  as recommended, with the XP a full score earns and the learner's best score.
+- The path shows three per stage and folds the rest.
+- The validator fails an unknown preset, task or lesson id and a test listed twice in one
+  path, and warns about a preset or task that no stage lists (`online-test-off-path`).
+- The levelled mock runs in the lesson player, not the simulator. It is named "Practice
+  test 4" so it reads as one more practice test, on the paths and in the hub.

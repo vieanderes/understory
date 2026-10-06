@@ -1,6 +1,6 @@
 'use client';
 
-import { X } from 'lucide-react';
+import { BookOpen, X } from 'lucide-react';
 import Link from 'next/link';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { AskScoutButton } from '@/features/tutor/StudyAssistant';
@@ -151,6 +151,15 @@ export function LessonPlayer({
                 ? 'Recall'
                 : ''}
           </p>
+          {/* The same lesson as one page to read, at any step. */}
+          <Link
+            href={`/lectures/${lesson.moduleSlug}/${lesson.slug}`}
+            aria-label="Read as a lecture"
+            title="Read as a lecture"
+            className="text-muted hover:text-fg hover:bg-raised rounded-control inline-flex size-5 shrink-0 items-center justify-center transition-colors duration-150 ease-out"
+          >
+            <BookOpen aria-hidden size={20} strokeWidth={2} />
+          </Link>
           <AskScoutButton
             onClick={() => setTutorOpen(true)}
             className="-mr-1 h-4 px-1 sm:pr-1.5"

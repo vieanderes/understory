@@ -192,6 +192,29 @@ test('the coding tests are on the shelf in the Library', async ({ page }) => {
   await expect(page.getByRole('heading', { name: 'Coding tests', level: 1 })).toBeVisible();
 });
 
+test('a path stage lists the tests that check it, optional and with their XP', async ({ page }) => {
+  await page.goto('/paths/ai-coding-tests');
+  const method = page.getByRole('region', { name: 'Test yourself: The method' });
+  await expect(method.getByText('Optional · recommended')).toBeVisible();
+  await expect(method.getByRole('link', { name: /Your first test/ })).toHaveAttribute(
+    'href',
+    '/practise/online-test/demo',
+  );
+  await expect(method.getByText('up to 20 XP').first()).toBeVisible();
+
+  const tasks = page.getByRole('region', { name: 'Test yourself: The tasks' });
+  await tasks.getByText(/more tasks/).click();
+  await expect(tasks.getByRole('link', { name: /RoomBookings/ })).toHaveAttribute(
+    'href',
+    '/practise/online-test/train-room-bookings',
+  );
+
+  const timed = page.getByRole('region', { name: 'Test yourself: Timed practice' });
+  await expect(
+    timed.getByRole('link', { name: /Practice test 4: one task in four levels/ }),
+  ).toHaveAttribute('href', /^\/learn\/.+/);
+});
+
 test('guided mode walks a task and fills the assistant with its prompt', async ({ page }) => {
   await page.goto(DEMO);
   await page.getByLabel('Guided mode').check();

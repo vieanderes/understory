@@ -19,6 +19,7 @@
   <a href="#a-note-before-you-start">Why this exists</a> ·
   <a href="#meet-scout-your-ai-tutor">Scout AI</a> ·
   <a href="#start-here">Start here</a> ·
+  <a href="#four-places">Four places</a> ·
   <a href="#how-it-works">How it works</a> ·
   <a href="#inside-a-lesson">Inside a lesson</a> ·
   <a href="#the-course">The course</a> ·
@@ -83,7 +84,7 @@ no server holding your progress. It works offline and on a phone.
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/home-dark.png">
-    <img alt="The home screen: a headline, a button to make a plan in 30 seconds, and eight goals to pick from." src="docs/assets/readme/home-light.png" width="100%">
+    <img alt="Home: a greeting, the next lesson on your path with a Continue button, and the first stories from today's news. The rail on the left lists Home, Learn, Practice and News, your paths with their progress, and this week's XP." src="docs/assets/readme/home-light.png" width="100%">
   </picture>
 </p>
 
@@ -102,10 +103,14 @@ answer. It replies with short explanations and highlighted code you can copy.
 
 It is built to keep you thinking. On an exercise it gives a hint first, then a nudge, and
 the full answer only when you ask. It stays out of timed exams, checkpoints and test-outs,
-which measure what you know without help. Away from a lesson it is a guide: ask where to
-start or which option on a page fits you. In the coding
-simulator the same assistant plays the one employers switch on, and every prompt goes into
-your report.
+which measure what you know without help.
+
+Away from a lesson it is a guide. It knows every page in the app and where you are on your
+paths, so you can ask where to start, what to practise or where yesterday's news went, and
+it answers with a link that takes you there. On a wide screen it docks beside the page
+instead of covering it, so the lesson and the answer stay side by side; on a phone it opens
+as a sheet. In the coding simulator the same assistant plays the one employers switch on,
+and every prompt goes into your report.
 
 ### It runs on your own Claude
 
@@ -132,17 +137,22 @@ The details, including the shared store a serverless host needs for MCP, are in
 
 ## Start here
 
-Answer three questions and get a plan: what you want to be able to do, how much time you
-have each week, and where you are starting from. The plan comes in phases drawn from the
-learning paths, with one step for today and an exam at the end of each phase.
+The first visit asks five short questions, most answered with one tap: what you want (learn
+it all, a first job, refresh and then specialise, AI engineering, interviews, or just the
+news), which topics you care about, where you are starting from, how much time you have each
+week, and whether Home should show today's news. The answers set up everything else: your
+path, the order of practice topics, and what Home leads with. You can change them any time
+in Settings.
+
+Then choose one or more learning paths. Each is three or four stages of lessons from the
+full course, and ends in a timed final exam and a certificate. Follow several at once and
+switch between them with tabs on Learn, or build your own path: pick whole parts, open one to
+choose individual chapters, or go down to single lessons.
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/plan-dark.png">
-  <img alt="A plan to become an AI engineer: 6 hours at about 3.5 hours a week, today's lesson with a start button, and the first phase, Python properly, with its lessons." src="docs/assets/readme/plan-light.png" width="100%">
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/learn-dark.png">
+  <img alt="Learn, with two chosen paths as tabs. The Python path shows a search box for any lesson, the next lesson with a Continue button and the path's progress, then its first stage with four lessons done." src="docs/assets/readme/learn-light.png" width="100%">
 </picture>
-
-Or pick a learning path yourself. Each one is three or four stages of lessons from the full
-course, and ends in a timed final exam and a certificate.
 
 | If this is you                                               | Take this path                                                      | Lessons | You leave able to                                                             |
 | ------------------------------------------------------------ | ------------------------------------------------------------------- | :-----: | ----------------------------------------------------------------------------- |
@@ -151,23 +161,53 @@ course, and ends in a timed final exam and a certificate.
 | Your next role or round uses Python                          | [Python](content/tracks/python.yaml)                                |   15    | Write clean, typed Python by hand                                             |
 | Someone will watch you solve a problem live                  | [Algorithms and coding patterns](content/tracks/coding-rounds.yaml) |   15    | Recognise the pattern behind a question and code it cleanly, out loud         |
 | The role is about building products on language models       | [AI engineering](content/tracks/ai-engineering.yaml)                |   21    | Build a RAG pipeline, a production model client and an agent loop             |
-| Your next step is an online coding test with an AI assistant | [AI-assisted coding tests](content/tracks/ai-coding-tests.yaml)     |   13    | Solve timed tasks against hidden tests, with the AI as an assistant you steer |
+| Your next step is an online coding test with an AI assistant | [AI-assisted coding tests](content/tracks/ai-coding-tests.yaml)     |   11    | Solve timed tasks against hidden tests, with the AI as an assistant you steer |
 | You have rounds that are about talking, not coding           | [Interviews and system design](content/tracks/interview-loop.yaml)  |    9    | Talk through your work, design a system and answer behavioural questions      |
 
-Not sure where you stand? The placement test at `/start` climbs 30 questions from first
-steps to race conditions and prompt injection, and tells you where to begin.
+Every stage lists what to try once its lessons are done, marked optional and recommended: a
+practice session on just that stage, the labs that show its mechanisms, and the timed
+coding tests it prepares you for. A path you build yourself gets the same, chapter by
+chapter.
+
+Not sure where you stand? The level check at `/start` climbs 30 questions from first steps
+to race conditions and prompt injection, lets you go back a question, and tells you where to
+begin.
+
+## Four places
+
+The navigation holds four places and nothing else. Everything the course has is still there,
+one step away.
+
+| Place        | What it is for                                                                                                                 |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------ |
+| **Home**     | Your next step on your path, what is due for practice, and the top of today's news.                                            |
+| **Learn**    | Your chosen paths and their stages, a search for any lesson, and the whole course one link away.                               |
+| **Practice** | One question: what to practise today. Pick topics and a length, then start. Timed coding tests and part checks sit underneath. |
+| **News**     | Today's edition, earlier ones by arrow, calendar or archive.                                                                   |
+
+On a wide screen the rail beside them shows your paths with their progress, how many
+practice questions are due, and this week's XP against your goal. **Progress** has the
+figures and the concept map, scoped to one path, part or the whole course. The **Library**
+holds every path, chapter, lecture, lab and test to browse. **Settings** holds your answers,
+your weekly goal, export and import, and the offline download.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/practice-dark.png">
+  <img alt="Practice: today's session of 14 questions on Python and AI engineering, a 5, 10 or 20 minute choice and a Start button, then the topics with how many questions each has new or due, and the timed tests underneath." src="docs/assets/readme/practice-light.png" width="100%">
+</picture>
 
 ## How it works
 
 |              | What you do                                                                                         | What is underneath                                                                                                                         |
 | ------------ | --------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| **Plan**     | Pick a goal, your time and your starting point. Get phases and a step for today.                    | Built from the learning paths and your progress; answers and progress live in the event log on your device.                                |
+| **Set up**   | Five short questions, then one or more paths, or a path you build from parts, chapters or lessons.  | Built from the learning paths and your progress; answers and progress live in the event log on your device.                                |
 | **Learn**    | Short lessons, one idea per screen. An explanation first, then you build, fix, predict or review.   | 370 lessons in 30 chapters. Every exercise has a solution that the build runs against its own tests before it ships.                       |
 | **Ask**      | Scout AI beside any lesson or page, on your own Claude.                                             | It reads the step on screen, answers in Markdown with highlighted code, and never sits in an exam.                                         |
-| **Practise** | Spaced, mixed review sessions, sized before you start. A concept map that fades as memory does.     | FSRS scheduling, a mastery model per concept and confidence ratings on each answer. See [`LEARNING-SCIENCE.md`](docs/LEARNING-SCIENCE.md). |
+| **Practise** | Spaced, mixed sessions by topic, due items first, sized before you start.                           | FSRS scheduling, a mastery model per concept and confidence ratings on each answer. See [`LEARNING-SCIENCE.md`](docs/LEARNING-SCIENCE.md). |
 | **Rehearse** | Timed online coding tests in a simulator, with an optional guided mode.                             | 30 original tasks with hidden correctness and performance tests. See [Practise the real test](#practise-the-real-test).                    |
 | **Prove it** | A checkpoint and capstone at the end of each part. A final exam at the end of each path.            | Capstones come with worked solutions, each built and tested as a real project.                                                             |
-| **Read**     | Every lesson as a lecture: the explanation, worked examples, every solution, the lines to remember. | Readable per lesson, chapter, part or path. Downloadable as PDF and as an audiobook with chapters.                                         |
+| **Track it** | A Progress page for one path, one part or everything: lessons, mastery, activity, what to do next.  | Derived from the event log, never stored. The concept map fades each concept as memory does.                                               |
+| **Read**     | Every lesson as a lecture: the explanation, worked examples, every solution, the lines to remember. | Read in the app per lesson, chapter, part or path, or download it as a PDF and as an audiobook with chapters.                              |
 | **Keep up**  | A daily digest of software and AI news, each item linked to the lessons underneath it.              | 41 verified feeds, fetched by a scheduled GitHub Action. See [Keep up with the field](#keep-up-with-the-field).                            |
 
 Nothing in the course asks you to do arithmetic in your head. Every scored step asks you to
@@ -177,6 +217,12 @@ do something a working engineer does: write code, fix it, read it, review it or 
 
 A lesson is a sequence of steps. There are 13 kinds, and at least half the scored steps in
 every lesson are active: you write or change something and it runs.
+
+One bar at the bottom carries every step: Back on the left, then Skip for now, how sure you
+are (Guess, Pretty sure or Certain) and Check. Saying how sure you are before you check is
+what makes a confident mistake stick once it is corrected. A refresh or a closed tab brings
+you back to the same step, the book icon opens the lesson as a lecture in a new tab, and
+closing the lesson returns you to the page you opened it from.
 
 **Code challenges** run against hidden tests, in JavaScript, TypeScript or Python. Unplugged steps switch off autocomplete, so the answer is yours. Each hint lowers the score.
 
@@ -232,17 +278,18 @@ every lesson are active: you write or change something and it runs.
 Every screen is designed from 390 px up and checked at 390, 768, 1024 and 1440 px, in light
 and dark. Writing code on a phone gets its own editor: a suggestion row above the keyboard,
 snippet gaps you tap to fill, trackpad-style cursor keys and a full-screen mode. See
-[`MOBILE-EDITING.md`](docs/MOBILE-EDITING.md). Scout opens as a sheet over the lesson.
+[`MOBILE-EDITING.md`](docs/MOBILE-EDITING.md). On a phone the four places sit in a tab bar,
+and Scout opens as a sheet over the lesson.
 
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/phone-home-dark.png">
-    <img alt="The home screen on a phone." src="docs/assets/readme/phone-home-light.png" width="30%">
+    <img alt="Home on a phone: a greeting, the next lesson with a Continue button and today's news, with the tab bar below." src="docs/assets/readme/phone-home-light.png" width="30%">
   </picture>
   &nbsp;
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/phone-plan-dark.png">
-    <img alt="A plan on a phone, with today's lesson and a start button." src="docs/assets/readme/phone-plan-light.png" width="30%">
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/phone-learn-dark.png">
+    <img alt="Learn on a phone, with two paths as tabs, a lesson search and the next lesson with a Continue button." src="docs/assets/readme/phone-learn-light.png" width="30%">
   </picture>
   &nbsp;
   <picture>
@@ -929,12 +976,15 @@ the interview answers to remember.
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/lectures-dark.png">
-    <img alt="The lectures page, with an audio player for the whole course and a PDF for each learning path." src="docs/assets/readme/lectures-light.png" width="100%">
+    <img alt="The lectures page in the Library: download the whole course, then each learning path as a lecture with a Read button and a PDF button." src="docs/assets/readme/lectures-light.png" width="100%">
   </picture>
 </p>
 
 - **Any scope.** Read one lesson, a chapter with its revision sheet, a part, a path or the
-  whole course, at `/lectures`.
+  whole course, at `/lectures` in the Library. Every row has Read, to read it in the app,
+  and PDF. On a long chapter the contents stay beside the text and scroll on their own.
+- **From where you are.** Each path stage links to its lecture, and a lesson opens its own
+  lecture in a new tab, so your place in the lesson stays put.
 - **PDF.** Each scope prints to its own PDF at build time.
 - **Audio.** Each scope has a narrated playlist that remembers where you stopped, and
   downloads as an audiobook with chapters.
@@ -942,8 +992,8 @@ the interview answers to remember.
 ## Practise the real test
 
 Most employers send a timed online coding test first, often with an AI assistant built in.
-Understory has an AI-assisted coding simulator of it, under **Coding tests**. It looks,
-runs and scores like the real thing, so on the day nothing is new.
+Understory has an AI-assisted coding simulator of it, under **Practice**, then **Timed
+coding tests**. It looks, runs and scores like the real thing, so on the day nothing is new.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/online-test-dark.png">
@@ -964,7 +1014,10 @@ runs and scores like the real thing, so on the day nothing is new.
   the AI and why, what to write yourself, what to let the AI write, when to optimise and
   when to submit. The build proves every guide ends in a solution that scores 100%.
 - **30 original tasks** across the classic assessment topics, in JavaScript, TypeScript
-  and Python, with 6 preset tests, 120-minute training on any task, and custom tests.
+  and Python, with 120-minute training on any task and custom tests.
+- **Ten tests, named for what they hold**, grouped as Start here (a one-task warm-up), Short
+  screens, With the AI assistant, and Full mocks, including one task in four levels. Each
+  path stage lists the tests and tasks it prepares you for.
 
 The assistant is Scout, on the same connection to your own Claude
 ([Meet Scout](#meet-scout-your-ai-tutor)). Here it knows the task, your code and the last
@@ -986,23 +1039,32 @@ format; the tasks and the code are our own.</sub>
 
 AI research moves faster than any course can be rewritten. A new model, method or tool
 lands every week, and it is easy to lose track of what matters. Understory has a news
-section for that: a short daily digest, plus a weekly and a monthly one, under **News**.
+section for that: a short daily edition under **News**, with the top of it on Home.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/news-dark.png">
+  <img alt="News: the edition for one day as the title, with earlier and later arrows, a calendar and links to the week, the month and all editions. Stories are listed with a topic, a lead line and the source, and earlier editions sit in a column on the right." src="docs/assets/readme/news-light.png" width="100%">
+</picture>
+
+- **Read today, or any day before.** Arrows step to the edition before or after, a calendar
+  picks any day, and the archive lists every edition by week. The week and the month have
+  their own digest too.
 - **Where the news comes from.** 41 hand-checked sources, listed in
   [`content/feeds.yaml`](content/feeds.yaml): the AI labs and researchers (OpenAI, Google
   DeepMind, Hugging Face, Simon Willison, Sebastian Raschka, Lilian Weng, Import AI), the
   web platform and the tools the course teaches (web.dev, WebKit, Chrome, React, Next.js,
   Node.js, TypeScript, PostgreSQL), engineering and security writing (The Pragmatic
   Engineer, Martin Fowler, Julia Evans, Jepsen, PortSwigger, Trail of Bits), plus Hacker
-  News and arXiv.
+  News and arXiv. The info button beside the date says the same in the app.
 - **How it is picked.** Each morning a scheduled job fetches the sources, drops anything
   older than 72 hours, merges duplicates, and scores what is left by topic, source,
-  engagement and recency. The best dozen become the day's edition.
-- **How it is explained.** Every item gets a brief in a fixed shape: what happened, why it
-  matters, and the two to four key concepts behind it. Each links to the lessons underneath
-  it, so a headline about a new attention trick leads to the lesson on how models work.
-  With an Anthropic key the briefs are written by a model; without one they are drawn from
-  the source text.
+  engagement and recency. The best dozen become the day's edition, ordered by the topics
+  you chose.
+- **How it is explained.** Every story has a lead line, and opens to a brief in a fixed
+  shape: what happened, why it matters, and the two to four key concepts behind it. Each
+  links to the lessons underneath it, so a headline about a new attention trick leads to the
+  lesson on how models work. With an Anthropic key the briefs are written by a model;
+  without one they are drawn from the source text.
 
 The pipeline is a plain Node script, so it runs just as well from a timer on a server. The
 details are in [`SIGNAL.md`](docs/SIGNAL.md).
@@ -1046,7 +1108,7 @@ connect Claude to the simulator's assistant on Vercel, add a Redis store (see
 | Online tests        | An AI-assisted coding simulator. Each case runs alone in the sandbox and is judged by hash outside it        |
 | Assistant           | Your Claude account through an MCP server, your own Anthropic key, or Claude Code on your machine            |
 | Storage             | IndexedDB on the device, behind a port, so a sync adapter can replace it                                     |
-| Offline             | A service worker built after each build, and a course download in Settings                                   |
+| Offline             | A service worker built after each build, and a course download in Settings. Development clears it            |
 | Content             | Lessons in YAML, checked by a zod schema and a validator that runs every solution against its tests          |
 | iOS                 | `ios/UnderstoryKit`, a Swift package that reads the same content bundle. The app is in progress              |
 

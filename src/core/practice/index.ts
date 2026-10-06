@@ -1,6 +1,8 @@
 export type { Catalog, CatalogConcept, CatalogRecallCard, CatalogSkillItem } from './catalog';
 export {
   buildSession,
+  FIRST_LOOK_TYPES,
+  sessionSize,
   type BuildSessionInput,
   type DeviceKind,
   type SessionItem,

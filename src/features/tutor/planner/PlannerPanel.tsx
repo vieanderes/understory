@@ -283,7 +283,11 @@ export function PlannerPanel({ onMessage, onFollowLink, ...panel }: PlannerPanel
           onChange={editDraft}
           onSave={saveDraft}
           onBack={() => setViewing(false)}
-          onFollow={onFollowLink}
+          // The page now shows the path, so the column goes back to the conversation.
+          onFollow={() => {
+            setViewing(false);
+            onFollowLink();
+          }}
         />
       ) : null}
     </div>

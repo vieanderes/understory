@@ -1,6 +1,6 @@
 'use client';
 
-import { ArrowRight, Check, ChevronDown, Plus } from 'lucide-react';
+import { ArrowRight, Check, ChevronDown, ChevronRight, Plus } from 'lucide-react';
 import Link from 'next/link';
 import { useSearchParams } from 'next/navigation';
 import { Suspense, useState } from 'react';
@@ -17,10 +17,26 @@ import { CHOSEN_PATH, chosenPathIds, chosenPaths, currentPath, togglePath } from
 import { CUSTOM_PATH_ID, customPathSummary, type CourseTree } from './custom';
 import { PathView } from './PathView';
 
+/** The tick a path row carries: an empty box, or ink with the path's place in the order. */
+function OrderTick({ order }: { order: number }) {
+  const chosen = order > 0;
+  return (
+    <span
+      aria-hidden
+      className={cn(
+        'rounded-control mt-0.5 flex size-2.5 shrink-0 items-center justify-center border transition-colors duration-150 ease-out',
+        chosen ? 'bg-fg border-fg text-bg' : 'bg-surface border-faint group-hover:border-fg',
+      )}
+    >
+      {chosen ? <span className="t-figure text-sm leading-none font-semibold">{order}</span> : null}
+    </span>
+  );
+}
+
 /**
- * A path as a hairline row that toggles. The marker holds its place in the order chosen,
- * so a learner on two paths sees which comes first. "See the stages" stays a separate,
- * quieter link, so choosing never navigates away.
+ * A path as a hairline row that toggles. The whole row is the toggle (the button stretches
+ * over it); "See the stages" sits above that layer, so choosing never navigates away and
+ * the link is still one tap. The tick holds the path's place in the order chosen.
  */
 function PathRow({
   path,
@@ -39,58 +55,81 @@ function PathRow({
   const chosen = order > 0;
   const custom = path.id === CUSTOM_PATH_ID;
   return (
-    <li className={cn(rowItem, 'flex items-start gap-1')}>
-      <button
-        type="button"
-        aria-pressed={chosen}
-        onClick={onToggle}
-        className="group rounded-control transition-press hover:bg-raised -ml-0.5 flex min-h-6 min-w-0 flex-1 items-start gap-1.5 py-1.5 pr-0.5 pl-0.5 text-left select-none active:scale-98"
+    <li className={rowItem}>
+      <div
+        className={cn(
+          'group rounded-control relative -mx-1 flex items-start gap-1.5 px-1 py-1.5 transition-colors duration-150 ease-out',
+          chosen ? 'bg-raised' : 'hover:bg-raised',
+        )}
       >
-        <span
-          aria-hidden
-          className={cn(
-            'mt-0.5 flex size-2.5 shrink-0 items-center justify-center rounded-full border text-sm transition-colors duration-150 ease-out',
-            chosen
-              ? 'bg-fg border-fg text-bg'
-              : 'border-border-strong group-hover:border-fg text-transparent',
-          )}
-        >
-          {chosen ? <span className="t-figure font-semibold">{order}</span> : null}
-        </span>
-        <span className="flex min-w-0 flex-1 flex-col">
-          <span className={chosen ? 'font-semibold' : 'font-medium'}>{path.name}</span>
-          <span className="text-muted text-sm">{path.promise}</span>
-          <span className="t-figure text-muted pt-0.5 text-sm">
-            {done > 0 ? `${done}/${total} lessons` : `${total} lessons`} · about{' '}
-            {formatMinutes(path.minutes)}
+        <OrderTick order={order} />
+        <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+          <div className="flex items-baseline justify-between gap-2">
+            <button
+              type="button"
+              aria-pressed={chosen}
+              onClick={onToggle}
+              className={cn(
+                'rounded-control min-w-0 text-left after:absolute after:inset-0',
+                'focus-visible:outline-accent focus-visible:outline-2 focus-visible:outline-offset-2',
+                chosen ? 'font-semibold' : 'font-medium',
+              )}
+            >
+              {path.name}
+            </button>
+            <span className="t-figure text-muted shrink-0 text-sm">
+              {done > 0 ? `${done}/${total}` : total} lessons · {formatMinutes(path.minutes)}
+            </span>
+          </div>
+          <div className="flex items-end justify-between gap-2">
+            <p className="text-muted line-clamp-2 text-sm">{path.promise}</p>
             {exam.passed ? (
-              <span className="text-fg inline-flex items-center gap-0.5 pl-1 font-medium">
+              <span className="text-fg inline-flex shrink-0 items-center gap-0.5 text-sm font-medium">
                 <Check aria-hidden size={16} strokeWidth={2} />
                 Certified
               </span>
-            ) : null}
-          </span>
-        </span>
-      </button>
-      <Link
-        href={custom ? '/learn/build' : `/paths/${path.id}`}
-        aria-label={custom ? 'Change my path' : `See the stages: ${path.name}`}
-        className="text-muted hover:text-fg rounded-control mt-1 inline-flex h-5 shrink-0 items-center px-1 text-sm font-medium transition-colors duration-150 ease-out"
-      >
-        {custom ? 'Change' : 'See the stages'}
-      </Link>
+            ) : (
+              <Link
+                href={custom ? '/learn/build' : `/paths/${path.id}`}
+                aria-label={custom ? 'Change my path' : `See the stages: ${path.name}`}
+                className="text-muted hover:text-fg relative z-10 -mr-0.5 inline-flex shrink-0 items-center text-sm font-medium transition-colors duration-150 ease-out"
+              >
+                {custom ? 'Change' : 'Stages'}
+                <ChevronRight aria-hidden size={16} strokeWidth={2} />
+              </Link>
+            )}
+          </div>
+        </div>
+      </div>
     </li>
   );
 }
 
-/** Every path as a hairline row, any number chosen, then building your own. */
-function PathPicker({ paths, titleId }: { paths: readonly PathSummary[]; titleId: string }) {
+/**
+ * Every path as a hairline row, any number chosen, then building your own. With `onToggle`
+ * the choice is a draft the screen confirms; without it each tap saves at once.
+ */
+function PathPicker({
+  paths,
+  titleId,
+  draft,
+  onToggle,
+}: {
+  paths: readonly PathSummary[];
+  titleId: string;
+  draft?: readonly string[];
+  onToggle?: (id: string) => void;
+}) {
   const store = useStore();
   const { status, state } = useProgress();
-  const chosen = chosenPathIds(state.settings[CHOSEN_PATH]);
+  const chosen = draft ?? chosenPathIds(state.settings[CHOSEN_PATH]);
   const doneOf = (path: PathSummary) =>
     status === 'ready' ? path.lessonIds.filter((id) => state.completedLessons.has(id)).length : 0;
   const hasCustom = paths.some((p) => p.id === CUSTOM_PATH_ID);
+  const toggle = (id: string) =>
+    onToggle
+      ? onToggle(id)
+      : void store.record('setting_changed', { key: CHOSEN_PATH, value: togglePath(chosen, id) });
   return (
     <div role="group" aria-labelledby={titleId}>
       <ul className={rowList()}>
@@ -100,27 +139,22 @@ function PathPicker({ paths, titleId }: { paths: readonly PathSummary[]; titleId
             path={path}
             order={chosen.indexOf(path.id) + 1}
             done={doneOf(path)}
-            onToggle={() =>
-              void store.record('setting_changed', {
-                key: CHOSEN_PATH,
-                value: togglePath(chosen, path.id),
-              })
-            }
+            onToggle={() => toggle(path.id)}
           />
         ))}
         {hasCustom ? null : (
           <li className={rowItem}>
             <Link
               href="/learn/build"
-              className="group rounded-control transition-press hover:bg-raised -mx-0.5 flex min-h-6 items-start gap-1.5 px-0.5 py-1.5 select-none active:scale-98"
+              className="group rounded-control hover:bg-raised -mx-1 flex items-start gap-1.5 px-1 py-1.5 transition-colors duration-150 ease-out"
             >
               <span
                 aria-hidden
-                className="border-border-strong text-muted group-hover:border-fg group-hover:text-fg mt-0.5 flex size-2.5 shrink-0 items-center justify-center rounded-full border border-dashed transition-colors duration-150 ease-out"
+                className="rounded-control border-faint text-muted group-hover:border-fg group-hover:text-fg mt-0.5 flex size-2.5 shrink-0 items-center justify-center border border-dashed transition-colors duration-150 ease-out"
               >
                 <Plus size={12} strokeWidth={2} />
               </span>
-              <span className="flex min-w-0 flex-1 flex-col">
+              <span className="flex min-w-0 flex-1 flex-col gap-0.5">
                 <span className="font-medium">Build your own path</span>
                 <span className="text-muted text-sm">
                   Whole parts, single chapters or just the lessons you want
@@ -203,7 +237,10 @@ function Learn({
   const { status, state } = useProgress();
   const planState = usePlan(catalog);
   const asked = useSearchParams().get('path');
+  const store = useStore();
   const [switching, setSwitching] = useState(false);
+  // On a first visit the choice is a draft, so several paths can be ticked before Start.
+  const [draft, setDraft] = useState<string[]>([]);
   if (status !== 'ready') return <p className="text-muted py-4">Reading your progress...</p>;
   const isDone = (id: string) => state.completedLessons.has(id);
   // A path the learner built sits first, as one of theirs.
@@ -217,25 +254,59 @@ function Learn({
 
   if (!path) {
     const setUp = !state.plan && !state.profile;
+    const names = draft.flatMap((id) => paths.find((p) => p.id === id)?.name ?? []);
     return (
       <div className="flex max-w-5xl flex-col gap-6 md:pt-2">
         <header className="flex flex-col gap-1">
           <h1 id="pick-title" className="t-title" data-arrive="title">
-            Choose one or more paths
+            Choose your paths
           </h1>
           <p data-arrive="rise" className="text-muted text-lg">
-            Short lessons for one goal, with practice and tests along the way.
+            Pick one or more. You work through them in the order you pick.
           </p>
           {setUp ? (
-            <div data-arrive="rise" className="pt-2">
-              <Link href="/plan" className={buttonClass('primary')}>
-                Help me choose · 1 minute
-                <ArrowRight aria-hidden size={16} strokeWidth={2} />
-              </Link>
-            </div>
+            <Link
+              href="/plan"
+              data-arrive="rise"
+              className="text-muted hover:text-fg inline-flex min-h-5 w-fit items-center gap-0.5 text-sm font-medium underline-offset-4 hover:underline"
+            >
+              Not sure? Answer five questions
+              <ArrowRight aria-hidden size={16} strokeWidth={2} />
+            </Link>
           ) : null}
         </header>
-        <PathPicker paths={paths} titleId="pick-title" />
+        <PathPicker
+          paths={paths}
+          titleId="pick-title"
+          draft={draft}
+          onToggle={(id) =>
+            setDraft((current) =>
+              current.includes(id) ? current.filter((c) => c !== id) : [...current, id],
+            )
+          }
+        />
+        {draft.length > 0 ? (
+          // Floats once something is ticked, above the tab bar and clear of the assistant's
+          // button in the corner, so Start is always in reach while choosing.
+          <div className="bg-surface border-border rounded-panel shadow-float sticky bottom-10 flex items-center justify-between gap-2 border py-1.5 pr-8 pl-2 md:bottom-10 md:px-3">
+            <p className="min-w-0 text-sm" aria-live="polite">
+              <span className="font-medium">{names[0]}</span>
+              {names.length > 1 ? (
+                <span className="text-muted">, then {names.slice(1).join(', ')}</span>
+              ) : null}
+            </p>
+            <button
+              type="button"
+              onClick={() =>
+                void store.record('setting_changed', { key: CHOSEN_PATH, value: draft.join(',') })
+              }
+              className={buttonClass('primary', 'lg', 'shrink-0')}
+            >
+              Start learning
+              <ArrowRight aria-hidden size={16} strokeWidth={2} />
+            </button>
+          </div>
+        ) : null}
       </div>
     );
   }

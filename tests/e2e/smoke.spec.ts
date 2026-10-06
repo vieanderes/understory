@@ -4,7 +4,7 @@ import { expect, test } from '@playwright/test';
 /** Every route renders, names itself, passes axe in both themes and never scrolls sideways. */
 const ROUTES: { path: string; heading: RegExp }[] = [
   { path: '/', heading: /one small step at a time/ },
-  { path: '/paths', heading: /Choose one or more paths/ },
+  { path: '/paths', heading: /Choose your paths/ },
   { path: '/library', heading: /Library/ },
   { path: '/paths/ai-coding-tests', heading: /AI-assisted coding tests/ },
   { path: '/learn', heading: /Seven parts/ },

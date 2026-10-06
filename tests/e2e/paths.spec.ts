@@ -8,17 +8,21 @@ import { expect, test } from '@playwright/test';
 test('a learner chooses two paths and switches between them with tabs', async ({ page }) => {
   await page.goto('/paths');
   await page.locator('html[data-hydrated="true"]').waitFor();
-  await expect(
-    page.getByRole('heading', { level: 1, name: 'Choose one or more paths' }),
-  ).toBeVisible();
+  await expect(page.getByRole('heading', { level: 1, name: 'Choose your paths' })).toBeVisible();
 
-  await page.getByRole('button', { name: /^Start coding/ }).click();
+  // Ticking is a draft: nothing moves until Start learning.
+  await page.getByRole('button', { name: 'Start coding', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Start coding', exact: true })).toHaveAttribute(
+    'aria-pressed',
+    'true',
+  );
+  await page.getByRole('button', { name: /Start learning/ }).click();
   await expect(page.getByRole('heading', { level: 1 })).toHaveText('Start coding from zero');
   // One path: no tabs.
   await expect(page.getByRole('navigation', { name: 'Your paths' })).toBeHidden();
 
   await page.getByRole('button', { name: 'Switch path' }).click();
-  const python = page.getByRole('button', { name: /^Python/ });
+  const python = page.getByRole('button', { name: 'Python', exact: true });
   await python.click();
   await expect(python).toHaveAttribute('aria-pressed', 'true');
 

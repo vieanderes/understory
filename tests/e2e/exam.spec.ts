@@ -155,9 +155,11 @@ test.describe('the certificate', () => {
 
     await page.goto('/paths');
     await settle(page);
-    await expect(page.getByRole('button', { name: new RegExp(`^${NAME}`) }).first()).toContainText(
-      'Certified',
-    );
+    await expect(
+      page
+        .getByRole('listitem')
+        .filter({ has: page.getByRole('button', { name: NAME, exact: true }) }),
+    ).toContainText('Certified');
 
     await page.goto(`/paths/${PATH_ID}/certificate`);
     await settle(page);

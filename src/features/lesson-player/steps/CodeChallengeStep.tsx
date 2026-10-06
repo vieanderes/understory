@@ -300,7 +300,6 @@ export function CodeChallengeStep({
           <Button
             variant="quiet"
             size="md"
-            className="-mr-2 pointer-coarse:mr-0"
             disabled={checked || code === active.starterCode}
             onClick={() => setConfirmingReset(true)}
           >
@@ -320,7 +319,10 @@ export function CodeChallengeStep({
       className="challenge-grid grid grid-cols-4 gap-x-4 gap-y-3 md:grid-cols-12"
       onKeyDown={onKeyDown}
     >
-      <div className="col-span-4 min-w-0 md:col-span-5">
+      {/* A label row as tall as the editor's header, so the task and the editor beside it
+          start on one line. */}
+      <div className="col-span-4 flex min-w-0 flex-col gap-1 md:col-span-5">
+        <h3 className="t-label flex min-h-5 items-center">Task</h3>
         <RichText value={step.prompt} />
       </div>
 

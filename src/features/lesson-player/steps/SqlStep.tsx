@@ -210,7 +210,6 @@ export function SqlStep({
           <Button
             variant="quiet"
             size="md"
-            className="-mr-2 pointer-coarse:mr-0"
             disabled={checked || code === step.starter}
             onClick={() => setConfirmingReset(true)}
           >
@@ -229,7 +228,12 @@ export function SqlStep({
       onKeyDown={onKeyDown}
     >
       <div className="col-span-4 flex min-w-0 flex-col gap-3 md:col-span-5">
-        <RichText value={step.prompt} />
+        {/* A label row as tall as the editor's header, so the task and the editor beside it
+            start on one line. */}
+        <div className="flex flex-col gap-1">
+          <h3 className="t-label flex min-h-5 items-center">Task</h3>
+          <RichText value={step.prompt} />
+        </div>
         {step.showSchema ? <SchemaPanel tables={tables} failure={tablesFailure} /> : null}
       </div>
 

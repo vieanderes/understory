@@ -241,7 +241,6 @@ export function PlaygroundStep({
           <Button
             variant="quiet"
             size="md"
-            className="-mr-2 pointer-coarse:mr-0"
             disabled={checked || !changed}
             onClick={() => setConfirmingReset(true)}
           >
@@ -255,9 +254,10 @@ export function PlaygroundStep({
 
   return (
     <div className="challenge-grid grid grid-cols-4 gap-x-4 gap-y-3 md:grid-cols-12">
-      <div className="col-span-4 flex min-w-0 flex-col gap-3 md:col-span-6">
-        <RichText value={step.prompt} />
+      {/* The task spans both columns, so the editor and the page below it start on one line. */}
+      <RichText value={step.prompt} className="col-span-4 max-w-3xl md:col-span-12" />
 
+      <div className="col-span-4 flex min-w-0 flex-col gap-3 md:col-span-6">
         <div className="flex flex-col gap-1">
           <LazyCodeEditor
             header={header}
@@ -280,12 +280,22 @@ export function PlaygroundStep({
       </div>
 
       {/* Second in the source, so a phone reads prompt, editor, page, checks. */}
-      <div className="col-span-4 min-w-0 md:col-span-6 md:col-start-7 md:row-span-2 md:row-start-1">
+      <div className="col-span-4 min-w-0 md:col-span-6 md:col-start-7 md:row-span-2 md:row-start-2">
         <div className="flex flex-col gap-3 md:sticky md:top-10">
           <section aria-labelledby="playground-page" className="flex flex-col gap-1">
-            <h3 id="playground-page" className="t-label">
-              Your page · live
-            </h3>
+            {/* As tall as the editor's header row beside it, so the page and the editor
+                share a top edge: the file tabs when there are several files (48 px and their
+                hairline border), else a label. */}
+            <div
+              className={cn(
+                'flex items-center',
+                fields.length > 1 ? 'box-content min-h-6 py-px' : 'min-h-5',
+              )}
+            >
+              <h3 id="playground-page" className="t-label">
+                Your page · live
+              </h3>
+            </div>
             {doc === null ? (
               <ReactLoading state={react} className="h-30 md:h-50" />
             ) : (

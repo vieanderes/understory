@@ -59,6 +59,7 @@ export function customPathSummary(tree: CourseTree, lessonIds: readonly string[]
         {
           title: chapter.title,
           why: part.title,
+          lectureHref: `/lectures/${chapter.slug}`,
           lessons: lessons.map(({ id, title, objective, minutes, href }) => ({
             id,
             title,

@@ -9,7 +9,7 @@ import { useProgress, useStore } from '@/features/store/StoreProvider';
 import type { PathSummary } from '@/lib/content';
 import { cn } from '@/lib/cn';
 import { CHOSEN_PATH, currentPath } from './current';
-import { customPathSummary, type CourseTree } from './custom';
+import { CUSTOM_PATH_ID, customPathSummary, type CourseTree } from './custom';
 import { PathView } from './PathView';
 
 /** Every path, one tap to make it yours. Folded away once a path is under way. */
@@ -128,7 +128,7 @@ export function LearnScreen({
           <PathPicker paths={paths} current={path.id} />
         </div>
       </details>
-      <PathView path={path} />
+      <PathView path={path} embedded custom={path.id === CUSTOM_PATH_ID} />
     </div>
   );
 }

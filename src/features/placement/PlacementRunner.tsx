@@ -266,7 +266,7 @@ function PlacementItem({
         <ConfidenceControl
           value={confidence}
           onChange={setConfidence}
-          className="min-w-0 flex-1 sm:max-w-36"
+          className="min-w-0 flex-1 sm:flex-none"
         />
         <Button variant="primary" onClick={next} disabled={!canAnswer}>
           Next

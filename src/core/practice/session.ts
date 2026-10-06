@@ -32,6 +32,9 @@ export interface BuildSessionInput {
   readonly seed: number;
   /** Topics the learner chose for today. Empty or absent means the whole course. */
   readonly topics?: readonly Interest[];
+  /** Chapter (module) ids, as a path stage's "Practise this stage" asks. Narrower than
+   * topics, so it wins when both are given. */
+  readonly chapters?: readonly string[];
 }
 
 export interface SessionResult {
@@ -169,7 +172,18 @@ function interleave(
 }
 
 export function buildSession(input: BuildSessionInput): SessionResult {
-  if (input.topics && input.topics.length > 0) return buildTopicSession(input, input.topics);
+  if (input.chapters && input.chapters.length > 0) {
+    return buildTopicSession(
+      input,
+      input.chapters.map((chapter) => (lessonId: string) => lessonId.split('.')[0] === chapter),
+    );
+  }
+  if (input.topics && input.topics.length > 0) {
+    return buildTopicSession(
+      input,
+      input.topics.map((topic) => (lessonId: string) => matchesInterests(lessonId, [topic])),
+    );
+  }
   const { state, catalog, now, minutes, device, seed } = input;
   const rng = mulberry32(seed);
   const size = sessionSize(minutes);
@@ -289,13 +303,12 @@ interface FirstLook {
  * where its first item stands.
  */
 function firstLooksFor(
-  topic: Interest,
+  inScope: Scope,
   state: ProgressState,
   catalog: Catalog,
   device: DeviceKind,
 ): FirstLook[] {
-  const fresh = (lessonId: string) =>
-    !state.completedLessons.has(lessonId) && matchesInterests(lessonId, [topic]);
+  const fresh = (lessonId: string) => !state.completedLessons.has(lessonId) && inScope(lessonId);
   const byLesson = new Map<string, { skills: CatalogSkillItem[]; recalls: CatalogRecallCard[] }>();
   const entry = (lessonId: string) => {
     let found = byLesson.get(lessonId);
@@ -333,7 +346,11 @@ export function recallCardKey(card: CatalogRecallCard): string {
   return `lesson:${card.lessonId}#${card.cardId}`;
 }
 
-function buildTopicSession(input: BuildSessionInput, topics: readonly Interest[]): SessionResult {
+/** Whether a lesson belongs to one group of a session's scope: an interest or a chapter. */
+type Scope = (lessonId: string) => boolean;
+
+function buildTopicSession(input: BuildSessionInput, groups: readonly Scope[]): SessionResult {
+  const inAny = (lessonId: string) => groups.some((inScope) => inScope(lessonId));
   const { state, catalog, now, minutes, device } = input;
   const size = sessionSize(minutes);
   const used = new Set<string>();
@@ -349,13 +366,13 @@ function buildTopicSession(input: BuildSessionInput, topics: readonly Interest[]
   };
   const inTopics = (cardKey: string) => {
     const lessonId = lessonOfCardKey(cardKey);
-    return lessonId !== undefined && matchesInterests(lessonId, topics);
+    return lessonId !== undefined && inAny(lessonId);
   };
 
   const due = dueByLowestRetrievability(state, now).filter((d) => inTopics(d.cardKey));
   const dueFirst = take(due, Math.round(size * DUE_SHARE));
   const firstLooks = take(
-    roundRobin(topics.map((topic) => firstLooksFor(topic, state, catalog, device))),
+    roundRobin(groups.map((inScope) => firstLooksFor(inScope, state, catalog, device))),
     size - dueFirst.length,
   );
   const dueMore = take(due, size - dueFirst.length - firstLooks.length);
@@ -364,7 +381,7 @@ function buildTopicSession(input: BuildSessionInput, topics: readonly Interest[]
   const done = catalog.skillItems.filter(
     (i) =>
       state.completedLessons.has(i.lessonId) &&
-      matchesInterests(i.lessonId, topics) &&
+      inAny(i.lessonId) &&
       !excludesTyping(device, i.type),
   );
   const concepts = [...new Set(done.map((i) => i.concept))].sort(

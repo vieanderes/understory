@@ -8,6 +8,17 @@ export function parseTopics(value: string | null | undefined): Interest[] {
   return INTERESTS.filter((id) => asked.has(id));
 }
 
+/** `js,ts` to chapter ids. Unknown ids simply match nothing, so no list is needed here. */
+export function parseChapters(value: string | null | undefined): string[] {
+  return [...new Set((value ?? '').split(','))].filter((id) => /^[a-z][a-z0-9-]*$/.test(id));
+}
+
+/** A path stage's practice: its chapters, ten minutes. */
+export function stageSessionHref(lessonIds: readonly string[]): string {
+  const chapters = [...new Set(lessonIds.map((id) => id.split('.')[0] ?? id))];
+  return `/practise/session/10?chapters=${chapters.join(',')}`;
+}
+
 /** The session URL. Topics ride in the query so the minutes route stays static. */
 export function sessionHref(minutes: SessionMinutes, topics: readonly Interest[]): string {
   const base = `/practise/session/${minutes}`;

@@ -66,7 +66,13 @@ const SOURCE_LABEL = {
  * exam: the test-out's length and pass mark over the path's required lessons.
  */
 export type SessionKind =
-  | { kind: 'practice'; minutes: SessionMinutes; topics?: readonly Interest[] }
+  | {
+      kind: 'practice';
+      minutes: SessionMinutes;
+      topics?: readonly Interest[];
+      /** Chapter ids, for a path stage's practice. */
+      chapters?: readonly string[];
+    }
   | { kind: 'checkpoint'; partId: string }
   | { kind: 'test-out'; partId: string }
   | { kind: 'exam'; path: PathSummary; onRetake: () => void };
@@ -129,6 +135,7 @@ export function SessionRunner({ session }: { session: SessionKind }) {
               device,
               seed,
               ...(session.topics ? { topics: session.topics } : {}),
+              ...(session.chapters ? { chapters: session.chapters } : {}),
             })
           : { items: [], nextDueDate: null };
     const sessionId = uuidv7(now.getTime(), { next: () => Math.random() });
@@ -303,7 +310,8 @@ export function SessionRunner({ session }: { session: SessionKind }) {
               <p className="t-label">{heading}</p>
               <Title id="closing-title">
                 {plan.items.length === 0 ? (
-                  session.kind === 'practice' && (session.topics?.length ?? 0) > 0 ? (
+                  session.kind === 'practice' &&
+                  ((session.topics?.length ?? 0) > 0 || (session.chapters?.length ?? 0) > 0) ? (
                     <>
                       Nothing here yet.{' '}
                       <span className="text-muted">These topics have no items to practise.</span>

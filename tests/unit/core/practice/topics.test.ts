@@ -212,3 +212,27 @@ describe('buildSession with topics', () => {
     );
   });
 });
+
+describe('buildSession for chapters', () => {
+  it('keeps to the chosen chapters, interleaved, with first looks at what is not done', () => {
+    const { items } = build({ chapters: ['python', 'js'] });
+    expect(items.length).toBeGreaterThan(0);
+    expect(new Set(items.map((i) => moduleOf(i.cardKey)))).toEqual(new Set(['python', 'js']));
+    expect(items[0]?.cardKey).toBe('skill:python.a#easy');
+    expect(items[1]?.cardKey).toBe('skill:js.a#easy');
+  });
+
+  it('wins over topics, since a stage is narrower than an interest', () => {
+    const { items } = build({ chapters: ['js'], topics: ['python'] });
+    expect(items.every((i) => moduleOf(i.cardKey) === 'js')).toBe(true);
+  });
+
+  it('puts due items of the chapter first', () => {
+    const { items } = build({
+      chapters: ['algo'],
+      state: state({ cards: { 'skill:algo.b#hard': card(), 'skill:python.a#hard': card() } }),
+    });
+    expect(items[0]?.cardKey).toBe('skill:algo.b#hard');
+    expect(items.some((i) => i.cardKey === 'skill:python.a#hard')).toBe(false);
+  });
+});

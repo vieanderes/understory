@@ -3,6 +3,7 @@ import {
   allLessonIds,
   chapterMeta,
   partMeta,
+  preview,
   sameChoice,
   summary,
   totals,
@@ -72,6 +73,12 @@ describe('path builder', () => {
       { id: 'p2', title: 'The web', chapters: [{ id: 'c3', title: 'HTML', chosen: 1, total: 1 }] },
     ]);
     expect(summary(tree, new Set())).toEqual([]);
+  });
+
+  it('previews the first names and counts the rest', () => {
+    expect(preview(['a', 'b'])).toEqual({ names: ['a', 'b'], more: 0 });
+    expect(preview(['a', 'b', 'c', 'd'])).toEqual({ names: ['a', 'b', 'c', 'd'], more: 0 });
+    expect(preview(['a', 'b', 'c', 'd', 'e'])).toEqual({ names: ['a', 'b', 'c'], more: 2 });
   });
 
   it('knows every lesson and when two choices are the same', () => {

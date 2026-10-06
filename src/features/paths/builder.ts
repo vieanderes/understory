@@ -80,6 +80,16 @@ export function summary(tree: CourseTree, chosen: ReadonlySet<string>): SummaryP
   });
 }
 
+/**
+ * A glimpse of what a level holds, so a row says what is inside before it is opened: the
+ * first few names, and how many more there are.
+ */
+export function preview(names: readonly string[], shown = 3): { names: string[]; more: number } {
+  // One hidden name reads worse as "+ 1 more" than as the name itself.
+  const take = names.length === shown + 1 ? names.length : shown;
+  return { names: names.slice(0, take), more: Math.max(0, names.length - take) };
+}
+
 /** Whether two choices hold the same lessons, so Save waits for a real change. */
 export function sameChoice(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
   if (a.size !== b.size) return false;

@@ -3,7 +3,7 @@
 import { Check, ChevronDown, Minus, X } from 'lucide-react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { Fragment, useId, useState, type ReactNode } from 'react';
+import { Fragment, useEffect, useId, useState, type ReactNode } from 'react';
 import { ActionBar } from '@/components/layout/ActionBar';
 import { Button } from '@/components/ui/Button';
 import { InlineCode } from '@/components/ui/InlineCode';
@@ -11,6 +11,9 @@ import { formatMinutes } from '@/core/insight';
 import { cleanPathName, MAX_NAME } from '@/core/planner';
 import { coverage, toggleGroup, type Coverage } from '@/core/profile';
 import { useProgress, useStore } from '@/features/store/StoreProvider';
+import { ScoutMark } from '@/features/tutor/ScoutMark';
+import { openScoutPlanner } from '@/features/tutor/planner/planner-store';
+import { dockTutorTrigger } from '@/features/tutor/tutor-store';
 import { cn } from '@/lib/cn';
 import {
   allLessonIds,
@@ -359,6 +362,8 @@ export function PathBuilder({ tree }: { tree: CourseTree }) {
   const hasPath = existing !== undefined;
   const name = named ?? existing?.name ?? 'My path';
   const nameId = useId();
+  // The save bar owns the bottom edge, so Scout opens from the header instead of the corner.
+  useEffect(() => dockTutorTrigger(), []);
 
   const sum = totals(tree, chosen);
   const line = totalsLine(sum.lessons, sum.minutes);
@@ -414,6 +419,15 @@ export function PathBuilder({ tree }: { tree: CourseTree }) {
             <X aria-hidden size={20} strokeWidth={2} />
           </Link>
           <p className="t-label flex-1">Paths</p>
+          <Button
+            variant="quiet"
+            size="md"
+            onClick={() => openScoutPlanner(existing)}
+            className="text-muted hover:text-fg -mr-1"
+          >
+            <ScoutMark size={16} />
+            {existing ? 'Plan again with Scout' : 'Plan with Scout'}
+          </Button>
         </div>
       </header>
 

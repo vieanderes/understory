@@ -16,6 +16,9 @@ import { cn } from '@/lib/cn';
 import { CHOSEN_PATH, chosenPathIds, chosenPaths, currentPath, togglePath } from './current';
 import { isOwnPathId, withOwnPaths, type CourseTree } from './custom';
 import { FindLesson } from './FindLesson';
+import { OwnPathTools, RemovedPathNotice } from './OwnPathTools';
+import { ScoutMark } from '@/features/tutor/ScoutMark';
+import { openScoutPlanner } from '@/features/tutor/planner/planner-store';
 import { PathView } from './PathView';
 
 /** The tick a path row carries: an empty box, or ink with the path's place in the order. */
@@ -121,7 +124,6 @@ function PathPicker({
   const chosen = draft ?? chosenPathIds(state.settings[CHOSEN_PATH]);
   const doneOf = (path: PathSummary) =>
     status === 'ready' ? path.lessonIds.filter((id) => state.completedLessons.has(id)).length : 0;
-  const hasCustom = paths.some((p) => isOwnPathId(p.id));
   const toggle = (id: string) =>
     onToggle
       ? onToggle(id)
@@ -138,33 +140,44 @@ function PathPicker({
             onToggle={() => toggle(path.id)}
           />
         ))}
-        {hasCustom ? null : (
-          <li className={rowItem}>
-            <Link
-              href="/learn/build"
-              className="hairline-row group flex items-start gap-1.5 py-1.5 transition-colors duration-150 ease-out"
+        <li className={rowItem}>
+          <button
+            type="button"
+            onClick={() => openScoutPlanner()}
+            className="hairline-row group flex w-full items-start gap-1.5 py-1.5 text-left transition-colors duration-150 ease-out"
+          >
+            <span aria-hidden className="mt-0.5 flex size-2.5 shrink-0 items-center justify-center">
+              <ScoutMark size={16} />
+            </span>
+            <span className="flex min-w-0 flex-1 flex-col gap-0.5">
+              <span className="font-medium">Plan a path with Scout</span>
+              <span className="text-muted text-sm">
+                Say what you are learning for and how much time you have; Scout drafts it
+              </span>
+            </span>
+            <ArrowRight aria-hidden size={16} strokeWidth={2} className={cn(rowArrow, 'mt-0.5')} />
+          </button>
+        </li>
+        <li className={rowItem}>
+          <Link
+            href="/learn/build"
+            className="hairline-row group flex items-start gap-1.5 py-1.5 transition-colors duration-150 ease-out"
+          >
+            <span
+              aria-hidden
+              className="rounded-control border-faint text-muted group-hover:border-fg group-hover:text-fg mt-0.5 flex size-2.5 shrink-0 items-center justify-center border border-dashed transition-colors duration-150 ease-out"
             >
-              <span
-                aria-hidden
-                className="rounded-control border-faint text-muted group-hover:border-fg group-hover:text-fg mt-0.5 flex size-2.5 shrink-0 items-center justify-center border border-dashed transition-colors duration-150 ease-out"
-              >
-                <Plus size={12} strokeWidth={2} />
+              <Plus size={12} strokeWidth={2} />
+            </span>
+            <span className="flex min-w-0 flex-1 flex-col gap-0.5">
+              <span className="font-medium">Build your own path</span>
+              <span className="text-muted text-sm">
+                Whole parts, single chapters or just the lessons you want
               </span>
-              <span className="flex min-w-0 flex-1 flex-col gap-0.5">
-                <span className="font-medium">Build your own path</span>
-                <span className="text-muted text-sm">
-                  Whole parts, single chapters or just the lessons you want
-                </span>
-              </span>
-              <ArrowRight
-                aria-hidden
-                size={16}
-                strokeWidth={2}
-                className={cn(rowArrow, 'mt-0.5')}
-              />
-            </Link>
-          </li>
-        )}
+            </span>
+            <ArrowRight aria-hidden size={16} strokeWidth={2} className={cn(rowArrow, 'mt-0.5')} />
+          </Link>
+        </li>
       </ul>
     </div>
   );
@@ -251,6 +264,7 @@ function Learn({
     const names = draft.flatMap((id) => paths.find((p) => p.id === id)?.name ?? []);
     return (
       <div className="flex max-w-5xl flex-col gap-6 md:pt-2">
+        <RemovedPathNotice />
         <header className="flex flex-col gap-1">
           <h1 id="pick-title" className="t-title" data-arrive="title">
             Choose your paths
@@ -308,6 +322,7 @@ function Learn({
 
   return (
     <div className="flex max-w-5xl flex-col gap-4 md:pt-2">
+      <RemovedPathNotice />
       {chosen.length > 1 ? <PathTabs paths={chosen} shown={path.id} isDone={isDone} /> : null}
       <FindLesson tree={tree} />
       <PathView
@@ -315,23 +330,26 @@ function Learn({
         embedded
         custom={isOwnPathId(path.id)}
         tools={
-          <button
-            type="button"
-            aria-expanded={switching}
-            onClick={() => setSwitching((open) => !open)}
-            className={buttonClass('quiet', 'md', 'text-muted hover:text-fg')}
-          >
-            Switch path
-            <ChevronDown
-              aria-hidden
-              size={16}
-              strokeWidth={2}
-              className={cn(
-                'transition-transform duration-150 ease-out',
-                switching && 'rotate-180',
-              )}
-            />
-          </button>
+          <>
+            {isOwnPathId(path.id) ? <OwnPathTools pathId={path.id} /> : null}
+            <button
+              type="button"
+              aria-expanded={switching}
+              onClick={() => setSwitching((open) => !open)}
+              className={buttonClass('quiet', 'md', 'text-muted hover:text-fg')}
+            >
+              Switch path
+              <ChevronDown
+                aria-hidden
+                size={16}
+                strokeWidth={2}
+                className={cn(
+                  'transition-transform duration-150 ease-out',
+                  switching && 'rotate-180',
+                )}
+              />
+            </button>
+          </>
         }
         drawer={
           switching ? (

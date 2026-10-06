@@ -13,6 +13,7 @@ import {
   type LucideIcon,
 } from 'lucide-react';
 import Link from 'next/link';
+import { OwnPathPace } from './OwnPathTools';
 import { useMemo } from 'react';
 import { buttonClass } from '@/components/ui/Button';
 import { InlineCode } from '@/components/ui/InlineCode';
@@ -88,6 +89,15 @@ export function PathView({
               <p data-arrive="rise" className="text-muted prose-measure text-lg">
                 {path.promise}
               </p>
+              {custom ? (
+                <OwnPathPace
+                  pathId={path.id}
+                  minutesLeft={path.stages
+                    .flatMap((s) => s.lessons)
+                    .filter((l) => !progress.isDone(l.id))
+                    .reduce((sum, l) => sum + l.minutes, 0)}
+                />
+              ) : null}
             </div>
             {custom && !tools ? null : (
               <div className="-ml-2 flex shrink-0 flex-wrap items-center lg:-mr-2 lg:ml-0">

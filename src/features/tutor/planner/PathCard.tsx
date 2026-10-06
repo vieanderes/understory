@@ -12,6 +12,14 @@ import { paceLine, sizeLine } from './facts';
  * at it closely, or save it. An earlier draft is a line of history.
  */
 
+/*
+ * Planning happens beside the builder, whose Save is the page's one primary action. Docked
+ * beside it (lg and up) Scout's Save steps back to a secondary look; on a phone Scout covers
+ * the builder, so its Save is the primary there.
+ */
+const BESIDE_BUILDER =
+  'lg:bg-raised lg:text-fg lg:border lg:border-border lg:shadow-edge lg:hover:bg-raised lg:hover:border-border-strong';
+
 const FOCUS = 'focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent';
 
 export function PathCard({
@@ -105,7 +113,13 @@ export function PathCard({
         </Link>
       ) : (
         <div className="flex flex-wrap gap-1">
-          <Button variant="primary" size="md" loading={saving} onClick={onSave}>
+          <Button
+            variant="primary"
+            size="md"
+            loading={saving}
+            onClick={onSave}
+            className={BESIDE_BUILDER}
+          >
             {savedHref ? 'Save changes' : 'Save path'}
           </Button>
           <Button variant="secondary" size="md" onClick={onOpen}>

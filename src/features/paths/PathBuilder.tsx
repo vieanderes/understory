@@ -411,9 +411,13 @@ export function PathBuilder({ tree }: { tree: CourseTree }) {
     }
   };
 
-  /** Scout plans from what the page shows: the path being edited, or the ticks so far. */
-  const planWithScout = () => {
-    if (!linked) {
+  /**
+   * Scout plans from what the page shows: the path being edited, or the ticks so far. The
+   * builder's own button carries on a conversation about this path; "Plan again with Scout"
+   * from a path's page (`fresh`) starts a new one about it.
+   */
+  const planWithScout = (fresh = false) => {
+    if (fresh || !linked) {
       const draft = existing?.stages
         ? draftFromOwnPath(existing)
         : chosen.size > 0
@@ -436,7 +440,7 @@ export function PathBuilder({ tree }: { tree: CourseTree }) {
     if (plan === 'new') {
       startPlanning(undefined);
       openScoutPlanner();
-    } else planWithScout();
+    } else planWithScout(existing !== undefined);
     // eslint-disable-next-line react-hooks/exhaustive-deps -- once, when the page has read the progress
   }, [status]);
 
@@ -494,7 +498,7 @@ export function PathBuilder({ tree }: { tree: CourseTree }) {
           <Button
             variant="quiet"
             size="md"
-            onClick={planWithScout}
+            onClick={() => planWithScout()}
             className="text-muted hover:text-fg -mr-1"
           >
             <ScoutMark size={16} />

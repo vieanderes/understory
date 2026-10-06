@@ -197,7 +197,7 @@ function PathTabs({
   isDone: (id: string) => boolean;
 }) {
   return (
-    <nav aria-label="Your paths" className="border-border border-b">
+    <nav aria-label="Chosen paths" className="border-border border-b">
       <ul className="flex flex-wrap gap-x-3">
         {paths.map((path) => {
           const active = path.id === shown;

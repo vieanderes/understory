@@ -1,6 +1,6 @@
 'use client';
 
-import { Settings } from 'lucide-react';
+import { Newspaper, Settings } from 'lucide-react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import { Wordmark } from '@/components/brand/Logo';
@@ -128,8 +128,17 @@ export function Sidebar({ paths }: { paths: readonly NavPath[] }) {
   );
 }
 
-/** Phone: a slim bar with the mark and the utilities. */
+const utility =
+  'hover:text-fg hover:bg-raised rounded-control inline-flex size-5 items-center justify-center transition-colors duration-150 ease-out';
+
+/**
+ * Phone: a slim bar with the mark and the utilities. News sits here rather than in the tab
+ * bar: a sixth tab would crowd the five places, and a daily edition is something you check,
+ * like an inbox, not a place you work in. Concept map and Labs are reached from Home.
+ */
 export function PhoneBar() {
+  const pathname = usePathname();
+  const onNews = isCurrent(pathname, '/signal');
   return (
     <header className="rule-b bg-bg sticky top-0 z-20 md:hidden print:hidden">
       <div className="frame flex h-7 items-center justify-between gap-2">
@@ -138,10 +147,19 @@ export function PhoneBar() {
         </Link>
         <div className="flex items-center gap-0.5">
           <Link
+            href="/signal"
+            aria-label="News"
+            title="News"
+            aria-current={onNews ? 'page' : undefined}
+            className={cn(utility, onNews ? 'bg-raised text-fg shadow-edge' : 'text-muted')}
+          >
+            <Newspaper aria-hidden size={20} strokeWidth={2} />
+          </Link>
+          <Link
             href="/settings"
             aria-label="Settings"
             title="Settings"
-            className="text-muted hover:text-fg hover:bg-raised rounded-control inline-flex size-5 items-center justify-center transition-colors duration-150 ease-out"
+            className={cn(utility, 'text-muted')}
           >
             <Settings aria-hidden size={20} strokeWidth={2} />
           </Link>

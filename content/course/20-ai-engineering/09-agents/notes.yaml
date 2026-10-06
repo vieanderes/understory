@@ -22,7 +22,7 @@ remember:
   - An agent is a model in a loop with tools, and the loop ends when a reply has no tool call or when your limits stop it.
   - Every agent loop needs a hard step cap, and production loops add a token budget, repeat detection and human approval before irreversible actions.
   - Save each assistant reply whole, because every `tool_result` must answer a `tool_use` block in the message before it.
-  - Stop on any stop reason other than `tool_use`, since a cut-off or refusal is not a request for tools.
+  - "Treat each stop reason on its own. `end_turn` is an answer, `max_tokens` is incomplete, `refusal` is refused, `pause_turn` means send it back, and only `tool_use` runs tools."
   - Prefer a workflow of plain code when the steps are known, and an agent only when the next step depends on what the last one found.
   - The model keeps nothing between calls, so working memory is the `messages` you send and long-term memory is a store your code writes and searches.
   - Tool errors go back to the model as `is_error` results so it can recover, while limits your code enforces end the run.
@@ -38,6 +38,9 @@ sections:
       ```python
       import json
 
+      OUTCOMES = {"end_turn": "answer", "stop_sequence": "answer",
+                  "max_tokens": "incomplete", "refusal": "refused"}
+
       class AgentStopped(Exception):
           pass
 
@@ -48,8 +51,11 @@ sections:
               reply = call_model(messages)
               spent += reply["usage"]["input_tokens"] + reply["usage"]["output_tokens"]
               messages.append({"role": "assistant", "content": reply["content"]})
+              if reply["stop_reason"] == "pause_turn":
+                  continue
               if reply["stop_reason"] != "tool_use":
-                  return "".join(b["text"] for b in reply["content"] if b["type"] == "text")
+                  text = "".join(b["text"] for b in reply["content"] if b["type"] == "text")
+                  return OUTCOMES[reply["stop_reason"]], text
               if spent > max_tokens:
                   raise AgentStopped(f"token budget used up after {step + 1} steps")
               results = []
@@ -89,7 +95,7 @@ sections:
       ])
       msgs = [{"role": "user", "content": "Book me a haircut on Friday"}]
       print(run_guarded(lambda m: next(script), tools, msgs, needs_approval={"book_slot"}))
-      # I found 10:00 but didn't book it.
+      # ('answer', "I found 10:00 but didn't book it.")
       ```
 
       Note the split. A declined action or a failing tool goes back to the model as an
@@ -202,7 +208,7 @@ sections:
 pitfalls:
   - "**No way out of the loop but the model.** `while True` with a break on `end_turn` runs until the bill stops it. Use `for step in range(max_steps)` and raise when the cap is reached."
   - "**Saving only the text of a reply.** The next call fails because the `tool_result` has no matching `tool_use`. Append `reply.content` whole."
-  - "**Stopping only on `end_turn`.** A reply cut off at `max_tokens` or refused has no tool calls, so the loop spins or crashes. Stop on anything but `tool_use`."
+  - "**Treating every stop but `tool_use` as an answer.** Text cut off at `max_tokens` is half an answer and a refusal is none, so report each as what it is. `pause_turn` isn't an ending at all: send the history back and the turn goes on."
   - "**Letting a tool exception kill the run.** One bad argument ends the whole task. Catch it and return an `is_error` result, so the model can correct itself."
   - "**Irreversible tools with no approval.** A model that misreads the task can pay, send or delete. Put those tools behind a confirmation step in code, and log who approved."
   - "**Building an agent for a fixed process.** Three known steps in a loop add cost, latency and failure modes. Write the steps as code and call the model where judgement is needed."
@@ -216,7 +222,8 @@ interview:
       a tool, you run it, it answers. An agent keeps going, so it can search, read the
       results, search again and then act, with the number of steps decided at run time. The
       loop itself is short: call, append the whole reply, run any tool calls, append the
-      results as one user message, repeat, and stop on any stop reason other than tool use.
+      results as one user message, repeat. It stops on an answer, and reports a cut-off or a
+      refusal as what it is, never as an answer.
       The difference that matters in production is control: in an agent the model picks the
       path, so the code must cap steps and spend and guard risky actions.
   - question: How do you stop an agent from running away with cost or doing something harmful?

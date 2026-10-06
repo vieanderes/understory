@@ -36,10 +36,10 @@ def ask(question):
     return [{"role": "user", "content": question}]
 
 
-@test("a plain answer comes back after one call")
+@test("end_turn comes back as an answer after one call")
 def _():
     call_model, seen = scripted(text("Hello."))
-    assert run_agent(call_model, TOOLS, ask("hi")) == "Hello."
+    assert run_agent(call_model, TOOLS, ask("hi")) == ("answer", "Hello.")
     assert len(seen) == 1
 
 
@@ -50,7 +50,7 @@ def _():
         text("The next train is at 09:10."),
     )
     messages = ask("Next train York to Leeds?")
-    assert run_agent(call_model, TOOLS, messages) == "The next train is at 09:10."
+    assert run_agent(call_model, TOOLS, messages) == ("answer", "The next train is at 09:10.")
     assert messages[2] == {
         "role": "user",
         "content": [{"type": "tool_result", "tool_use_id": "t1",
@@ -97,10 +97,32 @@ def _():
     assert "same" in results[0]["content"]
 
 
-@test("any stop reason other than tool_use ends the loop")
+@test("a reply cut off at max_tokens is reported as incomplete, not as an answer")
 def _():
     call_model, seen = scripted(text("The next train is at", stop_reason="max_tokens"))
-    assert run_agent(call_model, TOOLS, ask("Next train?")) == "The next train is at"
+    assert run_agent(call_model, TOOLS, ask("Next train?")) == ("incomplete", "The next train is at")
+    assert len(seen) == 1
+
+
+@test("a refusal is reported as refused")
+def _():
+    call_model, seen = scripted(text("I can't help with that.", stop_reason="refusal"))
+    assert run_agent(call_model, TOOLS, ask("Next train?")) == ("refused", "I can't help with that.")
+    assert len(seen) == 1
+
+
+@test("pause_turn sends the history back to continue the turn")
+def _():
+    call_model, seen = scripted(
+        text("Still searching.", stop_reason="pause_turn"),
+        text("The next train is at 09:10."),
+    )
+    messages = ask("Next train?")
+    assert run_agent(call_model, TOOLS, messages) == ("answer", "The next train is at 09:10.")
+    assert len(seen) == 2
+    # The paused reply is the last message of the second call, with no user message added.
+    assert seen[1][-1] == {"role": "assistant",
+                           "content": [{"type": "text", "text": "Still searching."}]}
 
 
 @test("gives up after max_steps calls instead of looping for ever")

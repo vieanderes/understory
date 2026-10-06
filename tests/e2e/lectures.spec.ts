@@ -79,7 +79,10 @@ test('a path reads as one lecture with its own PDF', async ({ page }) => {
     .first()
     .click();
   await expect(page).toHaveURL(/\/paths\/ai-engineering$/);
-  await page.getByRole('link', { name: 'Read as a lecture' }).click();
+  await expect(
+    page.getByRole('link', { name: 'Read as a lecture: The three builds' }),
+  ).toHaveAttribute('href', '/lectures/tracks/ai-engineering#day-1');
+  await page.getByRole('link', { name: 'Read as a lecture', exact: true }).click();
   await expect(page).toHaveURL(/\/lectures\/tracks\/ai-engineering$/);
   await expect(page.getByRole('heading', { level: 2, name: /The three builds/ })).toBeVisible();
   await expect(page.getByText('Interview questions, strong answers').first()).toBeVisible();
@@ -87,6 +90,14 @@ test('a path reads as one lecture with its own PDF', async ({ page }) => {
     'href',
     /\/pdf\/track-ai-engineering\.pdf/,
   );
+});
+
+test('a lesson links to its lecture from every step', async ({ page }) => {
+  await page.goto('/learn/javascript/values-types-coercion');
+  const lecture = page.getByRole('link', { name: 'Read as a lecture' });
+  await expect(lecture).toHaveAttribute('href', '/lectures/javascript/values-types-coercion');
+  await page.getByRole('button', { name: 'Begin' }).click();
+  await expect(lecture).toBeVisible();
 });
 
 test('the old fast track address leads to the paths', async ({ page }) => {

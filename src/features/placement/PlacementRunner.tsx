@@ -326,8 +326,8 @@ function Results({
             Start {first.title}
           </Link>
         ) : null}
-        <Link href="/map" className={buttonClass('quiet')}>
-          See the map
+        <Link href="/progress#mastery" className={buttonClass('quiet')}>
+          See your progress
         </Link>
       </div>
 

@@ -51,7 +51,7 @@ export const SHELL_ROUTES: readonly string[] = [
   '/',
   '/learn',
   '/practise',
-  '/map',
+  '/progress',
   '/signal',
   '/settings',
   '/decisions',

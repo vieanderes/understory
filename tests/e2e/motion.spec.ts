@@ -28,7 +28,7 @@ test.describe('smooth scroll', () => {
 });
 
 test.describe('arrival', () => {
-  for (const path of ['/', '/learn', '/map', '/learn/basics/your-first-line-of-code']) {
+  for (const path of ['/', '/learn', '/progress', '/learn/basics/your-first-line-of-code']) {
     test(`${path} ends settled: title whole, nothing held back`, async ({ page }) => {
       const errors: string[] = [];
       page.on('pageerror', (error) => errors.push(String(error)));
@@ -48,7 +48,7 @@ test.describe('arrival', () => {
   test('reduced motion holds nothing back', async ({ browser }) => {
     const context = await browser.newContext({ reducedMotion: 'reduce' });
     const page = await context.newPage();
-    await page.goto('/map');
+    await page.goto('/progress');
     await expect(page.locator('html')).not.toHaveAttribute('data-motion', 'on');
     await expect(page.getByRole('heading', { level: 1 })).toHaveCSS('opacity', '1');
     await context.close();
@@ -57,7 +57,7 @@ test.describe('arrival', () => {
 
 test('the theme toggle still switches the theme with the reveal', async ({ page }) => {
   await page.emulateMedia({ colorScheme: 'light' });
-  await page.goto('/map');
+  await page.goto('/progress');
   await page.locator('html[data-hydrated="true"]').waitFor();
   await page.getByRole('button', { name: 'Switch to dark theme' }).click();
   await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark');
@@ -76,8 +76,17 @@ test('content in a part opened later arrives and ends fully visible', async ({ p
   await expect(chapters.first()).toBeVisible();
 });
 
-test('the map filter glides and still filters', async ({ page }) => {
-  await page.goto('/map');
+test('the mastery filter glides and still filters', async ({ page }) => {
+  // The map shows once there is progress to map: one finished lesson, imported.
+  await page.goto('/settings');
+  await page.locator('html[data-hydrated="true"]').waitFor();
+  await page.getByLabel('Choose an Understory export file').setInputFiles({
+    name: 'seed.json',
+    mimeType: 'application/json',
+    buffer: Buffer.from(JSON.stringify(oneLesson())),
+  });
+  await expect(page.getByText(/events merged/)).toBeVisible();
+  await page.goto('/progress#mastery');
   await page.locator('html[data-hydrated="true"]').waitFor();
   const parts = page.getByTestId('map-part');
   // The atlas sits above the index, so the first part may start below the fold.
@@ -88,3 +97,25 @@ test('the map filter glides and still filters', async ({ page }) => {
   await page.getByText('All', { exact: true }).click();
   await expect(parts.first()).toHaveCSS('opacity', '1');
 });
+
+function oneLesson() {
+  const at = new Date().toISOString();
+  return {
+    format: 'understory-export',
+    version: 1,
+    exportedAt: at,
+    events: [
+      {
+        id: '01900000-0000-7000-8000-000000000001',
+        type: 'lesson_completed',
+        v: 1,
+        at,
+        localDate: at.slice(0, 10),
+        deviceId: 'seed',
+        seq: 1,
+        contentRev: 'seed',
+        payload: { lessonId: 'basics.first-program' },
+      },
+    ],
+  };
+}

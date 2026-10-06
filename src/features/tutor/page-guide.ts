@@ -118,13 +118,13 @@ const GUIDES: ReadonlyArray<readonly [RegExp, PageGuide]> = [
     },
   ],
   [
-    /^\/map/,
+    /^\/progress/,
     {
-      title: 'Concept map',
+      title: 'Progress',
       offers:
-        'Every concept in the course and how well the learner knows it, shown by weight: unseen, assumed, practised, solid, fluent. Gaps are marked.',
+        'What the learner did and how well they hold each concept, for the whole course or one scope: lessons, weekly activity, mastery by weight (unseen, assumed, practised, solid, fluent, gap), test and exam results, and what to work on next.',
       starters: [
-        'How do I read this map?',
+        'What should I work on next?',
         'Which gap should I close first?',
         'How does a concept become fluent?',
       ],

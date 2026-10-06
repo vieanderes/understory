@@ -1,0 +1,167 @@
+summary: >-
+  A workflow described in words hides its gaps. "The AI drafts it, the host approves, then
+  it publishes" sounds complete until you ask who acts when the host is on holiday, or what
+  happens when publishing fails. Drawing the workflow forces those questions early, when the
+  answer is a line on a diagram rather than a bug in production.
+
+
+  Three diagrams cover most needs, from rough to precise. A **swimlane** diagram gives each
+  actor, a person, the AI or the system, a lane, so handovers become visible. A **sequence
+  diagram** shows the messages between participants in time order, including alternative
+  outcomes. A **state diagram** follows one thing through every state it can be in, which is
+  where missing transitions and stuck states show up.
+
+
+  Mermaid writes all three as text that lives in the repository and is reviewed like code.
+  The habit that matters most is drawing the **failure paths**: every timeout, rejection
+  and error gets an arrow to a capped retry or an end state, and every one of those arrows
+  becomes a test.
+remember:
+  - Swimlanes show who does each step, and every arrow that crosses a lane is a handover where work can wait or get lost.
+  - A sequence diagram shows calls and replies in time order, with `alt` and `else` for different outcomes.
+  - A state diagram lists every state and move, so a state with no way to an end stands out.
+  - Every failure path ends in a capped retry that can still finish, or an end state with someone told.
+  - An approval step needs its own failure paths for no answer, with a reminder, a timeout and an escalation.
+  - The only route to an irreversible step, such as publishing, must pass through the approval.
+  - A state diagram becomes a table of allowed moves in code, and a check in the tests keeps it free of stuck states.
+sections:
+  - title: Choosing the diagram
+    body: |-
+      Each diagram answers a different question, so pick by the question you have.
+
+      **Who does what?** Draw swimlanes. They suit the first conversation about a workflow,
+      especially one that mixes people, AI and automated steps. Keep them coarse: five to ten
+      boxes. Look hard at every arrow that crosses into a person's lane. People are slow,
+      busy and sometimes away, so each of those handovers needs a plan for no response.
+
+      **What talks to what, in which order?** Draw a sequence diagram. It suits a design
+      review of the calls between services, the model and the user. It exposes a call made
+      before the data it needs exists, a reply nobody waits for, or two systems that each
+      think the other will send the email.
+
+      **What can this thing be, and how does it change?** Draw a state diagram for anything
+      with a lifecycle: an order, an episode, a support ticket, an agent's task. It exposes
+      states with no exit, moves that should be impossible, and the question every incident
+      review asks: what state was it in, and how did it get there?
+
+      For a feature where an AI drafts and a person approves, you usually want all three, in
+      that order, each small. One enormous diagram that tries to show everything gets read by
+      nobody. Three small ones get reviewed, argued over and fixed, which is the point.
+  - title: Approval steps and their failure paths
+    body: |-
+      A person in the loop is a step that can fail like any other. They can say no, ask for
+      changes, or not answer at all. The last is the one designs forget. A reminder, then a
+      timeout, then an escalation or a hold, keeps work from waiting for ever:
+
+      ```text
+      stateDiagram-v2
+        AwaitingApproval --> Publishing : approved
+        AwaitingApproval --> Drafting : changes requested
+        AwaitingApproval --> Reminded : no answer in 2 days
+        Reminded --> Publishing : approved
+        Reminded --> Drafting : changes requested
+        Reminded --> OnHold : no answer in 5 more days
+        OnHold --> AwaitingApproval : host returns
+        OnHold --> [*] : withdrawn after 30 days
+      ```
+
+      Three more questions belong on the diagram or beside it. **Who may approve?** If anyone
+      with an account can, the approval guards nothing. **Is the approval recorded?** Who said
+      yes, when, and to which version of the draft. If the AI redrafts after approval, the
+      approval no longer applies. **Can anything skip it?** Check that the only arrow into the
+      irreversible step, publishing, sending, paying, comes out of the approval. The lesson's
+      broken swimlane had a second arrow, and that was the whole bug.
+
+      Each of these becomes a test: publishing without approval is refused, an approval of an
+      older draft doesn't count, and an unanswered request reaches `Reminded` on time.
+  - title: From the drawing to checked code
+    body: |-
+      A state diagram translates almost line for line into code. Write the allowed moves as
+      data, and refuse any move that isn't listed:
+
+      ```ts
+      type State = 'Drafting' | 'AwaitingApproval' | 'Publishing' | 'Published';
+      type Event = 'draft ready' | 'approved' | 'changes requested' | 'feed updated';
+
+      // The diagram, as data. Anything not listed is refused.
+      const moves: Record<State, Partial<Record<Event, State>>> = {
+        Drafting: { 'draft ready': 'AwaitingApproval' },
+        AwaitingApproval: { approved: 'Publishing', 'changes requested': 'Drafting' },
+        Publishing: { 'feed updated': 'Published' },
+        Published: {},
+      };
+
+      function move(state: State, event: Event): State {
+        const next = moves[state][event];
+        if (!next) throw new Error(`"${event}" is not allowed in ${state}`);
+        return next;
+      }
+
+      console.log(move('AwaitingApproval', 'approved'));
+      try {
+        move('Drafting', 'approved'); // publishing a draft nobody reviewed
+      } catch (error) {
+        console.log((error as Error).message);
+      }
+      // Publishing
+      // "approved" is not allowed in Drafting
+      ```
+
+      Now the code can't drift from the drawing. A bug that tries to approve a draft from the
+      wrong state fails loudly, and the error names the state and the event.
+
+      The same table feeds the check from the lesson's challenge. Run it in the test suite,
+      and a teammate who adds a `PublishFailed` state without a way out gets a failing test
+      instead of a Monday-morning surprise. The type `Record<State, ...>` helps too: add a
+      state to the union and forget its row, and the compiler complains.
+
+      Store the current state in the database as a single column, and change it with a
+      guarded update, such as `WHERE state = 'AwaitingApproval'`. Then two approvals racing
+      each other can't both move the episode on.
+pitfalls:
+  - '**Drawing only the happy path.** It''s the path everyone tests, so it''s rarely where bugs live. Draw each timeout, rejection and error, and give each one somewhere to go.'
+  - '**A retry with no cap.** A failure state that loops back to itself retries for ever, in silence. Cap the retries, then move to a state that tells a person.'
+  - '**An approval with a way around it.** A second arrow into the publish step makes the approval decorative. Check that the only route to an irreversible step passes the approval.'
+  - '**Forgetting that people don''t answer.** An approval request with no timeout can wait for ever. Add a reminder, a timeout and an escalation.'
+  - '**One giant diagram.** Nobody reviews a diagram with forty boxes. Draw three small ones: swimlanes, a sequence and the states.'
+verify:
+  - lens: breaks
+    check: Every failure state in the workflow leads to a capped retry or an end state, so no episode, order or task can wait for ever.
+  - lens: leaks
+    check: Only the intended approvers can approve, and the record names who approved which draft, so the approval guards something.
+  - lens: tests
+    check: Write a test that the irreversible step is refused without approval, and one that an unanswered request moves on after its timeout.
+  - lens: confuses
+    check: Keep the Mermaid source next to the code it describes and update both in one pull request, so the drawing never lies.
+interview:
+  - question: Design a workflow where an AI drafts content and a person approves it before it goes out.
+    answer: >-
+      I'd model the content's lifecycle as a state machine: drafting, awaiting approval,
+      publishing, published, plus failure states. The key property is that the only
+      transition into publishing comes from an approval, recorded with who approved and
+      which version. If the AI redrafts, approval resets. Approval needs its own failure
+      paths: a reminder after a set time, then a hold or an escalation, because people go on
+      holiday. Model and publishing failures get capped retries, then a state that alerts a
+      person. I'd store the state in one column and change it with guarded updates so
+      concurrent actions can't both win. Then I'd test the important properties: no publish
+      without approval, timeouts fire, and every state can reach an end.
+  - question: When would you draw a sequence diagram rather than a state diagram?
+    answer: >-
+      A sequence diagram when the question is about interactions: which component calls
+      which, in what order, and what each waits for. It's the right tool for a design review
+      of a request flowing through services and a model, and it exposes calls made too early
+      or replies nobody handles. A state diagram when the question is about one thing's
+      lifecycle: what states an order or a ticket can be in and what moves it between them.
+      It exposes stuck states and impossible transitions. They complement each other. For an
+      approval workflow I'd draw both: the sequence for the conversation between host, system
+      and model, the states for the episode itself.
+  - question: How do you make sure a workflow can never get stuck?
+    answer: >-
+      Make the states and transitions explicit, then check them mechanically. I write the
+      allowed moves as data, so code can't take a move that isn't on the diagram. Then a test
+      walks that table: every state must be reachable from the start, and from every
+      non-terminal state some end must be reachable. That catches a failure state with no
+      exit and a retry loop that can never leave. The design rules behind it are simple:
+      every retry has a cap, every wait for a person has a timeout, and both lead to a state
+      that tells someone. In production, I'd alert on anything sitting in one state far
+      longer than normal.

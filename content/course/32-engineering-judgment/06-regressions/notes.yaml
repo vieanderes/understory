@@ -1,0 +1,179 @@
+summary: >-
+  Every change has a **blast radius**: the callers that use what you changed, the contracts
+  you promised to code you don't deploy, and the data already stored in the old shape. A
+  one-line diff can have a huge radius, and a hundred-line diff a tiny one. Judging the
+  radius before you touch the code tells you how careful to be and which tests to write.
+
+
+  The tools are plain. Search for callers by name, and walk the import graph backwards to
+  find the tests that could notice. Pin what each important caller relies on with a
+  characterisation test before you change anything. Then choose regression tests by one
+  rule: a test is worth adding if it would fail when the change breaks an existing caller
+  or contract.
+
+
+  This matters more with AI assistants, which change shared helpers "while they're there"
+  and write tests for the new behaviour only. Reach for the full routine on any change to a
+  shared function, a public reply or stored data. For a change inside one private function
+  with one caller, a quick search and the existing tests are enough.
+remember:
+  - A change's blast radius is its callers, its contracts with code you don't deploy, and its data in the old shape.
+  - Callers you can't redeploy, such as installed apps and other teams' services, can only be protected by keeping the old behaviour.
+  - Write characterisation tests for what each caller relies on before the change, so a red test shows exactly what moved.
+  - A regression test earns its place only if it would fail when the change breaks a caller; check by reintroducing the bug.
+  - Line coverage counts lines run, not behaviour checked, so full coverage can still miss a changed order or format.
+  - Walk the import graph backwards from the changed files to find related tests, and run the full suite before release.
+  - 'Change a contract in steps: add the new shape beside the old, move callers, then remove the old once nobody reads it.'
+sections:
+  - title: Callers, contracts and data
+    body: |-
+      The three parts of the radius need different handling.
+
+      **Callers you can see** are in your repository. A search or the type checker finds
+      them, and you can fix them in the same pull request. They're the cheap part.
+
+      **Contracts with code you don't deploy** are the expensive part. A phone app that's
+      already installed, a partner's integration, a spreadsheet macro someone built on your
+      CSV export: none of them update when you merge. Contract tests from the testing
+      chapter guard the ones you know about. The rest only show up as bug reports.
+
+      **Data in the old shape** outlives the code that wrote it. Cached replies, rows in a
+      table, jobs waiting on a queue and links in old emails all carry yesterday's format. A
+      new reader must cope with both until the old data has expired or been migrated.
+
+      So when a contract must change, change it in steps. Add the new shape beside the old,
+      so every existing reader keeps working:
+
+      ```ts
+      type Loan = { id: string; due: Date };
+
+      const formatDue = (loan: Loan) =>
+        loan.due.toLocaleDateString('en-GB', {
+          day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC',
+        });
+
+      // Expand: the old field stays as it was, the new one arrives beside it.
+      function loanReply(loan: Loan) {
+        return { id: loan.id, due: formatDue(loan), dueIso: loan.due.toISOString().slice(0, 10) };
+      }
+
+      console.log(loanReply({ id: 'L1', due: new Date(Date.UTC(2026, 2, 12)) }));
+      // { id: 'L1', due: '12 Mar 2026', dueIso: '2026-03-12' }
+      ```
+
+      Then move the callers you control to `dueIso`. Watch your logs until old app versions
+      stop calling. Only then remove `due`. Each step is small and can be undone, which is
+      the point.
+  - title: Pinning behaviour in bulk
+    body: |-
+      A characterisation test doesn't have to be written case by case. For a pure function,
+      record today's answers for a spread of inputs, then compare after the change. Pick the
+      inputs where behaviour turns: zero, one, the edges of every limit, and values that
+      should never happen.
+
+      ```ts
+      // Today's rule: 20p a day late, capped at £5.
+      const fine = (daysLate: number) => Math.min(daysLate * 20, 500);
+      // The refactor someone wants to ship.
+      const fineRefactored = (daysLate: number) => Math.min(Math.max(daysLate, 0) * 20, 500);
+
+      const inputs = [0, 1, 7, 24, 25, 26, 100, -1];
+      const pinned = new Map(inputs.map((d) => [d, fine(d)]));
+
+      for (const [days, before] of pinned) {
+        const after = fineRefactored(days);
+        if (after !== before) console.log(`days=${days}: was ${before}, now ${after}`);
+      }
+      console.log(`checked ${pinned.size} inputs`);
+      // days=-1: was -20, now 0
+      // checked 8 inputs
+      ```
+
+      The pin found something. Today a negative "days late" gives a negative fine, a credit.
+      The refactor quietly fixes that. Maybe that's right, but some caller might depend on
+      it, such as a job that refunds early returns. The pin turns a silent change into a
+      question you answer on purpose, in its own commit.
+
+      This style is often called approval or golden-master testing. Keep the recorded
+      answers small and readable. A pinned snapshot of a whole page breaks on every harmless
+      change, and people learn to update it without looking.
+  - title: Would this test catch it?
+    body: |-
+      The test that ships with a change usually checks the new behaviour. The tests that
+      protect you check the old behaviour the change wasn't meant to touch. To know whether
+      a test does that, reintroduce the bug and watch it fail. A copy of the code with one
+      deliberate bug in it is called a **mutant**.
+
+      ```ts
+      type Book = { title: string };
+      type Search = (books: Book[], query: string) => Book[];
+
+      const original: Search = (books, query) =>
+        books.filter((b) => b.title.toLowerCase().includes(query.toLowerCase()));
+      // The mutant: the bug we want a test to see.
+      const mutant: Search = (books, query) =>
+        original(books, query).sort((a, b) => a.title.localeCompare(b.title));
+
+      const shelf = [{ title: 'Ulysses' }, { title: 'Dune' }, { title: 'Emma' }];
+      const checks: [string, (s: Search) => boolean][] = [
+        ['ignores case', (s) => s(shelf, 'DUNE').length === 1],
+        ['keeps order', (s) => s(shelf, '').map((b) => b.title).join() === 'Ulysses,Dune,Emma'],
+      ];
+      for (const [name, check] of checks) {
+        console.log(`${name}: original ${check(original)}, mutant ${check(mutant)}`);
+      }
+      // ignores case: original true, mutant true
+      // keeps order: original true, mutant false
+      ```
+
+      The case test passes on both, so it can't see this bug. The order test tells them
+      apart, so it's the one worth keeping. Mutation testing tools such as Stryker automate
+      this: they make many small mutants and report the ones no test killed.
+
+      You rarely need the tool. Before you merge a fix, undo it locally and run the new test.
+      If it still passes, it isn't testing the fix.
+pitfalls:
+  - '**Searching only for the function name.** Callers reach code through re-exports, callbacks and dynamic imports, and other repositories read your replies. Search, follow imports, and list the contracts and stored data as well.'
+  - '**Changing a shared helper for one caller''s sake.** Switching `formatDue` to ISO dates so one list sorts well broke the phone app. Format at the one caller that wants something different.'
+  - '**Trusting the tests that came with the change.** They prove the new behaviour. Add tests for what the change must not move, such as order, format and the empty case.'
+  - '**Pinning everything.** Huge snapshots go red on every harmless change, so people approve them without reading. Pin what callers rely on, and nothing else.'
+  - '**Calling a passing suite proof.** Related tests follow static imports only. Run the full suite before release, and check contracts with code outside the repository.'
+verify:
+  - lens: breaks
+    check: A changed field in a public reply breaks installed clients you can't redeploy, so add a new field beside the old one instead.
+  - lens: confuses
+    check: A shared helper changed to suit one caller surprises every other caller, so format at that caller and leave the helper alone.
+  - lens: tests
+    check: Undo the change locally and confirm the new regression test fails, or it can't see the bug it claims to guard.
+  - lens: tests
+    check: Run the tests related to every changed file, then the full suite before release, because import graphs miss dynamic imports and data.
+interview:
+  - question: You need to change a function that's called from forty places. How do you do it safely?
+    answer: >-
+      I find the radius first, then change in small steps behind tests. I search for callers
+      and follow imports, and I ask which callers I can't redeploy, such as a public API or
+      another team's service, and what data is stored in the current shape. For the callers
+      that matter I write characterisation tests that pin what they rely on. If the change is
+      a contract change, I add the new behaviour beside the old, under a new name or field,
+      move callers over, and remove the old one once logs show nobody uses it. Each step is
+      a small pull request that can be reverted. The trade-off is time: three releases
+      instead of one. For a private function with two callers I'd skip the ceremony and
+      change it with the existing tests.
+  - question: How do you decide which tests to add for a change?
+    answer: >-
+      I add the tests that would fail if this change broke something that worked before. The
+      tests for the new behaviour are the obvious part. The ones that protect me check what
+      the change must not move: the order a caller gets, a format in a reply, the empty case,
+      the error path. For a bug fix, the first test reproduces the bug and fails before the
+      fix. Then I check each new test can see what it claims, by undoing the change locally
+      and watching it go red. I prefer one sharp test at the boundary where callers meet the
+      code over many tests of internals, which break on every refactor and catch little.
+  - question: Our coverage is 95%. Does that mean the code is well tested?
+    answer: >-
+      It means 95% of lines ran during the tests, not that their behaviour was checked. A
+      test with a weak assertion, or none, still counts every line it runs. I've seen a
+      search function at 100% coverage ship a sorting regression, because no test looked at
+      the order. Coverage is useful in the other direction: an uncovered line is definitely
+      untested, so low coverage is a real warning. To judge whether tests are good, I'd look
+      at their assertions, and try a few deliberate bugs, by hand or with a mutation testing
+      tool, to see whether any test fails.

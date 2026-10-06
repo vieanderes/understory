@@ -1,0 +1,298 @@
+id: judgment.regressions
+title: What could this change break?
+objective: Judge a change's blast radius from its callers and contracts, and choose characterisation and regression tests before you touch it.
+level: advanced
+minutes: 10
+concepts: [judgment.blast-radius, judgment.characterisation-tests, judgment.choosing-regression-tests]
+prerequisites: [testing.contract-tests, clean.code-smells, judgment.what-breaks]
+opening:
+  text: >-
+    You'll see everything a one-line change could break, and pick the few tests that would
+    catch it. Most reviews skip this half of "How would you prove it works, and what could it
+    regress?"
+
+steps:
+  - type: prose
+    id: who-depends-on-it
+    body: |-
+      A library app's `formatDue(loan)` returns `12 Mar 2026`. A teammate changes it to
+      return `2026-03-12`. One line. Who depends on it? `git grep` searches every file Git
+      tracks:
+
+      ```bash
+      $ git grep -n "formatDue("
+      src/emails/reminder.ts:14:  `Due back ${formatDue(loan)}`,
+      src/pages/account.tsx:31:   <td>{formatDue(loan)}</td>
+      src/api/loans.ts:22:        due: formatDue(loan),
+      tests/dates.test.ts:5:      expect(formatDue(loan)).toBe("12 Mar 2026");
+      ```
+
+      Everything a change touches is its **blast radius**: the callers you can see,
+      contracts with code you don't deploy, and data already stored in the old shape.
+
+  - type: multiple-choice
+    id: pick-caller-out-of-reach
+    concept: judgment.blast-radius
+    difficulty: 1
+    question: The library's phone app reads `due` from the API. Which caller can't this pull request fix?
+    choices:
+      - text: '`src/api/loans.ts`, read by installed phone apps'
+        correct: true
+        feedback: >-
+          Right. Old app versions on people's phones still parse `12 Mar 2026`.
+      - text: '`src/emails/reminder.ts`'
+        feedback: >-
+          The email is built in this repository. If its wording changes, you can fix it in
+          the same pull request.
+      - text: '`src/pages/account.tsx`'
+        feedback: >-
+          The page ships with the server, so it updates in the same deploy. You can fix it
+          here.
+      - text: '`tests/dates.test.ts`'
+        feedback: >-
+          A test that pins the old format will go red. That's useful, and you can update it
+          here.
+
+  - type: prose
+    id: pin-before-you-change
+    body: >-
+      You met **characterisation tests** in Code smells: tests that pin what code does today,
+      before you change it.
+
+
+      Before a risky change, write one for each caller you found. Assert exactly what that
+      caller relies on: the format, the order, the empty case. Then make the change. Green
+      means that caller is safe. Red shows exactly what moved, and you decide on purpose.
+
+  - type: fill-blank
+    id: fill-pin-the-order
+    concept: judgment.characterisation-tests
+    difficulty: 2
+    language: ts
+    prompt: >-
+      The home page's "New arrivals" shelf calls `searchBooks(shelf, '')` and shows the first
+      five. Pin the order it gets today. Fill the gap.
+    template: |
+      test('search keeps the order it was given', () => {
+        const shelf = [ulysses, dune, emma]; // newest first
+        const titles = searchBooks(shelf, '').map((book) => book.title);
+        expect(titles).{{1}}(['Ulysses', 'Dune', 'Emma']);
+      });
+    blanks:
+      - key: '1'
+        answer: toEqual
+    bank: [toEqual, toBe, toContain, toHaveLength]
+
+  - type: ai-review
+    id: review-search-sort
+    concept: judgment.choosing-regression-tests
+    difficulty: 3
+    language: ts
+    request: Make book search ignore upper and lower case.
+    flawClass: regression
+    code: |
+      export function searchBooks(books: Book[], query: string): Book[] {
+        const q = query.trim().toLowerCase();
+        return books
+          .filter((book) => book.title.toLowerCase().includes(q))
+          .sort((a, b) => a.title.localeCompare(b.title));
+      }
+    prompt: >-
+      An assistant wrote this. Its new test checks that `DUNE` finds `Dune`, and it passes.
+      After release, the "New arrivals" shelf shows old books. Tap the line at fault.
+    lines: [5]
+    reasons:
+      - text: It re-sorts results that callers expect in order
+        correct: true
+        feedback: >-
+          Yes. Nobody asked for sorting, and one caller relied on the order.
+      - text: '`toLowerCase` breaks titles with accents'
+        feedback: >-
+          `'É'.toLowerCase()` gives `'é'`, so accented titles still match. The shelf broke on
+          order, not on matching.
+      - text: '`filter` changes the caller''s list'
+        feedback: >-
+          `filter` returns a new array and leaves the original alone. So does the `sort` on
+          that copy.
+      - text: '`trim` cuts letters off the query'
+        feedback: >-
+          It only removes spaces at both ends. The shelf passes an empty query, which still
+          matches every book.
+    fix: |
+      export function searchBooks(books: Book[], query: string): Book[] {
+        const q = query.trim().toLowerCase();
+        return books.filter((book) => book.title.toLowerCase().includes(q));
+      }
+      // A page that wants A to Z sorts its own copy.
+    verify:
+      question: Which test would have caught this before release?
+      choices:
+        - text: A pinned test of the order a caller gets
+          correct: true
+          feedback: >-
+            Yes. The test from the last step goes red on line 5.
+        - text: A test that `dune` and `DUNE` both match
+          feedback: >-
+            That checks the new feature, and it passed. It never looks at the order of
+            results.
+        - text: Running the type checker
+          feedback: >-
+            `sort` still returns `Book[]`. Types can't tell one order of books from another.
+        - text: A test that search answers within 50 ms
+          feedback: >-
+            Speed didn't change in any way users noticed. The order did, and a timing test
+            can't see it.
+
+  - type: multiple-choice
+    id: pick-coverage-gap
+    concept: judgment.choosing-regression-tests
+    difficulty: 3
+    question: '`searchBooks` had 100% line coverage before and after that change. How did the bug get through?'
+    choices:
+      - text: The tests ran every line but never checked order
+        correct: true
+        feedback: >-
+          Right. Coverage counts lines run, not behaviour checked.
+      - text: Coverage tools skip chained method calls
+        feedback: >-
+          They count the chained lines too. Line 5 ran in every test. Nothing asserted what
+          it did.
+      - text: Coverage was measured on the old code
+        feedback: >-
+          It was measured after the change too, and still read 100%. Running a line isn't
+          checking it.
+      - text: The change was too small to measure
+        feedback: >-
+          Size doesn't matter to coverage. A line that runs counts, whatever it does to the
+          result.
+
+  - type: prose
+    id: walk-the-import-graph
+    body: >-
+      A search finds callers by name. Imports find them by structure. Every file lists what it
+      imports, so walk that graph backwards: who imports the changed file, then who imports
+      them.
+
+
+      Every test file you reach is worth running for this change. `vitest related
+      src/search.ts` and Jest's `--findRelatedTests` do this for you.
+
+  - type: code-challenge
+    id: write-tests-to-run
+    concept: judgment.blast-radius
+    difficulty: 4
+    language: ts
+    editable: '4-7'
+    prompt: >-
+      Write `testsToRun(imports, changed)`. `imports` maps each file to the files it imports.
+      Return every test file, ending in `.test.ts`, that imports a changed file directly or
+      through other files. Include a changed test file itself.
+
+
+      Sort the result, list each file once, and make sure an import cycle still finishes.
+      If `src/loans.ts` changes and `src/fines.ts` imports it, `tests/fines.test.ts` runs.
+    hints:
+      - The graph points from a file to what it imports. You need the opposite direction.
+      - Build a map from each file to the files that import it, then walk outwards from the changed files.
+      - Keep a `Set` of files already reached, and only queue a file the first time you see it.
+
+  - type: explain-back
+    id: explain-what-else-breaks
+    concept: judgment.blast-radius
+    difficulty: 4
+    audience: incident
+    kind: risk
+    prompt: >-
+      The `formatDue` change broke due dates in the phone app. Post in the incident channel
+      what else it could break, and how you'll check before the fix ships.
+    rubric:
+      - It names the rest of the blast radius, such as reminder emails, the account page and cached API replies.
+      - It says how you'll check, such as searching for callers, running related tests and pinning the API's `due` field.
+      - It gives a safe way forward, such as restoring the old format and adding the new one as a new field.
+    modelAnswer: >-
+      Rolling `formatDue` back to `12 Mar 2026` now. The same change also reached reminder
+      emails, the account page and any API replies cached in the new shape. Before the fix
+      ships, I'll search for every caller and run the related tests. I'll also add a test
+      that pins the API's `due` field. If we still want ISO dates, they'll go in a new `dueIso` field,
+      so installed apps keep working.
+
+recap:
+  - Find a change's blast radius from its callers, its contracts and its stored data.
+  - Pin what each caller relies on with a characterisation test before you change the code.
+  - Choose the tests that would fail if the change broke a caller, and run the related ones.
+
+recall:
+  - id: card-blast-radius
+    concept: judgment.blast-radius
+    front: What three things make up a change's blast radius?
+    back: >-
+      The callers you can see, contracts with code you don't deploy, such as installed apps,
+      and data already stored in the old shape.
+  - id: card-pin-callers
+    concept: judgment.characterisation-tests
+    front: Before changing a shared function, what do characterisation tests pin?
+    back: >-
+      What each caller relies on today, such as a format or an order. A red test then shows
+      exactly what the change moved.
+  - id: card-coverage
+    concept: judgment.choosing-regression-tests
+    front: Why can a function with 100% line coverage still ship a regression?
+    back: >-
+      Coverage counts the lines the tests ran, not what they checked. A line can run in every
+      test with nothing asserting its effect.
+  - id: card-related-tests
+    concept: judgment.blast-radius
+    front: How do you pick which tests to run for a change without running them all?
+    back: >-
+      Walk the import graph backwards from the changed files. Every test file you reach is
+      related, which is what `vitest related` does.
+
+references:
+  - kind: book
+    title: Working Effectively with Legacy Code
+    authors: Michael C. Feathers
+    year: 2004
+    venue: Prentice Hall
+    note: Characterisation tests, seams, and changing code you don't fully understand.
+    primary: true
+    verified: false
+  - kind: docs
+    title: Command Line Interface
+    authors: Vitest
+    venue: vitest.dev
+    url: https://vitest.dev/guide/cli
+    note: '`vitest related` runs the tests that import the given files, following static imports only.'
+    primary: true
+    verified: false
+  - kind: docs
+    title: Jest CLI Options
+    authors: Jest
+    venue: jestjs.io
+    url: https://jestjs.io/docs/cli
+    note: '`--findRelatedTests` runs the tests that cover a list of source files.'
+    verified: false
+  - kind: essay
+    title: Hyrum's Law
+    authors: Hyrum Wright
+    venue: hyrumslaw.com
+    url: https://www.hyrumslaw.com/
+    note: With enough users, every observable behaviour of an API is depended on by somebody.
+    verified: false
+
+deepDive: >-
+  An import graph only sees what the code imports by name. It misses a lot. It can't see a
+  dynamic `import()` built from a string, or a file read at run time. Nor an environment
+  variable, a database row another service reads, or code in another repository. Vitest's docs say `vitest related` follows static imports only. So treat the related
+  tests as the floor, and run the full suite before a release.
+
+
+  The order bug has a name. With enough users, every behaviour they can observe becomes
+  something somebody depends on, promised or not. That's often called Hyrum's law. Order,
+  timing, error wording and the exact shape of a reply are the usual victims.
+
+
+  When a contract must change, make the change in steps. Add the new shape beside the old
+  one, such as a `dueIso` field next to `due`. Move the callers you control. Watch until
+  the callers you don't, such as old app versions, have gone. Only then remove the old
+  shape. This pattern is often called expand and contract. Each step is small, and each one
+  can be undone.

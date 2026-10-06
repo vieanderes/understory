@@ -1,0 +1,352 @@
+id: judgment.reviewing-a-change
+title: Reviewing a whole change
+objective: Review an AI-written pull request end to end for security, efficiency, regressions and tests, and explain your verdict.
+level: advanced
+minutes: 10
+concepts: [judgment.end-to-end-review, judgment.review-verdict]
+prerequisites: [aisys.coding-agents, clean.code-review, judgment.regressions, judgment.what-leaks, judgment.what-scales]
+opening:
+  text: >-
+    You'll review a coding agent's whole pull request, lens by lens, and write a verdict its
+    author can act on. Every question from this module comes
+    together here.
+
+steps:
+  - type: prose
+    id: intent-then-lenses
+    body: |-
+      A coding agent opened a pull request on a cinema app: "Add a My bookings page with a
+      film filter." Read the intent first. Then ask the five questions in turn. Start with
+      the shape: which files changed?
+
+      ```bash
+      $ git diff --stat main
+       src/api/my-bookings.ts       | 24 +++++
+       src/pages/my-bookings.tsx    | 41 ++++++++
+       src/header/bookings-badge.ts |  9 ++
+       src/tickets/seat-label.ts    |  2 +-
+       tests/my-bookings.test.ts    | 12 +++
+      ```
+
+  - type: bug-hunt
+    id: hunt-out-of-scope-file
+    concept: judgment.end-to-end-review
+    difficulty: 1
+    language: bash
+    code: |
+      $ git diff --stat main
+       src/api/my-bookings.ts       | 24 +++++
+       src/pages/my-bookings.tsx    | 41 ++++++++
+       src/header/bookings-badge.ts |  9 ++
+       src/tickets/seat-label.ts    |  2 +-
+       tests/my-bookings.test.ts    | 12 +++
+    prompt: Tap the file that doesn't fit the pull request's title.
+    lines: [5]
+    reasons:
+      - text: Seat labels have nothing to do with listing bookings
+        correct: true
+        feedback: >-
+          Yes. A change outside the stated intent gets the closest look.
+      - text: The header badge needs its own pull request
+        feedback: >-
+          A badge that links to My bookings is part of the feature. It gets reviewed, but it
+          fits.
+      - text: Twelve lines of tests is too few
+        feedback: >-
+          Twelve lines can be plenty. The question here is fit, not size.
+      - text: The page is too large to review
+        feedback: >-
+          Forty-one lines is a comfortable read. The surprise is a file about something else.
+
+  - type: ai-review
+    id: review-select-star
+    concept: judgment.end-to-end-review
+    difficulty: 3
+    language: ts
+    request: Add an endpoint that lists the signed-in member's bookings, filtered by film.
+    flawClass: data-exposure
+    code: |
+      router.get('/api/my-bookings', requireMember, async (req, res) => {
+        const film = String(req.query.film ?? '');
+        const rows = await db.query(
+          `SELECT * FROM bookings
+           JOIN screenings ON screenings.id = bookings.screening_id
+           WHERE bookings.member_id = $1 AND screenings.film ILIKE $2
+           ORDER BY screenings.starts_at DESC`,
+          [req.member.id, `%${film}%`],
+        );
+        res.json(rows);
+      });
+    prompt: >-
+      First question: "What could this expose?" The bookings table also holds
+      `payment_token` and `staff_note`. The agent's test checks the page shows the right
+      films. Tap the line at fault.
+    lines: [4]
+    reasons:
+      - text: '`SELECT *` sends every column to the browser'
+        correct: true
+        feedback: >-
+          Yes. Name the columns the page shows, and nothing else.
+      - text: The film filter allows SQL injection
+        feedback: >-
+          The film goes in as parameter `$2`, so the database treats it as data. That part is
+          safe.
+      - text: Any member can read other members' bookings
+        feedback: >-
+          The query filters on `req.member.id`, which comes from the session. Ownership is
+          checked.
+      - text: '`ORDER BY` should put the oldest first'
+        feedback: >-
+          Newest first suits a bookings page. That's a product choice, and nothing leaks
+          because of it.
+    fix: |
+      `SELECT bookings.id, bookings.seat_row, bookings.seat_number,
+              screenings.film, screenings.starts_at
+       FROM bookings
+       JOIN screenings ON screenings.id = bookings.screening_id ...`
+    verify:
+      question: Which test proves the fix, and keeps proving it?
+      choices:
+        - text: Assert the reply's keys are exactly the expected ones
+          correct: true
+          feedback: >-
+            Yes. A new private column can't slip out without failing it.
+        - text: Check the page shows the right films
+          feedback: >-
+            It passed with the leak in place. The page ignores fields it doesn't display.
+        - text: Sign in as another member and compare
+          feedback: >-
+            That tests ownership, which was already fine. The leak is in each member's own
+            reply.
+        - text: Snapshot the rendered page
+          feedback: >-
+            The page never shows the token. The leak is in the JSON, which a page snapshot
+            can't see.
+
+  - type: bug-hunt
+    id: hunt-badge-at-10x
+    concept: judgment.end-to-end-review
+    difficulty: 3
+    language: ts
+    code: |
+      // src/header/bookings-badge.ts: runs on every page of the site
+      export async function upcomingCount(memberId: string): Promise<number> {
+        const all = await listBookings(memberId); // every booking they ever made
+        const now = Date.now();
+        return all.filter((booking) => booking.startsAt.getTime() > now).length;
+      }
+    prompt: >-
+      Next: "Will it hold at 10x?" Regulars have hundreds of past bookings, and the header
+      shows this count on every page. Tap the line at fault.
+    lines: [3]
+    reasons:
+      - text: It loads every booking ever to count a few
+        correct: true
+        feedback: >-
+          Yes. Let the database count upcoming rows, with an index to match.
+      - text: '`Date.now()` should be read inside the filter'
+        feedback: >-
+          Reading it once is better: one consistent moment for the whole count.
+      - text: '`getTime()` is slow for comparing dates'
+        feedback: >-
+          Comparing two numbers is cheap. The cost is fetching hundreds of rows on every page.
+      - text: The function shouldn't be `async`
+        feedback: >-
+          It has to wait for the database either way. The question is how much it fetches.
+    fix: |
+      const result = await db.query(
+        `SELECT count(*)::int AS count FROM bookings
+         JOIN screenings ON screenings.id = bookings.screening_id
+         WHERE bookings.member_id = $1 AND screenings.starts_at > now()`,
+        [memberId],
+      );
+      return result[0].count;
+
+  - type: multiple-choice
+    id: pick-seat-label-fix
+    concept: judgment.end-to-end-review
+    difficulty: 3
+    language: text
+    code: |2
+       export function seatLabel(row: string, seat: number): string {
+      -  return `${row}${seat}`;
+      +  return `${row}-${seat}`;
+       }
+    question: Printed tickets and door scanners use `seatLabel`. The agent changed it for the new page. What do you ask?
+    choices:
+      - text: Revert it, and format on the new page
+        correct: true
+        feedback: >-
+          Yes. The page gets its look, and every other caller is untouched.
+      - text: Update every caller in this pull request
+        feedback: >-
+          Tickets already printed and sold still say F12. Nobody can update paper.
+      - text: Approve it, since the tests pass
+        feedback: >-
+          No test pins the label's format, so green says nothing about the scanners.
+      - text: Add a test for the new format
+        feedback: >-
+          That locks the break in. The old format is the contract to protect.
+
+  - type: multiple-choice
+    id: pick-what-the-test-misses
+    concept: judgment.end-to-end-review
+    difficulty: 3
+    language: ts
+    code: |
+      test('lists my bookings', async () => {
+        const res = await asMember('m1').get('/api/my-bookings');
+        expect(res.status).toBe(200);
+        expect(res.body.length).toBeGreaterThan(0);
+      });
+    question: This is the agent's only test. Would it fail if the query lost its member filter?
+    choices:
+      - text: No, anyone's bookings still make a non-empty list
+        correct: true
+        feedback: >-
+          Right. It checks that something came back, not whose it is.
+      - text: Yes, the status would change
+        feedback: >-
+          A query without the filter still answers 200. The status can't see whose rows they
+          are.
+      - text: Yes, `asMember` hides other members' rows
+        feedback: >-
+          `asMember` only signs the test in. What comes back is decided by the query.
+      - text: It depends on the film filter
+        feedback: >-
+          The film is empty here, so it matches every film. The member filter is the one in
+          question.
+
+  - type: prose
+    id: sort-then-verdict
+    body: >-
+      Now sort the findings with the labels from code review. **must-fix** blocks the merge.
+      Then question, suggestion and nit.
+
+
+      Lead with the **verdict**: request changes, comment, or approve. Then each must-fix,
+      with why it matters and the test that proves the fix. Nits go last, or nowhere. The
+      author should know in ten seconds what to do first.
+
+  - type: code-challenge
+    id: write-verdict
+    concept: judgment.review-verdict
+    difficulty: 4
+    language: ts
+    editable: '20-21'
+    prompt: >-
+      Write `writeVerdict(findings)`. Each finding has a `label`, a `lens` and a `note`. Return
+      `{ decision, lines }`. Any must-fix means `'request changes'`. Otherwise a question or a
+      suggestion means `'comment'`, and anything else `'approve'`.
+
+
+      Each line reads `'must-fix (leaks): note'`. Sort by `LABEL_ORDER`, then by `LENS_ORDER`,
+      and keep the given order for ties.
+    hints:
+      - Work out the decision and the lines separately. Both only need the findings.
+      - '`LABEL_ORDER.indexOf(label)` turns a label into a rank you can subtract in a sort comparator.'
+      - 'Compare labels first, and use `||` to fall through to lenses when the labels are equal. `sort` keeps ties in order.'
+
+  - type: explain-back
+    id: explain-the-verdict
+    concept: judgment.review-verdict
+    difficulty: 5
+    audience: teammate
+    kind: decide
+    prompt: >-
+      Write the summary comment on the agent's pull request for the teammate who ran it: your
+      verdict, and what to do first.
+    rubric:
+      - It leads with the verdict, request changes, so the author knows it can't merge yet.
+      - It gives each must-fix with why it matters and how to prove the fix, such as the `SELECT *` leak and the seat-label change.
+      - It keeps the rest in proportion, such as the header count as a suggestion, and says what's good.
+    modelAnswer: >-
+      Request changes. Two must-fixes. The bookings query uses `SELECT *`, so `payment_token`
+      and `staff_note` reach the browser. Name the columns, and add a test that pins the
+      reply's keys. Then revert the `seatLabel` change: printed tickets and door scanners
+      expect `F12`, so format on the page instead. One suggestion: count upcoming bookings in
+      SQL, since the header runs on every page. The filter itself is safe and well tested.
+
+recap:
+  - Read the intent and the shape of the diff first, and look hardest at what doesn't fit.
+  - Ask the five questions in turn, and check each test can see the bug it claims to guard.
+  - Lead with a verdict, then must-fixes with their reasons and proof, and keep nits last.
+
+recall:
+  - id: card-review-order
+    concept: judgment.end-to-end-review
+    front: In what order does a full review of a pull request go?
+    back: >-
+      The intent and the shape of the diff first. Then leaks, breaks, tests and scale, and
+      readability last.
+  - id: card-out-of-scope
+    concept: judgment.end-to-end-review
+    front: Why does a file outside a pull request's stated intent deserve the closest look?
+    back: >-
+      Nobody asked for it, so nobody is checking its callers. Agents often change shared code
+      while they're there.
+  - id: card-verdict
+    concept: judgment.review-verdict
+    front: What does a useful review summary start with, and what follows?
+    back: >-
+      The decision: request changes, comment or approve. Then each must-fix with why it
+      matters and the test that proves the fix.
+  - id: card-weak-test
+    concept: judgment.end-to-end-review
+    front: Why can a test that checks for a 200 and a non-empty list miss a serious bug?
+    back: >-
+      It checks that something came back, not what or whose. A leak or a missing filter
+      still passes.
+
+references:
+  - kind: docs
+    title: What to look for in a code review
+    authors: Google
+    venue: Google Engineering Practices Documentation
+    url: https://google.github.io/eng-practices/review/reviewer/looking-for.html
+    note: Design, functionality, complexity, tests and naming, in the order a reviewer weighs them.
+    primary: true
+    verified: false
+  - kind: docs
+    title: The Standard of Code Review
+    authors: Google
+    venue: Google Engineering Practices Documentation
+    url: https://google.github.io/eng-practices/review/reviewer/standard.html
+    note: Approve once a change improves the code's health, even if it isn't perfect.
+    verified: false
+  - kind: spec
+    title: 'API3:2023 Broken Object Property Level Authorization'
+    authors: OWASP
+    venue: OWASP API Security Top 10, 2023
+    url: https://owasp.org/API-Security/editions/2023/en/0xa3-broken-object-property-level-authorization/
+    note: Replies that return more properties than the caller should see, as `SELECT *` did here.
+    primary: true
+    verified: false
+  - kind: docs
+    title: Conventional Comments
+    venue: conventionalcomments.org
+    url: https://conventionalcomments.org/
+    note: Labels such as suggestion, question and nitpick that tell an author how much a comment matters.
+    verified: false
+
+deepDive: >-
+  AI-written pull requests fail in recognisable ways. They drift outside their scope,
+  changing a shared helper "while they're there". They write tests for the new behaviour
+  only, often checking that something came back rather than what. They reach for `SELECT *`
+  and return whole rows. And they sometimes weaken an existing test to get green. So read
+  the diff of the tests as closely as the code, and start every review with the diffstat.
+
+
+  Approve when the change makes the code better, not when it's perfect. A review that holds
+  out for taste delays good work. Mark those comments as nits, so the author can merge
+  without them.
+
+
+  If the pull request is too big to review properly, say so, and ask for it split, as the
+  coding agents lesson suggested. A review you couldn't do well shouldn't end in an
+  approval.
+
+
+  The five questions also make a good brief for the agent itself. Ask it, before you review,
+  to list what the change could expose, break or slow down, and how its tests prove
+  otherwise. Then check its answers. Its list is a starting point, never the review.

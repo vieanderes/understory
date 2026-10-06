@@ -1,0 +1,326 @@
+id: aisys.checking-extractions
+title: Checking what a model extracted
+objective: "Check extracted fields in layers: schema, business rules, cross-checks against the source text, confidence and history, with code doing the arithmetic."
+level: advanced
+minutes: 10
+concepts: [aisys.validation-layers, aisys.source-cross-checks, aisys.code-calculates]
+prerequisites: [aisys.reading-documents, aisys.thresholds-and-calibration]
+opening:
+  text: >-
+    You'll catch the extraction that looks perfect and is wrong, before it reaches the
+    books. Layered checks are what let you automate most documents and trust the result.
+
+steps:
+  - type: prose
+    id: name-validation-layers
+    body: |-
+      An extraction can fit its schema and still be wrong. So it passes
+      **validation layers**, each catching different errors:
+
+      1. Schema: the shape and the types.
+      2. Business rules: dates in range, totals that add up, required fields per type.
+      3. The source: is each value really in the document?
+      4. Confidence and history: is this how the supplier is usually booked?
+
+      Anything that fails goes to a person.
+
+  - type: multiple-choice
+    id: pick-layer-for-date
+    concept: aisys.validation-layers
+    difficulty: 1
+    question: An invoice extraction passes the schema, but its date is `2062-09-14`. Which layer catches it?
+    choices:
+      - text: Business rules
+        correct: true
+        feedback: >-
+          Right. It's a valid date, but not a plausible one.
+      - text: The schema
+        feedback: >-
+          The schema only checks it's a date. 2062 is a perfectly valid one.
+      - text: History
+        feedback: >-
+          History could notice, but a date range is a plain rule. It catches this first.
+
+  - type: prose
+    id: code-calculates
+    body: |-
+      One rule carries this lesson: **the model extracts and decides, code calculates and
+      verifies.**
+
+      The model reads the printed total, the lines and the date, as strings. It never adds
+      them up, works out VAT or counts days. Code does that, with `Decimal`, which is exact
+      for money. A model's arithmetic is usually right, and usually isn't good enough.
+
+  - type: multiple-choice
+    id: pick-why-check-passed
+    concept: aisys.code-calculates
+    difficulty: 2
+    question: >-
+      You asked the model to check its total against the lines. The printed total was wrong,
+      yet it passed. Why?
+    choices:
+      - text: The model wrote the total it expected
+        correct: true
+        feedback: >-
+          The trap. A model fills in what fits, so its check hides the error.
+      - text: Its temperature was set too high
+        feedback: >-
+          Current models don't take a temperature at all. And randomness wouldn't make a wrong total agree.
+      - text: The schema didn't type the total
+        feedback: >-
+          A typed field holds whatever number the model writes. The type was never the problem.
+
+  - type: fill-blank
+    id: fill-totals-agree
+    concept: aisys.code-calculates
+    difficulty: 2
+    language: python
+    prompt: >-
+      Check in code that the line amounts add up to the printed total, within a cent. The
+      amounts are the strings the model read.
+    template: |
+      from decimal import Decimal
+
+      def totals_agree(lines, total, tolerance="0.01"):
+          computed = sum(({{1}}(line["amount"]) for line in lines), Decimal("0"))
+          return {{2}}(computed - Decimal(total)) <= Decimal(tolerance)
+
+      # totals_agree([{"amount": "0.10"}, {"amount": "0.20"}], "0.30", "0") is True
+    blanks:
+      - key: '1'
+        answer: Decimal
+      - key: '2'
+        answer: abs
+    bank: [Decimal, float, abs, round, int]
+
+  - type: prose
+    id: cross-checks
+    body: |-
+      Business rules can't tell a real number from an invented one. A **cross-check against
+      the source** can. Look each value up in the document's text: an invoice number the
+      text doesn't contain was made up.
+
+      Two more signals help. A second extractor, another model or a pattern, should agree.
+      And history: this supplier went to "Stock: books" the last 30 times.
+
+  - type: ai-review
+    id: review-fuzzy-match
+    concept: aisys.source-cross-checks
+    difficulty: 3
+    language: python
+    request: Stop false alarms when OCR misreads one character of an invoice number.
+    flawClass: regression
+    code: |
+      from difflib import SequenceMatcher
+
+      def in_source(value, source_text):
+          # OCR reads "MS-2041" as "MS-2O41", so allow near matches
+          return any(SequenceMatcher(None, value, token).ratio() >= 0.8
+                     for token in source_text.split())
+    prompt: >-
+      An assistant wrote this for the museum shop's invoices, and the false alarms stopped.
+      A month later, an invented number `MS-2047` was booked against `MS-2041`. Tap the lines
+      at fault.
+    lines: [5, 6]
+    reasons:
+      - text: A near match passes as if it were exact
+        correct: true
+        feedback: >-
+          Yes. One digit off scores 0.86, so invented numbers now pass.
+      - text: The text should be split on hyphens too
+        feedback: >-
+          That would break the number into pieces. The trouble is accepting near matches at all.
+      - text: The 0.8 bar should be 0.9
+        feedback: >-
+          A seven-character number one digit off still scores 0.86. Any bar trades one error for another.
+    fix: |
+      def check_number(value, source_text):
+          tokens = source_text.split()
+          if value in tokens:
+              return "ok"
+          if any(SequenceMatcher(None, value, t).ratio() >= 0.8 for t in tokens):
+              return "review"       # close isn't the same: a person looks
+          return "not-in-source"
+    verify:
+      question: Which test would have caught this regression?
+      choices:
+        - text: A made-up number one digit off the real one
+          correct: true
+          feedback: >-
+            Right. The old check rejects it, and the new one lets it through.
+        - text: The OCR case with a letter O
+          feedback: >-
+            That's the case the change fixed. It passes now, and says nothing about what broke.
+        - text: A number printed exactly as extracted
+          feedback: >-
+            Both versions pass that one, so it can't see the difference.
+
+  - type: bug-hunt
+    id: hunt-confidence-first
+    concept: aisys.validation-layers
+    difficulty: 3
+    language: python
+    code: |
+      def route(extraction, issues, history):
+          if extraction["confidence"] >= 0.95:
+              return "book"                    # the model is sure
+          if issues:
+              return "review"
+          usual = history.usual_account(extraction["supplier"])
+          if usual != extraction["account"]:
+              return "review"                  # booked differently 30 times before
+          return "book"
+    prompt: >-
+      A supplier's total was off by 100. The total check flagged it, yet the invoice was
+      booked automatically. Tap the lines to fix.
+    lines: [2, 3]
+    reasons:
+      - text: The model's confidence overrides the failed checks
+        correct: true
+        feedback: >-
+          Yes. Confidence is one signal. A failed check must always win.
+      - text: History should be checked before the issues
+        feedback: >-
+          Order between those two doesn't matter. Both send it to review. The early return does.
+      - text: The 0.95 bar is too low
+        feedback: >-
+          Even 0.999 would skip the checks. Confidence shouldn't come first at all.
+    fix: |
+      def route(extraction, issues, history):
+          if issues:
+              return "review"
+          usual = history.usual_account(extraction["supplier"])
+          if usual != extraction["account"] or extraction["confidence"] < 0.95:
+              return "review"
+          return "book"
+
+  - type: code-challenge
+    id: write-check-extraction
+    concept: aisys.validation-layers
+    difficulty: 4
+    language: python
+    starter: verify.starter.py
+    solution: verify.solution.py
+    tests: verify.tests.py
+    prompt: >-
+      Write `check_extraction(doc, source_text, today, tolerance="0.01")`. `doc` holds
+      `invoice_number`, `invoice_date` (ISO), `total` and `lines`, each line with an
+      `amount`. All values are strings. Return a list of issues, in this order:
+
+
+      1. `"missing:<field>"` for each empty `invoice_number`, `invoice_date` or `total`.
+
+      2. `"not-in-source:invoice_number"` unless the number is in `source_text` as a whole
+      word: no letter, digit or hyphen right before or after it.
+
+      3. `"bad-date"` if the date doesn't parse, or `"date-out-of-range"` if it's after
+      `today` or more than 365 days before it.
+
+      4. `"total-mismatch"` if the line amounts, added exactly, differ from `total` by more
+      than `tolerance`.
+
+
+      Skip a check whose field is missing. An empty list means book it.
+    hints:
+      - Each check looks at one field, and skips quietly when that field is empty. Append to one list as you go.
+      - For the whole word, `re.escape` the number, and wrap it in lookarounds that reject `[\w-]` on either side.
+      - '`date.fromisoformat` raises `ValueError` on a bad date. Sum the amounts as `Decimal`, starting from `Decimal("0")`.'
+
+  - type: explain-back
+    id: explain-model-arithmetic
+    concept: aisys.code-calculates
+    difficulty: 4
+    audience: incident
+    kind: risk
+    prompt: >-
+      A pipeline asks the model to extract invoices and also work out VAT and totals. Warn
+      the incident channel: what could go wrong, and how will you check?
+    rubric:
+      - The model's arithmetic is usually right, so wrong sums slip through unnoticed.
+      - A model checking its own sums tends to agree with itself, hiding a supplier's error.
+      - Fix it by extracting printed values only, recomputing in code with Decimal, and flagging mismatches.
+    modelAnswer: >-
+      Risk: the model does the sums, and is right often enough that nobody checks. When it's
+      wrong, or "corrects" a supplier's wrong total, a bad amount is booked and nothing
+      flags it. Fix: the model only reads the printed values. Code recomputes totals and VAT
+      with Decimal and compares them with what's printed. Every mismatch goes to review, and
+      we'll recheck last month's bookings.
+
+recap:
+  - 'Check an extraction in layers: schema, business rules, source, confidence and history.'
+  - Let the model read and decide, and let code do every sum, with `Decimal`.
+  - Look each value up in the source, and send near matches and failed checks to a person.
+
+recall:
+  - id: card-layers
+    concept: aisys.validation-layers
+    front: Name the validation layers for an extraction, and what each catches.
+    back: >-
+      Schema catches wrong shapes, business rules catch implausible values, the source check
+      catches invented values, and confidence and history catch the unusual.
+  - id: card-code-calculates
+    concept: aisys.code-calculates
+    front: Why shouldn't the model compute an invoice's total?
+    back: >-
+      Its arithmetic isn't exact, and it may agree with the lines instead of reading the
+      print. Code recomputes with `Decimal` and compares.
+  - id: card-in-source
+    concept: aisys.source-cross-checks
+    front: How do you catch an invoice number the model invented?
+    back: >-
+      Look it up in the document's text as a whole word. If it isn't there, flag it.
+  - id: card-near-match
+    concept: aisys.source-cross-checks
+    front: An extracted value is one character off from a word in the text. What should code do?
+    back: >-
+      Send it to a person. A near match may be an OCR slip or an invention, and code can't
+      tell which.
+
+references:
+  - kind: docs
+    title: decimal, Decimal fixed-point and floating-point arithmetic
+    authors: Python Software Foundation
+    url: https://docs.python.org/3/library/decimal.html
+    note: Why `Decimal` adds money exactly where `float` doesn't.
+    primary: true
+    verified: false
+  - kind: docs
+    title: Citations
+    authors: Anthropic
+    venue: Claude Platform Docs
+    url: https://platform.claude.com/docs/en/build-with-claude/citations
+    note: Answers that point at the passage and page they came from.
+    verified: false
+  - kind: docs
+    title: Reduce hallucinations
+    authors: Anthropic
+    venue: Claude Platform Docs
+    url: https://platform.claude.com/docs/en/test-and-evaluate/strengthen-guardrails/reduce-hallucinations
+    note: Letting the model say it doesn't know, and checking claims against quotes.
+    primary: true
+    verified: false
+
+deepDive: >-
+  No model was called. The checks, the fuzzy match and the `Decimal` sums ran in Python. `SequenceMatcher` scores `MS-2047` against `MS-2041` at 0.857, the same as the OCR
+  slip `MS-2O41`. That's why no threshold separates them.
+
+
+  **Why `float` fails here.** `0.1 + 0.2 == 0.3` is `False` in binary floating point.
+  `Decimal("0.10") + Decimal("0.20")` is exactly `Decimal("0.30")`. Build `Decimal` from
+  strings, never from floats, or the float's error comes along.
+
+
+  **Citations as a cross-check.** With citations on, the model returns the exact passage
+  and the page each claim came from. That's a strong source check. But citations can't be
+  combined with structured output in the same request. So many teams extract into the
+  schema first, then look the values up in code, as in the challenge.
+
+
+  **A second extractor.** Two different extractors, such as a model and a regex for the
+  invoice number, rarely make the same mistake. Agreement is cheap evidence. Disagreement
+  goes to review. Two calls to the same model with the same prompt share their blind spots,
+  so they prove less.
+
+
+  **Corrections are data.** Every value a reviewer fixes is a labelled example. Track the
+  error rate per field and per supplier, and lower automation where it rises.

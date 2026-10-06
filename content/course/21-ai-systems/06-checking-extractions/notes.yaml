@@ -1,0 +1,174 @@
+summary: >-
+  Structured output guarantees that an extraction has the right shape. It says nothing
+  about whether the values are true. A date can be valid and absurd, a total can be a
+  number the page never printed, and an invoice number can be invented outright while
+  fitting every type. This lesson is about the checks that sit between the model's output
+  and anything that acts on it, such as booking an invoice or enrolling a pupil.
+
+
+  The checks come in layers because each catches a different error. The schema catches
+  wrong shapes. Business rules catch implausible values: dates out of range, totals that
+  don't add up, fields a document type must have. Cross-checks against the source catch
+  invented values, by looking each one up in the document's text or comparing a second
+  extractor. Confidence and history catch the unusual: a supplier booked one way thirty
+  times and another way today. Anything that fails goes to a person, with the reason.
+
+
+  Underneath sits one rule: **the model extracts and decides, code calculates and
+  verifies.** The model is good at reading messy pages and judging what a field means.
+  Code is exact at sums, dates and comparisons. Mixing those jobs up is how a pipeline
+  ends up confidently booking a wrong amount.
+remember:
+  - The model extracts and decides; code calculates and verifies. Never let the model do arithmetic that matters.
+  - A schema checks shape, not truth, so every extraction passes business rules and source checks before anything acts on it.
+  - Ask the model for printed values as strings, then parse and add them in code with `Decimal`, built from strings.
+  - Look each identifier up in the source text as a whole word, so a value the document doesn't contain is caught as invented.
+  - A near match is not a match. Send it to a person instead of passing it.
+  - A failed check always beats the model's confidence. Confidence and history can only add reasons for review.
+  - Every reviewer correction is a labelled example, so track error rates per field and per supplier.
+sections:
+  - title: Why code does the arithmetic
+    body: |-
+      Two separate failures hide behind "the model can't add". The first is plain error: a
+      model's arithmetic is right most of the time, and most of the time is not a standard
+      for money. The second is subtler. Asked to extract a total and check it against the
+      lines, a model tends to produce a consistent answer, so a supplier's wrong total can
+      come back "corrected", and the check that should have caught it agrees with itself.
+
+      Code has its own trap: binary floating point.
+
+      ```python
+      from decimal import Decimal, ROUND_HALF_UP
+
+      print(sum([0.1] * 3) == 0.3)                            # False
+      print(sum([Decimal("0.1")] * 3) == Decimal("0.3"))      # True
+      print(Decimal(0.1))  # 0.1000000000000000055511151231257827021181583404541015625
+
+      CENT = Decimal("0.01")
+      lines = [Decimal("1.20")] * 3
+      rate = Decimal("0.19")
+      per_line = sum((n * rate).quantize(CENT, ROUND_HALF_UP) for n in lines)
+      on_total = (sum(lines) * rate).quantize(CENT, ROUND_HALF_UP)
+      print(per_line, on_total)                               # 0.69 0.68
+      ```
+
+      Build `Decimal` from strings, which is one more reason to extract amounts as printed
+      text. The last two lines show why a tolerance exists at all: tax rounded per line and
+      tax rounded on the total can differ by a cent or two, and both are legitimate. Keep the
+      tolerance tight and explicit, a cent per few lines, and never so loose that a typo
+      passes.
+  - title: Cross-checks that hold up
+    body: |-
+      A source check asks one question: does the document's text contain this value? For
+      identifiers such as invoice, order or membership numbers, the answer should be exact.
+      Match the value as a whole word, so `MS-2041` doesn't pass inside `MS-20417`, and
+      normalise only what's genuinely cosmetic, such as collapsing runs of whitespace.
+
+      Fuzzy matching feels kind to OCR, but it can't tell a misread from an invention:
+      `MS-2O41` and `MS-2047` score exactly the same against `MS-2041`. So a near match
+      becomes a third outcome, "review", never a pass. The same goes for amounts: look up
+      the printed total in the text in its printed form, and leave the parsing to code.
+
+      A **second extractor** is a cross-check that doesn't need the text at all. It works
+      best when the two fail differently: a model and a regular expression for the invoice
+      number, or a model reading the image and a text-layer parser. Two calls to the same
+      model with the same prompt share their blind spots, so their agreement proves less
+      than it seems.
+
+      Citations offer a third route on some APIs: the model returns the exact passage and
+      page behind each claim. Citations can't be combined with structured output in one
+      request, though, so a common design extracts into the schema first and checks the
+      values against the text in code afterwards.
+  - title: History, confidence and the review queue
+    body: |-
+      Once the values are plausible and present in the source, history asks whether they're
+      usual. Most suppliers are booked to the same account every time, and a sudden change
+      is worth a look.
+
+      ```python
+      from collections import Counter
+
+
+      def usual_account(history, supplier, min_count=10, min_share=0.9):
+          past = [h["account"] for h in history if h["supplier"] == supplier]
+          if len(past) < min_count:
+              return None                       # too little history to judge
+          account, count = Counter(past).most_common(1)[0]
+          return account if count / len(past) >= min_share else None
+
+
+      def route(extraction, issues, history):
+          if issues:
+              return "review", issues
+          usual = usual_account(history, extraction["supplier"])
+          if usual is not None and usual != extraction["account"]:
+              return "review", [f"unusual-account:{usual}"]
+          return "book", []
+
+
+      history = [{"supplier": "Gallery Prints", "account": "Stock: books"}] * 30
+      print(route({"supplier": "Gallery Prints", "account": "Repairs"}, [], history))
+      # ('review', ['unusual-account:Stock: books'])
+      ```
+
+      Order matters: failed checks first, and nothing later can undo them. A model's
+      self-reported confidence belongs here too, as one more reason to review, never as a
+      way to skip the checks. Send the reasons with each item, so a reviewer starts from
+      "total differs by 100.00" instead of rereading the whole document. Then measure the
+      queue: how many documents each check sends, and how many of those were really wrong.
+      A check that flags thousands and catches nothing gets tuned, and a field whose
+      corrections climb gets a lower automation bar.
+pitfalls:
+  - '**Asking the model to check its own sums.** It tends to agree with itself and can hide a supplier''s error. Extract printed values and recompute in code.'
+  - '**Adding money as `float`.** `0.1 + 0.2` isn''t `0.3` in binary floating point. Use `Decimal` built from strings.'
+  - '**Substring matching for identifiers.** `MS-2041` is inside `MS-20417`. Match whole words.'
+  - '**Fuzzy matching that passes near misses.** An invented number one digit off scores like an OCR slip. Route near matches to review.'
+  - '**Letting confidence skip the checks.** A confident extraction with a failed total is still wrong. Failed checks always win.'
+  - '**A tolerance wide enough to hide typos.** Rounding differences are a cent or two. A tolerance of a whole unit lets real errors through.'
+  - '**Review items without reasons.** A reviewer who gets only "check this" redoes the whole extraction. Send the failed checks with the item.'
+verify:
+  - lens: breaks
+    check: Run the checker on an extraction whose printed total is wrong but whose lines are right, and confirm it goes to review rather than being booked.
+  - lens: tests
+    check: Keep a test where an invented identifier differs from the real one by one character, so loosening the source check can't pass unnoticed.
+  - lens: tests
+    check: Assert that money sums use `Decimal` from strings, including a case such as 0.10 plus 0.20 against 0.30 with zero tolerance.
+  - lens: scales
+    check: Chart how many documents each check sends to review per day, because a noisy check floods the queue and reviewers start approving without reading.
+  - lens: confuses
+    check: Attach the failed checks and the source excerpt to every review item, so the reviewer sees why it was flagged.
+interview:
+  - question: How would you make sure the values an LLM extracts from invoices are correct before booking them?
+    answer: >-
+      I'd treat the output as untrusted and run it through layers, each catching a
+      different error. The schema checks shape. Business rules check plausibility: required
+      fields per document type, a date not in the future or years old, line amounts that add
+      up to the total, computed in code with `Decimal`. Source checks catch inventions: the
+      invoice number must appear in the document's text as a whole word, and a second
+      extractor such as a regex should agree. Then history: if this supplier was booked to
+      the same account the last thirty times, a different account goes to review. Anything
+      that fails goes to a person with the reasons attached. I'd measure precision of
+      auto-booking on a labelled set and tune which checks gate automation. The trade-off
+      is review volume, which I watch per check.
+  - question: Why shouldn't the model calculate totals or tax, even if it's usually right?
+    answer: >-
+      Because usually right isn't the bar for money, and its errors are hard to spot. A
+      model's arithmetic is mostly correct, so nobody looks, and the rare mistake gets
+      booked. Worse, when you ask it to check a total against the lines, it tends to give
+      a consistent answer, which can mean reporting the total the lines imply instead of the
+      one printed. Then a supplier's error disappears. The fix is a clean split: the model
+      reads printed values as strings and decides what each field means; code parses them,
+      recomputes totals and tax with exact decimal arithmetic, and compares. A mismatch
+      becomes a review item with both numbers. Code is also cheaper and deterministic, so the
+      check gives the same answer every time and can be unit tested.
+  - question: An OCR step keeps misreading O as 0 in reference numbers, causing false alarms in your source check. What do you do?
+    answer: >-
+      I don't loosen the check into a fuzzy pass, because a near match can't distinguish a
+      misread from an invented value one character off; both score the same. Instead I add
+      a third outcome. Exact whole-word match passes. A near match, say one character
+      different, goes to review with both strings shown, which is quick for a person to
+      confirm. No match is flagged as not in source. Then I fix the cause: if the format is
+      known, such as two letters, a hyphen and four digits, a format rule can say a letter O
+      in the digit part is a misread and normalise only that position. Better still, read
+      that page as an image with a stronger model, or use the text layer when there is one.
+      I'd add a regression test with an invented near-miss number.

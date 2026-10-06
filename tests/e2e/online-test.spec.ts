@@ -192,9 +192,11 @@ test('the coding tests are on the shelf in the Library', async ({ page }) => {
   await expect(page.getByRole('heading', { name: 'Coding tests', level: 1 })).toBeVisible();
 });
 
-test('a path stage lists the tests that check it, optional and with their XP', async ({ page }) => {
+test('a path stage offers practice, labs and tests, optional and with their XP', async ({
+  page,
+}) => {
   await page.goto('/paths/ai-coding-tests');
-  const method = page.getByRole('region', { name: 'Test yourself: The method' });
+  const method = page.getByRole('region', { name: 'Try it: The method' });
   await expect(method.getByText('Optional · recommended')).toBeVisible();
   await expect(method.getByRole('link', { name: /Your first test/ })).toHaveAttribute(
     'href',
@@ -202,17 +204,32 @@ test('a path stage lists the tests that check it, optional and with their XP', a
   );
   await expect(method.getByText('up to 20 XP').first()).toBeVisible();
 
-  const tasks = page.getByRole('region', { name: 'Test yourself: The tasks' });
+  const tasks = page.getByRole('region', { name: 'Try it: The tasks' });
   await tasks.getByText(/more tasks/).click();
   await expect(tasks.getByRole('link', { name: /RoomBookings/ })).toHaveAttribute(
     'href',
     '/practise/online-test/train-room-bookings',
   );
 
-  const timed = page.getByRole('region', { name: 'Test yourself: Timed practice' });
+  await expect(method.getByRole('link', { name: /Practise this stage/ })).toHaveAttribute(
+    'href',
+    /^\/practise\/session\/10\?chapters=/,
+  );
+
+  const timed = page.getByRole('region', { name: 'Try it: Timed practice' });
+  await timed.getByText(/\d+ more$/).click();
   await expect(
     timed.getByRole('link', { name: /Practice test 4: one task in four levels/ }),
   ).toHaveAttribute('href', /^\/learn\/.+/);
+});
+
+test('a path stage lists the labs that show its mechanisms', async ({ page }) => {
+  await page.goto('/paths/javascript-typescript');
+  const traps = page.getByRole('region', { name: 'Try it: JavaScript traps' });
+  await expect(traps.getByRole('link', { name: /Event loop stepper/ })).toHaveAttribute(
+    'href',
+    '/labs/event-loop-stepper',
+  );
 });
 
 test('guided mode walks a task and fills the assistant with its prompt', async ({ page }) => {

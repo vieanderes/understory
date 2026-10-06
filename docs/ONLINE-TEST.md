@@ -300,12 +300,16 @@ tests:
   - { test: screen-a, guided: true } # a preset; guided suggests the coach
   - { task: torn-pages } # one task as training, sat as train-torn-pages
   - { lesson: interview.mock-levelled } # an assessment lesson
+  - { lab: event-loop-stepper } # a lab, from src/core/labs/catalog.ts
 ```
 
 - Tests are optional. They never count towards finishing a path, but the stage shows them
   as recommended, with the XP a full score earns and the learner's best score.
-- The path shows three per stage and folds the rest.
+- The stage shows them under "Try it", after its lessons: first "Practise this stage", a
+  ten-minute session scoped to the stage's chapters (`/practise/session/10?chapters=…`),
+  then labs, then tests. It shows three and folds the rest.
+- Every lab sits in a stage too. A lab earns no XP itself; it is there to be tried.
 - The validator fails an unknown preset, task or lesson id and a test listed twice in one
-  path, and warns about a preset or task that no stage lists (`online-test-off-path`).
+  path, and warns about a preset, task or lab that no stage lists (`online-test-off-path`).
 - The levelled mock runs in the lesson player, not the simulator. It is named "Practice
   test 4" so it reads as one more practice test, on the paths and in the hub.

@@ -13,6 +13,7 @@ import { cn } from '@/lib/cn';
 import { certificateHref, examHref, formatLocalDate, percent } from '@/features/exam/stages';
 import { usePathExam } from '@/features/exam/usePathExam';
 import { useProgress } from '@/features/store/StoreProvider';
+import { stageSessionHref } from '@/features/practice/topics';
 import { usePathProgress } from './usePathProgress';
 import { onPath } from './links';
 
@@ -234,10 +235,18 @@ export function PathView({
                       </Fold>
                     </div>
                   ) : null}
-                  {stage.tests && stage.tests.length > 0 ? (
+                  {stage.lessons.length > 0 ? (
                     <div className="flex gap-2">
                       <Rail above="todo" below="todo" />
-                      <StageTests stage={stage.title} tests={stage.tests} result={testResult} />
+                      <StageTests
+                        stage={stage.title}
+                        practice={stageSessionHref([
+                          ...stage.lessons.map((l) => l.id),
+                          ...stage.optional.map((l) => l.id),
+                        ])}
+                        tests={stage.tests ?? []}
+                        result={testResult}
+                      />
                     </div>
                   ) : null}
                 </section>
@@ -542,38 +551,57 @@ function Fold({
 }
 
 /**
- * The timed tests that check a stage. Never needed to finish the path, but each earns XP for
- * its score and keeps a best score to beat, so the group says so plainly and stays quiet:
- * no accent, which marks the next lesson.
+ * What a stage offers beyond its lessons: practice of the stage, the labs that show its
+ * mechanisms moving, and the timed tests that check it. None is needed to finish the path,
+ * but each is the way to make the stage stick, so the group says so plainly and stays
+ * quiet: no accent, which marks the next lesson. Practice comes first, labs before tests,
+ * the order a learner would reach for them.
  */
 function StageTests({
   stage,
+  practice,
   tests,
   result,
 }: {
   stage: string;
+  practice: string;
   tests: readonly PathTest[];
   result: (test: PathTest) => string | undefined;
 }) {
-  const shown = tests.slice(0, TESTS_SHOWN);
-  const rest = tests.slice(TESTS_SHOWN);
-  const restNoun = rest.every((t) => t.kind === 'training') ? 'tasks' : 'tests';
+  const ordered = [
+    ...tests.filter((t) => t.kind === 'lab'),
+    ...tests.filter((t) => t.kind !== 'lab'),
+  ];
+  const shown = ordered.slice(0, TESTS_SHOWN);
+  const rest = ordered.slice(TESTS_SHOWN);
+  const restNoun = rest.every((t) => t.kind === 'training') ? 'tasks' : 'more';
   return (
-    <section
-      aria-label={`Test yourself: ${stage}`}
-      className="flex min-w-0 flex-1 flex-col gap-1 pb-2"
-    >
+    <section aria-label={`Try it: ${stage}`} className="flex min-w-0 flex-1 flex-col gap-1 pb-2">
       <div className="flex flex-wrap items-baseline justify-between gap-x-2 pt-1">
-        <h3 className="font-semibold whitespace-nowrap">Test yourself</h3>
+        <h3 className="font-semibold whitespace-nowrap">Try it</h3>
         <p className="t-label shrink-0">Optional · recommended</p>
       </div>
       <ul className="border-border rounded-panel divide-border divide-y overflow-hidden border">
+        <li>
+          <Link
+            href={practice}
+            className="hover:bg-raised flex items-start justify-between gap-2 px-2 py-1.5 transition-colors duration-150 ease-out"
+          >
+            <span className="flex min-w-0 flex-col">
+              <span className="font-medium">Practise this stage</span>
+              <span className="text-muted text-sm">
+                Questions from these lessons, done or not, the fading ones first
+              </span>
+            </span>
+            <span className="t-label t-figure shrink-0">10 min</span>
+          </Link>
+        </li>
         {shown.map((test) => (
           <TestRow key={test.key} test={test} result={result(test)} />
         ))}
       </ul>
       {rest.length > 0 ? (
-        <Fold label={`${rest.length} more ${restNoun}`}>
+        <Fold label={restNoun === 'tasks' ? `${rest.length} more tasks` : `${rest.length} more`}>
           <ul className="border-border rounded-panel divide-border mt-1 divide-y overflow-hidden border">
             {rest.map((test) => (
               <TestRow key={test.key} test={test} result={result(test)} />
@@ -595,8 +623,16 @@ function TestRow({ test, result }: { test: PathTest; result: string | undefined 
         <span className="flex min-w-0 flex-col">
           <span className={cn('font-medium', result === 'Done' && 'text-muted')}>{test.title}</span>
           <span className="text-muted text-sm">
-            {test.detail ? `${test.detail} · ` : ''}
-            <span className="t-figure">up to {test.xp} XP</span>
+            {test.kind === 'lab' ? (
+              <>
+                <span className="t-label">Lab</span> · {test.detail}
+              </>
+            ) : (
+              <>
+                {test.detail ? `${test.detail} · ` : ''}
+                <span className="t-figure">up to {test.xp} XP</span>
+              </>
+            )}
           </span>
         </span>
         <span className={cn('t-label t-figure shrink-0', result && result !== 'Done' && 'text-fg')}>

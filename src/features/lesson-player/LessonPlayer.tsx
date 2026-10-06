@@ -4,7 +4,12 @@ import { BookOpen, X } from 'lucide-react';
 import Link from 'next/link';
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { AskScoutButton } from '@/features/tutor/StudyAssistant';
-import { dockTutorTrigger, setTutorOpen, setTutorScope } from '@/features/tutor/tutor-store';
+import {
+  dockTutorTrigger,
+  setTutorOpen,
+  setTutorScope,
+  useTutorOpen,
+} from '@/features/tutor/tutor-store';
 import { stepText } from '@/features/tutor/step-text';
 import { ActionBar } from '@/components/layout/ActionBar';
 import { Button } from '@/components/ui/Button';
@@ -70,6 +75,7 @@ export function LessonPlayer({
   // Back to where the lesson was opened: Learn on its path, else the page before, else Learn.
   const exit = onThisPath ? `/paths?path=${onThisPath.id}` : (cameFrom ?? exitHref);
   const store = useStore();
+  const tutorOpen = useTutorOpen();
   const { state } = useProgress();
   const mode = state.modeByModule[lesson.moduleId] ?? 'guided';
 
@@ -194,11 +200,14 @@ export function LessonPlayer({
           >
             <BookOpen aria-hidden size={20} strokeWidth={2} />
           </Link>
-          <AskScoutButton
-            onClick={() => setTutorOpen(true)}
-            className="-mr-1 h-4 px-1 sm:pr-1.5"
-            labelClassName="max-sm:sr-only"
-          />
+          {/* While Scout is open beside the lesson, its own close button is the way back. */}
+          {tutorOpen ? null : (
+            <AskScoutButton
+              onClick={() => setTutorOpen(true)}
+              className="-mr-1 h-4 px-1 sm:pr-1.5"
+              labelClassName="max-sm:sr-only"
+            />
+          )}
         </div>
       </header>
 

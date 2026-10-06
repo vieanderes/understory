@@ -114,7 +114,17 @@ async function register(): Promise<void> {
 
 /** Idempotent. Production only: a worker in development serves stale code and confuses everyone. */
 export function startWorker(): void {
-  if (started || process.env.NODE_ENV !== 'production' || !workerSupported()) return;
+  if (started || !workerSupported()) return;
+  if (process.env.NODE_ENV !== 'production') {
+    // A worker left by a production build on the same origin would keep serving that
+    // build's pages and styles over the dev server, so development removes it.
+    started = true;
+    void navigator.serviceWorker
+      .getRegistrations()
+      .then((all) => Promise.all(all.map((r) => r.unregister())))
+      .catch(() => undefined);
+    return;
+  }
   started = true;
   const begin = (): void => void register().catch(() => undefined);
   // After load, so registration never competes with the first render for the network.

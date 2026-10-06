@@ -1,7 +1,7 @@
 def ask_json(client, prompt, validate, attempts=2):
     messages = [{"role": "user", "content": prompt}]
     for attempt in range(attempts):
-        reply = client.messages.create(model="claude-opus-5", max_tokens=1024, messages=messages)
+        reply = client.messages.create(model="claude-opus-5-5", max_tokens=1024, messages=messages)
         text = "".join(block.text for block in reply.content if block.type == "text")
         try:
             return validate(text)

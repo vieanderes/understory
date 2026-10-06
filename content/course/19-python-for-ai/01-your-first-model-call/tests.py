@@ -40,7 +40,7 @@ def _():
     client = FakeClient(text("Paris."))
     ask(client, "Capital of France?")
     sent = client.requests[0]
-    assert sent["model"] == "claude-opus-5"
+    assert sent["model"] == "claude-opus-5-5"
     assert sent["max_tokens"] > 0
 
 

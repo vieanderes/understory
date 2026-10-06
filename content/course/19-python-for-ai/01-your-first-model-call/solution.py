@@ -1,4 +1,4 @@
-MODEL = "claude-opus-5"
+MODEL = "claude-opus-5-5"
 
 
 def ask(client, question):

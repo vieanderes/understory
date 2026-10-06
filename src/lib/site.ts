@@ -3,3 +3,6 @@ export const SITE_URL = (process.env.NEXT_PUBLIC_SITE_URL ?? 'http://localhost:3
   /\/$/,
   '',
 );
+
+/** The code, the issues and how to contribute. */
+export const REPO_URL = 'https://github.com/vieanderes/understory';

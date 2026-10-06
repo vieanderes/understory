@@ -28,7 +28,13 @@ describe('Markdown replies', () => {
       'quote',
       'code',
     ]);
-    expect(blocks.at(-1)).toEqual({ kind: 'code', language: 'py', text: 'x = 1' });
+    expect(blocks.at(-1)).toEqual({
+      kind: 'code',
+      language: 'py',
+      text: 'x = 1',
+      closed: false,
+    });
+    expect(blocks[3]).toMatchObject({ kind: 'code', closed: true });
   });
 
   it('renders code highlighted with a copy button, and links safely', () => {
@@ -60,7 +66,12 @@ describe('step text for the tutor', () => {
   it('collects the prose of a step and leaves the answers out', () => {
     const text = stepText({
       prompt: { md: 'Count the votes.', html: '' },
-      options: [{ text: { md: 'A Map', html: '' }, feedback: { md: 'Right', html: '' } }],
+      options: [
+        {
+          text: { md: 'A Map', html: '' },
+          feedback: { md: 'Right', html: '' },
+        },
+      ],
       solution: { md: 'THE ANSWER', html: '' },
       starterCode: 'function count() {}',
     });
@@ -92,7 +103,8 @@ describe('StudyAssistant', () => {
     await user.click(screen.getByRole('button', { name: 'Ask Scout AI' }));
     const panel = screen.getByRole('complementary', { name: 'Scout AI' });
     expect(panel).toHaveTextContent('Counting with a Map');
-    expect(await screen.findByText('Why a Map?')).toBeInTheDocument();
+    // The panel is a lazy chunk; under a full parallel run it can take more than a second.
+    expect(await screen.findByText('Why a Map?', {}, { timeout: 5000 })).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: 'New chat' }));
     expect(readHistory('js.maps')).toEqual([]);
     // Clearing is never final by surprise: Undo brings the conversation back.

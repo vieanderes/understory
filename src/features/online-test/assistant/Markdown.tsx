@@ -5,7 +5,7 @@ import { pythonLanguage } from '@codemirror/lang-python';
 import { classHighlighter, highlightTree } from '@lezer/highlight';
 import { Check, Copy } from 'lucide-react';
 import Link from 'next/link';
-import { useState, type ReactNode } from 'react';
+import { Fragment, useState, type ReactNode } from 'react';
 
 /*
  * The assistant's replies, as Markdown. Built into React elements, never set as HTML: the
@@ -157,7 +157,7 @@ function inline(text: string, key: string, links?: InAppLinks): ReactNode[] {
 }
 
 type Block =
-  | { kind: 'code'; language: string; text: string }
+  | { kind: 'code'; language: string; text: string; closed: boolean }
   | { kind: 'heading'; level: number; text: string }
   | { kind: 'list'; ordered: boolean; items: string[] }
   | { kind: 'quote'; text: string }
@@ -175,8 +175,9 @@ export function parseBlocks(source: string): Block[] {
       i += 1;
       // An unclosed fence, as while a reply is still streaming, runs to the end.
       while (i < lines.length && !/^\s*```\s*$/.test(lines[i] ?? '')) body.push(lines[i++] ?? '');
+      const closed = i < lines.length;
       i += 1;
-      blocks.push({ kind: 'code', language: fence[1] ?? '', text: body.join('\n') });
+      blocks.push({ kind: 'code', language: fence[1] ?? '', text: body.join('\n'), closed });
       continue;
     }
     if (line.trim() === '') {
@@ -231,14 +232,32 @@ export function parseBlocks(source: string): Block[] {
   return blocks;
 }
 
-export function Markdown({ text, links }: { text: string; links?: InAppLinks }) {
+/**
+ * Fenced blocks drawn as something other than code, by language: Scout's planner draws its
+ * `scout-ask` and `scout-path` blocks as controls. `closed` is false while the reply is still
+ * streaming the block in.
+ */
+export type BlockRenderers = Partial<Record<string, (body: string, closed: boolean) => ReactNode>>;
+
+export function Markdown({
+  text,
+  links,
+  blocks,
+}: {
+  text: string;
+  links?: InAppLinks;
+  blocks?: BlockRenderers;
+}) {
   return (
     <div className="flex flex-col gap-1 text-sm">
       {parseBlocks(text).map((block, i) => {
         const key = String(i);
         switch (block.kind) {
-          case 'code':
+          case 'code': {
+            const draw = blocks?.[block.language];
+            if (draw) return <Fragment key={key}>{draw(block.text, block.closed)}</Fragment>;
             return <CodeBlock key={key} code={block.text} language={block.language} />;
+          }
           case 'heading':
             return (
               <p key={key} className="pt-0.5 font-semibold">

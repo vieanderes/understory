@@ -94,6 +94,30 @@ export interface AssistantPanelProps {
    * a link away would leave the timed task.
    */
   inAppLinks?: InAppLinks;
+  /**
+   * Draws a reply instead of plain Markdown: Scout's planner turns the blocks in its replies
+   * into choices and a draft path. The default is the Markdown alone.
+   */
+  renderReply?: (text: string, reply: ReplyState) => ReactNode;
+  /** Replaces the greeting and the starters of an empty conversation. */
+  renderEmpty?: (actions: PanelActions) => ReactNode;
+}
+
+/** What a custom reply or empty state can do: ask, or put the learner in the question box. */
+export interface PanelActions {
+  send: (text: string) => void;
+  focusComposer: () => void;
+  /** A provider is connected and nothing is on its way: a question can go now. */
+  canSend: boolean;
+}
+
+export interface ReplyState extends PanelActions {
+  /** The newest reply: the only one whose choices still apply. */
+  latest: boolean;
+  streaming: boolean;
+  /** What the learner said after this reply, if anything. */
+  answer?: string;
+  links?: InAppLinks;
 }
 
 const MODEL_LABEL: Record<AssistantModel, string> = {
@@ -126,6 +150,14 @@ function errorText(error: unknown): string {
 }
 
 /** Replies are Markdown: code blocks highlighted, lists and emphasis kept (Markdown.tsx). */
+/**
+ * Calls a parent's renderer as a component, so its actions arrive as props, like any
+ * event handler, rather than as values read while the panel renders.
+ */
+function Drawn<A>({ draw, arg }: { draw: (arg: A) => ReactNode; arg: A }) {
+  return draw(arg);
+}
+
 function ReplyText({ text, links }: { text: string; links?: InAppLinks }) {
   return <Markdown text={text} {...(links ? { links } : {})} />;
 }
@@ -199,7 +231,10 @@ function Step({ n, title, children }: { n: number; title: string; children: Reac
 type Choice = ClaudeClient | 'claude-cli' | 'api-key';
 
 const CHOICES: Record<Choice, { label: string; hint: string }> = {
-  app: { label: 'Claude app', hint: 'Web, desktop or phone. Connect once, then just ask here.' },
+  app: {
+    label: 'Claude app',
+    hint: 'Web, desktop or phone. Connect once, then just ask here.',
+  },
   code: {
     label: 'Claude Code',
     hint: 'Works now with one command. A plugin that needs even less is coming.',
@@ -208,7 +243,10 @@ const CHOICES: Record<Choice, { label: string; hint: string }> = {
     label: 'Claude Code on this machine',
     hint: 'Already signed in on this computer. Nothing to set up.',
   },
-  'api-key': { label: 'An API key', hint: 'No Claude plan? Pay per question with your own key.' },
+  'api-key': {
+    label: 'An API key',
+    hint: 'No Claude plan? Pay per question with your own key.',
+  },
 };
 
 function ProviderChoice({
@@ -511,6 +549,8 @@ export function AssistantPanel({
   thinkingMark,
   autoFocus = false,
   inAppLinks,
+  renderReply,
+  renderEmpty,
 }: AssistantPanelProps) {
   const storedProvider = useProvider();
   const client = useClaudeClient();
@@ -578,7 +618,10 @@ export function AssistantPanel({
 
     const abort = new AbortController();
     controller.current = abort;
-    const turns = [...transcript, question].map(({ role, text: body }) => ({ role, text: body }));
+    const turns = [...transcript, question].map(({ role, text: body }) => ({
+      role,
+      text: body,
+    }));
     let reply = '';
     try {
       for await (const chunk of port.send({ turns, context }, abort.signal)) {
@@ -619,6 +662,25 @@ export function AssistantPanel({
   const empty = transcript.length === 0 && !busy;
   const lastReply = transcript.findLastIndex((message) => message.role === 'assistant');
 
+  const actions: PanelActions = {
+    send: (text) => void send(text),
+    focusComposer: () => document.getElementById(draftId)?.focus(),
+    canSend: ready && !busy,
+  };
+  const drawReply = (text: string, index: number | null) => {
+    const links = inAppLinks ? { links: inAppLinks } : {};
+    if (!renderReply) return <ReplyText text={text} {...links} />;
+    const next = index === null ? undefined : transcript[index + 1];
+    const reply: ReplyState = {
+      ...actions,
+      ...links,
+      latest: index === null || (index === lastReply && !busy),
+      streaming: index === null,
+      ...(next?.role === 'user' ? { answer: next.text } : {}),
+    };
+    return <Drawn draw={(state: ReplyState) => renderReply(text, state)} arg={reply} />;
+  };
+
   return (
     <section aria-label="Assistant" className="bg-surface flex h-full min-h-0 flex-1 flex-col">
       <div
@@ -629,7 +691,8 @@ export function AssistantPanel({
         aria-label="Conversation"
         tabIndex={0}
       >
-        {empty ? (
+        {empty && renderEmpty ? <Drawn draw={renderEmpty} arg={actions} /> : null}
+        {empty && !renderEmpty ? (
           <div className="flex flex-col gap-3">
             <div className="flex flex-col gap-0.5">
               <p className="text-lg font-semibold tracking-tight text-balance">{greeting}</p>
@@ -680,7 +743,7 @@ export function AssistantPanel({
               <li key={`${index}-${message.at}`} className="group/reply flex flex-col gap-0.5">
                 <div className="min-w-0 break-words">
                   <p className="sr-only">Assistant</p>
-                  <ReplyText text={message.text} {...(inAppLinks ? { links: inAppLinks } : {})} />
+                  {drawReply(message.text, index)}
                 </div>
                 <div
                   className={cn(
@@ -700,7 +763,7 @@ export function AssistantPanel({
             <li className="flex flex-col gap-1">
               {streaming ? (
                 <div className="min-w-0 break-words" aria-live="polite" aria-busy="true">
-                  <ReplyText text={streaming} {...(inAppLinks ? { links: inAppLinks } : {})} />
+                  {drawReply(streaming, null)}
                 </div>
               ) : (
                 <div

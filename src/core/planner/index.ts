@@ -3,3 +3,4 @@ export * from './course';
 export * from './draft';
 export * from './name';
 export * from './protocol';
+export * from './situation';

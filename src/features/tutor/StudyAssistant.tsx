@@ -11,10 +11,12 @@ import {
   useState,
   useSyncExternalStore,
 } from 'react';
+import { Segmented } from '@/components/ui/Segmented';
 import type { AssistantContext } from '@/core/ports/assistant';
 import { cn } from '@/lib/cn';
 import type { PathIndexEntry } from './learner-situation';
 import { pageGuide } from './page-guide';
+import { PLANNER_KEY, resetPlanner, setScoutMode, useScoutMode } from './planner/planner-store';
 import { ScoutMark } from './ScoutMark';
 import {
   appendMessage,
@@ -35,6 +37,14 @@ import {
 // open, not with every page: the button alone is all a page pays for
 // (tests/e2e/bundle-budget.spec.ts).
 const ScoutPanel = lazy(() => import('./ScoutPanel').then((m) => ({ default: m.ScoutPanel })));
+const PlannerPanel = lazy(() =>
+  import('./planner/PlannerPanel').then((m) => ({ default: m.PlannerPanel })),
+);
+
+const MODES = [
+  { value: 'ask', label: 'Ask' },
+  { value: 'plan', label: 'Plan' },
+] as const;
 
 const TUTOR_STARTERS = [
   'Explain this step in plain words',
@@ -51,8 +61,6 @@ const HIDDEN = [
   /^\/practise\/online-test\//,
   /^\/practise\/(exam|checkpoint|test-out)\//,
   /^\/print\//,
-  // Choosing lessons for a path asks nothing of a tutor, and its bar owns the bottom edge.
-  /^\/learn\/build$/,
 ];
 
 const FOCUS = 'focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent';
@@ -158,11 +166,19 @@ export function StudyAssistant({
   // True only for the render in which the learner opened the panel; spent once it mounts.
   const opening = useTutorFocusRequest();
 
-  const key = scope?.key ?? `page:${pathname}`;
+  // Plan mode has one conversation, the same on every page, so planning goes on while the
+  // learner looks around the course.
+  const mode = useScoutMode();
+  const planning = mode === 'plan';
+  const key = planning ? PLANNER_KEY : (scope?.key ?? `page:${pathname}`);
   const history = useHistory(key);
   // "New chat" never loses a conversation by surprise: the cleared one waits here until the
   // next question, so Undo can put it back.
-  const [cleared, setCleared] = useState<{ key: string; messages: TutorMessage[] } | null>(null);
+  const [cleared, setCleared] = useState<{
+    key: string;
+    messages: TutorMessage[];
+    undoPlanner?: () => void;
+  } | null>(null);
   const canUndo = cleared?.key === key && history.length === 0;
 
   // Command or Ctrl and J opens and closes Scout AI from anywhere; Escape closes it. A
@@ -284,26 +300,39 @@ export function StudyAssistant({
           >
             <ScoutMark size={20} />
             <h2 className="text-sm font-semibold">Scout AI</h2>
+            <Segmented
+              label="Scout mode"
+              hideLabel
+              inline
+              options={MODES}
+              value={mode}
+              onChange={setScoutMode}
+              className="ml-0.5 w-15 shrink-0"
+            />
             <p className="text-muted min-w-0 flex-1 truncate text-sm">
-              <span className="sr-only">on </span>
-              {scope?.title ?? guide?.title}
+              {planning ? null : (
+                <>
+                  <span className="sr-only">on </span>
+                  {scope?.title ?? guide?.title}
+                </>
+              )}
             </p>
             {history.length > 0 ? (
               <button
                 type="button"
                 onClick={() => {
-                  setCleared({ key, messages: history });
+                  setCleared({
+                    key,
+                    messages: history,
+                    ...(planning ? { undoPlanner: resetPlanner() } : {}),
+                  });
                   clearHistory(key);
                 }}
-                title="Start a new conversation. You can undo it."
-                className={cn(
-                  'text-muted hover:text-fg hover:bg-raised rounded-control inline-flex h-4 shrink-0 items-center gap-0.5 px-1 text-sm font-medium',
-                  'transition-press active:scale-98',
-                  FOCUS,
-                )}
+                aria-label="New chat"
+                title="New chat. You can undo it."
+                className={ICON_BUTTON}
               >
                 <Plus aria-hidden size={16} strokeWidth={2} />
-                New chat
               </button>
             ) : null}
             <button
@@ -326,6 +355,7 @@ export function StudyAssistant({
                 type="button"
                 onClick={() => {
                   restoreHistory(key, cleared.messages);
+                  cleared.undoPlanner?.();
                   setCleared(null);
                 }}
                 className={cn(
@@ -348,32 +378,45 @@ export function StudyAssistant({
                   </div>
                 }
               >
-                <ScoutPanel
-                  pathname={pathname}
-                  paths={paths}
-                  {...(latestNews ? { latestNews } : {})}
-                  onFollowLink={followLink}
-                  context={context}
-                  transcript={history}
-                  onMessage={(message) => appendMessage(key, message)}
-                  {...(guide
-                    ? {
-                        greeting: 'Where do you want to go?',
-                        intro:
-                          'Scout AI knows the whole app and this page. Ask where something is, where to start, or what to do next.',
-                        placeholder: 'Ask Scout AI about the course',
-                        suggestions: guide.starters,
-                      }
-                    : {
-                        greeting: 'What would you like to understand?',
-                        intro:
-                          'Scout AI sees the step you are on. Ask about an idea, the code or the exercise.',
-                        placeholder: 'Ask Scout AI about this step',
-                        suggestions: TUTOR_STARTERS,
-                      })}
-                  thinkingMark={<ScoutMark size={16} thinking />}
-                  autoFocus={focusOnOpen}
-                />
+                {planning ? (
+                  <PlannerPanel
+                    pathname={pathname}
+                    paths={paths}
+                    {...(latestNews ? { latestNews } : {})}
+                    onFollowLink={followLink}
+                    transcript={history}
+                    onMessage={(message) => appendMessage(key, message)}
+                    thinkingMark={<ScoutMark size={16} thinking />}
+                    autoFocus={false}
+                  />
+                ) : (
+                  <ScoutPanel
+                    pathname={pathname}
+                    paths={paths}
+                    {...(latestNews ? { latestNews } : {})}
+                    onFollowLink={followLink}
+                    context={context}
+                    transcript={history}
+                    onMessage={(message) => appendMessage(key, message)}
+                    {...(guide
+                      ? {
+                          greeting: 'Where do you want to go?',
+                          intro:
+                            'Scout AI knows the whole app and this page. Ask where something is, where to start, or what to do next.',
+                          placeholder: 'Ask Scout AI about the course',
+                          suggestions: guide.starters,
+                        }
+                      : {
+                          greeting: 'What would you like to understand?',
+                          intro:
+                            'Scout AI sees the step you are on. Ask about an idea, the code or the exercise.',
+                          placeholder: 'Ask Scout AI about this step',
+                          suggestions: TUTOR_STARTERS,
+                        })}
+                    thinkingMark={<ScoutMark size={16} thinking />}
+                    autoFocus={focusOnOpen}
+                  />
+                )}
               </Suspense>
             )}
           </KeepFirst>

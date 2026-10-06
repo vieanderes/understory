@@ -1,0 +1,340 @@
+id: integrations.paging-through
+title: Reading everything, page by page
+objective: Read every record from a paged API with a tie-broken keyset cursor, so rows that share a timestamp are never skipped.
+level: advanced
+minutes: 10
+concepts: [integrations.cursor-tie-breaker, integrations.async-pagination, integrations.updated-after-filter]
+prerequisites: [integrations.systems-you-dont-control, backend.api-design]
+opening:
+  text: >-
+    You'll read every record a vendor has, page by page, without skipping or repeating one.
+    Lose a single row and nobody notices for weeks, so this is worth getting exactly right.
+
+steps:
+  - type: prose
+    id: reading-a-vendor-page-by-page
+    body: >-
+      In API design you served pages with a cursor. Now you're the client. A library syncs
+      its catalogue from a vendor each night, and only wants books that changed.
+
+
+      So it asks for `?updated_since=2026-10-01T00:00:00Z`, an **updated-after filter**. The
+      vendor sorts by `updated_at` and sends 100 books at a time. The next page starts after
+      the last book's timestamp. That's a **keyset cursor**: a value, not a position.
+
+  - type: predict-output
+    id: predict-skipped-book
+    concept: integrations.cursor-tie-breaker
+    difficulty: 1
+    language: text
+    code: |
+      id  updated_at
+      b1  10:00:04
+      b2  10:00:05   <- page 1 ends here
+      b3  10:00:05
+      b4  10:00:06
+
+      page 2: updated_at > 10:00:05
+    question: Which book does the sync never see?
+    choices:
+      - text: '`b3`'
+        correct: true
+        feedback: >-
+          Yes. It shares `b2`'s timestamp, so "after 10:00:05" steps right over it.
+      - text: '`b4`'
+        feedback: >-
+          `b4` is after 10:00:05, so page 2 starts with it. The loss is quieter than that.
+      - text: None, the cursor keeps its place
+        feedback: >-
+          Most people expect that. But a timestamp isn't unique, so it can't mark a single row.
+      - text: '`b2`, it comes again'
+        feedback: >-
+          That would happen with `>=`. With `>`, `b2` is safe and its twin is lost.
+
+  - type: prose
+    id: add-a-tie-breaker
+    body: >-
+      Timestamps collide all the time: bulk imports, rounding to the second, one transaction
+      touching many rows. So the cursor needs a **tie-breaker**, a unique column such as the
+      `id`.
+
+
+      Sort by `(updated_at, id)`, and start each page after that pair. Two books can share a
+      time, but never a time and an id.
+
+  - type: fill-blank
+    id: fill-pair-cursor
+    concept: integrations.cursor-tie-breaker
+    difficulty: 2
+    language: sql
+    prompt: >-
+      Your own API pages the synced books for the library's app. `$1` and `$2` are the last
+      book's `updated_at` and `id`. Fill the gaps, so ties are never skipped.
+    template: |
+      SELECT id, title, updated_at
+      FROM books
+      WHERE (updated_at, {{1}}) > ($1, $2)
+      ORDER BY {{2}}
+      LIMIT 100;
+    blanks:
+      - key: '1'
+        answer: id
+      - key: '2'
+        answer: updated_at, id
+    bank: [id, title, 'updated_at, id', updated_at, 'id, updated_at']
+
+  - type: multiple-choice
+    id: pick-inclusive-filter
+    concept: integrations.updated-after-filter
+    difficulty: 2
+    question: The vendor's `updated_since` is inclusive. You pass the last book's timestamp. What comes back first?
+    choices:
+      - text: The last book you already have
+        correct: true
+        feedback: >-
+          Right. "At or after" includes it, so you must skip what you've seen.
+      - text: The next book after it
+        feedback: >-
+          That's an exclusive filter. Inclusive means "at or after", so your last book returns.
+      - text: Nothing, the vendor refuses repeats
+        feedback: >-
+          The vendor doesn't know what you've read. Remembering that is your job.
+
+  - type: prose
+    id: hide-the-loop-in-a-generator
+    body: >-
+      Callers shouldn't juggle cursors. An **async generator**, written `async function*`,
+      hides the page loop. Each `yield` hands one record out, and the caller reads them with
+      `for await (const book of paginate(...))`.
+
+
+      It's lazy: a page is fetched only when the caller wants more. Many vendors give the next
+      page as a `Link` header, `<https://...>; rel="next"`. No link, no more pages.
+
+  - type: parsons
+    id: arrange-link-generator
+    concept: integrations.async-pagination
+    difficulty: 3
+    language: ts
+    prompt: >-
+      Arrange a generator that yields every loan, following the `Link` header. `LoansPage` is a
+      zod schema, and `nextLink(header)` returns the URL marked `rel="next"`, or `null`.
+    blocks:
+      - id: open-generator
+        code: 'async function* allLoans(firstUrl: string) {'
+        subgoal: Start at the first page
+      - id: init-url
+        code: 'let url: string | null = firstUrl;'
+        indent: 1
+      - id: loop-pages
+        code: 'while (url) {'
+        indent: 1
+        subgoal: Fetch and check each page
+      - id: fetch-page
+        code: 'const response = await fetch(url, { signal: AbortSignal.timeout(10_000) });'
+        indent: 2
+      - id: parse-page
+        code: 'const page = LoansPage.parse(await response.json());'
+        indent: 2
+      - id: yield-loans
+        code: 'for (const loan of page.loans) yield loan;'
+        indent: 2
+        subgoal: Hand out each loan
+      - id: follow-link
+        code: 'url = nextLink(response.headers.get("link"));'
+        indent: 2
+        subgoal: Follow the next link
+      - id: close-loop
+        code: '}'
+        indent: 1
+      - id: close-generator
+        code: '}'
+    distractors:
+      - id: return-loan
+        code: 'for (const loan of page.loans) return loan;'
+        feedback: >-
+          `return` ends the generator, so the caller gets one loan and no more.
+      - id: url-from-id
+        code: 'url = page.loans.at(-1)?.id ?? null;'
+        feedback: >-
+          A loan's id isn't an address. The vendor names the next page in the header.
+
+  - type: ai-review
+    id: review-short-page-stop
+    concept: integrations.async-pagination
+    difficulty: 3
+    language: ts
+    request: Raise the page size of the catalogue sync to cut round trips.
+    flawClass: edge-case
+    code: |
+      const LIMIT = 500; // was 100
+
+      async function* changedBooks(since: string) {
+        let cursor: string | null = null;
+        while (true) {
+          const page = await vendor.books({ updatedSince: since, cursor, limit: LIMIT });
+          for (const book of page.items) yield book;
+          if (page.items.length < LIMIT) return;
+          cursor = page.nextCursor;
+        }
+      }
+    prompt: >-
+      Tests with 20 fixture books passed. That night 4,000 books changed, and only 100
+      arrived. The vendor docs mention a maximum page size of 100. Tap the line at fault.
+    lines: [8]
+    reasons:
+      - text: A short page doesn't mean the last page
+        correct: true
+        feedback: >-
+          Yes. The vendor capped pages at 100 without a word. Stop when `nextCursor` is null.
+      - text: Asking for 500 trips the rate limit
+        feedback: >-
+          A rate limit answers `429`, which would throw. Here every call worked.
+      - text: '`since` should move forward each page'
+        feedback: >-
+          With a cursor, `since` stays put. The cursor carries the position between pages.
+    fix: |
+      for (const book of page.items) yield book;
+      if (page.nextCursor === null) return;
+      cursor = page.nextCursor;
+    verify:
+      question: Which test would have caught this?
+      choices:
+        - text: A fake vendor that caps pages at 100
+          correct: true
+          feedback: >-
+            That's how the real vendor behaved. The loop stops after one page.
+        - text: Twenty fixture books on one page
+          feedback: >-
+            That test already ran. Twenty books fit in one page, so stopping early looks right.
+        - text: A fake vendor with no books
+          feedback: >-
+            One empty page ends the loop either way. Both versions pass.
+
+  - type: code-challenge
+    id: write-paginate
+    concept: integrations.cursor-tie-breaker
+    difficulty: 4
+    language: ts
+    editable: '11-18'
+    prompt: >-
+      Write the generator `paginate(fetchPage, since, limit)`. `fetchPage(updatedSince, limit)`
+      returns `{ books, hasMore }`, with books at or after `updatedSince`, sorted by
+      `(updatedAt, id)`.
+
+
+      Yield every book once, in order. Remember the last `(updatedAt, id)` you yielded, and
+      skip books at or before it. Ask for the next page from its `updatedAt`. Stop when
+      `hasMore` is false. If a page with `hasMore` brings nothing new, a whole page shares one
+      timestamp and you can't move on: throw an error whose message contains `share`.
+    hints:
+      - The skip test compares the pair. A book is seen if its time is earlier, or equal with an id that isn't greater.
+      - Count the books you yield from each page. Zero new books with `hasMore` would fetch the same page for ever.
+      - "Start with `let last: { updatedAt: string; id: string } | null = null;` and update it right before each `yield`."
+
+  - type: explain-back
+    id: defend-pair-cursor
+    concept: integrations.cursor-tie-breaker
+    difficulty: 4
+    audience: reviewer
+    kind: decide
+    prompt: >-
+      A reviewer asks why `paginate` tracks the last id too, when the vendor already filters by
+      `updated_since`. Defend the choice, and name what it costs.
+    rubric:
+      - Timestamps aren't unique, so a timestamp alone either skips ties or repeats them.
+      - The pair (updated_at, id) is unique, so skipping up to it yields each book exactly once.
+      - The cost is extra state, and a whole page on one timestamp can't advance, so it throws.
+    modelAnswer: >-
+      Many books can share an `updated_at`. An exclusive filter would skip ties at a page
+      boundary. An inclusive one, like this vendor's, sends them twice. The pair of timestamp
+      and id is unique. So skipping up to the last pair gives each book exactly once. The cost
+      is a little state. And if a whole page shares one timestamp, we can't advance. Then we
+      throw loudly instead of looping or losing rows.
+
+recap:
+  - Page with a keyset cursor of `(updated_at, id)`, because timestamps alone collide.
+  - Skip what you've already seen when the vendor's filter is inclusive.
+  - Hide the page loop in an async generator, and stop on the vendor's own end signal.
+
+recall:
+  - id: card-tie-breaker
+    concept: integrations.cursor-tie-breaker
+    front: Why does a keyset cursor on `updated_at` alone lose rows?
+    back: >-
+      Several rows can share a timestamp. "After this time" skips the ones on the boundary that
+      the last page didn't include.
+  - id: card-inclusive-filter
+    concept: integrations.updated-after-filter
+    front: An `updated_since` filter is inclusive. What must the client do between pages?
+    back: >-
+      Skip records at or before the last `(updated_at, id)` it yielded, because the next page
+      starts with them again.
+  - id: card-generator
+    concept: integrations.async-pagination
+    front: What does an async generator give the caller of a paged API?
+    back: >-
+      One record at a time through `for await`, with no cursor handling. Pages are fetched only
+      as the caller asks for more.
+  - id: card-end-signal
+    concept: integrations.async-pagination
+    front: How should a pager decide it has reached the last page?
+    back: >-
+      From the vendor's own signal: no next cursor, `hasMore: false`, or no `rel="next"` link.
+      A short page can be a silent cap.
+
+references:
+  - kind: rfc
+    title: 'RFC 8288: Web Linking'
+    authors: M. Nottingham
+    year: 2017
+    venue: IETF
+    url: https://www.rfc-editor.org/rfc/rfc8288
+    note: The `Link` header and its `rel="next"` relation.
+    primary: true
+    verified: false
+  - kind: docs
+    title: Row and Array Comparisons
+    authors: PostgreSQL Global Development Group
+    venue: PostgreSQL documentation
+    url: https://www.postgresql.org/docs/current/functions-comparisons.html
+    note: How `(a, b) > (x, y)` compares a row constructor, field by field.
+    primary: true
+    verified: false
+  - kind: essay
+    title: Paging Through Results
+    authors: Markus Winand
+    venue: Use The Index, Luke
+    url: https://use-the-index-luke.com/sql/partial-results/fetch-next-page
+    note: The seek method, why it needs a unique sort, and why it beats offsets.
+    verified: false
+  - kind: docs
+    title: for await...of
+    authors: MDN contributors
+    venue: MDN Web Docs
+    url: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Statements/for-await...of
+    note: Reading an async generator, and what `break` does to it.
+    verified: false
+
+deepDive: >-
+  When the loop leaves a `for await` early, through `break`, `return` or a throw, JavaScript
+  calls the generator's `return()`. The generator resumes as if `yield` were a `return`, runs
+  any `finally` blocks and stops. So put clean-up in `finally`, and an abandoned read won't
+  leave anything open.
+
+
+  A keyset cursor has a second trap: a record can move while you read. If book `b9` is edited
+  during the sync, its `updated_at` jumps past your cursor, and a later page shows it again.
+  That's harmless if you upsert by id. What a keyset can miss is a row committed late with an
+  older timestamp, and the lesson on full and delta sync deals with that.
+
+
+  Opaque cursors, the ones that look like `eyJ0IjoiMTA6MDA6MDUifQ`, are usually this same pair
+  encoded by the vendor. Treat them as opaque anyway: store them, pass them back, never build
+  one. A vendor may also expire cursors after minutes or hours, so a sync that pauses
+  overnight may have to restart from its last saved timestamp.
+
+
+  In RFC 8288 the `Link` header can hold several links, such as `rel="next"` and
+  `rel="last"`, separated by commas. Parse it properly, or a link with a comma in its URL
+  will break a naive `split(",")`.

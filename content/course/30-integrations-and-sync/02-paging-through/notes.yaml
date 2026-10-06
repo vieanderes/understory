@@ -1,0 +1,168 @@
+summary: >-
+  A sync starts by reading. Reading everything a vendor holds, or everything that changed
+  since last night, means walking through pages, and the walk has to be exact: every record
+  once, none skipped, none forever repeated. A missed row is the worst kind of bug, because
+  nothing fails. The copy is quietly incomplete.
+
+
+  The tool is a **keyset cursor**: each page starts after a value from the last row, not
+  after a count of rows. On a timestamp alone that breaks, because timestamps collide, so the
+  cursor carries a unique tie-breaker such as the id, and the sort uses the same pair. When a
+  vendor only offers an inclusive `updated_since` filter, the client does the tie-breaking
+  itself, skipping what it has already seen.
+
+
+  Around that sits an async generator, so the rest of the code reads records one at a time
+  with `for await` and never touches a cursor. It stops on the vendor's own end signal, never
+  on a short page, and it surfaces the one case it can't solve, a whole page on one
+  timestamp, as an error instead of a loop.
+remember:
+  - A keyset cursor on a timestamp alone skips or repeats rows that share it, so add a unique tie-breaker such as the id.
+  - Sort by the same pair you compare, `ORDER BY updated_at, id`, or the cursor and the order disagree.
+  - With an inclusive `updated_since` filter, skip records at or before the last `(updated_at, id)` you yielded.
+  - Stop paging on the vendor's end signal, such as no next cursor, `hasMore` false or no `rel="next"` link, never on a short page.
+  - An async generator hides the page loop and fetches lazily, and a `break` in `for await` closes it and runs its `finally`.
+  - If a whole page shares one timestamp and the filter can't go past it, throw, because looping or skipping are both silent failures.
+  - Treat a vendor's opaque cursor as opaque, and store it and pass it back but never decode or build one.
+sections:
+  - title: The pair cursor in SQL, and why the index matters
+    body: |-
+      When you control the query, as for your own copy of the data, the pair cursor is one
+      row comparison. PostgreSQL compares row constructors field by field, left to right, so
+      `(updated_at, id) > ($1, $2)` means "a later time, or the same time with a larger id".
+
+      ```sql
+      CREATE INDEX books_updated_id ON books (updated_at, id);
+
+      SELECT id, title, updated_at
+      FROM books
+      WHERE (updated_at, id) > ($1, $2)
+      ORDER BY updated_at, id
+      LIMIT 100;
+      ```
+
+      With an index on the same pair in the same order, the database jumps straight to the
+      cursor and reads 100 entries. That's why keyset paging costs the same on page 1 and
+      page 4,000, while `OFFSET 400000` reads and throws away 400,000 rows first.
+
+      Writing the comparison out by hand, `updated_at > $1 OR (updated_at = $1 AND id > $2)`,
+      means the same, but some planners use the index less well for the `OR` form. Prefer the
+      row comparison where your database supports it.
+
+      Two details bite. Both columns must be `NOT NULL`, because a comparison with null is
+      neither true nor false, and those rows vanish from every page. And the precision must
+      match: PostgreSQL stores microseconds, JavaScript's `Date` keeps milliseconds. A cursor
+      that went through a `Date` can land a fraction before or after the row it came from. Pass
+      the timestamp back as the exact string you received.
+  - title: Following Link headers without a fragile split
+    body: |-
+      RFC 8288 lets one `Link` header carry several links, each a URL in angle brackets
+      followed by parameters. A comma separates links, but a URL may contain a comma too, so
+      `header.split(",")` breaks on the first query string with a list in it. And `rel` can
+      hold several space-separated relation types.
+
+      ```ts
+      // Returns the URL whose rel list includes "next", or null.
+      export function nextLink(header: string | null): string | null {
+        if (!header) return null;
+        for (const match of header.matchAll(/<([^>]*)>((?:\s*;\s*[^;,]+)*)/g)) {
+          const rel = /;\s*rel\s*=\s*"?([^";]+)"?/i.exec(match[2] ?? '')?.[1];
+          if (rel?.toLowerCase().split(/\s+/).includes('next')) return match[1] ?? null;
+        }
+        return null;
+      }
+
+      nextLink('<https://api.example.com/loans?page=3>; rel="next", <https://api.example.com/loans?page=9>; rel="last"');
+      // https://api.example.com/loans?page=3
+      nextLink('<https://api.example.com/loans?page=1>; rel="prev first"');
+      // null
+      nextLink('<https://api.example.com/loans?tags=a,b&page=4>; rel="next"');
+      // https://api.example.com/loans?tags=a,b&page=4
+      ```
+
+      This handles the common shapes, not every corner of the grammar. A link target can
+      also be relative, resolved against the request URL, so pass it through
+      `new URL(target, requestUrl)` before fetching. And check the host is the vendor's
+      before following it, so a tampered header can't send your token somewhere else.
+  - title: Generators, early exits and clean-up
+    body: |-
+      A generator only runs when someone asks for the next value. That gives a sync two
+      useful properties: memory stays at one page however many records there are, and a
+      caller that stops early stops the fetching too.
+
+      ```ts
+      async function* pages() {
+        try {
+          for (let page = 1; ; page++) {
+            console.log(`fetching page ${page}`);
+            yield* [`loan ${page}a`, `loan ${page}b`];
+          }
+        } finally {
+          console.log('generator closed');
+        }
+      }
+
+      for await (const loan of pages()) {
+        console.log(loan);
+        if (loan === 'loan 2a') break;
+      }
+      console.log('after the loop');
+      ```
+
+      It prints `fetching page 1`, `loan 1a`, `loan 1b`, `fetching page 2`, `loan 2a`, then
+      `generator closed` and `after the loop`. Page 3 is never fetched. The `break` called the
+      generator's `return()`, which ran the `finally`. A throw inside the loop body does the
+      same. So release anything the generator holds in `finally`, such as a database cursor
+      or a lease on the sync.
+
+      One trap: collecting everything first, `const all = []; for await (...) all.push(x)`,
+      throws the laziness away and holds the whole data set in memory. Process each record,
+      or each batch, as it arrives.
+pitfalls:
+  - '**A cursor on the timestamp alone.** Bulk imports and second-precision clocks put many rows on one timestamp, and `>` skips the ones past the page edge. Use `(updated_at, id)`.'
+  - '**Treating a short page as the last page.** Vendors cap page sizes silently. Ask for 500, get 100, and a loop that stops on `length < limit` reads one page. Stop on the vendor''s end signal.'
+  - '**Paging with offsets over changing data.** Rows inserted or deleted ahead of you shift every later page, so rows repeat or vanish. Use a keyset cursor for anything that changes while you read.'
+  - '**Round-tripping the cursor through `Date`.** Milliseconds lose the microseconds the database stored, so the next page starts a hair early or late. Pass the timestamp string back unchanged.'
+  - '**Collecting the generator into an array.** It defeats lazy fetching and holds every record in memory. Handle records as they stream past.'
+verify:
+  - lens: breaks
+    check: Run the pager against a fake vendor where several records share a timestamp at a page boundary, and check every id arrives exactly once.
+  - lens: breaks
+    check: Make the fake vendor cap pages below the requested size, and confirm the pager still reads to the end.
+  - lens: scales
+    check: Confirm memory stays flat while paging a million records, which fails if anything collects the generator into an array.
+  - lens: tests
+    check: Assert that a caller who breaks after the first record triggers exactly one page request.
+  - lens: leaks
+    check: Check that a next link points at the vendor's host before following it with the access token attached.
+interview:
+  - question: How would you page through a large, changing data set from a third-party API without missing records?
+    answer: >-
+      With a keyset cursor on a unique, sorted pair, usually the update timestamp plus the id.
+      Offsets shift when rows are inserted or deleted ahead of you, and a timestamp alone
+      skips rows that share it at a page boundary. If the vendor takes both values, I pass
+      the last pair. If it only offers an inclusive `updated_since`, I pass the last timestamp
+      and skip records at or before the last pair I've seen. I stop on the vendor's end signal,
+      not a short page, because page sizes get capped silently. The edge case is a whole page
+      on one timestamp, which an inclusive filter can't get past, so I raise an alert rather
+      than loop. Records edited mid-read reappear later, which is fine because writes upsert
+      by id.
+  - question: Why use an async generator for pagination instead of returning an array?
+    answer: >-
+      It separates walking the pages from using the records, and it's lazy. The caller writes
+      `for await (const record of paginate(...))` and never sees a cursor, a page size or a
+      next link. Pages are fetched only as the caller consumes them, so memory stays at one
+      page and an early `break` stops the requests. Returning an array would hold everything
+      in memory and fetch pages nobody needed. Breaking out also closes the generator and
+      runs its `finally`, so clean-up is reliable. The trade-off is that errors arrive mid
+      loop, so the consumer must be ready for a throw after it has already handled some
+      records, which a sync handles by not saving its watermark until the end.
+  - question: Offset or cursor pagination, when would you pick each?
+    answer: >-
+      Offsets suit small, stable lists where people jump to page 7, such as an admin table
+      that rarely changes. They're simple and allow random access. But each page costs more
+      than the last, because the database reads and discards the skipped rows, and inserts or
+      deletes ahead of you shift every later page. Cursors suit large or changing data, infinite
+      scroll and syncs: each page costs the same with the right index, and nothing shifts. The
+      cost is no "jump to page N" and a cursor that must include a unique tie-breaker. For
+      anything a machine reads end to end, I use cursors.

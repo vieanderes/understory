@@ -1,0 +1,286 @@
+id: integrations.tokens-that-expire
+title: Tokens that expire
+objective: "Keep an access token fresh for many callers with one refresh, handle rotation, and send the user back to sign in on `invalid_grant`."
+level: advanced
+minutes: 10
+concepts: [integrations.proactive-refresh, integrations.single-flight-refresh, integrations.refresh-token-rotation, integrations.granted-scopes]
+prerequisites: [backend.oauth-and-passkeys, scale.race-conditions, integrations.systems-you-dont-control]
+opening:
+  text: >-
+    You'll keep a vendor connection signed in for months, with one token refresh however many
+    jobs need it at once. Get this wrong and your customers get logged out at 3am.
+
+steps:
+  - type: prose
+    id: two-tokens
+    body: >-
+      In the OAuth lesson, the redirect flow ended with tokens. Now you keep them alive. A gym
+      connects its booking vendor once, and your sync calls that vendor every hour.
+
+
+      The **access token** goes on every call and expires soon, often in an hour. The
+      **refresh token** lasts longer, and buys a new access token from the vendor's token
+      endpoint with `grant_type=refresh_token`.
+
+  - type: predict-output
+    id: predict-token-dies-mid-job
+    concept: integrations.proactive-refresh
+    difficulty: 1
+    language: ts
+    code: |
+      const token = await getAccessToken(gymId); // valid for 20 more seconds
+      for (const classId of classIds) {          // 300 classes, about one a second
+        await fetchBookings(classId, token);
+      }
+    question: What happens partway through the loop?
+    choices:
+      - text: Calls start failing with `401`
+        correct: true
+        feedback: >-
+          Yes. The token was read once and outlived. Ask for it per call instead.
+      - text: The vendor extends the token while it's used
+        feedback: >-
+          Access tokens have a fixed lifetime. Using one doesn't stretch it.
+      - text: '`getAccessToken` refreshes it in the background'
+        feedback: >-
+          It ran once, before the loop. Nothing calls it again, so nothing refreshes.
+
+  - type: prose
+    id: refresh-early
+    body: >-
+      The token reply says how long it lives: `expires_in`, in seconds. Turn it into a
+      deadline the moment it arrives.
+
+
+      Then refresh **before** the deadline, with a margin of a minute or so. Clocks drift,
+      and a request takes time to land. Still handle a `401` too: refresh once, retry once.
+      A token can be revoked early.
+
+  - type: fill-blank
+    id: fill-refresh-margin
+    concept: integrations.proactive-refresh
+    difficulty: 2
+    language: ts
+    prompt: >-
+      Treat a token as stale a minute before it expires, and turn `expires_in` into a deadline
+      in milliseconds. Fill the gaps.
+    template: |
+      const MARGIN_MS = 60_000;
+
+      function isFresh(connection: Connection, now: number): boolean {
+        return now < connection.expiresAt - {{1}};
+      }
+
+      function expiryFrom(reply: TokenReply, now: number): number {
+        return now + reply.expires_in * {{2}};
+      }
+    blanks:
+      - key: '1'
+        answer: MARGIN_MS
+      - key: '2'
+        answer: '1000'
+    bank: [MARGIN_MS, '0', '1000', '60', '3600']
+
+  - type: prose
+    id: rotation-and-the-race
+    body: >-
+      Many vendors **rotate** refresh tokens: each refresh returns a new one, and the old one
+      dies.
+
+
+      Now two jobs find the token stale at once. Both send the same refresh token. One wins.
+      The other gets `invalid_grant`, OAuth's error for "this grant is no good". Some vendors
+      then revoke the whole connection. The fix is a **single-flight refresh**: one refresh
+      per connection, and everyone waits for it.
+
+  - type: ai-review
+    id: review-late-promise
+    concept: integrations.single-flight-refresh
+    difficulty: 3
+    language: ts
+    request: Make the token refresh safe when many sync jobs run at once.
+    flawClass: race
+    code: |
+      const refreshing = new Map<string, Promise<Token>>();
+
+      async function freshToken(gymId: string): Promise<Token> {
+        const stored = await tokens.load(gymId);
+        if (Date.now() < stored.expiresAt - MARGIN_MS) return stored;
+        const pending = refreshing.get(gymId);
+        if (pending) return pending;
+        const next = await refreshWith(stored.refreshToken);
+        refreshing.set(gymId, Promise.resolve(next));
+        await tokens.save(gymId, next);
+        refreshing.delete(gymId);
+        return next;
+      }
+    prompt: >-
+      Its tests call it once at a time, and pass. In production, 20 class syncs run in
+      parallel, and gyms keep getting disconnected. Tap the line at fault.
+    lines: [8]
+    reasons:
+      - text: Each caller awaits its own refresh before sharing it
+        correct: true
+        feedback: >-
+          Yes. The map gets the promise after the refresh ends. Store it before awaiting.
+      - text: The margin is too small for 20 jobs
+        feedback: >-
+          A bigger margin moves the moment, not the race. All 20 still refresh together.
+      - text: The token should be saved before refreshing
+        feedback: >-
+          There's nothing new to save until the vendor answers. The gap is in the map.
+    fix: |
+      let pending = refreshing.get(gymId);
+      if (!pending) {
+        pending = refreshWith(stored.refreshToken).finally(() => refreshing.delete(gymId));
+        refreshing.set(gymId, pending);
+      }
+      return pending;
+    verify:
+      question: Which test would have caught this?
+      choices:
+        - text: Five calls at once, expecting one refresh
+          correct: true
+          feedback: >-
+            That's production's shape. The flawed code makes five refreshes, and the test fails.
+        - text: One call with an expired token
+          feedback: >-
+            One caller refreshes once with either version. The race needs company.
+        - text: Two calls, the second after the first
+          feedback: >-
+            The second finds a fresh token and never refreshes. No overlap, no race.
+
+  - type: multiple-choice
+    id: pick-silent-scope
+    concept: integrations.granted-scopes
+    difficulty: 3
+    question: A gym connected with a "front desk" API role. Paid classes show no bookings, and no call fails. Likely cause?
+    choices:
+      - text: The role can't see paid bookings
+        correct: true
+        feedback: >-
+          Yes. Vendors often filter by permission without an error. Check what was granted.
+      - text: The access token expired mid-sync
+        feedback: >-
+          An expired token fails loudly with `401`. Here every call worked.
+      - text: The cursor skipped those classes
+        feedback: >-
+          A cursor bug loses rows at page edges. It wouldn't pick out exactly the paid ones.
+      - text: The vendor rate-limited the sync
+        feedback: >-
+          Rate limits answer `429`. Nothing failed, so the data was filtered, not refused.
+
+  - type: code-challenge
+    id: write-get-access-token
+    concept: integrations.single-flight-refresh
+    difficulty: 5
+    language: ts
+    editable: '27-34'
+    prompt: >-
+      Write `getAccessToken(connectionId)`, which `createTokenSource(store, refresh, now,
+      marginMs)` returns. If the stored token is valid for longer than `marginMs`, return it.
+      Otherwise refresh and save the new access token and `expiresAt: now() + expires_in *
+      1000`. Save the new refresh token too, or keep the old one if none came back.
+
+
+      Calls for one connection share a single promise. Keep it in a `Map` until it settles,
+      and read the store inside it. On an `OAuthError` with code `invalid_grant`, save
+      `needsReconnect: true` and throw `NeedsReconnectError`. A connection already marked
+      throws at once. For example, five calls at once on an expired token make one refresh. A
+      `Map` covers one process. Several workers would need a lock in the database.
+    hints:
+      - Split it in two. An inner async function reads, checks and refreshes. The outer one only manages the map.
+      - The outer function must put the promise in the map before anything awaits, and remove it with `.finally()`.
+      - "Start the outer one with `const running = inFlight.get(connectionId); if (running) return running;`"
+
+  - type: explain-back
+    id: incident-rotation-race
+    concept: integrations.refresh-token-rotation
+    difficulty: 4
+    audience: incident
+    kind: risk
+    prompt: >-
+      Overnight, 40 gyms were disconnected after the sync went from one worker process to
+      four. Write the incident update: what went wrong, and how you'll check the fix.
+    rubric:
+      - Rotation makes each refresh token single use, so two workers refreshing at once spent one twice.
+      - The loser got `invalid_grant`, and the vendor revoked the connection, so gyms must reconnect.
+      - An in-memory lock covers one process, so add a per-connection lock in the database and test with parallel workers.
+    modelAnswer: >-
+      The vendor rotates refresh tokens, so each works once. With four workers, two refreshed
+      the same connection at the same moment. One won, the other got `invalid_grant`, and the
+      vendor revoked the connection as a suspected theft. Our single-flight lock lives in one
+      process's memory, so it couldn't see the other workers. Fix: take a per-connection lock
+      in the database before refreshing, and re-read the token after taking it. We'll prove it
+      with four workers refreshing at once.
+
+recap:
+  - Turn `expires_in` into a deadline and refresh a minute early, while still handling a `401`.
+  - Share one refresh per connection, so a rotated refresh token is never spent twice.
+  - Treat `invalid_grant` as "needs reconnect", and check the scopes you were granted.
+
+recall:
+  - id: card-refresh-margin
+    concept: integrations.proactive-refresh
+    front: Why refresh an access token before its `expires_in` runs out?
+    back: >-
+      Clocks drift and requests take time, so a token that's valid when sent can be expired on
+      arrival. A margin of about a minute avoids the `401`.
+  - id: card-single-flight
+    concept: integrations.single-flight-refresh
+    front: Five jobs find the same token stale at once. What should happen?
+    back: >-
+      One refresh runs, and the other four await its promise. That needs the promise stored
+      before anything awaits.
+  - id: card-invalid-grant
+    concept: integrations.refresh-token-rotation
+    front: What should a client do when a refresh returns `invalid_grant`?
+    back: >-
+      Stop retrying and mark the connection "needs reconnect". The refresh token is dead, so
+      only the user signing in again can fix it.
+  - id: card-scopes
+    concept: integrations.granted-scopes
+    front: How can a client notice it was granted less access than it asked for?
+    back: >-
+      Read the `scope` field in the token reply and compare it with what it requested. Vendors
+      may filter data by role without any error.
+
+references:
+  - kind: rfc
+    title: 'RFC 6749: The OAuth 2.0 Authorization Framework'
+    authors: D. Hardt
+    year: 2012
+    venue: IETF
+    url: https://www.rfc-editor.org/rfc/rfc6749
+    note: Refreshing (section 6), `expires_in` and `scope` in the token reply (5.1), and `invalid_grant` (5.2).
+    primary: true
+    verified: false
+  - kind: rfc
+    title: 'RFC 9700: Best Current Practice for OAuth 2.0 Security'
+    authors: T. Lodderstedt, J. Bradley, A. Labunets, D. Fett
+    year: 2025
+    venue: IETF
+    url: https://www.rfc-editor.org/rfc/rfc9700
+    note: Refresh token rotation, and why reuse of an old token revokes the active one.
+    primary: true
+    verified: false
+
+deepDive: >-
+  RFC 6749 lets a server issue a new refresh token on each refresh, and then the client must
+  discard the old one. RFC 9700 requires servers to protect the refresh tokens of public
+  clients, which can't keep a secret, by binding them to the client or by rotating them. When
+  a rotated token is used again, the server can't tell the thief from the real client, so it
+  revokes the active token. That's why the race in this lesson disconnects
+  people instead of failing one request.
+
+
+  Machine-to-machine calls, with no user at all, use the **client credentials** grant. Your
+  server sends its client id and secret to the token endpoint and gets an access token,
+  normally without a refresh token. When it expires, you ask again. Single flight still helps,
+  because a hundred jobs asking at once is a hundred calls to a rate-limited endpoint.
+
+
+  Some vendors skip OAuth's scopes and use an **API user** with a role, set up by the
+  customer's admin. Changing that role is invisible to you. The only defence is to notice:
+  log the scopes or role you were granted, and alert when a sync suddenly returns far fewer
+  records than last time. The lesson on deletions builds a guard for exactly that.

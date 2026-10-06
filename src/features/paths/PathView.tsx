@@ -81,7 +81,13 @@ export function PathView({
               </Link>
             </nav>
           )}
-          <div className="flex flex-col gap-1 lg:flex-row lg:items-end lg:justify-between lg:gap-4">
+          {/* An own path carries more actions than fit beside its title, so they go under it. */}
+          <div
+            className={cn(
+              'flex flex-col gap-1',
+              !custom && 'lg:flex-row lg:items-end lg:justify-between lg:gap-4',
+            )}
+          >
             <div className="flex min-w-0 flex-col gap-1">
               <h1 className="t-title" data-arrive="title">
                 {path.title}
@@ -100,7 +106,12 @@ export function PathView({
               ) : null}
             </div>
             {custom && !tools ? null : (
-              <div className="-ml-2 flex shrink-0 flex-wrap items-center lg:-mr-2 lg:ml-0">
+              <div
+                className={cn(
+                  '-ml-2 flex shrink-0 flex-wrap items-center',
+                  !custom && 'lg:-mr-2 lg:ml-0',
+                )}
+              >
                 {custom ? null : (
                   <Link
                     href={`/lectures/tracks/${path.id}`}

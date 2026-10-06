@@ -257,15 +257,19 @@ export function PlannerPanel({ onMessage, onFollowLink, ...panel }: PlannerPanel
 
   return (
     <div className="relative flex min-h-0 flex-1 flex-col">
-      <ScoutPanel
-        {...panel}
-        context={context}
-        onMessage={keep}
-        onFollowLink={onFollowLink}
-        renderReply={renderReply}
-        renderEmpty={renderEmpty}
-        placeholder="Tell Scout what you want to learn"
-      />
+      {/* Behind the draft view the conversation stays mounted, so a reply on its way keeps
+          streaming, but out of reach of the keyboard and screen readers. */}
+      <div inert={viewing && draft !== undefined} className="flex min-h-0 flex-1 flex-col">
+        <ScoutPanel
+          {...panel}
+          context={context}
+          onMessage={keep}
+          onFollowLink={onFollowLink}
+          renderReply={renderReply}
+          renderEmpty={renderEmpty}
+          placeholder="Tell Scout what you want to learn"
+        />
+      </div>
       {viewing && draft && facts && course ? (
         <DraftView
           draft={draft}

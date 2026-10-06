@@ -16,7 +16,7 @@ test.describe('practice by topic', () => {
       'false',
     );
     await page.getByText('5 min', { exact: true }).click();
-    const start = page.getByRole('link', { name: 'Start', exact: true });
+    const start = page.getByRole('link', { name: /^Start · \d+ min/ });
     await expect(start).toHaveAttribute('href', '/practise/session/5?topics=python');
     await start.click();
     await expect(page).toHaveURL(/\/practise\/session\/5\?topics=python$/);

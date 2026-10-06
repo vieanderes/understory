@@ -147,10 +147,11 @@ export function PracticeHome({ parts }: { parts: PracticePart[] }) {
       <section
         aria-label="Today's practice"
         data-arrive="rise"
-        className="bg-surface border-border rounded-panel shadow-edge flex flex-col gap-3 border p-2 md:p-3"
+        className="bg-surface border-border rounded-panel shadow-edge flex flex-col gap-3 border p-3 md:p-4"
       >
-        <div className="flex flex-col gap-2 lg:flex-row lg:items-center lg:gap-4">
-          <div className="flex min-w-0 flex-1 flex-col gap-0.5" aria-live="polite">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
+          <div className="flex min-w-0 flex-col gap-1" aria-live="polite">
+            <p className="t-label">Today · {names}</p>
             {count === 0 ? (
               <>
                 <p className="text-lg font-semibold">Nothing to practise here yet</p>
@@ -158,19 +159,26 @@ export function PracticeHome({ parts }: { parts: PracticePart[] }) {
               </>
             ) : (
               <>
-                <p className="text-lg font-semibold">
-                  <span className="t-figure">{count}</span> {count === 1 ? 'question' : 'questions'}
-                  {due > 0 ? (
-                    <span className="text-muted font-normal">
-                      , <span className="t-figure">{due}</span> due first
-                    </span>
-                  ) : null}
+                <p className="flex items-baseline gap-1">
+                  <span className="t-figure text-xl leading-none">{count}</span>
+                  <span className="text-lg font-semibold">
+                    {count === 1 ? 'question' : 'questions'}
+                  </span>
                 </p>
-                <p className="text-muted truncate text-sm">{names}</p>
+                <p className="text-muted text-sm">
+                  {due > 0 ? (
+                    <>
+                      <span className="t-figure text-fg">{due}</span> due first, then{' '}
+                      <span className="t-figure">{count - due}</span> new
+                    </>
+                  ) : (
+                    'New questions, each answer explained'
+                  )}
+                </p>
               </>
             )}
           </div>
-          <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+          <div className="flex shrink-0 flex-col gap-1.5 sm:flex-row sm:items-center">
             <Segmented
               label="Length"
               hideLabel
@@ -181,7 +189,7 @@ export function PracticeHome({ parts }: { parts: PracticePart[] }) {
             />
             {count > 0 ? (
               <Link href={href} className={buttonClass('primary', 'lg', 'shrink-0')}>
-                Start
+                Start · {minutes} min
                 <ArrowRight aria-hidden size={16} strokeWidth={2} />
               </Link>
             ) : (

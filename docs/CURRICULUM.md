@@ -1,7 +1,7 @@
 # Curriculum
 
-The course holds 370 lessons. Each lesson is marked **E** (beginner-essential) or
-**A** (advanced). The count is 246 E and 119 A. A module names its lab where a moving
+The course holds 417 lessons. Each lesson is marked **E** (beginner-essential) or
+**A** (advanced). The count is 250 E and 167 A. A module names its lab where a moving
 simulation teaches what a playground cannot; the rest are hands-on through playgrounds, sql
 steps and challenges.
 
@@ -13,19 +13,21 @@ This map came out of the planning research on 2026-09-17. It is the source for
 The chapters are grouped into seven parts, each with a checkpoint, a capstone and a
 milestone at its end (`docs/LEARNING-SCIENCE.md`, C, "Parts and milestones"). The parts,
 their summaries and their capstone briefs live in `content/course/course.yaml`. The woven
-modules (17 CS fundamentals, 26 Clean code, 27 Code like a pro, 29 Next.js on the server)
-belong to no part: each of their lessons counts towards the part of the lesson it is woven
-after, so the lesson counts below include them.
+modules (17 CS fundamentals, 26 Clean code, 27 Code like a pro, 29 Next.js on the server,
+32 Engineering judgment, 33 Explaining your work) belong to no part: each of their lessons
+counts towards the part of the lesson it is woven after, so the lesson counts below include
+them. Module folders are numbered in the order they were added, so 30 Integrations sits
+after 14 Scale and 31 Agent engineering after 21 AI systems.
 
-| Part | Title                     | Modules                                                   | Lessons | Capstone                      |
-| ---- | ------------------------- | --------------------------------------------------------- | ------- | ----------------------------- |
-| 1    | First code                | 0 First steps, 1 HTML, 2 CSS                              | 29      | A reading list page           |
-| 2    | JavaScript and TypeScript | 3 JavaScript, 4 TypeScript, 5 Tooling                     | 51      | A typed shopping cart         |
-| 3    | Interfaces                | 6 React, 7 Next.js, 8 Design systems                      | 31      | A small storefront            |
-| 4    | Servers and data          | 9 Backend, 10 Databases, 11 Testing                       | 53      | A booking API                 |
-| 5    | Production                | 12 Security, 13 Performance, 14 Scale, 15 Arch., 16 Cloud | 72      | The booking API in production |
-| 6    | Python and AI engineering | 18 Python, 19 Python for AI, 20 AI eng., 21 AI systems    | 50      | A support assistant           |
-| 7    | Senior engineer           | 22 System design, 23 Patterns, 24 Atlas, 25 Career        | 37      | A design review pack          |
+| Part | Title                     | Modules                                                                    | Lessons | Capstone                      |
+| ---- | ------------------------- | -------------------------------------------------------------------------- | ------- | ----------------------------- |
+| 1    | First code                | 0 First steps, 1 HTML, 2 CSS                                               | 33      | A reading list page           |
+| 2    | JavaScript and TypeScript | 3 JavaScript, 4 TypeScript, 5 Tooling                                      | 58      | A typed shopping cart         |
+| 3    | Interfaces                | 6 React, 7 Next.js, 8 Design systems                                       | 31      | A small storefront            |
+| 4    | Servers and data          | 9 Backend, 10 Databases, 11 Testing                                        | 56      | A booking API                 |
+| 5    | Production                | 12 Security, 13 Performance, 14 Scale, 30 Integrations, 15 Arch., 16 Cloud | 94      | The booking API in production |
+| 6    | Python and AI engineering | 18 Python, 19 Python for AI, 20 AI eng., 21 AI systems, 31 Agents          | 70      | A support assistant           |
+| 7    | Senior engineer           | 22 System design, 23 Patterns, 24 Atlas, 25 Career, 28 Interviews          | 75      | A design review pack          |
 
 ## Chapters
 
@@ -34,38 +36,42 @@ matters and what the learner can build afterwards. Examples inside lessons are p
 realistic and varied (`docs/AUTHOR-BRIEF.md`, "Examples"). `module.yaml` holds the same text
 as `why` and `youCanBuild`.
 
-| Module | Why it matters                                                                                                            | You can build                                                                                                                                                       |
-| ------ | ------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 0      | Every program you'll ever write is built from these few ideas.                                                            | A small to-do list program, written from scratch.                                                                                                                   |
-| 1      | Markup decides whether a page works for search engines, screen readers and slow phones.                                   | A semantic page with a form that works without JavaScript.                                                                                                          |
-| 2      | Layout bugs are easy to cause and hard to see until a real screen shows them.                                             | A responsive layout on an 8 pt grid, with design tokens as custom properties.                                                                                       |
-| 3      | Most browser bugs start with JavaScript doing exactly what it was told.                                                   | A shopping cart with quantity rules, written unplugged.                                                                                                             |
-| 4      | Types catch whole families of bugs before the code ever runs.                                                             | A typed data model with runtime validation where data enters.                                                                                                       |
-| 5      | A build you cannot reproduce fails on the day it matters most.                                                            | A reproducible build, a lint and type-check gate, and an env schema.                                                                                                |
-| 6      | Keeping a page in step with its data by hand is where interface bugs come from. React does that part for you.             | A small React app with a form, a filtered list and data loaded from a server, each piece of state in the right place.                                               |
-| 7      | React draws a page, but a real site also needs URLs, fast first loads and a safe place for data and secrets.              | A Next.js site with several pages, a shared layout, a search box that runs in the browser and data loaded on the server.                                            |
-| 8      | An interface that some people cannot operate is a broken interface.                                                       | An accessible form, a themed component library with variants, and a dialog that handles focus.                                                                      |
-| 9      | The server is where trust, money and data meet.                                                                           | An API with sessions, ownership checks and an idempotent payment webhook handler.                                                                                   |
-| 10     | Data outlives the code that writes it, so mistakes here last longest.                                                     | A schema with keys and constraints, safe queries from code, an index that fixes a slow page, a transaction that can't half-happen, and row-level security.          |
-| 11     | Tests let you change code without fear.                                                                                   | A test suite with unit tests, integration tests on a real database, one end-to-end journey and a load test.                                                         |
-| 12     | An attacker needs only one open door.                                                                                     | A threat model, a page that shows hostile input as text, safe cookie and CORS settings, access-control tests, safe uploads, and an audit of a small app.            |
-| 13     | Slow pages lose people before they read a word.                                                                           | A page and an API measured before and after: no blocking scripts, no jumping content, no leaks, honest caches and one query instead of 201.                         |
-| 14     | Code that is correct for one user can be wrong for two at once.                                                           | A batched, rate-safe pipeline of model calls, an idempotent payment endpoint, a queue worker for long AI jobs, and a scheduled job that runs once across servers.   |
-| 15     | When every change touches twelve files, the structure is the problem.                                                     | A modular monolith refactored under tests, with thin handlers, ports for storage and the model, an outbox, and decision records.                                    |
-| 16     | Code only helps people once it runs somewhere reliable.                                                                   | A containerised deploy behind a reverse proxy, a zero-downtime release, dashboards and a tested restore.                                                            |
-| 17     | These ideas explain why code is fast, slow or wrong.                                                                      | Five complexity analyses of real code, written up as notes.                                                                                                         |
-| 18     | Python is the language of the AI and data world, and most model tooling is written for it first.                          | A typed command-line tool that reads a JSON file of eval results and prints a report, with exit codes CI can trust.                                                 |
-| 19     | Model services, eval pipelines and data work are written in Python, and they fail in Python-specific ways.                | A FastAPI service that calls a model, validates its reply with Pydantic, streams it, retries on rate limits, and is tested with a fake client.                      |
-| 20     | A language model is a component that can be wrong in new ways.                                                            | A support assistant with retrieval, tool use and an evaluation suite.                                                                                               |
-| 21     | A demo needs a prompt, but a product needs routing, guardrails, evals and budgets around it.                              | A support pipeline where code owns the flow: a classifier routes each ticket, a guarded agent acts, humans approve risky steps, and evals gate every prompt change. |
-| 22     | Architecture decisions are expensive to reverse, and a design review or interview tests how you reason about them.        | Written designs for a link shortener, a feed, a document assistant and an agent, each with requirements, numbers, a sketch, deep dives and failure modes.           |
-| 23     | A coding round tests whether you can turn a problem into a known pattern and explain the cost.                            | A solved set of classic problems, one per pattern, each with tests and a complexity note.                                                                           |
-| 24     | The right platform saves months, and the wrong one costs them.                                                            | A written platform decision, an offline-first website, and a safe server endpoint for an app's AI feature.                                                          |
-| 25     | Being good at the work and showing it in an hour are separate skills, and the second one can be practised.                | A one-minute introduction, a bank of five STAR stories, questions for each interviewer, a counter-offer email and a 90-day plan.                                    |
-| 26     | Code is read far more often than it is written, and every unclear line costs the next person time.                        | A messy module refactored under tests, with a written review explaining each change.                                                                                |
-| 27     | Reviewers judge your skill in seconds from small signs, and the same signs decide how easy your code is to live with.     | A before-and-after portfolio: one amateur snippet per language rewritten to a professional standard, with the reasons.                                              |
-| 28     | Each format rewards a different way of working, and knowing the format is worth as much as another practised pattern.     | Three timed mock assessments passed, a set of practical and AI build tasks with tests, and a rehearsed plan and presentation for a four-hour build.                 |
-| 29     | Once you know requests, sessions, databases and servers, Next.js runs your API, forms and caching beside your React code. | A Next.js app with a JSON endpoint, a form that saves safely, cached pages that refresh, and a deployment you run yourself.                                         |
+| Module | Why it matters                                                                                                                          | You can build                                                                                                                                                       |
+| ------ | --------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 0      | Every program you'll ever write is built from these few ideas.                                                                          | A small to-do list program, written from scratch.                                                                                                                   |
+| 1      | Markup decides whether a page works for search engines, screen readers and slow phones.                                                 | A semantic page with a form that works without JavaScript.                                                                                                          |
+| 2      | Layout bugs are easy to cause and hard to see until a real screen shows them.                                                           | A responsive layout on an 8 pt grid, with design tokens as custom properties.                                                                                       |
+| 3      | Most browser bugs start with JavaScript doing exactly what it was told.                                                                 | A shopping cart with quantity rules, written unplugged.                                                                                                             |
+| 4      | Types catch whole families of bugs before the code ever runs.                                                                           | A typed data model with runtime validation where data enters.                                                                                                       |
+| 5      | A build you cannot reproduce fails on the day it matters most.                                                                          | A reproducible build, a lint and type-check gate, and an env schema.                                                                                                |
+| 6      | Keeping a page in step with its data by hand is where interface bugs come from. React does that part for you.                           | A small React app with a form, a filtered list and data loaded from a server, each piece of state in the right place.                                               |
+| 7      | React draws a page, but a real site also needs URLs, fast first loads and a safe place for data and secrets.                            | A Next.js site with several pages, a shared layout, a search box that runs in the browser and data loaded on the server.                                            |
+| 8      | An interface that some people cannot operate is a broken interface.                                                                     | An accessible form, a themed component library with variants, and a dialog that handles focus.                                                                      |
+| 9      | The server is where trust, money and data meet.                                                                                         | An API with sessions, ownership checks and an idempotent payment webhook handler.                                                                                   |
+| 10     | Data outlives the code that writes it, so mistakes here last longest.                                                                   | A schema with keys and constraints, safe queries from code, an index that fixes a slow page, a transaction that can't half-happen, and row-level security.          |
+| 11     | Tests let you change code without fear.                                                                                                 | A test suite with unit tests, integration tests on a real database, one end-to-end journey and a load test.                                                         |
+| 12     | An attacker needs only one open door.                                                                                                   | A threat model, a page that shows hostile input as text, safe cookie and CORS settings, access-control tests, safe uploads, and an audit of a small app.            |
+| 13     | Slow pages lose people before they read a word.                                                                                         | A page and an API measured before and after: no blocking scripts, no jumping content, no leaks, honest caches and one query instead of 201.                         |
+| 14     | Code that is correct for one user can be wrong for two at once.                                                                         | A batched, rate-safe pipeline of model calls, an idempotent payment endpoint, a queue worker for long AI jobs, and a scheduled job that runs once across servers.   |
+| 15     | When every change touches twelve files, the structure is the problem.                                                                   | A modular monolith refactored under tests, with thin handlers, ports for storage and the model, an outbox, and decision records.                                    |
+| 16     | Code only helps people once it runs somewhere reliable.                                                                                 | A containerised deploy behind a reverse proxy, a zero-downtime release, dashboards and a tested restore.                                                            |
+| 17     | These ideas explain why code is fast, slow or wrong.                                                                                    | Five complexity analyses of real code, written up as notes.                                                                                                         |
+| 18     | Python is the language of the AI and data world, and most model tooling is written for it first.                                        | A typed command-line tool that reads a JSON file of eval results and prints a report, with exit codes CI can trust.                                                 |
+| 19     | Model services, eval pipelines and data work are written in Python, and they fail in Python-specific ways.                              | A FastAPI service that calls a model, validates its reply with Pydantic, streams it, retries on rate limits, and is tested with a fake client.                      |
+| 20     | A language model is a component that can be wrong in new ways.                                                                          | A support assistant with retrieval, tool use and an evaluation suite.                                                                                               |
+| 21     | A demo needs a prompt, but a product needs routing, guardrails, evals and budgets around it.                                            | A support pipeline where code owns the flow: a classifier routes each ticket, a guarded agent acts, humans approve risky steps, and evals gate every prompt change. |
+| 22     | Architecture decisions are expensive to reverse, and a design review or interview tests how you reason about them.                      | Written designs for a link shortener, a feed, a document assistant and an agent, each with requirements, numbers, a sketch, deep dives and failure modes.           |
+| 23     | A coding round tests whether you can turn a problem into a known pattern and explain the cost.                                          | A solved set of classic problems, one per pattern, each with tests and a complexity note.                                                                           |
+| 24     | The right platform saves months, and the wrong one costs them.                                                                          | A written platform decision, an offline-first website, and a safe server endpoint for an app's AI feature.                                                          |
+| 25     | Being good at the work and showing it in an hour are separate skills, and the second one can be practised.                              | A one-minute introduction, a bank of five STAR stories, questions for each interviewer, a counter-offer email and a 90-day plan.                                    |
+| 26     | Code is read far more often than it is written, and every unclear line costs the next person time.                                      | A messy module refactored under tests, with a written review explaining each change.                                                                                |
+| 27     | Reviewers judge your skill in seconds from small signs, and the same signs decide how easy your code is to live with.                   | A before-and-after portfolio: one amateur snippet per language rewritten to a professional standard, with the reasons.                                              |
+| 28     | Each format rewards a different way of working, and knowing the format is worth as much as another practised pattern.                   | Three timed mock assessments passed, a set of practical and AI build tasks with tests, and a rehearsed plan and presentation for a four-hour build.                 |
+| 29     | Once you know requests, sessions, databases and servers, Next.js runs your API, forms and caching beside your React code.               | A Next.js app with a JSON endpoint, a form that saves safely, cached pages that refresh, and a deployment you run yourself.                                         |
+| 30     | Most products depend on data that lives in someone else's system, and that system will change, fail and lie to you.                     | A nightly sync from a vendor API with a tie-broken cursor, token refresh, change detection by hash, deletions behind a safety valve, and reconciliation.            |
+| 31     | An agent that runs for hours with real tools fails in ways a single model call never does, and the harness decides how far that goes.   | A budgeted, resumable agent with permission hooks, well-designed tools, scoped memory, a review queue, a pass^k eval suite and traces that find the costly run.     |
+| 32     | Writing code is getting cheaper, and knowing what will break, leak or confuse before it ships is what makes an engineer worth trusting. | A review of an AI-written pull request covering security, efficiency, regressions and tests, with a pre-mortem, a ranked plan and a workflow diagram.               |
+| 33     | Work nobody understands does not get used, reviewed or trusted, and explaining it well is a skill you can practise.                     | A one-page design doc, an incident update and a recorded walkthrough of a diagram, each explained to two different audiences.                                       |
 
 ## Module 0: First steps in JavaScript (11)
 
@@ -237,27 +243,28 @@ was dropped.
 8. Forms that help `design.forms-that-help`: labels that stay, hints and errors linked to their fields, and grouped choices. **E**
 9. Internationalisation `design.i18n-and-forms`: dates, money and plurals with `Intl`, and the `lang` and `dir` attributes. **A**
 
-## Module 9: Backend, APIs, auth, payments (17)
+## Module 9: Backend, APIs, auth, payments (18)
 
 **Lab: Request Journey**, which steps a URL through DNS, TCP, TLS and HTTP, one hop at a time.
 
-0. What a backend is `backend.what-a-backend-is`: frontend, server, backend, endpoints and APIs, and reading a real response with `curl` and `curl -i`. **E**
-1. How a page reaches you `backend.how-a-page-reaches-you`: the parts of a URL, the DNS, TCP, TLS and HTTP hops with `curl -v`, and which hop an error names, with the **Request Journey** lab. **E**
-2. Your first endpoint `backend.first-endpoint`: a handler with `Request` and `Response`, routing by method and path, JSON in and out, run with Node. **E**
-3. Methods and status codes `backend.http-in-depth`: `curl -X`, `-H` and `-d`, what each method promises, safe and idempotent methods, and 201, 204, 400, 404 and 405. **E**
-4. API design `backend.api-design`: resources as nouns, filtering with a query string, and cursor pagination. **E**
-5. Errors clients can use `backend.error-responses`: true statuses, one problem details shape, and a logged 500 that leaks nothing. **E**
-6. Validation at the trust boundary `backend.validation`: parse every body with a schema, keep only named fields, and stop mass assignment. **E**
-7. Sessions, cookies and tokens `backend.sessions-and-tokens`: a session cookie with `HttpOnly`, `Secure` and `SameSite`, a 401 for strangers, and sessions against JWTs. **E**
-8. Authorisation `backend.authorisation`: ownership checks, roles, and IDOR. **E**
-9. Signing in with another account `backend.oauth-and-passkeys`: the OAuth redirect flow, the `state` check, PKCE, the ID token, and passkeys. **A**
-10. Calling other APIs from your server `backend.calling-other-apis`: API keys kept on the server, a proxy in front of a model API, timeouts, and 502 and 504. **E**
-11. Rate limits `backend.rate-limits`: a counter per caller, 429 with `Retry-After`, and retrying politely. **E**
-12. Webhooks `backend.webhooks`: events from another service, signatures on the raw body, repeats, reordering and idempotent handlers. **E**
-13. Payments with Stripe `backend.payments`: Checkout, pence, SCA, an order marked paid only from a verified webhook, and refunds. **E**
-14. Files and object storage `backend.files`: uploads with size and type checks, buckets and keys, and signed URLs. **A**
-15. Realtime and streaming `backend.realtime`: polling, server-sent events, streaming a model's answer, WebSockets, and the cost of open connections. **A**
-16. Changing an API safely `backend.api-evolution`: compatible and breaking changes, expand and contract, versions, and REST, RPC and GraphQL. **A**
+1. What a backend is `backend.what-a-backend-is`: frontend, server, backend, endpoints and APIs, and reading a real response with `curl` and `curl -i`. **E**
+2. How a page reaches you `backend.how-a-page-reaches-you`: the parts of a URL, the DNS, TCP, TLS and HTTP hops with `curl -v`, and which hop an error names, with the **Request Journey** lab. **E**
+3. Your first endpoint `backend.first-endpoint`: a handler with `Request` and `Response`, routing by method and path, JSON in and out, run with Node. **E**
+4. Methods and status codes `backend.http-in-depth`: `curl -X`, `-H` and `-d`, what each method promises, safe and idempotent methods, and 201, 204, 400, 404 and 405. **E**
+5. API design `backend.api-design`: resources as nouns, filtering with a query string, and cursor pagination. **E**
+6. Errors clients can use `backend.error-responses`: true statuses, one problem details shape, and a logged 500 that leaks nothing. **E**
+7. Validation at the trust boundary `backend.validation`: parse every body with a schema, keep only named fields, and stop mass assignment. **E**
+8. Sessions, cookies and tokens `backend.sessions-and-tokens`: a session cookie with `HttpOnly`, `Secure` and `SameSite`, a 401 for strangers, and sessions against JWTs. **E**
+9. Authorisation `backend.authorisation`: ownership checks, roles, and IDOR. **E**
+10. Signing in with another account `backend.oauth-and-passkeys`: the OAuth redirect flow, the `state` check, PKCE, the ID token, and passkeys. **A**
+11. Calling other APIs from your server `backend.calling-other-apis`: API keys kept on the server, a proxy in front of a model API, timeouts, and 502 and 504. **E**
+12. Rate limits `backend.rate-limits`: a counter per caller, 429 with `Retry-After`, and retrying politely. **E**
+13. Webhooks `backend.webhooks`: events from another service, signatures on the raw body, repeats, reordering and idempotent handlers. **E**
+14. Payments with Stripe `backend.payments`: Checkout, pence, SCA, an order marked paid only from a verified webhook, and refunds. **E**
+15. Files and object storage `backend.files`: uploads with size and type checks, buckets and keys, and signed URLs. **A**
+16. Realtime and streaming `backend.realtime`: polling, server-sent events, streaming a model's answer, WebSockets, and the cost of open connections. **A**
+17. Changing an API safely `backend.api-evolution`: compatible and breaking changes, expand and contract, versions, and REST, RPC and GraphQL. **A**
+18. Long and bulk operations `backend.long-running-and-bulk`: 202 with a status URL and polling, bulk endpoints with per-item results and 207, and JSON Merge Patch against JSON Patch. **A**
 
 ## Module 10: Databases (16)
 
@@ -285,7 +292,7 @@ with interleaving you control.
 15. Row-level security and the Supabase model `db.row-level-security`: policies, `USING` and `WITH CHECK`, Supabase roles, and the secret-key hazard. **E**
 16. Scaling a database `db.storage-and-pooling`: pooling, read replicas and their lag, caching with Redis, and sharding as the last resort. **A**
 
-## Module 11: Testing (10)
+## Module 11: Testing (12)
 
 **Hands-on:** a playground runs the learner's tests against three mutants and reports which
 survive. The code challenges grade the learner's own tests the same way: they must
@@ -301,13 +308,16 @@ pass on the real code and fail on broken copies of it.
 8. Property-based and concurrency tests `testing.property-based`: properties, evals as property checks on model output, invariants, and calls that overlap. **A**
 9. Load testing with k6 `testing.load-testing`: latency and throughput, the knee, percentiles, and thresholds. **A**
 10. Contract tests `testing.contract-tests`: check that a consumer and a provider agree on an API with consumer-driven contracts, and place them in the test pyramid. **A**
+11. Testing code that calls other services `testing.testing-other-services`: HTTP mocking with MSW, sanitised recorded fixtures with schema checks, and real dependencies with Testcontainers. **A**
+12. Breaking it on purpose `testing.breaking-it-on-purpose`: stress, soak and spike tests against load tests, fault injection with slow vendors, 500s and timeouts, chaos experiments, and loading an LLM endpoint against provider rate limits. **A**
 
-## Module 12: Security (18)
+## Module 12: Security (19)
 
 Every attack runs against the learner's own sandboxed code: an XSS fires in a playground, an
 injection reads another table in live Postgres, and each one is then fixed. Lessons 1 to 11
 build web-application defence, 12 to 15 the defensive side (abuse, logging, incidents,
-layers), 16 attacking your own app within the law, and 18 is a capstone audit.
+layers), 16 attacking your own app within the law, 17 the supply chain, 18 personal data, and
+19 is a capstone audit.
 
 1. What attackers want `security.threat-modelling`: what security means for a web developer, the OWASP Top 10 as a map of the chapter, and a threat model with assets, entry points, trust boundaries and STRIDE. **E**
 2. Cross-site scripting and CSP `security.xss-and-csp`: an `innerHTML` XSS run live and fixed with `textContent`, escaping per context, a nonce-based CSP and security headers. **E**
@@ -326,7 +336,8 @@ layers), 16 attacking your own app within the law, and 18 is a capstone audit.
 15. Defence in depth and zero trust `security.defence-in-depth`: layered checks, verifying every request instead of trusting the network, and switching off what you don't use. **E**
 16. Attacking your own app, legally `security.attacker-playbook`: the law and written permission, what your app reveals to a stranger, privilege escalation through mass assignment, and responsible disclosure. **E**
 17. When a dependency turns malicious `security.supply-chain`: install scripts, a suspicious lockfile change, and the response to a hijacked package. **A**
-18. Capstone: audit an app `security.owasp-top-ten`: find and fix the chapter's flaws in one small app, fail closed, and review AI-written code. **E**
+18. Personal data by design `security.personal-data`: personal, pseudonymised and anonymised data, lawful bases and Art. 9 special categories, controller and processor with DPAs and sub-processors, retention, erasure and data subject requests, residency and transfers, and audit trails. **A**
+19. Capstone: audit an app `security.owasp-top-ten`: find and fix the chapter's flaws in one small app, fail closed, and review AI-written code. **E**
 
 ## Module 13: Performance (10)
 
@@ -345,7 +356,7 @@ plans, and writes the clean-up and caching code.
 9. Caching on the server `perf.server-caching`: cache keys and TTLs, deleting on write, and caching model calls without mixing users. **E**
 10. Finding a slow request `perf.backend-performance`: `Server-Timing`, the N+1 behind `Promise.all`, one join with its real `EXPLAIN`, and tail latency across many calls. **A**
 
-## Module 14: Concurrency and scale (10)
+## Module 14: Concurrency and scale (11)
 
 **Lab: Overselling Simulator**, which runs N buyers and M servers under a seeded scheduler so
 the learner can toggle the strategy and watch the invariant.
@@ -358,10 +369,28 @@ the learner can toggle the strategy and watch the invariant.
 6. Holds that expire `scale.overselling`: hold stock while a buyer pays, expire it with guarded transitions, and check that no transition oversells. **A**
 7. Idempotency `scale.idempotency`: idempotency keys, so a retried payment never charges twice, and deduplication windows. **A**
 8. Queues and workers `scale.queues-and-workers`: long AI jobs on a queue, acknowledging after the work, visibility timeouts, dead-letter queues, and the exactly-once myth. **A**
-9. Scheduled jobs `scale.cron`: one run across servers, leases, watermarks for missed runs, and schedules in UTC. **A**
-10. Failure handling `scale.failure-handling`: deadlines, retries with backoff and jitter, circuit breakers and load shedding. **A**
+9. Fair and prioritised queues `scale.fair-queues`: the noisy neighbour, per-tenant round robin, priorities without starvation, and bulkheads. **A**
+10. Scheduled jobs `scale.cron`: one run across servers, leases, watermarks for missed runs, and schedules in UTC. **A**
+11. Failure handling `scale.failure-handling`: deadlines, retries with backoff and jitter, circuit breakers and load shedding. **A**
 
-## Module 15: Architecture (12)
+## Module 30: Integrations and data sync (9)
+
+Working with systems you don't control. It sits in Production after Scale; its folder number
+is 30 because it was added later. Every lesson ends in a TypeScript challenge written as a
+pure function. `backend.webhooks`, `scale.idempotency` and `security.abuse-and-privacy`
+point here instead of repeating it.
+
+1. Systems you don't control `integrations.systems-you-dont-control`: vendors that break the spec with a 200 and an error body or an HTML error page, runtime schema validation, a tolerant reader for unknown enums, and timeouts. **A**
+2. Reading everything, page by page `integrations.paging-through`: a keyset cursor with a tie-breaker, pagination as an async generator, `updated_after`, and the Link header. **A**
+3. Tokens that expire `integrations.tokens-that-expire`: refreshing before expiry, one refresh for many callers, rotation, `invalid_grant` and reauthorisation, client credentials, and scopes that quietly return less. **A**
+4. Copying data you don't own `integrations.full-and-delta-sync`: pass-through against stored, full against delta, the watermark taken at sync start, an overlap window, and change detection by a hash with stable key order. **A**
+5. Noticing what disappeared `integrations.deletions`: mark and sweep, soft deletes, a safety valve for mass deletion, and remote against internal ids. **A**
+6. Making messy data consistent `integrations.normalising-data`: pure dates against timestamps, enum mapping with a fallback, empty values, and CSV encodings, delimiters and the BOM. **A**
+7. Many vendors, one model `integrations.adapters-and-models`: an adapter per vendor, a capability matrix, a common data model, the raw payload, custom-field mapping and passthrough. **A**
+8. Webhooks for speed, polling for truth `integrations.webhooks-and-polling`: thin events that trigger a sync, reconciliation, sending webhooks with a retry schedule, disabling after repeated failures and SSRF checks, and data-quality signals. **A**
+9. Writing into someone else's system `integrations.writing-to-other-systems`: an idempotent create without vendor support through an external reference and a lookup before retry, mapping vendor errors, and partial results. **A**
+
+## Module 15: Architecture (13)
 
 The chapter is built on refactoring: most challenges hand the learner working code with the
 boundary in the wrong place, and tests prove the behaviour is unchanged after the move.
@@ -378,9 +407,10 @@ System design.
 7. Domain modelling `arch.domain-modelling`: flags refactored into a state machine, invariants in one place, and value objects. **A**
 8. Monolith or services `arch.monolith-and-services`: deploys, the modular monolith, and the bill for a network boundary, including the transaction a split loses. **A**
 9. Events and the outbox `arch.event-driven`: events and commands, what a message broker is, the dual write, and an outbox with a relay. **A**
-10. Read models and event logs `arch.cqrs-and-event-sourcing`: read models and their lag, CQRS, and event sourcing for when history is the product. **A**
-11. Serving many customers `arch.tenants`: multi-tenancy, the tenant from the session, a scoped store, and row-level security as the net. **A**
-12. Recording decisions `arch.adrs-and-twelve-factor`: ADRs with context, decision and costs, trade-offs, and superseding. **E**
+10. Steps that span systems `arch.sagas-and-workflows`: the transaction that can't undo the email, a step-wise state machine, sagas with compensation, durable workflow engines with retried activities and deterministic replay, and reconciliation. **A**
+11. Read models and event logs `arch.cqrs-and-event-sourcing`: read models and their lag, CQRS, and event sourcing for when history is the product. **A**
+12. Serving many customers `arch.tenants`: multi-tenancy, the tenant from the session, a scoped store, and row-level security as the net. **A**
+13. Recording decisions `arch.adrs-and-twelve-factor`: ADRs with context, decision and costs, trade-offs, and superseding. **E**
 
 ## Module 16: Cloud and DevOps (19)
 
@@ -479,7 +509,7 @@ Language models as a component you engineer around, in Python: how they write, p
 13. Prompt injection and data leakage `ai.injection-and-leakage`: keep untrusted text from steering a model's actions, gate risky tools behind people, and keep secrets and personal data out of prompts and logs. **A**
 14. Reasoning models and how they are trained `ai.reasoning-and-training`: explain chain of thought, test-time compute, best-of-n and voting, tree search, outcome and process reward models, and how RLHF with PPO and GRPO trains a reasoning model. **A**
 
-## Module 21: AI systems in production (14)
+## Module 21: AI systems in production (17)
 
 The engineering around a model once it serves real users: the pipeline as a whole, deeper retrieval, classifiers and thresholds at decision points, agent harnesses, guardrails, PII, evals, prompts as code, cost, latency and failures, MCP servers, and coding agents.
 
@@ -487,16 +517,37 @@ The engineering around a model once it serves real users: the pipeline as a whol
 2. Retrieval in depth `aisys.retrieval-in-depth`: choose a chunking strategy, filter by metadata, rewrite queries, and rerank candidates before they reach the prompt. **A**
 3. Classifiers at the fork `aisys.classifiers-at-the-fork`: say what a classifier is and how to get one, then answer the fuzzy question at each branch with a label and a probability, and keep the large model for writing. **A**
 4. Confidence thresholds and calibration `aisys.thresholds-and-calibration`: split scores into automate, review and refuse bands, choose the cut-offs from labelled data, and check that the scores are calibrated. **A**
-5. The agent harness `aisys.agent-harness`: keep control flow in code, cap steps and spend, detect loops, and prefer a fixed workflow when the path is known. **A**
-6. Guardrails and human approval `aisys.guardrails`: check inputs and outputs, gate irreversible actions behind human approval, verify grounding, and moderate content. **A**
-7. PII and privacy in AI systems `aisys.pii-and-privacy`: recognise personally identifiable information, detect and redact it, keep it out of prompts, logs and eval sets, and meet GDPR duties. **A**
-8. Evals in depth `aisys.evals-in-depth`: check an LLM judge against human labels, grow an eval set from production traces, compare versions pairwise, and run evals online. **A**
-9. Prompts and evals as code `aisys.llmops`: version prompts with the code, gate changes in CI with evals, trace every model call, and monitor quality in production. **A**
-10. Cost, latency and fallbacks `aisys.cost-and-latency`: budget tokens and milliseconds per feature, keep the cached prefix stable, route by measured quality, and fall back safely when a provider fails. **A**
-11. Building MCP servers `aisys.mcp-servers`: write an MCP server with tools, resources and prompts, return tool errors the model can act on, keep stdout clean, and never trust the caller. **A**
-12. Engineering with coding agents `aisys.coding-agents`: work with agentic coding tools in a team: give them context files, keep diffs small, use tests and linters as the feedback loop, and own what ships. **E**
-13. Working with a coding agent on a real repo `aisys.agent-workbench`: set up a coding agent's task so it can be checked: rules it can test, a scope contract, a verification gate, a reviewer pass and a handoff note. **A**
-14. Shape the build before you code `aisys.shaping-the-build`: state the outcome and its success metric, rank the assumptions by risk, pick the smallest testable slice, and write a spec that leaves room for judgement. **A**
+5. Reading documents `aisys.reading-documents`: PDFs and images as model input, native text against OCR, layout, splitting and classifying a mixed scan, extraction into a schema, and structured e-invoices parsed rather than read. **A**
+6. Checking what a model extracted `aisys.checking-extractions`: validation layers from schema and business rules to cross-checks against the source text, confidence and history, with the model extracting and code calculating. **A**
+7. Controlling the agent loop `aisys.agent-harness`: keep control flow in code, cap steps and spend, detect loops, and prefer a fixed workflow when the path is known. **A**
+8. Guardrails and human approval `aisys.guardrails`: check inputs and outputs, gate irreversible actions behind human approval, verify grounding, and moderate content. **A**
+9. PII and privacy in AI systems `aisys.pii-and-privacy`: recognise personally identifiable information, detect and redact it, keep it out of prompts, logs and eval sets, and meet GDPR duties. **A**
+10. Evals in depth `aisys.evals-in-depth`: check an LLM judge against human labels, grow an eval set from production traces, compare versions pairwise, and run evals online. **A**
+11. Prompts and evals as code `aisys.llmops`: version prompts with the code, gate changes in CI with evals, trace every model call, and monitor quality in production. **A**
+12. Cost, latency and fallbacks `aisys.cost-and-latency`: budget tokens and milliseconds per feature, keep the cached prefix stable, route by measured quality, and fall back safely when a provider fails. **A**
+13. Choosing and hosting a model `aisys.choosing-models`: frontier against open weights, the cost of self-hosting, small models, fine-tuning on corrections against prompting or RAG, routing by risk, and provider data terms. **A**
+14. Building MCP servers `aisys.mcp-servers`: write an MCP server with tools, resources and prompts, return tool errors the model can act on, keep stdout clean, and never trust the caller. **A**
+15. Engineering with coding agents `aisys.coding-agents`: work with agentic coding tools in a team: give them context files, keep diffs small, use tests and linters as the feedback loop, and own what ships. **E**
+16. Working with a coding agent on a real repo `aisys.agent-workbench`: set up a coding agent's task so it can be checked: rules it can test, a scope contract, a verification gate, a reviewer pass and a handoff note. **A**
+17. Shape the build before you code `aisys.shaping-the-build`: state the outcome and its success metric, rank the assumptions by risk, pick the smallest testable slice, and write a spec that leaves room for judgement. **A**
+
+## Module 31: Agent engineering (10)
+
+Systems where the model acts over many steps and tools, for a long time, with people in the
+loop. It sits in Python and AI engineering after AI systems; its folder number is 31 because
+it was added later. It builds on `ai.agents`, `aisys.agent-harness`, `aisys.guardrails` and
+`aisys.mcp-servers` without teaching them again. Python challenges, like 20 and 21.
+
+1. The harness around the model `agents.the-harness`: the action space, sandbox and egress, permission modes, hooks, instruction files and skills, sub-agents, and harness regressions. **A**
+2. Loops that run for hours `agents.long-running-loops`: token, time and cost budgets, stall detection by result hash, self-correction and re-planning, checkpoint and resume with the tool-call id as idempotency key, generator and evaluator, and escalation. **A**
+3. Context that stays sharp `agents.context-at-scale`: context rot, lost in the middle, compaction, just-in-time retrieval, trimming tool output, sub-agents for isolation, and token counting. **A**
+4. Designing tools a model uses well `agents.tool-design`: consolidated against granular tools, token-efficient paged responses, actionable errors, identity from the session, the read and write split, annotations, and tool search. **A**
+5. Memory that helps instead of haunts `agents.memory`: short and long term, episodic, semantic and procedural memory, file and vector stores, write policies that dedupe, update and forget, staleness checks, poisoning, and scoping. **A**
+6. One agent or many `agents.orchestration`: chaining, routing, sectioning and voting, orchestrator and workers, evaluator and optimiser, handoffs, and what many agents cost. **A**
+7. What an agent may touch `agents.what-an-agent-may-touch`: least privilege per tool, indirect injection through tool results, the lethal trifecta, spend limits, and an audit log. **A**
+8. Designing the human's part `agents.human-in-the-loop`: approval checkpoints, risk-ranked queues, suggest, edit and accept with diffs and sources, interrupt and resume, clarifying questions, automation bias, reviewer workload, and corrections as ground truth. **A**
+9. Evaluating an agent `agents.evals-for-agents`: outcome against trajectory, pass@k against pass^k, tool-call accuracy, environment-based tasks, repeated trials and variance, and red teaming. **A**
+10. Watching agents in production `agents.watching-agents`: spans per step and tool, cost per run and tenant, version tags, replay, an error taxonomy of hallucination, tool misuse, loops, refusals and truncation, drift, and OTel GenAI attributes. **A**
 
 ## Module 22: System design (12)
 
@@ -640,6 +691,41 @@ revalidation call reaches.
 2. Server Actions `nextserver.server-actions`: a form that saves through a `'use server'` function, checked inside for the caller, every field and ownership. Woven after authorisation. **E**
 3. Caching pages and data `nextserver.caching`: `'use cache'`, `cacheLife`, refreshing with `cacheTag` and `updateTag`, and the copy in the browser. Woven after reading `EXPLAIN`. **E**
 4. Deploying a Next.js app `nextserver.deploying`: `next start`, standalone output and its missing static files, and what a managed host does for you. Woven after reverse proxies. **A**
+
+## Module 32: Engineering judgment (11)
+
+Knowing what to verify: what breaks, what scales, what confuses the next reader, what leaks
+and what a change could regress, then pressure-testing designs, making the call, ranking
+work and drawing workflows. Its lessons are woven into the journey, each after the lesson it
+builds on, and later lessons refer back to its five questions.
+
+1. What to check before you trust code `judgment.what-to-verify`: the five questions (what breaks, what scales, what confuses, what leaks, how you'd prove it) applied to an AI-written diff. Woven after working with AI. **E**
+2. Finding what breaks `judgment.what-breaks`: inputs from outside, partial failure, boundaries and time, listing failure modes and picking the test that matters. Woven after what to test. **A**
+3. Will it hold at 10x? `judgment.what-scales`: unbounded lists, N+1 queries, hot paths and quick estimates, spotting the line that dies at ten times the load. Woven after backpressure. **A**
+4. What confuses the next person `judgment.next-reader`: surprise, hidden invariants, implicit contracts and misleading names, fixing the surprise rather than the style. Woven after code review. **A**
+5. Following the data `judgment.what-leaks`: tracing a field through logs, errors, URLs, caches, analytics and prompts to find the leak. Woven after defence in depth. **A**
+6. What could this change break? `judgment.regressions`: blast radius, callers and contracts, characterisation tests, and choosing regression tests. Woven after contract tests. **A**
+7. Pressure-testing a design `judgment.pressure-testing`: a pre-mortem, a light failure-mode table, a steelman, an adversarial review, and what breaks at 10x. Woven after the system design method. **A**
+8. Making the call `judgment.trade-offs`: build or buy, boring technology, one-way and two-way doors, and the rule of three. Woven after recording decisions. **A**
+9. From intent to a ranked list `judgment.intents-and-priorities`: jobs to be done, intent mapping, impact and effort, MoSCoW, RICE and non-goals. Woven after shaping the build. **A**
+10. Drawing the workflow `judgment.workflows-on-paper`: swimlanes for people, AI and system, then sequence and state diagrams in Mermaid, with failure paths. Woven after intents and priorities. **A**
+11. Reviewing a whole change `judgment.reviewing-a-change`: an end-to-end review of an AI-written pull request for security, efficiency, regressions and tests, and explaining the verdict. Woven after coding agents. **A**
+
+## Module 33: Explaining your work (8)
+
+Saying things so people understand them. Short, light lessons that lean on saying it out
+loud. Its lessons are woven into the journey, each after the lesson it builds on. Pull
+requests stay with `pro.commits-and-prs`, and interview talk with `interview.communication`
+and `interview.presenting`; these lessons link to them instead of repeating them.
+
+1. Saying it plainly `explain.say-it-plainly`: the point first, one idea at a time, the example before the term, and checking they followed. Woven after a small program. **E**
+2. Asking a question people can answer `explain.asking-for-help`: expected against actual, a minimal reproduction, and what you tried. Woven after errors. **E**
+3. Walking someone through code `explain.walking-through-code`: intent before mechanics, one path at a time, and the why. Woven after small functions. **E**
+4. Explaining a decision `explain.explaining-a-decision`: options, criteria, a recommendation, and what would change your mind. Woven after monolith or services. **A**
+5. Same idea, different listeners `explain.audiences`: a junior developer, product, a customer and an executive, with the vocabulary, detail and stakes each needs. Woven after incident response. **A**
+6. Writing an incident update `explain.incident-updates`: impact, status, the time of the next update, and no blame. Woven after alerts and on-call. **A**
+7. A one-page design doc `explain.design-docs`: problem, goals and non-goals, options, decision, rollout and risks. Woven after making the call. **A**
+8. Talking through a diagram `explain.talking-through-a-diagram`: the order of the boxes, narrating the data flow, and marking the failure points. Woven after drawing the workflow. **A**
 
 ## Added beyond the first topic list
 

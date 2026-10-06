@@ -1,0 +1,328 @@
+id: judgment.what-leaks
+title: Following the data
+objective: Trace a sensitive field through logs, errors, URLs, caches, analytics and prompts, and close every place it leaks.
+level: advanced
+minutes: 10
+concepts: [judgment.data-tracing, judgment.leak-sinks]
+prerequisites: [security.defence-in-depth, security.detection-and-logging, judgment.what-to-verify]
+opening:
+  text: >-
+    You'll follow one piece of personal data through your code and find every place it
+    escapes. Most leaks aren't break-ins: they're a log line, an error or a URL nobody
+    thought about.
+
+steps:
+  - type: prose
+    id: follow-one-field
+    body: >-
+      The logging lesson masked passwords by their key name. Leaks are wider than that.
+
+
+      Pick one sensitive field, such as a cinema customer's email. Note where it enters. Then
+      list every place it's stored, sent or printed. That's **tracing a field**. Each place
+      it lands is a new copy, with its own readers and its own lifetime.
+
+  - type: bug-hunt
+    id: hunt-analytics-email
+    concept: judgment.data-tracing
+    difficulty: 1
+    language: js
+    code: |
+      async function signUp(request) {
+        const { email, password } = await request.json();
+        const user = await users.create({ email, passwordHash: await hash(password) });
+        analytics.track("signed_up", { email, plan: user.plan });
+        return Response.json({ id: user.id });
+      }
+    prompt: >-
+      Trace `email` through this sign-up. The analytics tool is run by another company. Tap
+      the line where the email leaves your control.
+    lines: [4]
+    reasons:
+      - text: It sends the email to another company's analytics
+        correct: true
+        feedback: >-
+          Yes. Send an id that names nobody, or leave the field out.
+      - text: The password is stored in the database
+        feedback: >-
+          Only its hash is stored, which is the right way. The email on line 4 travels further.
+      - text: The response returns the new user's id
+        feedback: >-
+          Returning an id the user now owns is fine. Line 4 copies the email out of your
+          system.
+    fix: |
+      analytics.track("signed_up", { userId: user.id, plan: user.plan });
+
+  - type: prose
+    id: six-sinks
+    body: >-
+      Data rarely leaks through the front door. It slips out through side doors: logs, error
+      messages, URLs, caches, analytics events and model prompts. In security, places where
+      data lands are called **sinks**. Each keeps a copy with more readers or a longer life
+      than your database.
+
+
+      A **CDN** is a shared cache in front of your server. It keeps one copy of a reply and
+      hands it to everyone.
+
+  - type: predict-output
+    id: predict-cdn-profile
+    concept: judgment.leak-sinks
+    difficulty: 2
+    language: http
+    code: |
+      GET /api/me HTTP/1.1
+      Cookie: session=ana-7f3c
+
+      HTTP/1.1 200 OK
+      Cache-Control: public, max-age=300
+      Content-Type: application/json
+
+      {"name":"Ana Silva","email":"ana@example.com"}
+    question: A CDN that follows `Cache-Control` sits in front. Ben requests `/api/me` a minute later. What does he get?
+    choices:
+      - text: Ana's profile, from the CDN
+        correct: true
+        feedback: >-
+          Yes. `public` let the shared cache keep it, and the URL is the same.
+      - text: His own profile, since his cookie differs
+        feedback: >-
+          Most people expect that. But the cache matches on the URL, and `public` told it to
+          share the reply.
+      - text: An error, since the cookie doesn't match
+        feedback: >-
+          The CDN doesn't check sessions. It finds a stored reply for that URL and serves it.
+
+  - type: ai-review
+    id: review-booking-error
+    concept: judgment.leak-sinks
+    difficulty: 3
+    language: js
+    request: Make booking failures easier to debug.
+    flawClass: data-exposure
+    code: |
+      async function bookSeats(customer, showId, seats) {
+        const show = await shows.find(showId);
+        if (!show) throw new BookingError(`No show ${showId}`);
+        try {
+          return await payments.charge(customer.cardToken, show.pricePence * seats.length);
+        } catch (error) {
+          throw new BookingError(`Charge failed for ${JSON.stringify(customer)}: ${error.message}`);
+        }
+      }
+    prompt: >-
+      The app's error handler sends `error.message` to the browser and to an error tracker.
+      The tests only checked that a `BookingError` is thrown. Tap the line at fault.
+    lines: [7]
+    reasons:
+      - text: It writes the whole customer into the message
+        correct: true
+        feedback: >-
+          Yes. Card token, email and phone, now in the browser and the tracker.
+      - text: The provider's `error.message` hides the cause
+        feedback: >-
+          The provider's message is useful for debugging. `JSON.stringify(customer)` beside it
+          is the leak.
+      - text: It should return a 500 instead of throwing
+        feedback: >-
+          Throwing to the handler is fine. What the message carries is the problem.
+    verify:
+      question: Which test would have caught this?
+      choices:
+        - text: Seed fake customer values, then search the error
+          correct: true
+          feedback: >-
+            Yes. Known fake values show up in any output that leaks them.
+        - text: Assert that a `BookingError` is thrown
+          feedback: >-
+            That's the test it already passed. It checks the type, not the text.
+        - text: Assert the charge for two seats is right
+          feedback: >-
+            The amount is fine. Finding a leak needs a test that reads what goes out.
+    fix: |
+      } catch (error) {
+        log.error("charge failed", { customerId: customer.id, showId, cause: error.message });
+        throw new BookingError("We couldn't confirm the payment.");
+      }
+
+  - type: bug-hunt
+    id: hunt-whole-record-prompt
+    concept: judgment.leak-sinks
+    difficulty: 3
+    language: js
+    code: |
+      // Summarise a support ticket for the agent on duty.
+      async function summarise(ticket, customer) {
+        const prompt = [
+          "Summarise this ticket for a support agent.",
+          `Customer: ${JSON.stringify(customer)}`,
+          `Ticket: ${ticket.text}`,
+        ].join("\n");
+        const reply = await model.complete(prompt);
+        return reply.text;
+      }
+    prompt: >-
+      A prompt is the text your code sends to an AI model, run by another company. The
+      customer record holds an address, a birthday and a card token. Tap the line at fault.
+    lines: [5]
+    reasons:
+      - text: It sends the whole customer record to the provider
+        correct: true
+        feedback: >-
+          Yes. Send only what a summary needs, such as the customer's plan.
+      - text: The ticket text shouldn't be sent at all
+        feedback: >-
+          The summary needs the ticket. It's the full customer record on line 5 that it
+          doesn't need.
+      - text: The reply should be checked for personal data
+        feedback: >-
+          Checking output is wise, but by then the record has already reached the provider.
+    fix: |
+      const prompt = [
+        "Summarise this ticket for a support agent.",
+        `Plan: ${customer.plan}`,
+        `Ticket: ${ticket.text}`,
+      ].join("\n");
+
+  - type: code-challenge
+    id: write-leaked-sinks
+    concept: judgment.data-tracing
+    difficulty: 4
+    language: ts
+    editable: '7-11'
+    prompt: >-
+      Write the check a test runs after a fake sign-up. It plants **canaries**, fake values
+      such as `ana.canary@example.com`, then collects what every sink received.
+      `leakedSinks(canaries, sinks)` says which sinks leaked:
+
+
+      - A sink leaks when its `text` contains a canary, ignoring case.
+
+      - Catch a canary inside a URL too, written with `encodeURIComponent`.
+
+      - Ignore empty canaries.
+
+      - Return each leaking sink's `name` once, in the order given.
+
+
+      Example: canary `'tok_123'` and a sink `{ name: 'log', text: 'refresh tok_123 ok' }`
+      give `['log']`.
+    hints:
+      - Try the starter with a canary of `''`. Why does every sink look leaky?
+      - >-
+        `encodeURIComponent('a@b.com')` is `'a%40b.com'`. Lower-case both the needles and the
+        text before comparing.
+      - >-
+        Build the needles first: drop empty canaries, add each one's encoded form, and
+        lower-case them all. Then check `!leaked.includes(sink.name)` before you push.
+
+  - type: explain-back
+    id: explain-leaks-to-support
+    concept: judgment.leak-sinks
+    difficulty: 4
+    audience: non-technical
+    kind: risk
+    prompt: >-
+      The head of support asks whether the cinema app is "leaking data". Explain, without
+      jargon, where customer details could escape and how you'll check.
+    rubric:
+      - Leaks usually come through side doors, such as logs, errors, links, caches, analytics and AI tools, not break-ins.
+      - It gives a concrete example from this app, such as card details in an error message.
+      - It says how you'll check, by planting fake customer details in a test and searching every output.
+    modelAnswer: >-
+      Leaks are rarely break-ins. Details escape through side doors. One error message held a
+      whole customer record. A shared cache could show a profile to the next visitor.
+      Analytics received email addresses. We've fixed those three. Our tests now sign up a
+      made-up customer, then search every log, error, link and event for them. Any match fails the build.
+
+recap:
+  - Trace each sensitive field from where it enters to every place it lands.
+  - Check the usual sinks, from logs and errors to URLs, caches, analytics and prompts.
+  - Prove there's no leak by planting fake values and searching every output.
+
+recall:
+  - id: card-trace-a-field
+    concept: judgment.data-tracing
+    front: How do you trace a sensitive field through a system?
+    back: >-
+      Start where it enters, then list every place it's stored, sent or printed, and who can
+      read each copy.
+  - id: card-six-sinks
+    concept: judgment.leak-sinks
+    front: Name the six usual places personal data leaks from code.
+    back: >-
+      Logs, error messages, URLs, caches, analytics events and model prompts.
+  - id: card-public-cache
+    concept: judgment.leak-sinks
+    front: "Why must a personal API reply never carry `Cache-Control: public`?"
+    back: >-
+      A shared cache may serve that reply to anyone requesting the same URL. Use `private` or
+      `no-store`.
+  - id: card-canary
+    concept: judgment.data-tracing
+    front: What is a canary value in a leak test, and how is it used?
+    back: >-
+      A fake, unique value planted in test data. If it appears in any output, that output
+      leaks.
+
+references:
+  - kind: docs
+    title: Logging Cheat Sheet
+    authors: OWASP Cheat Sheet Series
+    venue: OWASP
+    url: https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html
+    note: What to keep out of logs, including session ids, tokens, personal data and card details.
+    primary: true
+    verified: false
+  - kind: rfc
+    title: "RFC 9111: HTTP Caching"
+    authors: R. Fielding, M. Nottingham and J. Reschke (eds)
+    year: 2022
+    venue: IETF
+    url: https://www.rfc-editor.org/rfc/rfc9111
+    note: What `public`, `private` and `no-store` let a shared cache do with a reply.
+    primary: true
+    verified: false
+  - kind: spec
+    title: "CWE-532: Insertion of Sensitive Information into Log File"
+    authors: MITRE
+    venue: Common Weakness Enumeration
+    url: https://cwe.mitre.org/data/definitions/532.html
+    note: The weakness behind most log leaks, with examples.
+    verified: false
+  - kind: spec
+    title: "CWE-598: Use of GET Request Method With Sensitive Query Strings"
+    authors: MITRE
+    venue: Common Weakness Enumeration
+    url: https://cwe.mitre.org/data/definitions/598.html
+    note: Why secrets in a query string end up in logs, history and proxies.
+    verified: false
+
+deepDive: >-
+  URLs leak because so much records them in full: your web server's access log, every proxy
+  and load balancer in between, the browser's history and bookmarks. Modern browsers send
+  only the origin, not the path or query, in the `Referer` header to other sites by default.
+  Your own logs still keep the whole URL, so a reset token or an email in a query string
+  ends up there. Put secrets in a `POST` body or a header instead.
+
+
+  Security tools call this source-to-sink analysis. A source is where untrusted or sensitive
+  data enters, such as a request body. A sink is where it ends up. Static analysis tools can
+  follow values from sources to sinks across a codebase. The manual version is this lesson:
+  pick a field, follow it, list the sinks.
+
+
+  The best fix sits at the sink, not at every call site. Think of a logger that masks known
+  fields, or an analytics wrapper that accepts only an allowlist of fields. An error handler
+  can send a generic message to the browser and the detail to the logs. Each protects
+  every future caller, including the one an assistant writes next month.
+
+
+  Canary tests have limits. They find a value copied as it is or URL-encoded. They miss it
+  hashed, base64-encoded or cut in half. Add the encodings your system really uses, and
+  remember that a passing canary test shows the paths you exercised, not every path.
+
+
+  Model prompts deserve the same care as analytics. The provider may keep requests under its
+  own retention terms, and tickets written by customers often contain personal details
+  themselves. Send the fields the task needs, and mask obvious identifiers in free text.

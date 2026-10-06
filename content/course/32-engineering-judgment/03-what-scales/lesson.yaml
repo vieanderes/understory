@@ -1,0 +1,325 @@
+id: judgment.what-scales
+title: Will it hold at 10x?
+objective: Spot the line that dies at ten times the load, such as an unbounded list, an N+1 query or a hot path, by estimating.
+level: advanced
+minutes: 10
+concepts: [judgment.unbounded-work, judgment.hot-paths, judgment.quick-estimates]
+prerequisites: [scale.backpressure, db.from-code, judgment.what-to-verify]
+opening:
+  text: >-
+    You'll spot the line that falls over when the data or the traffic grows ten times. A
+    two-minute estimate then tells you whether to fix it today or next year.
+
+steps:
+  - type: prose
+    id: ten-times
+    body: >-
+      Most lines don't care about 10x. A few do: the ones whose work grows with the data. A
+      query with no `LIMIT` returns every row. A list loaded into memory grows with its
+      table. A query per item multiplies round trips.
+
+
+      Work that grows with the data, with nothing capping it, is **unbounded work**.
+
+  - type: multiple-choice
+    id: pick-why-slower
+    concept: judgment.unbounded-work
+    difficulty: 1
+    code: |
+      // A library's "My loans" page, unchanged for two years.
+      async function loanHistory(memberId) {
+        const { rows } = await db.query(
+          "SELECT * FROM loans WHERE member_id = $1 ORDER BY due DESC",
+          [memberId],
+        );
+        return rows;
+      }
+    language: js
+    question: Traffic is flat and the code hasn't changed. Why is the page far slower than last year?
+    choices:
+      - text: Every member's loan history keeps growing
+        correct: true
+        feedback: >-
+          Right. With no `LIMIT`, each year adds rows to every page.
+      - text: The database server has slowed down with age
+        feedback: >-
+          Servers don't wear out like that. The same query has more rows to read and send each
+          year.
+      - text: "`ORDER BY` gets slower every time it runs"
+        feedback: >-
+          Sorting the same rows costs the same each time. There are more rows to sort now.
+
+  - type: bug-hunt
+    id: hunt-plays-per-show
+    concept: judgment.unbounded-work
+    difficulty: 2
+    language: js
+    code: |
+      // A podcast host's dashboard: every show with its play count.
+      async function dashboard(hostId) {
+        const shows = await db.query("SELECT id, title FROM shows WHERE host_id = $1", [hostId]);
+        for (const show of shows.rows) {
+          const plays = await db.query("SELECT count(*) FROM plays WHERE show_id = $1", [show.id]);
+          show.plays = plays.rows[0].count;
+        }
+        return shows.rows;
+      }
+    prompt: >-
+      Quick for a host with three shows. A network with 400 shows waits eight seconds. Tap
+      the line whose cost grows with the shows.
+    lines: [5]
+    reasons:
+      - text: One query per show, each waiting for the last
+        correct: true
+        feedback: >-
+          Yes. 400 shows, 401 round trips. One `GROUP BY` query does it all.
+      - text: "`count(*)` should be `count(id)`"
+        feedback: >-
+          Both count rows here, at about the same cost. The trouble is running a count once per
+          show.
+      - text: The first query needs a `LIMIT`
+        feedback: >-
+          A host's own shows are a fair list to load. It's the query inside the loop that
+          multiplies.
+    fix: |
+      const { rows } = await db.query(
+        `SELECT s.id, s.title, count(p.show_id) AS plays
+         FROM shows s LEFT JOIN plays p ON p.show_id = s.id
+         WHERE s.host_id = $1
+         GROUP BY s.id, s.title`,
+        [hostId],
+      );
+
+  - type: prose
+    id: hot-paths
+    body: >-
+      Some code runs once a night. Some runs on every request: the sign-in check, the page
+      layout, the footer. That's a **hot path**.
+
+
+      A cost there is multiplied by all your traffic. Ten extra milliseconds in a nightly
+      report cost nothing. On every page of a busy site, they add up to hours of database
+      time a day.
+
+  - type: ai-review
+    id: review-recipe-count
+    concept: judgment.hot-paths
+    difficulty: 3
+    language: js
+    request: Show the total number of recipes in the site footer.
+    flawClass: performance
+    code: |
+      // Runs before every page is rendered.
+      async function layoutData(userId) {
+        const user = await db.query("SELECT id, name FROM users WHERE id = $1", [userId]);
+        const total = await db.query("SELECT count(*) FROM recipes");
+        return {
+          user: user.rows[0],
+          footer: `${total.rows[0].count} recipes and counting`,
+        };
+      }
+    prompt: >-
+      It passed review on a laptop with 200 recipes. In production, with 3 million, every
+      page got slower. Tap the line at fault.
+    lines: [4]
+    reasons:
+      - text: It counts every recipe on every page view
+        correct: true
+        feedback: >-
+          Yes. Postgres counts by reading rows, and this runs for every visitor.
+      - text: The user lookup should be cached instead
+        feedback: >-
+          That finds one row by its primary key, which stays fast at any size.
+      - text: The template string is rebuilt every time
+        feedback: >-
+          Building a short string takes microseconds. Counting 3 million rows takes far
+          longer.
+    verify:
+      question: Which test would have caught this before release?
+      choices:
+        - text: A load test against a production-sized copy
+          correct: true
+          feedback: >-
+            Yes. Only with millions of rows does the count show its cost.
+        - text: A unit test that checks the footer text
+          feedback: >-
+            The text is right. A test with a few rows can't see what the count costs.
+        - text: A test that counts the queries per page
+          feedback: >-
+            Two queries per page looks fine. The cost hides inside one of them, not in how many
+            there are.
+    fix: |
+      let cached = { count: 0, at: 0 };
+
+      // The footer can be a minute out of date. Nobody minds.
+      async function recipeCount() {
+        if (Date.now() - cached.at > 60_000) {
+          const total = await db.query("SELECT count(*) FROM recipes");
+          cached = { count: total.rows[0].count, at: Date.now() };
+        }
+        return cached.count;
+      }
+
+  - type: prose
+    id: quick-estimates
+    body: |-
+      You don't need a benchmark to see trouble coming. Multiply:
+
+      - A day has 86,400 seconds. Round it to 100,000 in your head.
+      - The busiest hour runs at a few times the daily average.
+      - Requests per second, times queries per request, is your database's load.
+
+      Two minutes of this before you build is a **quick estimate**.
+
+  - type: fill-blank
+    id: fill-estimate
+    concept: judgment.quick-estimates
+    difficulty: 3
+    language: js
+    prompt: >-
+      Will the database keep up at ten times today's users? Finish the estimate of queries per
+      second in the busiest hour.
+    template: |
+      const DAILY_USERS = 40_000 * 10; // ten times today
+      const REQUESTS_PER_USER = 30;    // in a day
+      const PEAK_FACTOR = 4;           // busiest hour against the average
+      const QUERIES_PER_REQUEST = 6;
+
+      const averagePerSecond = (DAILY_USERS * REQUESTS_PER_USER) / {{1}};
+      const peakPerSecond = averagePerSecond * {{2}};
+      const queriesPerSecond = peakPerSecond * {{3}};
+    blanks:
+      - key: '1'
+        answer: '86_400'
+        accept: ['86400']
+      - key: '2'
+        answer: PEAK_FACTOR
+      - key: '3'
+        answer: QUERIES_PER_REQUEST
+    bank: ['86_400', '3_600', '24', PEAK_FACTOR, QUERIES_PER_REQUEST, DAILY_USERS]
+
+  - type: code-challenge
+    id: write-scale-risks
+    concept: judgment.unbounded-work
+    difficulty: 4
+    language: ts
+    editable: '13-17'
+    prompt: >-
+      Write a first pass for a review bot. `scaleRisks(calls)` gets the database calls in a
+      diff, in order. Each has a `line`, its `sql`, and `inLoop`, true when it runs once per
+      item of a list. Return a finding for each risk:
+
+
+      - `'n-plus-one'` for any call with `inLoop`.
+
+      - `'unbounded'` for a `SELECT` with no `LIMIT`, unless it returns one row: it has
+      `WHERE id =` or a `count(`.
+
+
+      Ignore case and leading spaces. A call can have both findings, `n-plus-one` first.
+      Example: `{ line: 4, sql: 'SELECT * FROM books', inLoop: false }` gives
+      `[{ line: 4, problem: 'unbounded' }]`.
+    hints:
+      - The starter already flags loops. What does it never look at in the SQL?
+      - >-
+        Compare in one case: `call.sql.toUpperCase().includes('LIMIT')`. A query that returns
+        one row needs no limit.
+      - >-
+        Start each call with `const sql = call.sql.trim().toUpperCase();` and work out
+        `oneRow` from `'WHERE ID ='` and `'COUNT('`. Push `'unbounded'` after the loop check.
+
+  - type: explain-back
+    id: explain-cached-count
+    concept: judgment.quick-estimates
+    difficulty: 4
+    audience: reviewer
+    kind: decide
+    prompt: >-
+      A reviewer asks why you cache the recipe count for a minute instead of counting on every
+      page. Defend the choice with a quick estimate.
+    rubric:
+      - It estimates the daily cost as page views times the time one count takes.
+      - It names the trade-off, a footer that can be up to a minute out of date.
+      - It says why that's fine here, and where it wouldn't be, such as stock at checkout.
+    modelAnswer: >-
+      We serve about 200,000 pages a day, and counting 3 million recipes takes about 100 ms.
+      That's 20,000 seconds, over five hours of database time a day, spent on a footer.
+      Cached for a minute, it's 1,440 counts a day. The cost is a footer up to a minute
+      stale, which nobody notices. I wouldn't do this where freshness matters, such as stock
+      levels at checkout.
+
+recap:
+  - Find the work that grows with the data, such as no `LIMIT` or a query per item.
+  - Look at hot paths first, because every request pays their cost.
+  - Estimate before you build, from users, requests, the peak and queries per request.
+
+recall:
+  - id: card-unbounded
+    concept: judgment.unbounded-work
+    front: Name three shapes of unbounded work to look for in a diff.
+    back: >-
+      A query with no `LIMIT`, a whole table loaded into memory, and a query or call per item
+      in a loop.
+  - id: card-hot-path
+    concept: judgment.hot-paths
+    front: Why look at hot paths first when you ask "Will it hold at 10x?"
+    back: >-
+      Every request pays their cost, so a small cost there is multiplied by all your traffic.
+  - id: card-count-star
+    concept: judgment.hot-paths
+    front: Why is `SELECT count(*)` on a big table risky on every page view?
+    back: >-
+      Postgres keeps no stored row count, so each count reads the whole table or an index.
+  - id: card-estimate
+    concept: judgment.quick-estimates
+    front: How do you turn daily users into peak requests per second?
+    back: >-
+      Users times requests each, divided by 86,400 seconds, then times a peak factor of a few.
+
+references:
+  - kind: book
+    title: Designing Data-Intensive Applications
+    authors: Martin Kleppmann
+    year: 2017
+    venue: O'Reilly Media
+    note: Chapter 1 on describing load with a few numbers, and how one design breaks as they grow.
+    primary: true
+    verified: false
+  - kind: talk
+    title: Designs, Lessons and Advice from Building Large Distributed Systems
+    authors: Jeff Dean
+    year: 2009
+    venue: LADIS 2009 keynote
+    note: Back-of-the-envelope estimates, and the latency numbers that make them possible.
+    primary: true
+    verified: false
+  - kind: docs
+    title: Slow Counting
+    authors: PostgreSQL wiki contributors
+    venue: PostgreSQL wiki
+    url: https://wiki.postgresql.org/wiki/Slow_Counting
+    note: Why `count(*)` reads every row in Postgres, and the estimate you can use instead.
+    verified: false
+
+deepDive: >-
+  Pagination with `OFFSET` is unbounded in a quieter way. `LIMIT 20 OFFSET 40000` still reads
+  and throws away 40,000 rows to return 20, so deep pages get slower as the table grows. The
+  cursor pagination from API design stays fast at any depth, because `WHERE id < $1` jumps
+  straight to the page through the index.
+
+
+  When a footer needs only a rough size, Postgres keeps an estimate:
+  `SELECT reltuples::bigint FROM pg_class WHERE relname = 'recipes'`. It's refreshed by
+  `VACUUM` and `ANALYZE`, so it can lag, and it reads `-1` for a table never analysed. For an
+  exact count that's cheap to read, keep a counter row that the same transaction updates on
+  every insert and delete. The price is that the counter row becomes a hot spot for writes.
+
+
+  N+1 hides best inside an ORM. `post.author` looks like a field, but with lazy loading it
+  fires a query the first time it's read. A loop over posts then quietly runs one query per
+  post. The fix is the ORM's eager loading, which turns it back into one or two queries.
+
+
+  Estimates find the shape of a problem, not its exact size. Measure the hot path in
+  production before you optimise it: the busiest routes, by total time, are rarely the ones
+  anyone guessed.

@@ -6,6 +6,8 @@ export interface CourseTree {
   parts: {
     id: string;
     title: string;
+    /** One sentence: what the part leaves you able to do. */
+    summary: string;
     chapters: {
       id: string;
       slug: string;
@@ -23,6 +25,7 @@ export function courseTree(manifest: Manifest): CourseTree {
     parts: manifest.parts.map((part) => ({
       id: part.id,
       title: part.title,
+      summary: part.summary,
       chapters: part.modules.flatMap((id) => {
         const chapter = chapters.get(id);
         if (!chapter) return [];

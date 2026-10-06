@@ -3,6 +3,8 @@
 import { ArrowRight, ChevronDown, ListChecks } from 'lucide-react';
 import Link from 'next/link';
 import { buttonClass } from '@/components/ui/Button';
+import { ProgressLine } from '@/components/ui/ProgressLine';
+import { formatMinutes } from '@/core/insight';
 import type { PlanCatalog } from '@/core/plan';
 import { usePlan } from '@/features/plan/usePlan';
 import { useProgress, useStore } from '@/features/store/StoreProvider';
@@ -12,7 +14,68 @@ import { CHOSEN_PATH, currentPath } from './current';
 import { CUSTOM_PATH_ID, customPathSummary, type CourseTree } from './custom';
 import { PathView } from './PathView';
 
-/** Every path, one tap to make it yours. Folded away once a path is under way. */
+/** A path as a card: what it gets you, its stages, its size, and two clear actions. */
+function PathCard({
+  path,
+  current,
+  done,
+  onChoose,
+}: {
+  path: PathSummary;
+  current: boolean;
+  done: number;
+  onChoose: () => void;
+}) {
+  const total = path.lessonIds.length;
+  const stages = path.stages.map((s) => s.title);
+  return (
+    <li
+      className={cn(
+        'rounded-panel bg-surface flex flex-col gap-2 border p-2 md:p-3',
+        current ? 'border-fg' : 'border-border',
+      )}
+    >
+      <div className="flex flex-col gap-0.5">
+        <div className="flex items-baseline justify-between gap-2">
+          <h3 className="text-lg font-semibold">{path.name}</h3>
+          {current ? <span className="t-label shrink-0">Your path</span> : null}
+        </div>
+        <p className="text-muted text-sm">{path.promise}</p>
+      </div>
+      {stages.length > 0 ? (
+        <ol className="flex flex-col gap-0.5 text-sm">
+          {stages.map((title, i) => (
+            <li key={title} className="flex gap-1">
+              <span className="t-figure text-faint w-2 shrink-0">{i + 1}</span>
+              <span className="min-w-0">{title}</span>
+            </li>
+          ))}
+        </ol>
+      ) : null}
+      <div className="mt-auto flex flex-col gap-1.5 pt-1">
+        {done > 0 ? (
+          <ProgressLine value={done / Math.max(1, total)} label={`${path.name} done`} />
+        ) : null}
+        <p className="t-figure text-muted text-sm">
+          {done > 0 ? `${done} of ${total} lessons` : `${total} lessons`} · about{' '}
+          {formatMinutes(path.minutes)}
+        </p>
+        <div className="flex flex-wrap items-center gap-1">
+          {current ? null : (
+            <button type="button" onClick={onChoose} className={buttonClass('secondary', 'md')}>
+              Choose this path
+            </button>
+          )}
+          <Link href={`/paths/${path.id}`} className={buttonClass('quiet', 'md')}>
+            See the stages
+          </Link>
+        </div>
+      </div>
+    </li>
+  );
+}
+
+/** Every path as a card, then building your own. Choosing one makes it Learn's path. */
 function PathPicker({
   paths,
   current,
@@ -21,42 +84,35 @@ function PathPicker({
   current: string | undefined;
 }) {
   const store = useStore();
+  const { status, state } = useProgress();
+  const doneOf = (path: PathSummary) =>
+    status === 'ready' ? path.lessonIds.filter((id) => state.completedLessons.has(id)).length : 0;
   return (
-    <ul className="border-border rounded-panel bg-surface divide-border divide-y overflow-hidden border">
-      {paths.map((path) => {
-        const on = path.id === current;
-        return (
-          <li key={path.id}>
-            <button
-              type="button"
-              aria-pressed={on}
-              onClick={() =>
-                void store.record('setting_changed', { key: CHOSEN_PATH, value: path.id })
-              }
-              className={cn(
-                'hover:bg-raised flex min-h-6 w-full flex-col items-start gap-0.5 p-2 text-left transition-colors duration-150 ease-out md:px-3',
-                on && 'bg-raised',
-              )}
-            >
-              <span className={cn('font-medium', on && 'font-semibold')}>{path.name}</span>
-              <span className="text-muted text-sm">{path.decision ?? path.promise}</span>
-            </button>
-          </li>
-        );
-      })}
-      <li>
-        <Link
-          href="/learn/build"
-          className="hover:bg-raised flex min-h-6 w-full items-center gap-1 p-2 transition-colors duration-150 ease-out md:px-3"
-        >
-          <ListChecks aria-hidden size={20} strokeWidth={2} className="text-muted shrink-0" />
-          <span className="min-w-0 flex-1">
-            <span className="block font-medium">Build your own path</span>
-            <span className="text-muted block text-sm">
-              Choose parts, chapters or single lessons from the whole course.
-            </span>
-          </span>
-        </Link>
+    <ul className="grid grid-cols-1 gap-2 md:grid-cols-2 xl:grid-cols-3">
+      {paths.map((path) => (
+        <PathCard
+          key={path.id}
+          path={path}
+          current={path.id === current}
+          done={doneOf(path)}
+          onChoose={() =>
+            void store.record('setting_changed', { key: CHOSEN_PATH, value: path.id })
+          }
+        />
+      ))}
+      <li className="rounded-panel border-border flex flex-col gap-2 border p-2 md:p-3">
+        <ListChecks aria-hidden size={24} strokeWidth={2} className="text-muted" />
+        <div className="flex flex-col gap-0.5">
+          <h3 className="text-lg font-semibold">Build your own path</h3>
+          <p className="text-muted text-sm">
+            Choose whole parts, single chapters or just the lessons you want, from the whole course.
+          </p>
+        </div>
+        <div className="mt-auto pt-1">
+          <Link href="/learn/build" className={buttonClass('secondary', 'md')}>
+            Build my path
+          </Link>
+        </div>
       </li>
     </ul>
   );
@@ -92,11 +148,10 @@ export function LearnScreen({
       <div className="flex flex-col gap-6">
         <header className="flex flex-col gap-2">
           <h1 className="t-title" data-arrive="title">
-            Pick a path.
+            Choose a path.
           </h1>
           <p data-arrive="rise" className="text-muted prose-measure text-lg">
-            Each one takes you through the lessons for one goal, with tests along the way and a
-            certificate at the end.
+            Short lessons for one goal, with practice and tests along the way.
           </p>
           {setUp ? (
             <div data-arrive="rise" className="flex flex-wrap items-center gap-1 pt-1">

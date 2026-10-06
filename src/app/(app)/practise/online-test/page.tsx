@@ -12,7 +12,7 @@ export const metadata: Metadata = {
 const LESSON_TEST_COPY: Record<string, { title: string; note: string }> = {
   'interview.mock-levelled': {
     title: 'Full mock 4: one task in four levels',
-    note: 'TypeScript',
+    note: 'Grow a small bank system over four levels in TypeScript, keeping every earlier level passing.',
   },
 };
 

@@ -73,9 +73,10 @@ test('an unknown scope is a 404, not an error', async ({ request }) => {
 });
 
 test('a path reads as one lecture with its own PDF', async ({ page }) => {
-  await page.goto('/paths');
+  // Every path is listed in the Library; Learn opens on the learner's own.
+  await page.goto('/library');
   await page
-    .getByRole('link', { name: /AI engineering/ })
+    .getByRole('link', { name: /^AI engineering/ })
     .first()
     .click();
   await expect(page).toHaveURL(/\/paths\/ai-engineering$/);

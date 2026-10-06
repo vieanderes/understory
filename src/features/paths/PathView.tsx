@@ -175,11 +175,11 @@ export function PathView({
                       {stage.lectureHref ? (
                         <Link
                           href={stage.lectureHref}
+                          aria-label={`Read as a lecture: ${stage.title}`}
                           className="text-muted hover:text-fg rounded-control -ml-0.5 inline-flex h-5 items-center gap-1 self-start px-0.5 text-sm font-medium transition-colors duration-150 ease-out"
                         >
                           <BookOpen aria-hidden size={16} strokeWidth={2} />
                           Read as a lecture
-                          <span className="sr-only">: {stage.title}</span>
                         </Link>
                       ) : null}
                     </div>

@@ -95,7 +95,7 @@ const GUIDES: ReadonlyArray<readonly [RegExp, PageGuide]> = [
     {
       title: 'Library',
       offers:
-        'Everything beside the four places: the course, coding tests, lectures, labs, the concept map, the news archive, decision records, find your level and every learning path.',
+        'Everything beside the four places: the course, coding tests, lectures, labs, your progress, the news archive, decision records, find your level and every learning path.',
       starters: [
         'What is in the Library?',
         'Lessons, lectures or labs?',
@@ -146,18 +146,9 @@ const GUIDES: ReadonlyArray<readonly [RegExp, PageGuide]> = [
     {
       title: 'Progress',
       offers:
-        'The learner’s progress: what they know concept by concept, gaps to close and how far through the course they are.',
-      starters: ['How am I doing?', 'Which gap should I close first?'],
-    },
-  ],
-  [
-    /^\/map/,
-    {
-      title: 'Concept map',
-      offers:
-        'Every concept in the course and how well the learner knows it: unseen, assumed, practised, solid, fluent. Gaps are marked.',
+        'What the learner did and how well they hold each concept, for the whole course or one scope: lessons, weekly activity, mastery by weight (unseen, assumed, practised, solid, fluent, gap), test and exam results, and what to work on next.',
       starters: [
-        'How do I read this map?',
+        'What should I work on next?',
         'Which gap should I close first?',
         'How does a concept become fluent?',
       ],

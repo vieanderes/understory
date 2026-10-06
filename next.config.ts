@@ -77,6 +77,8 @@ const nextConfig: NextConfig = {
     return [
       { source: '/courses', destination: '/paths', permanent: true },
       { source: '/courses/:id', destination: '/paths/:id', permanent: true },
+      // The concept map became the Mastery section of Progress on 6 October 2026.
+      { source: '/map', destination: '/progress#mastery', permanent: true },
     ];
   },
   async headers() {

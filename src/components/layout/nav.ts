@@ -33,7 +33,7 @@ export const LIBRARY: Place = {
 };
 
 /** Pages the library holds. They light up the library, not a place. */
-const LIBRARY_ROUTES = ['/library', '/lectures', '/labs', '/map', '/decisions'];
+const LIBRARY_ROUTES = ['/library', '/lectures', '/labs', '/progress', '/decisions'];
 
 export function isCurrent(pathname: string, href: string): boolean {
   if (href === '/') return pathname === '/';

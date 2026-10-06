@@ -8,7 +8,7 @@ const ROUTES: { path: string; heading: RegExp }[] = [
   { path: '/library', heading: /Library/ },
   { path: '/paths/ai-coding-tests', heading: /AI-assisted coding tests/ },
   { path: '/learn', heading: /Seven parts/ },
-  { path: '/map', heading: /concepts/ },
+  { path: '/progress', heading: /Nothing to count yet/ },
   { path: '/practise', heading: /What do you want to practise today/ },
   { path: '/practise/online-test', heading: /Coding tests/ },
   { path: '/settings', heading: /Settings/ },

@@ -62,7 +62,7 @@ test.describe('offline', () => {
     await controlled(page);
     await context.setOffline(true);
 
-    await page.goto('/map');
+    await page.goto('/progress');
     await expect(page.getByRole('heading', { level: 1 })).toBeVisible();
   });
 });

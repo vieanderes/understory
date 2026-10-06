@@ -353,6 +353,8 @@ parts there was one capstone per module and Engineer asked for 10.
 - The accent colour is used for gaps and the primary action, and nowhere else.
 - The mono column on the right shows R in per cent and the next due date.
 - There is a second view: the same data as an 8 pt grid heatmap per module.
+- The map is the Mastery section of the Progress page (`/progress#mastery`), scoped like the
+  rest of that page to everything, the learner's path, an interest or a part.
 
 ### Collectibles that are knowledge
 

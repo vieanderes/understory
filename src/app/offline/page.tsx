@@ -28,8 +28,8 @@ const WORKS: readonly { href: string | null; what: string; how: string }[] = [
     how: 'What is due is worked out here, from your own log. Sessions are recorded.',
   },
   {
-    href: '/map',
-    what: 'The map',
+    href: '/progress',
+    what: 'Progress',
     how: 'Mastery, XP and the weekly run are derived on this device.',
   },
   {

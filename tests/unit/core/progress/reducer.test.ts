@@ -229,6 +229,15 @@ describe('applyEvent', () => {
     expect(state.completedLessons.has('js.closures')).toBe(true);
   });
 
+  it('keeps the learner date of the first completion of each lesson', () => {
+    const first = makeEvent(deps, 'lesson_completed', { lessonId: 'js.closures' });
+    const again = makeEvent(depsFor('device-1', '2026-09-20T10:00:00Z', 'r'), 'lesson_completed', {
+      lessonId: 'js.closures',
+    });
+    const state = [first, again].reduce(applyEvent, initialProgressState());
+    expect(state.lessonCompletedOn).toEqual({ 'js.closures': '2026-09-17' });
+  });
+
   it('grades explain-back with the self-grade score mapping and awards XP', () => {
     const event = makeEvent(deps, 'explain_back_graded', {
       lessonId: 'js.closures',

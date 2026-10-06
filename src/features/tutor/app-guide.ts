@@ -24,7 +24,7 @@ export const LIBRARY_SHELVES: readonly (readonly [label: string, href: string])[
   ['coding tests', '/practise/online-test'],
   ['lectures to read, hear or print', '/lectures'],
   ['labs', '/labs'],
-  ['the concept map', '/map'],
+  ['your progress: what you have done, what you know and what to work on next', '/progress'],
   ['the news archive', '/signal/archive'],
   ['decision records', '/decisions'],
   ['find your level, a placement check', '/start'],

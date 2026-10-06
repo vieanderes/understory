@@ -76,8 +76,25 @@ const pad = (n: number) => String(n).padStart(2, '0');
  * rendered on the server with every concept unseen, and the learner's state is laid over
  * it once the log is read. Weight is what you hold. Memory fades, so the page does.
  */
-export function MapView({ modules, parts = [] }: { modules: MapModule[]; parts?: MapPart[] }) {
+export function MapView({
+  modules: allModules,
+  parts = [],
+  concepts: only,
+  folded = false,
+}: {
+  modules: MapModule[];
+  parts?: MapPart[];
+  /** The concepts in scope. Without it the map shows the whole course. */
+  concepts?: ReadonlySet<string>;
+  /** Every part starts closed, for a page where the map is one section of many. */
+  folded?: boolean;
+}) {
   const { view } = useOverview();
+  const modules = only
+    ? allModules
+        .map((m) => ({ ...m, concepts: m.concepts.filter((c) => only.has(c.id)) }))
+        .filter((m) => m.concepts.length > 0)
+    : allModules;
   const [lens, setLens] = useState<Lens>('all');
   const partList = useRef<HTMLOListElement>(null);
   const captureParts = useFlip(partList, '[data-testid="map-part"]', lens);
@@ -104,7 +121,7 @@ export function MapView({ modules, parts = [] }: { modules: MapModule[]; parts?:
       modules: part.modules.flatMap((id) => moduleById.get(id) ?? []),
     })),
     { ...WOVEN, number: null, modules: modules.filter((m) => !owned.has(m.id)) },
-  ];
+  ].filter((group) => group.modules.length > 0);
   const groups = allGroups
     .map((group) => ({
       ...group,
@@ -122,8 +139,9 @@ export function MapView({ modules, parts = [] }: { modules: MapModule[]; parts?:
   const anyStarted = modules.some((m) => startedIn(m.concepts) > 0);
   const partByDefault = (group: Group) =>
     lens !== 'all' ||
-    group.modules.some((m) => startedIn(m.concepts) > 0) ||
-    (!anyStarted && group.id === groups[0]?.id);
+    (!folded &&
+      (group.modules.some((m) => startedIn(m.concepts) > 0) ||
+        (!anyStarted && group.id === groups[0]?.id)));
   const isOpen = (id: string, byDefault: boolean) => allOpen || byDefault !== toggled.has(id);
   const toggle = (id: string) =>
     setToggled((all) => {
@@ -146,9 +164,9 @@ export function MapView({ modules, parts = [] }: { modules: MapModule[]; parts?:
       <section aria-labelledby="atlas-title" className="flex flex-col gap-3">
         <div className="flex flex-col gap-0.5">
           <p className="t-label">One cell per concept</p>
-          <h2 id="atlas-title" className="t-section">
+          <h3 id="atlas-title" className="t-section">
             The atlas
-          </h2>
+          </h3>
         </div>
         <ul className="border-border flex flex-col border-b sm:grid sm:grid-cols-2 sm:gap-2 sm:border-b-0 lg:grid-cols-4">
           {allGroups.map((group) => {
@@ -215,9 +233,9 @@ export function MapView({ modules, parts = [] }: { modules: MapModule[]; parts?:
         <div className="flex flex-wrap items-end justify-between gap-x-4 gap-y-2">
           <div className="flex flex-col gap-0.5">
             <p className="t-label">Recall and due dates</p>
-            <h2 id="index-title" className="t-section">
+            <h3 id="index-title" className="t-section">
               The index
-            </h2>
+            </h3>
           </div>
           <div className="flex w-full flex-wrap items-end gap-2 sm:w-auto">
             <Segmented
@@ -282,7 +300,7 @@ export function MapView({ modules, parts = [] }: { modules: MapModule[]; parts?:
                           </>
                         )}
                       </p>
-                      <h3 className="t-section">
+                      <h4 className="t-section">
                         <button
                           type="button"
                           onClick={() => toggle(group.id)}
@@ -301,7 +319,7 @@ export function MapView({ modules, parts = [] }: { modules: MapModule[]; parts?:
                             )}
                           />
                         </button>
-                      </h3>
+                      </h4>
                       <p className="text-muted prose-measure text-sm">{group.summary}</p>
                     </div>
                     <div className="col-span-4 flex items-end justify-end gap-2">
@@ -408,7 +426,7 @@ function ModuleBlock({
   const bodyId = `map-module-${m.id}`;
   return (
     <section className="rule-t" aria-labelledby={`map-module-title-${m.id}`}>
-      <h3 id={`map-module-title-${m.id}`}>
+      <h5 id={`map-module-title-${m.id}`}>
         <button
           type="button"
           onClick={onToggle}
@@ -435,7 +453,7 @@ function ModuleBlock({
             />
           </span>
         </button>
-      </h3>
+      </h5>
       <div id={bodyId} hidden={!open}>
         <table className="mb-3 w-full">
           <thead>

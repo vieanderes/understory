@@ -184,7 +184,7 @@ export function PlanSetup({
   const specialise = goal === 'refresh-specialise';
 
   return (
-    <section aria-labelledby={titleId} className="flex max-w-3xl flex-col gap-4">
+    <section aria-labelledby={titleId} className="flex max-w-5xl flex-col gap-4">
       <div className="flex flex-col gap-1">
         <p className="t-label t-figure">
           {editing ? 'Your goals' : 'Set up'}
@@ -200,48 +200,68 @@ export function PlanSetup({
       </div>
 
       {step === 'goal' ? (
-        <div className="flex flex-col gap-3">
+        <div className="flex flex-col gap-4">
           <p className="text-muted">Pick the closest. You can change it any time.</p>
           {GROUPS.map((group) => (
-            <section key={group.title} className="flex flex-col gap-1">
-              <h2 className="t-label">{group.title}</h2>
+            <section key={group.title} className="flex flex-col gap-0.5">
+              <h2 className="t-label pb-0.5">{group.title}</h2>
               <div
                 role="radiogroup"
                 aria-label={group.title}
-                className="grid grid-cols-1 gap-1 sm:grid-cols-2"
+                className="grid grid-cols-1 gap-x-4 sm:grid-cols-2"
               >
                 {group.goals.map((id) => {
                   const { title, who } = copyOf(id);
-                  const selected = id === goal;
+                  // Only an answer already given is shown as chosen; a first visit starts with none.
+                  const selected = editing && id === goal;
                   return (
-                    <button
-                      key={id}
-                      type="button"
-                      role="radio"
-                      aria-checked={selected}
-                      onClick={() => pickGoal(id)}
-                      className={cn(
-                        'rounded-panel transition-press flex flex-col items-start gap-0.5 border p-2 text-left active:scale-98',
-                        selected
-                          ? 'border-accent bg-accent-tint'
-                          : 'border-border hover:border-border-strong hover:bg-raised',
-                      )}
-                    >
-                      <span className="font-medium">{title}</span>
-                      <span className="text-muted text-sm">{who}</span>
-                    </button>
+                    <div key={id} className="rule-t">
+                      <button
+                        type="button"
+                        role="radio"
+                        aria-checked={selected}
+                        onClick={() => pickGoal(id)}
+                        className={cn(
+                          'group hover:bg-raised rounded-control -mx-1 flex min-h-6 w-full items-center gap-2 px-1 py-2 text-left transition-colors duration-150 ease-out',
+                          selected && 'bg-raised',
+                        )}
+                      >
+                        <span className="min-w-0 flex-1">
+                          <span className={cn('block font-medium', selected && 'font-semibold')}>
+                            {title}
+                          </span>
+                          <span className="text-muted block text-sm">{who}</span>
+                        </span>
+                        <ArrowRight
+                          aria-hidden
+                          size={16}
+                          strokeWidth={2}
+                          className="text-faint group-hover:text-fg shrink-0 transition-transform duration-150 ease-out group-hover:translate-x-0.5"
+                        />
+                      </button>
+                    </div>
                   );
                 })}
                 {group.title === 'Keep up' ? (
-                  <Link
-                    href="/learn/build"
-                    className="rounded-panel transition-press border-border hover:border-border-strong hover:bg-raised flex flex-col items-start gap-0.5 border p-2 text-left active:scale-98"
-                  >
-                    <span className="font-medium">Choose my own lessons</span>
-                    <span className="text-muted text-sm">
-                      Pick parts, chapters or single lessons from the whole course.
-                    </span>
-                  </Link>
+                  <div className="rule-t">
+                    <Link
+                      href="/learn/build"
+                      className="group hover:bg-raised rounded-control -mx-1 flex min-h-6 w-full items-center gap-2 px-1 py-2 text-left transition-colors duration-150 ease-out"
+                    >
+                      <span className="min-w-0 flex-1">
+                        <span className="block font-medium">Choose my own lessons</span>
+                        <span className="text-muted block text-sm">
+                          Pick parts, chapters or single lessons from the whole course.
+                        </span>
+                      </span>
+                      <ArrowRight
+                        aria-hidden
+                        size={16}
+                        strokeWidth={2}
+                        className="text-faint group-hover:text-fg shrink-0 transition-transform duration-150 ease-out group-hover:translate-x-0.5"
+                      />
+                    </Link>
+                  </div>
                 ) : null}
               </div>
             </section>

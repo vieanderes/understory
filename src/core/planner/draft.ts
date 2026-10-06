@@ -1,4 +1,3 @@
-import { daysBetween } from '@/core/plan/plan';
 import { lessonIndex, type LessonEntry, type PlannerCourse } from './course';
 import { cleanPathName } from './name';
 import type { PathBlock } from './protocol';
@@ -195,33 +194,5 @@ function insertBefore(draft: Draft, lessonId: string, beforeId: string): Draft {
       if (at < 0) return s;
       return { ...s, lessonIds: [...s.lessonIds.slice(0, at), lessonId, ...s.lessonIds.slice(at)] };
     }),
-  };
-}
-
-// ---- Pace ------------------------------------------------------------------------------------
-
-export interface PathPace {
-  /** Weeks to finish at the learner's minutes a week, at least one. */
-  weeks: number;
-  /** With a deadline: days to go, and the minutes a week that would finish in time. */
-  daysLeft?: number;
-  minutesPerWeekNeeded?: number;
-  fits?: boolean;
-}
-
-export function pathPace(
-  minutesLeft: number,
-  pace: { minutesPerWeek: number; deadline?: string },
-  today: string,
-): PathPace {
-  const weeks = Math.max(1, Math.ceil(minutesLeft / pace.minutesPerWeek));
-  if (!pace.deadline) return { weeks };
-  const daysLeft = daysBetween(today, pace.deadline);
-  const minutesPerWeekNeeded = Math.ceil((minutesLeft * 7) / Math.max(1, daysLeft));
-  return {
-    weeks,
-    daysLeft,
-    minutesPerWeekNeeded,
-    fits: daysLeft >= 0 && minutesPerWeekNeeded <= pace.minutesPerWeek,
   };
 }

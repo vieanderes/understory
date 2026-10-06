@@ -8,7 +8,7 @@ import { ActionBar } from '@/components/layout/ActionBar';
 import { Button } from '@/components/ui/Button';
 import { InlineCode } from '@/components/ui/InlineCode';
 import { formatMinutes } from '@/core/insight';
-import { cleanPathName, MAX_NAME } from '@/core/planner';
+import { cleanPathName, MAX_NAME } from '@/core/planner/name';
 import { coverage, toggleGroup, type Coverage } from '@/core/profile';
 import { useProgress, useStore } from '@/features/store/StoreProvider';
 import { ScoutMark } from '@/features/tutor/ScoutMark';

@@ -5,7 +5,7 @@ import Link from 'next/link';
 import { useSyncExternalStore } from 'react';
 import { buttonClass } from '@/components/ui/Button';
 import { formatMinutes } from '@/core/insight';
-import { pathPace } from '@/core/planner';
+import { pathPace } from '@/core/planner/pace';
 import { useNow } from '@/features/catalog/useNow';
 import type { OwnPath } from '@/core/progress';
 import { useProgress, useStore } from '@/features/store/StoreProvider';

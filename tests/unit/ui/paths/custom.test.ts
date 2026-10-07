@@ -9,6 +9,7 @@ const lesson = (id: string) => ({
   objective: '',
   minutes: 10,
   href: `/learn/${id}`,
+  concepts: [],
 });
 const tree: CourseTree = {
   parts: [

@@ -28,7 +28,7 @@ export function PathsIndex({ paths }: { paths: readonly PathSummary[] }) {
 }
 
 export function PathRow({ path, compact = false }: { path: PathSummary; compact?: boolean }) {
-  const progress = usePathProgress(path.lessonIds);
+  const progress = usePathProgress(path);
   const finished = progress.ready && progress.nextId === undefined;
   const { passed: certified } = usePathExam(path.id);
   return (

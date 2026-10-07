@@ -114,7 +114,7 @@ function load(entry: ManifestLesson | undefined): CompiledLesson | undefined {
   return lesson;
 }
 
-/** The placement ladder (`placement.json`). It is small and read once per build. */
+/** Placement, its areas and path rules (`placement.json`). It is small and read once per build. */
 export async function getPlacement(): Promise<CompiledPlacementFile> {
   const { dir } = current();
   return readJson(dir, 'placement.json', compiledPlacementSchema) as CompiledPlacementFile;

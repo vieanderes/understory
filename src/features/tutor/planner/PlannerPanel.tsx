@@ -118,6 +118,10 @@ export function PlannerPanel({ onMessage, onFollowLink, ...panel }: PlannerPanel
           }
         : {}),
       interests: (state.profile?.interests ?? []).map((i) => INTEREST_COPY[i].label),
+      placement: Object.entries(state.placementByArea).map(([area, p]) => ({
+        area,
+        level: p.level,
+      })),
       done: course.modules.map((m) => ({
         chapter: m.title,
         id: m.id,

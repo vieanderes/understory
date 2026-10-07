@@ -68,6 +68,25 @@ describe('what Scout knows about the learner while planning', () => {
     expect(plain).toContain('Name: Backend in six weeks. Deadline: 2026-11-01.');
   });
 
+  it('gives the placement levels by area', () => {
+    const text = plannerSituation({
+      today: '2026-10-06',
+      placement: [
+        { area: 'firstcode', level: 3 },
+        { area: 'servers', level: 1 },
+      ],
+      done: [],
+      lessons: 1,
+    });
+    expect(text).toContain(
+      'Placement by area (0 new, 1 foundations, 2 working, 3 advanced): firstcode 3, servers 1.',
+    );
+    expect(text).toContain('Leave out lessons an area at 2 or 3 already covers');
+    expect(plannerSituation({ today: '2026-10-06', done: [], lessons: 1 })).not.toContain(
+      'Placement',
+    );
+  });
+
   it('says when the draft is saved', () => {
     const text = plannerSituation({
       today: '2026-10-06',

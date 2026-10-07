@@ -500,18 +500,48 @@ describe('applyEvent', () => {
     expect(reduce([first, first, second]).pathExams['coding-rounds']).toHaveLength(2);
   });
 
-  it('applies placement_completed: assumed concepts and theta by module', () => {
+  it('applies placement_completed: assumed concepts, theta by module, level by area', () => {
     const event = makeEvent(deps, 'placement_completed', {
+      scope: 'all',
       startedAs: 'new',
+      levelByArea: { firstcode: 1, servers: 0 },
       thetaByModule: { html: 900 },
       assumedConcepts: ['html.tags'],
+      unassumedConcepts: [],
     });
     const state = applyEvent(initialProgressState(), event);
     expect(state.assumedConcepts.has('html.tags')).toBe(true);
     expect(state.concepts['html.tags']?.assumed).toBe(true);
     expect(state.thetaByModule.html).toBe(900);
     expect(state.placementsCompleted).toBe(1);
+    expect(state.placementByArea).toEqual({
+      firstcode: { level: 1, at: event.at },
+      servers: { level: 0, at: event.at },
+    });
     expect(initialProgressState().placementsCompleted).toBe(0);
+  });
+
+  it('lets a later placement of one area take back what an earlier one assumed', () => {
+    const first = makeEvent(deps, 'placement_completed', {
+      scope: 'all',
+      levelByArea: { firstcode: 3, servers: 2 },
+      thetaByModule: {},
+      assumedConcepts: ['html.tags', 'css.grid'],
+      unassumedConcepts: [],
+    });
+    const second = makeEvent(deps, 'placement_completed', {
+      scope: 'firstcode',
+      levelByArea: { firstcode: 1 },
+      thetaByModule: {},
+      assumedConcepts: ['html.tags'],
+      unassumedConcepts: ['css.grid', 'css.never-assumed'],
+    });
+    const state = applyEvent(applyEvent(initialProgressState(), first), second);
+    expect([...state.assumedConcepts]).toEqual(['html.tags']);
+    expect(state.concepts['css.grid']?.assumed).toBe(false);
+    expect(state.concepts['css.never-assumed']).toBeUndefined();
+    expect(state.placementByArea.firstcode?.level).toBe(1);
+    expect(state.placementByArea.servers?.level).toBe(2);
   });
 
   it('applies last-writer-wins for goal tier, mode and settings', () => {
@@ -620,7 +650,8 @@ describe('applyEvent', () => {
     const event = makeEvent(deps, 'placement_answered', {
       itemId: 'html-1',
       moduleId: 'html',
-      rung: 1,
+      areaId: 'firstcode',
+      level: 1,
       correct: true,
       confidence: 'fairly',
     });

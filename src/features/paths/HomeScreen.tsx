@@ -13,6 +13,7 @@ import { usePlan } from '@/features/plan/usePlan';
 import type { PlanCatalog } from '@/core/plan';
 import { cn } from '@/lib/cn';
 import { onPath } from './links';
+import { placementKnows } from '@/core/placement';
 import { CHOSEN_PATH, chosenPathIds, currentPath, nextOnPath } from './current';
 import { withOwnPaths, type CourseTree } from './custom';
 
@@ -278,7 +279,7 @@ export function HomeScreen({
   // first, else their plan's, else the one with most done); else the course's next lesson.
   const all = ready ? withOwnPaths(tree, state.ownPaths, paths) : paths;
   const path = currentPath(all, planState, isDone, state.settings[CHOSEN_PATH]);
-  const pathNext = path ? nextOnPath(path, isDone) : undefined;
+  const pathNext = path ? nextOnPath(path, isDone, placementKnows(state)) : undefined;
   const begun = path ? path.lessonIds.some(isDone) : false;
   let next = pathNext;
   if (!next && !path && anythingDone) {

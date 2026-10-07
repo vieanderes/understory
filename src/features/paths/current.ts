@@ -1,3 +1,4 @@
+import { placedOut } from '@/core/placement';
 import type { PlanState } from '@/features/plan/usePlan';
 import type { PathSummary } from '@/lib/content';
 import { onPath } from './links';
@@ -47,9 +48,18 @@ export function currentPath(
     .sort((a, b) => b.done - a.done)[0]?.path;
 }
 
-/** The next lesson on a path, linked so the lesson knows which path it was opened from. */
-export function nextOnPath(path: PathSummary, isDone: (lessonId: string) => boolean) {
-  const lesson = path.stages.flatMap((s) => s.lessons).find((l) => !isDone(l.id));
+/**
+ * The next lesson on a path, linked so the lesson knows which path it was opened from. A
+ * lesson placement showed the learner knows is passed over, when `isKnown` is given.
+ */
+export function nextOnPath(
+  path: PathSummary,
+  isDone: (lessonId: string) => boolean,
+  isKnown?: (concept: string) => boolean,
+) {
+  const lesson = path.stages
+    .flatMap((s) => s.lessons)
+    .find((l) => !isDone(l.id) && !(isKnown && placedOut(l.concepts, isKnown)));
   if (!lesson?.href) return undefined;
   const position = path.lessonIds.indexOf(lesson.id) + 1;
   return {

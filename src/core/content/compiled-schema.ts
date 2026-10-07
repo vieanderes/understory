@@ -181,23 +181,31 @@ export const compiledStepSchema = z.discriminatedUnion('type', [
   compiledSql,
 ]);
 
-/** `placement.json`: the ladder, with each item compiled the way a lesson step is. */
+/** `placement.json`: the areas, with each item compiled the way a lesson step is. */
 export const compiledPlacementSchema = z.strictObject({
-  schema: z.literal(1),
-  rungs: z.array(
+  schema: z.literal(2),
+  areas: z.array(
     z.strictObject({
-      rung: z.int(),
-      moduleBand: z.array(z.string()),
-      concepts: z.array(z.string()),
-      items: z.array(
-        z.discriminatedUnion('type', [
-          compiledPredict,
-          compiledMultipleChoice,
-          compiledBugHunt.omit({ verify: true }),
-        ]),
+      id: z.string(),
+      title: z.string(),
+      part: z.string().optional(),
+      modules: z.array(z.string()),
+      levels: z.array(
+        z.strictObject({
+          level: z.int(),
+          concepts: z.array(z.string()),
+          items: z.array(
+            z.discriminatedUnion('type', [
+              compiledPredict,
+              compiledMultipleChoice,
+              compiledBugHunt.omit({ verify: true }),
+            ]),
+          ),
+        }),
       ),
     }),
   ),
+  paths: z.array(z.strictObject({ area: z.string(), below: z.int(), path: z.string() })),
 });
 
 export const compiledLessonSchema = lessonSchema.extend({

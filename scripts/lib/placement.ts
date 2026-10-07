@@ -1,21 +1,25 @@
 import { allModules } from '../../src/core/content/catalog';
 import type { Issue, RawCatalog } from '../../src/core/content/catalog';
 import type {
+  CompiledPlacementArea,
   CompiledPlacementFile,
   CompiledPlacementItem,
-  CompiledPlacementRung,
   PlacementFile,
   PlacementItem,
   PlacementWorld,
 } from '../../src/core/content/placement-schema';
-import { checkPlacement, placementFileSchema } from '../../src/core/content/placement-schema';
+import {
+  assumedByLevel,
+  checkPlacement,
+  placementFileSchema,
+} from '../../src/core/content/placement-schema';
 import type { Choice, Language } from '../../src/core/content/schema';
-import { ContentError, readYaml } from '../../src/lib/content/fs';
+import { ContentError, loadTracks, readYaml } from '../../src/lib/content/fs';
 import { stableStringify, type Bundle } from './compile';
 import { createRenderer, type Renderer } from './render';
 
 /*
- * The placement ladder, from `content/placement.yaml` to `placement.json` in the
+ * Placement, from `content/placement.yaml` to `placement.json` in the
  * bundle. It uses the same renderer as the lessons, so an item's code is highlighted at
  * build time and its markdown ships as `{md, html}`: the client needs neither a
  * highlighter nor a markdown parser (scripts/lib/compile.ts).
@@ -31,7 +35,7 @@ export interface LoadedPlacement {
   issues: Issue[];
 }
 
-/** Reads and schema-checks the ladder. A problem is an issue, never a thrown error. */
+/** Reads and schema-checks the placement file. A problem is an issue, never a thrown error. */
 export function loadPlacement(root?: string): LoadedPlacement {
   try {
     return { file: readYaml(PLACEMENT_FILE, placementFileSchema, root), issues: [] };
@@ -52,21 +56,29 @@ export function loadPlacement(root?: string): LoadedPlacement {
   }
 }
 
-/** The modules and their concepts, as the semantic checks need them. */
-export function placementWorld(catalog: RawCatalog): PlacementWorld {
+/** The modules, parts and paths, as the semantic checks need them. */
+export function placementWorld(catalog: RawCatalog, root?: string): PlacementWorld {
   return {
     modules: allModules(catalog).map((courseModule) => ({
       id: courseModule.data.id,
       concepts: courseModule.data.concepts.map((concept) => concept.id),
     })),
+    lessons: allModules(catalog).flatMap((courseModule) =>
+      courseModule.lessons.map((lesson) => ({
+        moduleId: courseModule.data.id,
+        concepts: lesson.data.concepts,
+      })),
+    ),
+    parts: (catalog.course?.data.parts ?? []).map((part) => part.id),
+    paths: Object.keys(loadTracks(root).tracks),
   };
 }
 
-/** Everything the validator and the build both want to say about the ladder. */
+/** Everything the validator and the build both want to say about placement. */
 export function checkPlacementContent(catalog: RawCatalog, root?: string): Issue[] {
   const { file, issues } = loadPlacement(root);
   if (!file) return issues;
-  return [...issues, ...checkPlacement(file, placementWorld(catalog), PLACEMENT_PATH)];
+  return [...issues, ...checkPlacement(file, placementWorld(catalog, root), PLACEMENT_PATH)];
 }
 
 // ---------------------------------------------------------------------------
@@ -111,31 +123,41 @@ function compileItem(item: PlacementItem, render: Renderer): CompiledPlacementIt
   }
 }
 
-export function compilePlacement(file: PlacementFile, render: Renderer): CompiledPlacementFile {
-  const rungs: CompiledPlacementRung[] = file.rungs.map((rung) => ({
-    rung: rung.rung,
-    moduleBand: [...rung.moduleBand],
-    concepts: [...rung.concepts],
-    items: rung.items.map((item) => compileItem(item, render)),
-  }));
-  return { schema: file.schema, rungs };
+export function compilePlacement(
+  file: PlacementFile,
+  render: Renderer,
+  lessons: PlacementWorld['lessons'],
+): CompiledPlacementFile {
+  const areas: CompiledPlacementArea[] = file.areas.map((area) => {
+    const assumed = assumedByLevel(area, lessons);
+    return {
+      id: area.id,
+      title: area.title,
+      ...(area.part === undefined ? {} : { part: area.part }),
+      modules: [...area.modules],
+      levels: area.levels.map((level, index) => ({
+        level: level.level,
+        concepts: assumed[index] ?? [],
+        items: level.items.map((item) => compileItem(item, render)),
+      })),
+    };
+  });
+  return { schema: file.schema, areas, paths: file.paths.map((rule) => ({ ...rule })) };
 }
 
-/** Every language the ladder's own renderer has to load. */
+/** Every language placement's own renderer has to load. */
 export function placementLanguages(file: PlacementFile): Language[] {
   const found = new Set<Language>();
-  for (const rung of file.rungs) {
-    for (const item of rung.items) {
-      if (item.type === 'multiple-choice') {
-        if (item.language) found.add(item.language);
-      } else found.add(item.language);
-    }
+  for (const item of file.areas.flatMap((a) => a.levels.flatMap((l) => l.items))) {
+    if (item.type === 'multiple-choice') {
+      if (item.language) found.add(item.language);
+    } else found.add(item.language);
   }
   return [...found].sort();
 }
 
 /**
- * Adds `placement.json` to the bundle. It carries its own renderer because the ladder
+ * Adds `placement.json` to the bundle. It carries its own renderer because placement
  * uses languages no lesson has to use.
  */
 export async function addPlacement(
@@ -144,10 +166,8 @@ export async function addPlacement(
   root?: string,
 ): Promise<void> {
   const { file, issues } = loadPlacement(root);
-  const problems = [
-    ...issues,
-    ...(file ? checkPlacement(file, placementWorld(catalog), PLACEMENT_PATH) : []),
-  ];
+  const world = placementWorld(catalog, root);
+  const problems = [...issues, ...(file ? checkPlacement(file, world, PLACEMENT_PATH) : [])];
   const errors = problems.filter((problem) => problem.severity === 'error');
   if (!file || errors.length > 0) {
     throw new Error(
@@ -157,5 +177,8 @@ export async function addPlacement(
     );
   }
   const render = await createRenderer(placementLanguages(file));
-  bundle.files.set(PLACEMENT_BUNDLE_FILE, stableStringify(compilePlacement(file, render)));
+  bundle.files.set(
+    PLACEMENT_BUNDLE_FILE,
+    stableStringify(compilePlacement(file, render, world.lessons)),
+  );
 }

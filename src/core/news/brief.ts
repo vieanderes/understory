@@ -76,13 +76,17 @@ function byline(authors: readonly string[]): string | null {
   return `${first} and ${plural(authors.length - 1, 'other')}`;
 }
 
-/** The sentence frame around the headline. `%` marks where the headline goes. */
-function leadFrame(item: NewsItem): string {
+/**
+ * The sentence frame around the headline. A function rather than a template with a marker,
+ * because source names, authors and titles are free text: a marker character or a `$&` in
+ * them would otherwise land the headline in the wrong place.
+ */
+function leadFrame(item: NewsItem): (headline: string) => string {
   if (item.source.kind === 'arxiv') {
     const who = byline(item.authors ?? []);
     return who === null
-      ? 'The paper "%" was posted on arXiv.'
-      : `${who} posted the paper "%" on arXiv.`;
+      ? (headline) => `The paper "${headline}" was posted on arXiv.`
+      : (headline) => `${who} posted the paper "${headline}" on arXiv.`;
   }
   if (item.source.kind === 'hn') {
     const numbers = [
@@ -90,16 +94,17 @@ function leadFrame(item: NewsItem): string {
       item.comments !== undefined && plural(item.comments, 'comment'),
     ].filter((part): part is string => part !== false);
     const tail = numbers.length > 0 ? ` with ${numbers.join(' and ')}` : '';
-    return `"%" reached the Hacker News front page${tail}.`;
+    return (headline) => `"${headline}" reached the Hacker News front page${tail}.`;
   }
-  return `${item.source.name} published "%".`;
+  const name = item.source.name;
+  return (headline) => `${name} published "${headline}".`;
 }
 
 function lead(item: NewsItem): string {
   const frame = leadFrame(item);
-  const frameWords = wordCount(frame.replace('%', ''));
+  const frameWords = wordCount(frame(''));
   const title = truncateWords(quotable(item.title), WHAT_HAPPENED_MAX_WORDS - frameWords);
-  return frame.replace('%', title);
+  return frame(title);
 }
 
 /** Sentences of the excerpt a neutral summary can repeat as they are. */

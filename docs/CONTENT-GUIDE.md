@@ -94,18 +94,22 @@ content/harness.d.ts
 ### placement.yaml
 
 Find your level (`docs/LEARNING-SCIENCE.md` B1). Schema: `placementFileSchema` in
-`src/core/content/placement-schema.ts`.
+`src/core/content/placement-schema.ts`. Every learner meets the same questions, so a change
+here changes everyone's check.
 
-- `areas`: in course order. Each has an `id`, a `title`, the `part` it mirrors (optional,
-  for the test-out link), its `modules`, and exactly three `levels`. Every module belongs to
-  one area.
-- A level holds at least three alternative `items`. What a pass lets the course assume is
-  derived at build time, never written: the concepts of the lessons the items' concepts come
-  from. So an item's `concept` picks the lesson a right answer marks known; choose it from
-  the lesson the item really tests. It must belong to the area and be taught by a lesson.
+- `areas`: the parts, in course order. Each has an `id`, a `title`, the `part` it mirrors
+  (optional, for the test-out link), `quick` (the two modules the quick check asks) and its
+  `modules` in course order. Every course module belongs to one area.
+- A module has exactly two `core` questions and two `deep` ones. `core[0]` is asked in every
+  mode, `core[1]` in the thorough check; `deep[0]` follows a right core answer, `deep[1]`
+  confirms it. The four test four different lessons of the module.
 - An item is a `predict-output`, `multiple-choice` or `bug-hunt` step (no `verify`) that
-  reads in under 45 seconds, with exactly one correct choice. Ids read `<area>-<level>-<slug>`.
-  Run every snippet first, and say how in a comment above the item.
+  reads in under 45 seconds, with exactly one correct choice. Its `concept` belongs to the
+  module and picks the lessons a right answer marks known; `also` adds further concepts it
+  truly tests, from modules of the same area. Ids read `<area>-<module>-<slug>`.
+- Core questions are everyday scenarios with an "aha" in the feedback, not definitions.
+  Mix questions with and without code. Run every snippet first, and say how in a comment
+  above the item.
 - `paths`: rules from the area to work on to a written path, `{ area, below, path }`. The
   first rule whose area matches and whose `below` is above the learner's level wins.
 

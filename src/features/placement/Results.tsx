@@ -7,10 +7,15 @@ import { Button, buttonClass } from '@/components/ui/Button';
 import { Figure } from '@/components/ui/Figure';
 import type { CompiledPlacementItem } from '@/core/content/placement-schema';
 import {
+  areaReports,
   focusArea,
   overallLevel,
   placementKnows,
   recommendPath,
+  verdictFor,
+  type AreaReport,
+  type AreaVerdict,
+  type ModuleState,
   type OverallStage,
   type PlacementOutcome,
   type PlacementSession,
@@ -26,7 +31,38 @@ import { useProgress, useStore } from '@/features/store/StoreProvider';
 import { ScoutMark } from '@/features/tutor/ScoutMark';
 import { startPlanning } from '@/features/tutor/planner/planner-store';
 import { cn } from '@/lib/cn';
-import { levelName, type PlacementData } from './types';
+import type { PlacementData } from './types';
+
+const VERDICT: Readonly<Record<AreaVerdict, string>> = {
+  deeper: 'Go deeper',
+  mostly: 'Mostly there',
+  solid: 'Solid',
+};
+
+const SURE_BUT_WRONG_SHOWN = 3;
+
+/** A module's state in words, its strength carried by weight and the gap by the accent. */
+const MODULE_STATE: Readonly<Record<ModuleState, string>> = {
+  gap: 'gap',
+  known: 'basics',
+  strong: 'strong',
+};
+
+const MODULE_STATE_CLASS: Readonly<Record<ModuleState, string>> = {
+  gap: 'text-accent',
+  known: 'text-fg',
+  strong: 'text-fg font-semibold',
+};
+
+/** Where to look first: the gaps, then the near misses, then what holds. */
+const VERDICT_ORDER: readonly AreaVerdict[] = ['deeper', 'mostly', 'solid'];
+
+interface AreaRow {
+  readonly area: PlacementData['areas'][number];
+  readonly verdict: AreaVerdict;
+  /** This run's evidence; absent for an area placed by an earlier check. */
+  readonly report: AreaReport | undefined;
+}
 
 const STAGE: Readonly<Record<OverallStage, string>> = {
   starting: 'Starting out',
@@ -36,8 +72,10 @@ const STAGE: Readonly<Record<OverallStage, string>> = {
 };
 
 /**
- * The end of placement: one lesson to start, on a path that fits, then the overall level
- * and a level per area, each with a deeper check of its own.
+ * The end of placement: one lesson to start, then an honest picture. Each area gets a
+ * verdict in plain words, solid, mostly there or go deeper, with the answers behind it, so
+ * a learner can see how much it rests on. Misses the learner was certain of come last:
+ * they are the surest sign of a misconception.
  */
 export function Results({
   session,
@@ -68,12 +106,19 @@ export function Results({
   const isKnown = (c: string) => assumed.has(c) || (!unassumed.has(c) && knownBefore(c));
   const isDone = (id: string) => state.completedLessons.has(id);
 
-  const focusId =
-    session.scope === 'all' ? focusArea(areaIds, levels, session.ratings) : session.scope;
+  const focusId = session.scope === 'all' ? focusArea(outcome.checked, levels) : session.scope;
   const focus = data.areas.find((a) => a.id === focusId);
+  // The path starts where the gaps are: the focus area's gap modules, else all of it.
+  const gapModules = outcome.modules
+    .filter((m) => m.areaId === focusId && m.state === 'gap')
+    .map((m) => m.moduleId);
   const rec = focus
     ? recommendPath({
-        focus,
+        focus: {
+          id: focus.id,
+          title: focus.title,
+          modules: gapModules.length > 0 ? gapModules : focus.modules.map((m) => m.id),
+        },
         level: levels[focus.id] ?? 0,
         rules: data.rules,
         paths: data.paths,
@@ -118,16 +163,34 @@ export function Results({
     router.push('/learn/build?plan=1');
   }
 
-  const right = session.answers.filter((a) => a.correct).length;
-  const missed = session.answers
-    .filter((a) => !a.correct)
+  const reports = new Map(areaReports(session, data.areas).map((r) => [r.areaId, r]));
+  // A verdict for every area with a level: this run's, or an earlier check's.
+  const verdicts = data.areas.flatMap((area): AreaRow[] => {
+    const report = reports.get(area.id);
+    const earlier = state.placementByArea[area.id];
+    if (report) return [{ area, verdict: report.verdict, report }];
+    // A part not picked this time keeps what an earlier check found.
+    if (earlier) return [{ area, verdict: verdictFor(earlier.level), report: undefined }];
+    return [];
+  });
+  const unchecked = data.areas.filter((a) => !verdicts.some((v) => v.area.id === a.id));
+  const count = (v: AreaVerdict) => verdicts.filter((x) => x.verdict === v).length;
+  const right = session.answers.filter((a) => a.correct && a.confidence !== 'guess').length;
+
+  const sureButWrong = session.answers
+    .filter((a) => !a.correct && a.confidence === 'certain')
     .map((a) =>
       data.areas
         .find((area) => area.id === a.areaId)
-        ?.levels.find((l) => l.level === a.level)
-        ?.items.find((i) => i.id === a.itemId),
+        ?.modules.flatMap((m) => [...m.core, ...m.deep])
+        .find((i) => i.id === a.itemId),
     )
     .filter((i): i is CompiledPlacementItem => i !== undefined);
+  // A few, so the list stays a short read; the rest sit in their areas' verdicts.
+  const sureShown = sureButWrong.slice(0, SURE_BUT_WRONG_SHOWN);
+
+  const link =
+    'hover:text-accent inline-flex min-h-5 items-center text-sm underline underline-offset-4';
 
   return (
     <section aria-labelledby="result-title" className="step-in flex flex-col gap-6 py-2">
@@ -140,26 +203,54 @@ export function Results({
           ) : focus ? (
             <>
               Nothing left to learn in {focus.title}.{' '}
-              <span className="text-muted">Pick another area.</span>
+              <span className="text-muted">Pick another part.</span>
             </>
           ) : (
             <>
-              Advanced in every area you checked.{' '}
+              Solid in every part you checked.{' '}
               <span className="text-muted">Test out to mark a part done.</span>
             </>
           )}
         </Title>
         <p className="text-muted prose-measure">
-          Concepts you showed are marked assumed. Practice checks them now and then over the next
-          two weeks, so a gap still shows up.
+          {session.mode === 'quick' ? 'A rough estimate' : 'An estimate'} from{' '}
+          {session.answers.length} {session.answers.length === 1 ? 'answer' : 'answers'} over{' '}
+          {outcome.modules.length} {outcome.modules.length === 1 ? 'module' : 'modules'}. A module
+          counts as strong only after a harder question, confirmed, and a guess never counts as
+          right. Practice keeps checking over the next two weeks, so a gap still shows up.
         </p>
       </div>
+
+      <dl className="grid grid-cols-2 gap-x-4 gap-y-3 md:grid-cols-4">
+        <Figure
+          label="Go deeper"
+          value={String(count('deeper'))}
+          unit={count('deeper') === 1 ? 'part' : 'parts'}
+          tone={count('deeper') > 0 ? 'gap' : 'default'}
+        />
+        <Figure
+          label="Mostly there"
+          value={String(count('mostly'))}
+          unit={count('mostly') === 1 ? 'part' : 'parts'}
+        />
+        <Figure
+          label="Solid"
+          value={String(count('solid'))}
+          unit={count('solid') === 1 ? 'part' : 'parts'}
+        />
+        <Figure
+          label="Right"
+          value={String(right)}
+          unit={`/ ${session.answers.length}`}
+          note={`Overall ${overall.score} / ${overall.max}, ${STAGE[overall.stage]}`}
+        />
+      </dl>
 
       {rec && lesson && focus ? (
         <RecommendedPath
           rec={rec}
           name={path?.name ?? rec.draft.name}
-          reason={`Your ${focus.title} level is ${levelName(levels[focus.id] ?? 0)}.`}
+          reason={`${focus.title} is where to go deeper next.`}
           leaving={leaving}
           onStart={() => void start()}
           onRefine={refine}
@@ -170,71 +261,105 @@ export function Results({
         </Link>
       )}
 
-      <dl className="grid grid-cols-2 gap-x-4 gap-y-3 md:grid-cols-4">
-        <Figure
-          label="Overall"
-          value={String(overall.score)}
-          unit={`/ ${overall.max}`}
-          note={STAGE[overall.stage]}
-        />
-        <Figure
-          label="Areas checked"
-          value={String(outcome.checked.length)}
-          unit={`/ ${areaIds.length}`}
-        />
-        <Figure label="Right" value={String(right)} unit={`/ ${session.answers.length}`} />
-        <Figure label="Assumed" value={String(outcome.assumedConcepts.length)} unit="concepts" />
-      </dl>
-
-      <section aria-labelledby="areas-title" className="prose-measure flex flex-col gap-1">
+      <section aria-labelledby="areas-title" className="prose-measure flex flex-col gap-3">
         <h2 id="areas-title" className="t-label">
-          By area
+          By part
         </h2>
-        <ul className="flex flex-col">
-          {data.areas.map((area) => {
-            const level = levels[area.id];
-            // An area rated New in this run was skipped, not shown to be new.
-            const skipped = session.scope === 'all' && !outcome.checked.includes(area.id);
-            const placed = level !== undefined && !skipped;
-            const isFocus = area.id === focusId;
-            const link =
-              'hover:text-accent inline-flex min-h-5 items-center text-sm underline underline-offset-4';
-            return (
-              <li key={area.id} className="rule-t flex items-center gap-2 py-1">
-                <div className="flex min-w-0 flex-1 flex-col">
-                  <span className="font-medium">{area.title}</span>
-                  <span className={cn('text-sm', isFocus ? 'text-accent' : 'text-muted')}>
-                    {placed ? levelName(level) : 'Not checked'}
-                    {isFocus ? ' · work on this next' : ''}
-                  </span>
-                </div>
-                <div className="flex shrink-0 flex-col items-end">
-                  <LevelMeter level={placed ? level : 0} gap={isFocus} />
-                  <div className="flex gap-2">
-                    {placed && level === 3 && area.part ? (
-                      <Link href={`/practise/test-out/${area.part}`} className={link}>
-                        Test out<span className="sr-only">: {area.title}</span>
-                      </Link>
-                    ) : null}
-                    <Link href={`/start?area=${area.id}`} className={link}>
-                      {placed ? 'Check in depth' : 'Check this area'}
-                      <span className="sr-only">: {area.title}</span>
-                    </Link>
-                  </div>
-                </div>
-              </li>
-            );
-          })}
-        </ul>
+        {VERDICT_ORDER.map((verdict) => {
+          const rows = verdicts.filter((v) => v.verdict === verdict);
+          if (rows.length === 0) return null;
+          return (
+            <div key={verdict} className="flex flex-col">
+              <h3
+                className={cn('pb-1 font-medium', verdict === 'deeper' ? 'text-accent' : 'text-fg')}
+              >
+                {VERDICT[verdict]}
+              </h3>
+              <ul className="flex flex-col">
+                {rows.map(({ area, report }) => {
+                  const level = levels[area.id] ?? 0;
+                  const isFocus = area.id === focusId;
+                  return (
+                    <li key={area.id} className="rule-t flex items-start gap-2 py-1">
+                      <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+                        <span>{area.title}</span>
+                        <span className="t-label text-muted">
+                          {report
+                            ? `${report.right} of ${report.asked} right${
+                                report.modulesAsked < report.modulesTotal
+                                  ? ` · ${report.modulesAsked} of ${report.modulesTotal} modules`
+                                  : ''
+                              }`
+                            : 'From an earlier check'}
+                          {isFocus ? ' · start here' : ''}
+                        </span>
+                        {report ? (
+                          <ul className="flex flex-wrap gap-x-2 text-sm">
+                            {report.modules.map((m) => (
+                              <li key={m.moduleId}>
+                                <span className="text-muted">
+                                  {data.moduleTitles[m.moduleId] ?? m.moduleId}{' '}
+                                </span>
+                                <span className={MODULE_STATE_CLASS[m.state]}>
+                                  {MODULE_STATE[m.state]}
+                                </span>
+                              </li>
+                            ))}
+                          </ul>
+                        ) : null}
+                      </div>
+                      <div className="flex shrink-0 flex-col items-end">
+                        <LevelMeter level={level} gap={verdict === 'deeper'} />
+                        <div className="flex gap-2">
+                          {level === 3 && area.part ? (
+                            <Link href={`/practise/test-out/${area.part}`} className={link}>
+                              Test out<span className="sr-only">: {area.title}</span>
+                            </Link>
+                          ) : null}
+                          <Link href={`/start?area=${area.id}`} className={link}>
+                            Check in depth<span className="sr-only">: {area.title}</span>
+                          </Link>
+                        </div>
+                      </div>
+                    </li>
+                  );
+                })}
+              </ul>
+            </div>
+          );
+        })}
+        {unchecked.length > 0 ? (
+          <div className="flex flex-col">
+            <h3 className="text-muted pb-1 font-medium">Not checked</h3>
+            <ul className="flex flex-col">
+              {unchecked.map((area) => (
+                <li key={area.id} className="rule-t flex items-center gap-2 py-1">
+                  <span className="text-muted min-w-0 flex-1">{area.title}</span>
+                  <Link href={`/start?area=${area.id}`} className={link}>
+                    Check this part<span className="sr-only">: {area.title}</span>
+                  </Link>
+                </li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
       </section>
 
-      {missed.length > 0 ? (
-        <section aria-labelledby="missed-title" className="prose-measure flex flex-col gap-3">
-          <h2 id="missed-title" className="t-label">
-            Worth a second look
-          </h2>
+      {sureButWrong.length > 0 ? (
+        <section aria-labelledby="sure-title" className="prose-measure flex flex-col gap-3">
+          <div className="flex flex-col gap-0.5">
+            <h2 id="sure-title" className="t-label">
+              Sure, but wrong
+            </h2>
+            <p className="text-muted text-sm">
+              You were certain of these. They are the gaps most worth closing.
+              {sureButWrong.length > sureShown.length
+                ? ` ${sureShown.length} of ${sureButWrong.length} shown.`
+                : ''}
+            </p>
+          </div>
           <ul className="flex flex-col gap-3">
-            {missed.map((missedItem) => {
+            {sureShown.map((missedItem) => {
               const choices =
                 missedItem.type === 'bug-hunt' ? missedItem.reasons : missedItem.choices;
               const answer = choices.find((c) => c.correct);

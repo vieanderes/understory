@@ -181,26 +181,27 @@ export const compiledStepSchema = z.discriminatedUnion('type', [
   compiledSql,
 ]);
 
-/** `placement.json`: the areas, with each item compiled the way a lesson step is. */
+const compiledPlacementItem = z.discriminatedUnion('type', [
+  compiledPredict.extend({ also: z.array(z.string()).optional() }),
+  compiledMultipleChoice.extend({ also: z.array(z.string()).optional() }),
+  compiledBugHunt.omit({ verify: true }).extend({ also: z.array(z.string()).optional() }),
+]);
+
+/** `placement.json`: the areas and their modules, each item compiled the way a lesson step is. */
 export const compiledPlacementSchema = z.strictObject({
-  schema: z.literal(2),
+  schema: z.literal(3),
   areas: z.array(
     z.strictObject({
       id: z.string(),
       title: z.string(),
       part: z.string().optional(),
-      modules: z.array(z.string()),
-      levels: z.array(
+      quick: z.array(z.string()),
+      modules: z.array(
         z.strictObject({
-          level: z.int(),
-          concepts: z.array(z.string()),
-          items: z.array(
-            z.discriminatedUnion('type', [
-              compiledPredict,
-              compiledMultipleChoice,
-              compiledBugHunt.omit({ verify: true }),
-            ]),
-          ),
+          id: z.string(),
+          core: z.array(compiledPlacementItem),
+          deep: z.array(compiledPlacementItem),
+          assumes: z.record(z.string(), z.array(z.string())),
         }),
       ),
     }),

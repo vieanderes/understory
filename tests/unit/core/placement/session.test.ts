@@ -2,173 +2,226 @@ import { describe, expect, it } from 'vitest';
 import {
   answerPlacement,
   currentPlacementItem,
-  defaultRatings,
+  moduleStateOf,
+  placementLength,
   placementProgress,
+  plannedModules,
   startPlacement,
   undoPlacement,
-  type AreaRating,
   type PlacementAreaSpec,
+  type PlacementMode,
   type PlacementSession,
 } from '@/core/placement';
+import type { Confidence } from '@/core/progress';
 
-/** Three areas, three levels each, three items per level. */
-const AREAS: PlacementAreaSpec[] = ['web', 'lang', 'data'].map((id) => ({
-  id,
-  modules: [`${id}m`, `${id}n`],
-  levels: [1, 2, 3].map((level) => ({
-    level,
-    concepts: [`${id}m.l${level}`, `${id}n.l${level}`],
-    items: ['x', 'y', 'z'].map((suffix, i) => ({
-      id: `${id}-${level}-${suffix}`,
-      concept: i === 1 ? `${id}n.l${level}` : `${id}m.l${level}`,
-    })),
+/** Two areas: web with three modules, data with two. Each module: two core, two deep. */
+const AREAS: PlacementAreaSpec[] = [
+  { id: 'web', modules: ['html', 'css', 'js'], quick: ['html', 'js'] },
+  { id: 'data', modules: ['sql', 'cache'], quick: ['sql', 'cache'] },
+].map((a) => ({
+  id: a.id,
+  quick: a.quick,
+  modules: a.modules.map((m) => ({
+    id: m,
+    core: [0, 1].map((i) => ({ id: `${m}-core-${i}`, concept: `${m}.c${i}` })),
+    deep: [0, 1].map((i) => ({ id: `${m}-deep-${i}`, concept: `${m}.d${i}` })),
   })),
 }));
 
-const ratings = (...values: AreaRating[]) =>
-  Object.fromEntries(AREAS.map((a, i) => [a.id, values[i] ?? 'new']));
+const start = (mode: PlacementMode = 'balanced', areas = ['web', 'data']) =>
+  startPlacement({ areas, mode });
 
-function answer(session: PlacementSession, correct: boolean, confidence = 'fairly' as const) {
+function answer(session: PlacementSession, correct: boolean, confidence: Confidence = 'fairly') {
   const item = currentPlacementItem(session, AREAS);
   if (!item) throw new Error('No item to answer');
   return answerPlacement(session, AREAS, { itemId: item.id, correct, confidence });
 }
 
-describe('defaultRatings', () => {
-  const ids = ['a', 'b', 'c', 'd', 'e'];
+/** Answers until the session ends, each answer decided by the item. */
+function runBy(
+  session: PlacementSession,
+  decide: (itemId: string) => [boolean, Confidence?],
+): { session: PlacementSession; asked: string[] } {
+  const asked: string[] = [];
+  let s = session;
+  for (let item = currentPlacementItem(s, AREAS); item; item = currentPlacementItem(s, AREAS)) {
+    asked.push(item.id);
+    const [correct, confidence = 'fairly'] = decide(item.id);
+    s = answerPlacement(s, AREAS, { itemId: item.id, correct, confidence });
+  }
+  return { session: s, asked };
+}
 
-  it('starts someone new on the first area only', () => {
-    expect(defaultRatings('new', ids)).toEqual({
-      a: 'some',
-      b: 'new',
-      c: 'new',
-      d: 'new',
-      e: 'new',
-    });
+describe('plannedModules', () => {
+  it('takes the areas in turn, so the topics mix, in the same order for everyone', () => {
+    expect(plannedModules(start(), AREAS).map((p) => p.moduleId)).toEqual([
+      'html',
+      'sql',
+      'css',
+      'cache',
+      'js',
+    ]);
   });
 
-  it('starts someone who builds with AI on the first three areas', () => {
-    expect(defaultRatings('ai-builder', ids)).toEqual({
-      a: 'some',
-      b: 'some',
-      c: 'some',
-      d: 'new',
-      e: 'new',
-    });
+  it('keeps to the areas chosen', () => {
+    expect(plannedModules(start('balanced', ['data']), AREAS).map((p) => p.moduleId)).toEqual([
+      'sql',
+      'cache',
+    ]);
   });
 
-  it('checks every area for someone experienced, the first two from the middle', () => {
-    expect(defaultRatings('experienced', ids)).toEqual({
-      a: 'confident',
-      b: 'confident',
-      c: 'some',
-      d: 'some',
-      e: 'some',
-    });
+  it('asks only the quick modules in the quick check', () => {
+    expect(plannedModules(start('quick'), AREAS).map((p) => p.moduleId)).toEqual([
+      'html',
+      'sql',
+      'js',
+      'cache',
+    ]);
+  });
+
+  it('keeps course order whatever order the areas were picked in', () => {
+    const picked = startPlacement({ areas: ['data', 'web'], mode: 'balanced' });
+    expect(plannedModules(picked, AREAS)[0]?.moduleId).toBe('html');
   });
 });
 
-describe('currentPlacementItem', () => {
-  it('skips areas rated new and starts on the level the rating sets', () => {
-    const session = startPlacement({ ratings: ratings('new', 'confident', 'some') });
-    expect(currentPlacementItem(session, AREAS)).toEqual({
-      id: 'lang-2-x',
-      areaId: 'lang',
-      level: 2,
-      concept: 'langm.l2',
-      moduleId: 'langm',
+describe('a module in the balanced check', () => {
+  it('asks the first core question, then the first deep one after a right answer', () => {
+    let session = start('balanced', ['data']);
+    expect(currentPlacementItem(session, AREAS)).toMatchObject({
+      id: 'sql-core-0',
+      role: 'core',
+      areaId: 'data',
+      moduleId: 'sql',
     });
-  });
-
-  it('moves to the next area when one is settled', () => {
-    let session = startPlacement({ ratings: ratings('some', 'some') });
-    session = answer(session, false);
-    expect(currentPlacementItem(session, AREAS)?.areaId).toBe('lang');
-  });
-
-  it('rotates items by attempt, so a retake opens on another snippet', () => {
-    const first = startPlacement({ ratings: ratings('some'), attempt: 0 });
-    const second = startPlacement({ ratings: ratings('some'), attempt: 1 });
-    expect(currentPlacementItem(first, AREAS)?.id).toBe('web-1-x');
-    expect(currentPlacementItem(second, AREAS)?.id).toBe('web-1-y');
-  });
-
-  it('never repeats an item at one level', () => {
-    let session = startPlacement({ ratings: ratings('some'), itemsToPass: 2 });
     session = answer(session, true);
-    expect(currentPlacementItem(session, AREAS)?.id).toBe('web-1-y');
+    expect(currentPlacementItem(session, AREAS)).toMatchObject({ id: 'sql-deep-0', role: 'deep' });
   });
 
-  it('ends an area whose level has no unseen item left', () => {
-    const thin: PlacementAreaSpec[] = [
-      { ...AREAS[0]!, levels: AREAS[0]!.levels.map((l) => ({ ...l, items: l.items.slice(0, 1) })) },
-    ];
-    let session = startPlacement({ ratings: { web: 'some' }, itemsToPass: 2 });
-    const item = currentPlacementItem(session, thin)!;
-    session = answerPlacement(session, thin, {
-      itemId: item.id,
-      correct: true,
-      confidence: 'certain',
-    });
-    expect(currentPlacementItem(session, thin)).toBeNull();
-  });
-
-  it('is null when every area is rated new', () => {
-    expect(currentPlacementItem(startPlacement({ ratings: ratings() }), AREAS)).toBeNull();
-  });
-
-  it('checks only the one area of an area run', () => {
-    let session = startPlacement({ ratings: ratings('some', 'some', 'some'), scope: 'data' });
-    expect(currentPlacementItem(session, AREAS)?.areaId).toBe('data');
+  it('moves on after a miss on the core question: the module is a gap', () => {
+    let session = start('balanced', ['data']);
     session = answer(session, false);
-    expect(currentPlacementItem(session, AREAS)).toBeNull();
+    expect(currentPlacementItem(session, AREAS)?.id).toBe('cache-core-0');
+    expect(moduleStateOf(session, AREAS, 'sql')).toBe('gap');
+  });
+
+  it('counts a right guess as not shown', () => {
+    let session = start('balanced', ['data']);
+    session = answer(session, true, 'guess');
+    expect(moduleStateOf(session, AREAS, 'sql')).toBe('gap');
+  });
+
+  it('calls a module strong on a certain deep answer, with no second one', () => {
+    const { session, asked } = runBy(start('balanced', ['data']), (id) =>
+      id.startsWith('sql') ? [true, 'certain'] : [false],
+    );
+    expect(asked.filter((id) => id.startsWith('sql'))).toEqual(['sql-core-0', 'sql-deep-0']);
+    expect(moduleStateOf(session, AREAS, 'sql')).toBe('strong');
+  });
+
+  it('confirms a deep answer that was not certain with the second deep question', () => {
+    let session = start('balanced', ['data']);
+    session = answer(session, true);
+    session = answer(session, true, 'fairly');
+    expect(currentPlacementItem(session, AREAS)?.id).toBe('sql-deep-1');
+    expect(moduleStateOf(answer(session, true), AREAS, 'sql')).toBe('strong');
+    expect(moduleStateOf(answer(session, false), AREAS, 'sql')).toBe('known');
+  });
+
+  it('calls a module known when the deep question is missed', () => {
+    let session = start('balanced', ['data']);
+    session = answer(session, true);
+    session = answer(session, false);
+    expect(moduleStateOf(session, AREAS, 'sql')).toBe('known');
+    expect(currentPlacementItem(session, AREAS)?.moduleId).toBe('cache');
+  });
+
+  it('has no state for a module not reached yet', () => {
+    expect(moduleStateOf(start(), AREAS, 'cache')).toBeUndefined();
+  });
+});
+
+describe('a module in the thorough check', () => {
+  it('needs both core questions before it asks a deep one', () => {
+    let session = start('thorough', ['data']);
+    session = answer(session, true);
+    expect(currentPlacementItem(session, AREAS)?.id).toBe('sql-core-1');
+    session = answer(session, true);
+    expect(currentPlacementItem(session, AREAS)?.id).toBe('sql-deep-0');
+  });
+
+  it('stops at a gap when the first core question is missed', () => {
+    let session = start('thorough', ['data']);
+    session = answer(session, false);
+    expect(moduleStateOf(session, AREAS, 'sql')).toBe('gap');
+    expect(currentPlacementItem(session, AREAS)?.moduleId).toBe('cache');
+  });
+
+  it('asks both deep questions, even after a certain answer', () => {
+    let session = start('thorough', ['data']);
+    session = answer(session, true);
+    session = answer(session, true);
+    session = answer(session, true, 'certain');
+    expect(currentPlacementItem(session, AREAS)?.id).toBe('sql-deep-1');
+  });
+});
+
+describe('placementLength', () => {
+  it('runs from one question a module to three, or four when thorough', () => {
+    expect(placementLength(start('balanced'), AREAS)).toEqual({ fewest: 5, most: 15 });
+    expect(placementLength(start('thorough'), AREAS)).toEqual({ fewest: 5, most: 20 });
+    expect(placementLength(start('quick'), AREAS)).toEqual({ fewest: 4, most: 12 });
+  });
+});
+
+describe('placementProgress', () => {
+  it('lowers the ceiling as modules settle early', () => {
+    let session = start('balanced', ['data']);
+    expect(placementProgress(session, AREAS)).toEqual({ asked: 0, maxItems: 6 });
+    session = answer(session, false);
+    expect(placementProgress(session, AREAS)).toEqual({ asked: 1, maxItems: 4 });
   });
 });
 
 describe('answerPlacement', () => {
   it('ignores an answer to anything but the current item', () => {
-    const session = startPlacement({ ratings: ratings('some') });
+    const session = start();
     const same = answerPlacement(session, AREAS, {
-      itemId: 'web-3-z',
+      itemId: 'js-deep-1',
       correct: true,
       confidence: 'certain',
     });
     expect(same).toBe(session);
   });
 
-  it('does not move up on a right guess, but records it as right', () => {
-    let session = startPlacement({ ratings: ratings('some', 'some') });
-    session = answer(session, true, 'guess' as never);
-    expect(session.answers[0]).toMatchObject({ correct: true, confidence: 'guess' });
-    expect(currentPlacementItem(session, AREAS)?.areaId).toBe('lang');
-  });
-});
-
-describe('placementProgress', () => {
-  it('counts areas to check, the one under way and the most items left', () => {
-    let session = startPlacement({ ratings: ratings('some', 'some') });
-    expect(placementProgress(session, AREAS)).toEqual({
-      areaIndex: 0,
-      areaCount: 2,
-      asked: 0,
-      maxItems: 6,
+  it('records the area, module and role of the answer', () => {
+    const session = answer(start('balanced', ['data']), true, 'certain');
+    expect(session.answers[0]).toEqual({
+      itemId: 'sql-core-0',
+      areaId: 'data',
+      moduleId: 'sql',
+      role: 'core',
+      correct: true,
+      confidence: 'certain',
     });
-    session = answer(session, false);
-    expect(placementProgress(session, AREAS)).toMatchObject({ areaIndex: 1, asked: 1 });
+  });
+
+  it('is done when every planned module is settled', () => {
+    const { session } = runBy(start('quick', ['data']), () => [false]);
+    expect(currentPlacementItem(session, AREAS)).toBeNull();
   });
 });
 
 describe('undoPlacement', () => {
   it('brings back the last item where it was asked', () => {
-    let session = startPlacement({ ratings: ratings('some', 'some') });
-    session = answer(session, false);
+    const session = answer(start(), true);
     const back = undoPlacement(session);
     expect(back.answers).toHaveLength(0);
-    expect(currentPlacementItem(back, AREAS)?.id).toBe('web-1-x');
+    expect(currentPlacementItem(back, AREAS)?.id).toBe('html-core-0');
   });
 
   it('does nothing before the first answer', () => {
-    const session = startPlacement({ ratings: ratings('some') });
+    const session = start();
     expect(undoPlacement(session)).toBe(session);
   });
 });

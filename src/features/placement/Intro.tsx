@@ -1,153 +1,177 @@
 'use client';
 
+import { Check } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import type { CompiledPlacementArea } from '@/core/content/placement-schema';
-import { AREA_LEVELS, type AreaRating, type StartedAs } from '@/core/placement';
+import type { PlacementMode } from '@/core/placement';
 import { Title } from '@/features/motion/Title';
 import { cn } from '@/lib/cn';
 
-const STARTS: readonly { value: StartedAs; label: string; note: string }[] = [
-  { value: 'new', label: 'New to code', note: 'Checks the very first steps.' },
-  { value: 'ai-builder', label: 'I build with AI', note: 'Checks where gaps often hide.' },
-  { value: 'experienced', label: 'Experienced', note: 'Checks every area.' },
+const MODES: readonly { value: PlacementMode; label: string; note: string }[] = [
+  { value: 'quick', label: 'Quick', note: 'A rough picture: two modules of each part.' },
+  {
+    value: 'balanced',
+    label: 'Balanced',
+    note: 'Every module once, a harder one when you know it.',
+  },
+  {
+    value: 'thorough',
+    label: 'Thorough',
+    note: 'Every module, each answer confirmed. The surest result.',
+  },
 ];
 
-const RATINGS: readonly { value: AreaRating; label: string }[] = [
-  { value: 'new', label: 'New' },
-  { value: 'some', label: 'Some' },
-  { value: 'confident', label: 'Confident' },
-];
+/** Questions a module asks on average: the core, and a follow-up about half the time. */
+const TYPICAL_PER_MODULE: Readonly<Record<PlacementMode, number>> = {
+  quick: 1.7,
+  balanced: 1.7,
+  thorough: 2.6,
+};
 
-/** About 40 seconds a question, rounded up to whole minutes. */
-const minutesFor = (questions: number) => Math.max(1, Math.ceil((questions * 40) / 60));
+/** About 30 seconds a question, the answer included. */
+const minutesFor = (questions: number) => Math.max(1, Math.round(questions / 2));
 
-const choice = (selected: boolean) =>
+export const typicalQuestions = (modules: number, mode: PlacementMode) =>
+  Math.max(modules, Math.round(modules * TYPICAL_PER_MODULE[mode]));
+
+const toggle = (selected: boolean) =>
   cn(
-    'rounded-control flex cursor-pointer border transition-colors duration-150 ease-out',
+    'rounded-control flex cursor-pointer border text-left transition-colors duration-150 ease-out active:scale-98',
+    'focus-visible:outline-accent focus-visible:outline-2 focus-visible:outline-offset-2',
     'has-focus-visible:outline-accent has-focus-visible:outline-2 has-focus-visible:outline-offset-2',
-    selected ? 'border-accent bg-accent-tint' : 'border-border hover:bg-raised',
+    selected ? 'border-fg bg-raised' : 'border-border hover:bg-raised',
   );
 
 /**
- * The start of the full check: where the learner comes from, then how they rate each
- * area. An area rated New asks nothing; the opening answer only fills in the ratings.
+ * The start of the check: which parts of the course to measure, and how long to spend.
+ * Parts someone has never touched, or does not care about, are left out rather than
+ * asked about, and the time each choice takes is said up front.
  */
 export function Intro({
   areas,
-  startedAs,
-  ratings,
-  onStartedAs,
-  onRate,
-  onBegin,
+  picked,
+  mode,
+  onToggle,
+  onAll,
+  onMode,
+  onStart,
+  modulesFor,
   ready,
 }: {
   areas: readonly CompiledPlacementArea[];
-  startedAs: StartedAs | null;
-  ratings: Readonly<Record<string, AreaRating>>;
-  onStartedAs: (value: StartedAs) => void;
-  onRate: (areaId: string, rating: AreaRating) => void;
-  onBegin: () => void;
+  picked: readonly string[];
+  mode: PlacementMode;
+  onToggle: (areaId: string) => void;
+  onAll: (all: boolean) => void;
+  onMode: (mode: PlacementMode) => void;
+  onStart: () => void;
+  /** How many modules a mode asks over the picked parts. */
+  modulesFor: (mode: PlacementMode) => number;
   ready: boolean;
 }) {
-  const checked = areas.filter((a) => (ratings[a.id] ?? 'new') !== 'new').length;
-  const questions = checked * AREA_LEVELS;
+  const allPicked = picked.length === areas.length;
+  const questions = typicalQuestions(modulesFor(mode), mode);
 
   return (
     <section aria-labelledby="start-title" className="step-in flex flex-col gap-6 py-2">
       <div className="flex flex-col gap-2">
         <Title id="start-title">Find your level.</Title>
         <p className="text-muted prose-measure">
-          Each area of the course gets its own short check, up to three questions that get harder
-          when you answer well. You get a level per area, an overall level and a path to start on.
-          Nothing is locked, whatever the result.
+          Pick what to check and how long you have. Quick questions, the answer after each one, and
+          at the end a clear picture: where you are solid, where to go deeper, where to start.
         </p>
       </div>
 
-      <fieldset className="prose-measure flex min-w-0 flex-col gap-1">
-        <legend className="mb-1 font-medium">Where are you starting from?</legend>
-        {STARTS.map((option) => (
-          <label
-            key={option.value}
-            className={cn(
-              choice(startedAs === option.value),
-              'min-h-6 flex-col justify-center px-2 py-1',
-            )}
+      <fieldset className="flex min-w-0 flex-col gap-2">
+        <div className="flex items-baseline justify-between gap-2">
+          <legend className="font-medium">What should we check?</legend>
+          <button
+            type="button"
+            onClick={() => onAll(!allPicked)}
+            className="hover:text-accent text-muted inline-flex min-h-5 items-center text-sm underline underline-offset-4"
           >
-            <input
-              type="radio"
-              name="started-as"
-              value={option.value}
-              checked={startedAs === option.value}
-              onChange={() => onStartedAs(option.value)}
-              className="sr-only"
-            />
-            <span className="font-medium">{option.label}</span>
-            <span className="text-muted text-sm">{option.note}</span>
-          </label>
-        ))}
+            {allPicked ? 'Clear all' : 'Pick all'}
+          </button>
+        </div>
+        <ul className="grid grid-cols-1 gap-1 sm:grid-cols-2 lg:grid-cols-4">
+          {areas.map((area) => {
+            const selected = picked.includes(area.id);
+            return (
+              <li key={area.id} className="flex">
+                <button
+                  type="button"
+                  aria-pressed={selected}
+                  onClick={() => onToggle(area.id)}
+                  className={cn(toggle(selected), 'min-h-8 w-full items-center gap-1 px-2 py-1')}
+                >
+                  <span className="flex min-w-0 flex-1 flex-col">
+                    <span className="font-medium">{area.title}</span>
+                    <span className="t-label text-muted">{area.modules.length} modules</span>
+                  </span>
+                  <Check
+                    aria-hidden
+                    size={16}
+                    strokeWidth={2}
+                    className={cn(
+                      'shrink-0 transition-opacity duration-150 ease-out',
+                      selected ? 'opacity-100' : 'opacity-0',
+                    )}
+                  />
+                </button>
+              </li>
+            );
+          })}
+        </ul>
       </fieldset>
 
-      {startedAs ? (
-        <div className="prose-measure flex flex-col gap-1">
-          <h2 className="font-medium">How much have you done in each area?</h2>
-          <p className="text-muted text-sm">New skips the area. Confident starts a level higher.</p>
-          <ul className="flex flex-col pt-1">
-            {areas.map((area) => (
-              <li key={area.id} className="rule-t py-1">
-                <fieldset className="flex min-w-0 flex-col gap-1 sm:flex-row sm:items-center sm:gap-2">
-                  <legend className="float-left min-w-0 flex-1 sm:py-1">{area.title}</legend>
-                  <div className="flex gap-0.5">
-                    {RATINGS.map((rating) => {
-                      const selected = (ratings[area.id] ?? 'new') === rating.value;
-                      return (
-                        <label
-                          key={rating.value}
-                          className={cn(
-                            choice(selected),
-                            'h-5 flex-1 items-center justify-center px-1.5 text-sm sm:flex-none',
-                          )}
-                        >
-                          <input
-                            type="radio"
-                            name={`rating-${area.id}`}
-                            value={rating.value}
-                            checked={selected}
-                            onChange={() => onRate(area.id, rating.value)}
-                            className="sr-only"
-                          />
-                          {rating.label}
-                        </label>
-                      );
-                    })}
-                  </div>
-                </fieldset>
-              </li>
-            ))}
-          </ul>
-        </div>
-      ) : null}
+      <fieldset className="prose-measure flex min-w-0 flex-col gap-1">
+        <legend className="mb-1 font-medium">How thorough?</legend>
+        {MODES.map((option) => {
+          const selected = option.value === mode;
+          const count = typicalQuestions(modulesFor(option.value), option.value);
+          return (
+            <label
+              key={option.value}
+              className={cn(toggle(selected), 'min-h-6 items-center gap-2 px-2 py-1')}
+            >
+              <input
+                type="radio"
+                name="placement-mode"
+                value={option.value}
+                checked={selected}
+                onChange={() => onMode(option.value)}
+                className="sr-only"
+              />
+              <span className="flex min-w-0 flex-1 flex-col">
+                <span className="font-medium">{option.label}</span>
+                <span className="text-muted text-sm">{option.note}</span>
+              </span>
+              {picked.length > 0 ? (
+                <span className="t-label t-figure text-muted shrink-0 text-right">
+                  ~{count} questions
+                  <span className="max-sm:hidden"> · {minutesFor(count)} min</span>
+                </span>
+              ) : null}
+            </label>
+          );
+        })}
+      </fieldset>
 
       <div className="flex flex-wrap items-center gap-2">
-        <Button
-          variant="primary"
-          onClick={onBegin}
-          disabled={startedAs === null || checked === 0 || !ready}
-        >
+        <Button variant="primary" onClick={onStart} disabled={picked.length === 0 || !ready}>
           Start
         </Button>
-        {startedAs ? (
-          <p className="t-label text-muted" aria-live="polite">
-            {checked === 0
-              ? 'Rate one area Some or Confident to start'
-              : `${checked} ${checked === 1 ? 'area' : 'areas'} · up to ${questions} questions · about ${minutesFor(questions)} min`}
-          </p>
-        ) : null}
+        <p className="t-label text-muted" aria-live="polite">
+          {picked.length === 0
+            ? 'Pick at least one part'
+            : `${picked.length} ${picked.length === 1 ? 'part' : 'parts'} · about ${questions} questions · ${minutesFor(questions)} min`}
+        </p>
       </div>
     </section>
   );
 }
 
-/** The start of the deeper check of one area. */
+/** The start of the thorough check of one area, linked from a result. */
 export function AreaIntro({
   title,
   questions,
@@ -163,11 +187,11 @@ export function AreaIntro({
     <section aria-labelledby="start-title" className="step-in flex flex-col gap-4 py-2">
       <div className="flex flex-col gap-2">
         <Title id="start-title">
-          {title}. <span className="text-muted">Up to {questions} questions.</span>
+          {title}. <span className="text-muted">About {questions} questions.</span>
         </Title>
         <p className="text-muted prose-measure">
-          A level counts once you get two of its questions right, so this check is steadier than the
-          quick one. It updates this area only. Nothing is locked, whatever the result.
+          Every module of this part, each answer confirmed, so this is the surest check there is. It
+          updates this part only.
         </p>
       </div>
       <Button variant="primary" className="self-start" onClick={onBegin} disabled={!ready}>

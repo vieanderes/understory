@@ -16,7 +16,7 @@
 </p>
 
 <p align="center">
-  <a href="https://understory-khaki-ten.vercel.app"><strong>Open Understory in your browser</strong></a>
+  <a href="https://understory-course.vercel.app"><strong>Open Understory in your browser</strong></a>
   · free, no account, nothing to install
 </p>
 
@@ -177,7 +177,7 @@ The details, including the shared store a serverless host needs for MCP, are in
 
 ## Start here
 
-[Open Understory](https://understory-khaki-ten.vercel.app) and start. Everything runs in your
+[Open Understory](https://understory-course.vercel.app) and start. Everything runs in your
 browser, and your progress stays on your device.
 
 The first visit asks five short questions, most answered with one tap: what you want (learn

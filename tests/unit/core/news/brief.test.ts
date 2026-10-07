@@ -144,6 +144,22 @@ describe('extractiveBrief', () => {
     expect(validateBrief(long, item(), lessonIndex).ok).toBe(true);
   });
 
+  it('places the headline literally, whatever the source name and title contain', () => {
+    const odd = extractiveBrief(
+      item({
+        title: "Prices rise 5% as $& and $' appear",
+        source: { id: 'odd', name: '100% Uptime Weekly', kind: 'feed' },
+        excerpt: '',
+        topics: ['databases'],
+      }),
+      lessonIndex,
+      interests,
+    );
+    expect(odd.whatHappened).toBe(
+      `100% Uptime Weekly published "Prices rise 5% as $& and $' appear".`,
+    );
+  });
+
   it('has a plain fallback when the item has no known topic', () => {
     const plain = extractiveBrief(item({ topics: [] }), lessonIndex, interests);
     expect(plain.whyItMatters).toBe('It matched your interests. The source does not say more.');

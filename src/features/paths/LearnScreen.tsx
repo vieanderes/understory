@@ -252,16 +252,24 @@ function Learn({
           <p data-arrive="rise" className="text-muted text-lg">
             Pick one or more. You work through them in the order you pick.
           </p>
-          {setUp ? (
+          <div data-arrive="rise" className="flex flex-wrap gap-x-4">
             <Link
-              href="/plan"
-              data-arrive="rise"
+              href="/start"
               className="text-muted hover:text-fg inline-flex min-h-5 w-fit items-center gap-0.5 text-sm font-medium underline-offset-4 hover:underline"
             >
-              Not sure? Answer five questions
+              Not sure where you stand? Find your level
               <ArrowRight aria-hidden size={16} strokeWidth={2} />
             </Link>
-          ) : null}
+            {setUp ? (
+              <Link
+                href="/plan"
+                className="text-muted hover:text-fg inline-flex min-h-5 w-fit items-center gap-0.5 text-sm font-medium underline-offset-4 hover:underline"
+              >
+                Or answer five questions
+                <ArrowRight aria-hidden size={16} strokeWidth={2} />
+              </Link>
+            ) : null}
+          </div>
         </header>
         <FindLesson tree={tree} />
         <PathPicker

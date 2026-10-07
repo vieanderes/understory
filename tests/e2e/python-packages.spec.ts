@@ -77,7 +77,7 @@ test.describe('Python packages and async', () => {
       await expect(status(page)).toContainText(/Loading (Python and )?numpy…/);
       await expect(status(page)).toHaveAttribute('data-status', 'failed', FIRST_RUN);
       expect(wheels).toHaveLength(1);
-      expect(wheels[0]).toMatch(/\/pyodide\/0\.27\.8\/numpy-2\.0\.2-.*\.whl$/);
+      expect(wheels[0]).toMatch(/\/pyodide\/0\.29\.5\/numpy-2\.2\.5-.*\.whl$/);
       expect(new URL(wheels[0] ?? '').origin).toBe(new URL(page.url()).origin);
 
       await writeCode(page, solution(NUMPY.file));
@@ -124,11 +124,11 @@ test.describe('Python packages and async', () => {
     await expect(status(page)).toHaveAttribute('data-status', 'passed', FIRST_RUN);
 
     const cached = await page.evaluate(async () => {
-      const cache = await caches.open('understory-python-v1');
+      const cache = await caches.open('understory-python-v2');
       const keys = await cache.keys();
       return keys.map((request) => new URL(request.url).pathname);
     });
-    expect(cached.some((name) => /\/numpy-2\.0\.2-.*\.whl$/.test(name))).toBe(true);
+    expect(cached.some((name) => /\/numpy-2\.2\.5-.*\.whl$/.test(name))).toBe(true);
 
     await context.setOffline(true);
     // A new document: a new frame and interpreter, with numpy from the worker's cache.

@@ -119,16 +119,16 @@ describe('classify: stale-while-revalidate for the short-lived files', () => {
 
 describe('classify: Pyodide', () => {
   it('keeps the Pyodide files on first use, in their own cache, never precached', () => {
-    expect(classify(req('/pyodide/0.27.8/pyodide.asm.wasm'), ORIGIN)).toEqual({
+    expect(classify(req('/pyodide/0.29.5/pyodide.asm.wasm'), ORIGIN)).toEqual({
       strategy: 'cache-first',
       cache: CACHES.python,
-      key: '/pyodide/0.27.8/pyodide.asm.wasm',
+      key: '/pyodide/0.29.5/pyodide.asm.wasm',
     });
     expect(PRECACHE_FILES.some((file) => file.startsWith('/pyodide/'))).toBe(false);
   });
 
   it('keeps a package wheel beside them, in the same cache, after its first use', () => {
-    const wheel = '/pyodide/0.27.8/numpy-2.0.2-cp312-cp312-pyodide_2024_0_wasm32.whl';
+    const wheel = '/pyodide/0.29.5/numpy-2.2.5-cp313-cp313-pyemscripten_2025_0_wasm32.whl';
     expect(classify(req(wheel), ORIGIN)).toEqual({
       strategy: 'cache-first',
       cache: CACHES.python,

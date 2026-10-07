@@ -14,7 +14,7 @@
 import { packageFiles, type PyodideLock } from '@/core/running/python-packages';
 
 /** Kept equal to the installed package by tests/unit/adapters/pyodide/assets.test.ts. */
-export const PYODIDE_VERSION = '0.27.8';
+export const PYODIDE_VERSION = '0.29.5';
 
 export const PYODIDE_BASE_URL = `/pyodide/${PYODIDE_VERSION}/`;
 

@@ -17,7 +17,7 @@
       /// Where the web build keeps the wheels, checked against the lock file
       /// (src/adapters/pyodide/wheels.ts). Filled by `pnpm build` or sync-resources.sh.
       static let wheelCache = JavaScriptRunnerTests.repoRoot.appending(
-        path: "node_modules/.cache/understory-pyodide/0.27.8", directoryHint: .isDirectory)
+        path: "node_modules/.cache/understory-pyodide/0.29.5", directoryHint: .isDirectory)
 
       static var pyodideInstalled: Bool {
         FileManager.default.fileExists(atPath: pyodideSource.appending(path: "pyodide.asm.wasm").path)
@@ -249,7 +249,7 @@
         let pinned = Dictionary(uniqueKeysWithValues: lock.packages.values.map { ($0.file_name, $0.sha256) })
         let manifest = try PyodideManifest.bundled()
         #expect(Set(manifest.packages.keys) == Set(PythonPackages.supported))
-        #expect(manifest.wheels.count == 9)
+        #expect(manifest.wheels.count == 10)
         for (name, file) in manifest.wheels {
           #expect(pinned[name] == file.sha256, "\(name)")
         }

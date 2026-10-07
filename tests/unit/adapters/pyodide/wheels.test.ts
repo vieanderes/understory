@@ -24,7 +24,9 @@ describe('ensureWheels', () => {
       return Promise.resolve(new Response('not a wheel'));
     };
     await expect(ensureWheels(['numpy'], { dir, fetchFile })).rejects.toThrow(/SHA-256/);
-    expect(asked).toEqual([`${WHEEL_SOURCE}numpy-2.0.2-cp312-cp312-pyodide_2024_0_wasm32.whl`]);
+    expect(asked).toEqual([
+      `${WHEEL_SOURCE}numpy-2.2.5-cp313-cp313-pyemscripten_2025_0_wasm32.whl`,
+    ]);
     expect(await readdir(dir)).toEqual([]);
   });
 

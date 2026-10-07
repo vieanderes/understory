@@ -753,8 +753,7 @@ reference in `tests/unit/adapters/online-test/program.test.ts`.
 
 ## Python
 
-Python challenges run CPython in WebAssembly: Pyodide 0.27.8, which is CPython 3.12.7, the
-version common assessment platforms run. The standard library is there, and three packages load on the first
+Python challenges run CPython in WebAssembly: Pyodide 0.29.5, which is CPython 3.13.2. The standard library is there, and three packages load on the first
 run that imports them: NumPy, pandas and Pydantic ("Packages"). A test may be an
 `async def` ("Async tests").
 
@@ -786,8 +785,8 @@ is not loosened for Python.
 Instead:
 
 1. On the first Python run, `IframeRunner` calls `loadPythonAssets`, which fetches
-   `/pyodide/0.27.8/*` on the app origin. The service worker answers these cache-first from
-   `understory-python-v1` after the first time, and they are never precached: most learners
+   `/pyodide/0.29.5/*` on the app origin. The service worker answers these cache-first from
+   `understory-python-v2` after the first time, and they are never precached: most learners
    never run Python. The frame's own requests could never reach that cache. The runner
    document comes from the service worker too (see "Offline"), so Python runs offline
    once the files have been fetched once.
@@ -848,25 +847,25 @@ Python challenge appears.
 ### Packages
 
 Three packages beyond the standard library, chosen for the AI chapters: `pydantic` (with
-`pydantic_core`), `numpy` and `pandas`. Their wheels are the ones the Pyodide 0.27.8
+`pydantic_core`), `numpy` and `pandas`. Their wheels are the ones the Pyodide 0.29.5
 distribution ships, pinned by the SHA-256s in the `pyodide-lock.json` the npm package
 carries. Nothing else can be imported; `micropip` is not there and the frame could not
 reach an index anyway.
 
-| Package  | Wheels it needs                                                           | Size   |
-| -------- | ------------------------------------------------------------------------- | ------ |
-| numpy    | numpy 2.0.2                                                               | 2.9 MB |
-| pandas   | pandas 2.2.3, numpy, python-dateutil, six, pytz                           | 9.0 MB |
-| pydantic | pydantic 2.10.5, pydantic_core 2.27.2, typing_extensions, annotated_types | 1.8 MB |
+| Package  | Wheels it needs                                                                              | Size   |
+| -------- | -------------------------------------------------------------------------------------------- | ------ |
+| numpy    | numpy 2.2.5                                                                                  | 2.8 MB |
+| pandas   | pandas 2.3.3, numpy, python-dateutil, six, pytz                                              | 8.1 MB |
+| pydantic | pydantic 2.12.5, pydantic_core 2.41.5, typing_extensions, annotated_types, typing_inspection | 2.0 MB |
 
-All nine files come to 10.9 MB. The wheels are already compressed, so gzip gains nothing.
+All ten files come to 10.0 MB. The wheels are already compressed, so gzip gains nothing.
 
 **Where they come from.** The npm package holds the interpreter, not the wheels.
 `src/adapters/pyodide/wheels.ts` fetches each wheel from jsDelivr's copy of the same
-release (`cdn.jsdelivr.net/pyodide/v0.27.8/full/`) into `node_modules/.cache/understory-pyodide/`,
+release (`cdn.jsdelivr.net/pyodide/v0.29.5/full/`) into `node_modules/.cache/understory-pyodide/`,
 and keeps a file only when its SHA-256 matches the lock file. `scripts/copy-pyodide.ts`
-then copies them next to the five start files in `public/pyodide/0.27.8/`. So the first
-build on a machine downloads 10.9 MB once; later builds, the gate and the unit tests read
+then copies them next to the five start files in `public/pyodide/0.29.5/`. So the first
+build on a machine downloads 10.0 MB once; later builds, the gate and the unit tests read
 the cache and need no network.
 
 **Which packages a run needs.** `importedPythonPackages` in
@@ -881,7 +880,7 @@ not seen and fails with Python's own `ModuleNotFoundError`.
 1. On the first run that needs a package, `IframeRunner` calls `fetchPythonPackages`,
    which reads the lock file (already cached), works out every wheel the packages need,
    dependencies first, and fetches those this frame does not hold yet from
-   `/pyodide/0.27.8/`. The service worker keeps them cache-first in `understory-python-v1`,
+   `/pyodide/0.29.5/`. The service worker keeps them cache-first in `understory-python-v2`,
    as it keeps the start files, so each is downloaded once per device and never precached.
 2. The parent posts them in one `python-packages` message: file names that match a wheel's
    and nothing else, bytes only, at most 32 files, each under the asset cap. The frame
@@ -1062,17 +1061,17 @@ The shape is the browser frame's:
 
 **The files.** 13.2 MB raw is too much to add to every install for a language most
 learners never run, so the files are not in the app bundle. `PyodideAssetStore` downloads
-them once, on the first Python run, into Application Support/Understory/pyodide/0.27.8/
+them once, on the first Python run, into Application Support/Understory/pyodide/0.29.5/
 (excluded from backup), from a source the app names: the web app's own
-`/pyodide/0.27.8/` (`PyodideAssetStore.webAppSource`), or any folder with the same bytes.
+`/pyodide/0.29.5/` (`PyodideAssetStore.webAppSource`), or any folder with the same bytes.
 Every file is checked against the size and SHA-256 in `pyodide.v1.json`, which
 `build-resources.ts` computes from the installed `pyodide` package (pinned exactly in
 package.json). A download reaches its final name only once it matches; a damaged file on
 disk is fetched again; a source serving other bytes is refused. The check runs once per
-process and takes about 10 ms. jsDelivr's `pyodide/v0.27.8/full/` served identical bytes
+process and takes about 10 ms. jsDelivr's `pyodide/v0.29.5/full/` served identical bytes
 when checked. The wheels are handled the same way, but only on the first run that needs
-them: `pyodide.v1.json` also pins every wheel numpy, pandas and pydantic need (nine files,
-10.9 MB) with the lock file's SHA-256, per package in load order, and
+them: `pyodide.v1.json` also pins every wheel numpy, pandas and pydantic need (ten files,
+10.0 MB) with the lock file's SHA-256, per package in load order, and
 `PyodideAssetStore.ensure(packages:)` fetches those a run asks for.
 
 **Numbers**, `swift test` on Apple silicon, macOS 26, files already on disk:

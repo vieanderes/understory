@@ -1,18 +1,23 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/banner-dark.png">
-    <img alt="Understory. Learn software engineering from your first line of code to a system in production. 370 lessons, 7 learning paths, 30 timed test tasks, and Scout, an AI tutor on your own Claude." src="docs/assets/readme/banner-light.png" width="100%">
+    <img alt="Understory. Learn software engineering from your first line of code to a system in production. 417 lessons, 9 learning paths, 40 timed test tasks, and Scout, an AI tutor on your own Claude." src="docs/assets/readme/banner-light.png" width="100%">
   </picture>
 </p>
 
 <p align="center">
   <a href="https://github.com/vieanderes/understory/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/vieanderes/understory/ci.yml?branch=main&style=flat-square&label=ci&labelColor=0e0f11&color=4c55c7"></a>
   <a href="#meet-scout-your-ai-tutor"><img alt="AI tutor on your own Claude" src="https://img.shields.io/badge/AI_tutor-your_own_Claude-4c55c7?style=flat-square&labelColor=0e0f11"></a>
-  <img alt="370 lessons" src="https://img.shields.io/badge/lessons-370-4c55c7?style=flat-square&labelColor=0e0f11">
+  <img alt="417 lessons" src="https://img.shields.io/badge/lessons-417-4c55c7?style=flat-square&labelColor=0e0f11">
   <img alt="Next.js 16" src="https://img.shields.io/badge/Next.js-16-4c55c7?style=flat-square&labelColor=0e0f11">
   <img alt="WCAG 2.2 AA" src="https://img.shields.io/badge/WCAG-2.2_AA-4c55c7?style=flat-square&labelColor=0e0f11">
   <img alt="Local-first" src="https://img.shields.io/badge/local--first-no_account-4c55c7?style=flat-square&labelColor=0e0f11">
   <a href="#licence"><img alt="Licence: MIT and CC BY-NC-SA 4.0" src="https://img.shields.io/badge/licence-MIT_%C2%B7_CC_BY--NC--SA-4c55c7?style=flat-square&labelColor=0e0f11"></a>
+</p>
+
+<p align="center">
+  <a href="https://understory-khaki-ten.vercel.app"><strong>Open Understory in your browser</strong></a>
+  · free, no account, nothing to install
 </p>
 
 <p align="center">
@@ -172,6 +177,9 @@ The details, including the shared store a serverless host needs for MCP, are in
 
 ## Start here
 
+[Open Understory](https://understory-khaki-ten.vercel.app) and start. Everything runs in your
+browser, and your progress stays on your device.
+
 The first visit asks five short questions, most answered with one tap: what you want (learn
 it all, a first job, refresh and then specialise, AI engineering, interviews, or just the
 news), which topics you care about, where you are starting from, how much time you have each
@@ -191,15 +199,17 @@ again, edited or removed from its page on Learn.
   <img alt="Learn, with two chosen paths as tabs. The Python path shows a search box for any lesson, the next lesson with a Continue button and the path's progress, then its first stage with four lessons done." src="docs/assets/readme/learn-light.png" width="100%">
 </picture>
 
-| If this is you                                               | Take this path                                                      | Lessons | You leave able to                                                             |
-| ------------------------------------------------------------ | ------------------------------------------------------------------- | :-----: | ----------------------------------------------------------------------------- |
-| You have never written code, or only copied it               | [Start coding](content/tracks/start-coding.yaml)                    |   15    | Write, run and fix small programs, then put one on a web page                 |
-| You let an assistant write your JavaScript for a while       | [TypeScript](content/tracks/javascript-typescript.yaml)             |   17    | Write correct TypeScript by hand again                                        |
-| Your next role or round uses Python                          | [Python](content/tracks/python.yaml)                                |   15    | Write clean, typed Python by hand                                             |
-| Someone will watch you solve a problem live                  | [Algorithms and coding patterns](content/tracks/coding-rounds.yaml) |   15    | Recognise the pattern behind a question and code it cleanly, out loud         |
-| The role is about building products on language models       | [AI engineering](content/tracks/ai-engineering.yaml)                |   21    | Build a RAG pipeline, a production model client and an agent loop             |
-| Your next step is an online coding test with an AI assistant | [AI-assisted coding tests](content/tracks/ai-coding-tests.yaml)     |   11    | Solve timed tasks against hidden tests, with the AI as an assistant you steer |
-| You have rounds that are about talking, not coding           | [Interviews and system design](content/tracks/interview-loop.yaml)  |    9    | Talk through your work, design a system and answer behavioural questions      |
+| If this is you                                               | Take this path                                                      | Lessons | You leave able to                                                                   |
+| ------------------------------------------------------------ | ------------------------------------------------------------------- | :-----: | ----------------------------------------------------------------------------------- |
+| You have never written code, or only copied it               | [Start coding](content/tracks/start-coding.yaml)                    |   15    | Write, run and fix small programs, then put one on a web page                       |
+| You let an assistant write your JavaScript for a while       | [TypeScript](content/tracks/javascript-typescript.yaml)             |   17    | Write correct TypeScript by hand again                                              |
+| Your next role or round uses Python                          | [Python](content/tracks/python.yaml)                                |   15    | Write clean, typed Python by hand                                                   |
+| Someone will watch you solve a problem live                  | [Algorithms and coding patterns](content/tracks/coding-rounds.yaml) |   15    | Recognise the pattern behind a question and code it cleanly, out loud               |
+| The role is about building products on language models       | [AI engineering](content/tracks/ai-engineering.yaml)                |   24    | Build a RAG pipeline, a production model client and an agent loop                   |
+| You are building agents that act over many steps             | [Agent engineering](content/tracks/agent-engineering.yaml)          |   13    | Build an agent with budgets, resume and a person in charge, and measure it          |
+| Your next step is an online coding test with an AI assistant | [AI-assisted coding tests](content/tracks/ai-coding-tests.yaml)     |   11    | Solve timed tasks against hidden tests, with the AI as an assistant you steer       |
+| You have rounds that are about talking, not coding           | [Interviews and system design](content/tracks/interview-loop.yaml)  |    9    | Talk through your work, design a system and answer behavioural questions            |
+| You review more code than you write, or are moving to senior | [Senior judgment](content/tracks/senior-judgment.yaml)              |   31    | Spot what will break, scale, confuse or leak before it ships, and explain your call |
 
 Every stage lists what to try once its lessons are done, marked optional and recommended: a
 practice session on just that stage, the labs that show its mechanisms, and the timed
@@ -238,10 +248,10 @@ your weekly goal, export and import, and the offline download.
 |              | What you do                                                                                         | What is underneath                                                                                                                         |
 | ------------ | --------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
 | **Set up**   | Five short questions, then one or more paths, or a path you build from parts, chapters or lessons.  | Built from the learning paths and your progress; answers and progress live in the event log on your device.                                |
-| **Learn**    | Short lessons, one idea per screen. An explanation first, then you build, fix, predict or review.   | 370 lessons in 30 chapters. Every exercise has a solution that the build runs against its own tests before it ships.                       |
+| **Learn**    | Short lessons, one idea per screen. An explanation first, then you build, fix, predict or review.   | 417 lessons in 34 chapters. Every exercise has a solution that the build runs against its own tests before it ships.                       |
 | **Ask**      | Scout AI beside any lesson or page, on your own Claude.                                             | It reads the step on screen, answers in Markdown with highlighted code, and never sits in an exam.                                         |
 | **Practise** | Spaced, mixed sessions by topic, due items first, sized before you start.                           | FSRS scheduling, a mastery model per concept and confidence ratings on each answer. See [`LEARNING-SCIENCE.md`](docs/LEARNING-SCIENCE.md). |
-| **Rehearse** | Timed online coding tests in a simulator, with an optional guided mode.                             | 30 original tasks with hidden correctness and performance tests. See [Practise the real test](#practise-the-real-test).                    |
+| **Rehearse** | Timed online coding tests in a simulator, with an optional guided mode.                             | 40 original tasks with hidden correctness and performance tests. See [Practise the real test](#practise-the-real-test).                    |
 | **Prove it** | A checkpoint and capstone at the end of each part. A final exam at the end of each path.            | Capstones come with worked solutions, each built and tested as a real project.                                                             |
 | **Track it** | A Progress page for one path, one part or everything: lessons, mastery, activity, what to do next.  | Derived from the event log, never stored. The concept map fades each concept as memory does.                                               |
 | **Read**     | Every lesson as a lecture: the explanation, worked examples, every solution, the lines to remember. | Read in the app per lesson, chapter, part or path, or download it as a PDF and as an audiobook with chapters.                              |
@@ -289,6 +299,18 @@ closing the lesson returns you to the page you opened it from.
   <img alt="The event loop stepper lab, showing a program, the call stack, the task and microtask queues and the clock." src="docs/assets/readme/lab-light.png" width="100%">
 </picture>
 
+**Explaining** closes every lesson, because saying it in your own words is where
+understanding sets. Each explain-back names who you are talking to and what you owe them: why
+something happens for a newcomer, a choice defended to a reviewer, or a warning to a teammate
+about what could go wrong. Type it, or press **Say it out loud** and talk for up to a minute;
+your browser turns speech into text and Understory stores no audio. Then compare with a model
+answer, mark the points you made, and if you like, ask Scout to push back with the one
+question a senior colleague would ask next.
+
+**Judgment** runs through the review steps. After you find the flaw in code an assistant
+wrote, some steps ask the next question: which test would have caught it, or what else the
+change could break. Knowing what to verify is the part an assistant cannot do for you.
+
 <details>
 <summary><b>All 13 step types</b></summary>
 
@@ -298,14 +320,14 @@ closing the lesson returns you to the page you opened it from.
 | `code-challenge`  | Writes code against tests, in JavaScript, TypeScript or Python, often in two languages |
 | `playground`      | Builds a live page in HTML, CSS, JavaScript or React, checked on a fresh render        |
 | `sql`             | Queries and changes a real Postgres database                                           |
-| `bug-hunt`        | Finds and fixes the bug in working-looking code                                        |
-| `ai-review`       | Reviews code an assistant wrote and points to the line that is wrong                   |
+| `bug-hunt`        | Finds and fixes the bug in working-looking code, then says which test would catch it   |
+| `ai-review`       | Reviews code an assistant wrote, points to the wrong line, and says what else it risks |
 | `predict-output`  | Says what code prints before running it                                                |
 | `trace-table`     | Follows variables through a loop, a row at a time                                      |
 | `parsons`         | Puts shuffled lines of a solution in order                                             |
 | `fill-blank`      | Completes the missing piece of a snippet                                               |
 | `multiple-choice` | Chooses between answers, with feedback on each wrong one                               |
-| `explain-back`    | Explains a cause in their own words, then marks it against three key points            |
+| `explain-back`    | Explains, defends a choice or names a risk for a set listener, typed or spoken         |
 | `lab`             | Steps through a simulation                                                             |
 
 </details>
@@ -337,9 +359,9 @@ and Scout fills the screen over the lesson.
 
 ## The course
 
-Seven parts, each ending in a checkpoint and a capstone project. Four more chapters are woven
-through them: CS fundamentals, clean code, professional habits and Next.js on the server
-appear right after the lesson they build on.
+Seven parts, each ending in a checkpoint and a capstone project. Six more chapters are woven
+through them: CS fundamentals, clean code, professional habits, Next.js on the server,
+engineering judgment and explaining your work appear right after the lesson they build on.
 
 ```mermaid
 flowchart TB
@@ -349,12 +371,12 @@ flowchart TB
   end
   subgraph B[" "]
     direction LR
-    P5["<b>5 · Production</b><br/>Security, performance, scale,<br/>architecture, cloud"] --> P6["<b>6 · Python and AI</b><br/>Python, AI engineering, AI systems"] --> P7["<b>7 · Senior engineer</b><br/>System design, patterns, interviews"]
+    P5["<b>5 · Production</b><br/>Security, performance, scale,<br/>integrations, architecture, cloud"] --> P6["<b>6 · Python and AI</b><br/>Python, AI engineering,<br/>AI systems, agents"] --> P7["<b>7 · Senior engineer</b><br/>System design, patterns, interviews"]
   end
   A --> B
 ```
 
-About 67 hours of lessons, 246 of them marked essential and 124 advanced. The advanced ones
+About 74 hours of lessons, 250 of them marked essential and 167 advanced. The advanced ones
 can wait for a second pass. The full map, with the reason each chapter matters, is in
 [`docs/CURRICULUM.md`](docs/CURRICULUM.md).
 
@@ -546,13 +568,13 @@ can wait for a second pass. The full map, with the reason each chapter matters, 
 </details>
 
 <details>
-<summary><b>Part 4 · Servers and data</b> · 43 lessons · 7 h 4 min · capstone: A booking API</summary>
+<summary><b>Part 4 · Servers and data</b> · 46 lessons · 7 h 34 min · capstone: A booking API</summary>
 
 | Chapter                                                                  | Lessons | You can build                                                                                                                                              |
 | ------------------------------------------------------------------------ | ------: | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 09 · [Backend, APIs, auth, payments](content/course/09-backend-and-apis) |      17 | An API with validated endpoints, sessions, ownership checks, rate limits, and an idempotent payment webhook handler.                                       |
+| 09 · [Backend, APIs, auth, payments](content/course/09-backend-and-apis) |      18 | An API with validated endpoints, sessions, ownership checks, rate limits, and an idempotent payment webhook handler.                                       |
 | 10 · [Databases](content/course/10-databases)                            |      16 | A schema with keys and constraints, safe queries from code, an index that fixes a slow page, a transaction that can't half-happen, and row-level security. |
-| 11 · [Testing](content/course/11-testing)                                |      10 | A test suite with unit tests, integration tests on a real database, one end-to-end journey and a load test.                                                |
+| 11 · [Testing](content/course/11-testing)                                |      12 | A test suite with unit tests, integration tests on a real database, one end-to-end journey and a load test.                                                |
 
 <details>
 <summary>09 · Backend, APIs, auth, payments</summary>
@@ -574,6 +596,7 @@ can wait for a second pass. The full map, with the reason each chapter matters, 
 15. [Files and object storage](content/course/09-backend-and-apis/15-files-and-object-storage) <sub>advanced</sub>
 16. [Realtime and streaming](content/course/09-backend-and-apis/16-realtime) <sub>advanced</sub>
 17. [Changing an API safely](content/course/09-backend-and-apis/17-api-evolution) <sub>advanced</sub>
+18. [Long and bulk operations](content/course/09-backend-and-apis/18-long-and-bulk-operations) <sub>advanced</sub>
 
 </details>
 
@@ -612,21 +635,24 @@ can wait for a second pass. The full map, with the reason each chapter matters, 
 8. [Property-based and concurrency tests](content/course/11-testing/08-property-based-and-concurrency-tests) <sub>advanced</sub>
 9. [Load testing with k6](content/course/11-testing/09-load-testing-with-k6) <sub>advanced</sub>
 10. [Contract tests](content/course/11-testing/10-contract-tests) <sub>advanced</sub>
+11. [Testing code that calls other services](content/course/11-testing/11-testing-other-services) <sub>advanced</sub>
+12. [Breaking it on purpose](content/course/11-testing/12-breaking-it-on-purpose) <sub>advanced</sub>
 
 </details>
 
 </details>
 
 <details>
-<summary><b>Part 5 · Production</b> · 69 lessons · 11 h 29 min · capstone: The booking API in production</summary>
+<summary><b>Part 5 · Production</b> · 81 lessons · 13 h 29 min · capstone: The booking API in production</summary>
 
-| Chapter                                                               | Lessons | You can build                                                                                                                                                     |
-| --------------------------------------------------------------------- | ------: | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 12 · [Security](content/course/12-security)                           |      18 | A threat model, a page that shows hostile input as text, safe cookie and CORS settings, access-control tests, safe uploads, and an audit of a small app.          |
-| 13 · [Performance](content/course/13-performance)                     |      10 | A page and an API measured before and after: no blocking scripts, no jumping content, no leaks, honest caches and one query instead of 201.                       |
-| 14 · [Concurrency and scale](content/course/14-concurrency-and-scale) |      10 | A batched, rate-safe pipeline of model calls, an idempotent payment endpoint, a queue worker for long AI jobs, and a scheduled job that runs once across servers. |
-| 15 · [Architecture](content/course/15-architecture)                   |      12 | A modular monolith refactored under tests, with thin handlers, ports for storage and the model, an outbox, and decision records.                                  |
-| 16 · [Cloud and DevOps](content/course/16-cloud-and-devops)           |      19 | A model-backed API in a container behind a reverse proxy, deployed by a pipeline with a rollback, with logs, metrics, alerts and a tested restore.                |
+| Chapter                                                                    | Lessons | You can build                                                                                                                                                     |
+| -------------------------------------------------------------------------- | ------: | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 12 · [Security](content/course/12-security)                                |      19 | A threat model, a page that shows hostile input as text, safe cookie and CORS settings, access-control tests, safe uploads, and an audit of a small app.          |
+| 13 · [Performance](content/course/13-performance)                          |      10 | A page and an API measured before and after: no blocking scripts, no jumping content, no leaks, honest caches and one query instead of 201.                       |
+| 14 · [Concurrency and scale](content/course/14-concurrency-and-scale)      |      11 | A batched, rate-safe pipeline of model calls, an idempotent payment endpoint, a queue worker for long AI jobs, and a scheduled job that runs once across servers. |
+| 30 · [Integrations and data sync](content/course/30-integrations-and-sync) |       9 | A nightly sync from a vendor API with a tie-broken cursor, token refresh, change detection by hash, deletions behind a safety valve, and reconciliation.          |
+| 15 · [Architecture](content/course/15-architecture)                        |      13 | A modular monolith refactored under tests, with thin handlers, ports for storage and the model, an outbox, and decision records.                                  |
+| 16 · [Cloud and DevOps](content/course/16-cloud-and-devops)                |      19 | A model-backed API in a container behind a reverse proxy, deployed by a pipeline with a rollback, with logs, metrics, alerts and a tested restore.                |
 
 <details>
 <summary>12 · Security</summary>
@@ -648,7 +674,8 @@ can wait for a second pass. The full map, with the reason each chapter matters, 
 15. [Defence in depth and zero trust](content/course/12-security/15-defence-in-depth-and-zero-trust)
 16. [Attacking your own app, legally](content/course/12-security/16-the-attackers-playbook)
 17. [When a dependency turns malicious](content/course/12-security/17-supply-chain) <sub>advanced</sub>
-18. [Capstone: audit an app](content/course/12-security/18-owasp-top-ten)
+18. [Personal data by design](content/course/12-security/18-personal-data-by-design) <sub>advanced</sub>
+19. [Capstone: audit an app](content/course/12-security/19-owasp-top-ten)
 
 </details>
 
@@ -679,8 +706,24 @@ can wait for a second pass. The full map, with the reason each chapter matters, 
 6. [Holds that expire](content/course/14-concurrency-and-scale/06-holds-that-expire) <sub>advanced</sub>
 7. [Idempotency](content/course/14-concurrency-and-scale/07-idempotency) <sub>advanced</sub>
 8. [Queues and workers](content/course/14-concurrency-and-scale/08-queues-and-workers) <sub>advanced</sub>
-9. [Scheduled jobs](content/course/14-concurrency-and-scale/09-scheduled-jobs) <sub>advanced</sub>
-10. [Failure handling](content/course/14-concurrency-and-scale/10-failure-handling) <sub>advanced</sub>
+9. [Fair and prioritised queues](content/course/14-concurrency-and-scale/09-fair-and-prioritised-queues) <sub>advanced</sub>
+10. [Scheduled jobs](content/course/14-concurrency-and-scale/10-scheduled-jobs) <sub>advanced</sub>
+11. [Failure handling](content/course/14-concurrency-and-scale/11-failure-handling) <sub>advanced</sub>
+
+</details>
+
+<details>
+<summary>30 · Integrations and data sync</summary>
+
+1. [Systems you don't control](content/course/30-integrations-and-sync/01-systems-you-dont-control) <sub>advanced</sub>
+2. [Reading everything, page by page](content/course/30-integrations-and-sync/02-paging-through) <sub>advanced</sub>
+3. [Tokens that expire](content/course/30-integrations-and-sync/03-tokens-that-expire) <sub>advanced</sub>
+4. [Copying data you don't own](content/course/30-integrations-and-sync/04-full-and-delta-sync) <sub>advanced</sub>
+5. [Noticing what disappeared](content/course/30-integrations-and-sync/05-noticing-deletions) <sub>advanced</sub>
+6. [Making messy data consistent](content/course/30-integrations-and-sync/06-normalising-data) <sub>advanced</sub>
+7. [Many vendors, one model](content/course/30-integrations-and-sync/07-adapters-and-models) <sub>advanced</sub>
+8. [Webhooks for speed, polling for truth](content/course/30-integrations-and-sync/08-webhooks-and-polling) <sub>advanced</sub>
+9. [Writing into someone else's system](content/course/30-integrations-and-sync/09-writing-to-other-systems) <sub>advanced</sub>
 
 </details>
 
@@ -696,9 +739,10 @@ can wait for a second pass. The full map, with the reason each chapter matters, 
 7. [Domain modelling](content/course/15-architecture/07-domain-modelling) <sub>advanced</sub>
 8. [Monolith or services](content/course/15-architecture/08-monolith-or-services) <sub>advanced</sub>
 9. [Events and the outbox](content/course/15-architecture/09-events-and-the-outbox) <sub>advanced</sub>
-10. [Read models and event logs](content/course/15-architecture/10-read-models-and-event-logs) <sub>advanced</sub>
-11. [Serving many customers](content/course/15-architecture/11-serving-many-customers) <sub>advanced</sub>
-12. [Recording decisions](content/course/15-architecture/12-recording-decisions)
+10. [Steps that span systems](content/course/15-architecture/10-steps-that-span-systems) <sub>advanced</sub>
+11. [Read models and event logs](content/course/15-architecture/11-read-models-and-event-logs) <sub>advanced</sub>
+12. [Serving many customers](content/course/15-architecture/12-serving-many-customers) <sub>advanced</sub>
+13. [Recording decisions](content/course/15-architecture/13-recording-decisions)
 
 </details>
 
@@ -730,14 +774,15 @@ can wait for a second pass. The full map, with the reason each chapter matters, 
 </details>
 
 <details>
-<summary><b>Part 6 · Python and AI engineering</b> · 51 lessons · 8 h 25 min · capstone: A support assistant</summary>
+<summary><b>Part 6 · Python and AI engineering</b> · 64 lessons · 10 h 35 min · capstone: A support assistant</summary>
 
 | Chapter                                                           | Lessons | You can build                                                                                                                                                       |
 | ----------------------------------------------------------------- | ------: | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 18 · [Python](content/course/18-python)                           |      14 | A typed command-line tool that reads a JSON file of eval results and prints a report, with exit codes CI can trust.                                                 |
 | 19 · [Python for AI engineering](content/course/19-python-for-ai) |       9 | A FastAPI service that calls a model, validates its reply with Pydantic, streams it, retries on rate limits, and is tested with a fake client.                      |
 | 20 · [AI engineering](content/course/20-ai-engineering)           |      14 | A support assistant that answers from your own documents with citations, uses tools through checked code, survives rate limits, and is gated by an eval suite.      |
-| 21 · [AI systems in production](content/course/21-ai-systems)     |      14 | A support pipeline where code owns the flow: a classifier routes each ticket, a guarded agent acts, humans approve risky steps, and evals gate every prompt change. |
+| 21 · [AI systems in production](content/course/21-ai-systems)     |      17 | A support pipeline where code owns the flow: a classifier routes each ticket, a guarded agent acts, humans approve risky steps, and evals gate every prompt change. |
+| 31 · [Agent engineering](content/course/31-agent-engineering)     |      10 | A budgeted, resumable agent with permission hooks, well-designed tools, scoped memory, a review queue, a pass^k eval suite and traces that find the costly run.     |
 
 <details>
 <summary>18 · Python</summary>
@@ -801,16 +846,35 @@ can wait for a second pass. The full map, with the reason each chapter matters, 
 2. [Retrieval in depth](content/course/21-ai-systems/02-retrieval-in-depth) <sub>advanced</sub>
 3. [Classifiers at the fork](content/course/21-ai-systems/03-classifiers-at-the-fork) <sub>advanced</sub>
 4. [Confidence thresholds and calibration](content/course/21-ai-systems/04-thresholds-and-calibration) <sub>advanced</sub>
-5. [The agent harness](content/course/21-ai-systems/05-agent-harness) <sub>advanced</sub>
-6. [Guardrails and human approval](content/course/21-ai-systems/06-guardrails) <sub>advanced</sub>
-7. [PII and privacy in AI systems](content/course/21-ai-systems/07-pii-and-privacy) <sub>advanced</sub>
-8. [Evals in depth](content/course/21-ai-systems/08-evals-in-depth) <sub>advanced</sub>
-9. [Prompts and evals as code](content/course/21-ai-systems/09-llmops) <sub>advanced</sub>
-10. [Cost, latency and fallbacks](content/course/21-ai-systems/10-cost-and-latency) <sub>advanced</sub>
-11. [Building MCP servers](content/course/21-ai-systems/11-mcp-servers) <sub>advanced</sub>
-12. [Engineering with coding agents](content/course/21-ai-systems/12-coding-agents)
-13. [Working with a coding agent on a real repo](content/course/21-ai-systems/13-agent-workbench) <sub>advanced</sub>
-14. [Shape the build before you code](content/course/21-ai-systems/14-shaping-the-build) <sub>advanced</sub>
+5. [Reading documents](content/course/21-ai-systems/05-reading-documents) <sub>advanced</sub>
+6. [Checking what a model extracted](content/course/21-ai-systems/06-checking-extractions) <sub>advanced</sub>
+7. [Controlling the agent loop](content/course/21-ai-systems/07-agent-harness) <sub>advanced</sub>
+8. [Guardrails and human approval](content/course/21-ai-systems/08-guardrails) <sub>advanced</sub>
+9. [PII and privacy in AI systems](content/course/21-ai-systems/09-pii-and-privacy) <sub>advanced</sub>
+10. [Evals in depth](content/course/21-ai-systems/10-evals-in-depth) <sub>advanced</sub>
+11. [Prompts and evals as code](content/course/21-ai-systems/11-llmops) <sub>advanced</sub>
+12. [Cost, latency and fallbacks](content/course/21-ai-systems/12-cost-and-latency) <sub>advanced</sub>
+13. [Choosing and hosting a model](content/course/21-ai-systems/13-choosing-models) <sub>advanced</sub>
+14. [Building MCP servers](content/course/21-ai-systems/14-mcp-servers) <sub>advanced</sub>
+15. [Engineering with coding agents](content/course/21-ai-systems/15-coding-agents)
+16. [Working with a coding agent on a real repo](content/course/21-ai-systems/16-agent-workbench) <sub>advanced</sub>
+17. [Shape the build before you code](content/course/21-ai-systems/17-shaping-the-build) <sub>advanced</sub>
+
+</details>
+
+<details>
+<summary>31 · Agent engineering</summary>
+
+1. [The harness around the model](content/course/31-agent-engineering/01-the-harness) <sub>advanced</sub>
+2. [Loops that run for hours](content/course/31-agent-engineering/02-long-running-loops) <sub>advanced</sub>
+3. [Context that stays sharp](content/course/31-agent-engineering/03-context-at-scale) <sub>advanced</sub>
+4. [Designing tools a model uses well](content/course/31-agent-engineering/04-tool-design) <sub>advanced</sub>
+5. [Memory that helps instead of haunts](content/course/31-agent-engineering/05-memory) <sub>advanced</sub>
+6. [One agent or many](content/course/31-agent-engineering/06-orchestration) <sub>advanced</sub>
+7. [What an agent may touch](content/course/31-agent-engineering/07-what-an-agent-may-touch) <sub>advanced</sub>
+8. [Designing the human's part](content/course/31-agent-engineering/08-human-in-the-loop) <sub>advanced</sub>
+9. [Evaluating an agent](content/course/31-agent-engineering/09-evals-for-agents) <sub>advanced</sub>
+10. [Watching agents in production](content/course/31-agent-engineering/10-watching-agents) <sub>advanced</sub>
 
 </details>
 
@@ -924,7 +988,7 @@ can wait for a second pass. The full map, with the reason each chapter matters, 
 23. [Presenting your build](content/course/28-interview-challenges/23-presenting-your-build)
 24. [Mock assessment A](content/course/28-interview-challenges/24-mock-assessment-a) <sub>advanced</sub>
 25. [Mock assessment B](content/course/28-interview-challenges/25-mock-assessment-b) <sub>advanced</sub>
-26. [Practice test 4: one task in four levels](content/course/28-interview-challenges/26-mock-levelled-assessment) <sub>advanced</sub>
+26. [Full mock 4: one task in four levels](content/course/28-interview-challenges/26-mock-levelled-assessment) <sub>advanced</sub>
 27. [Mock assessment C, in Python](content/course/28-interview-challenges/27-mock-assessment-python) <sub>advanced</sub>
 28. [AI build: a production LLM client](content/course/28-interview-challenges/28-ai-build-llm-client) <sub>advanced</sub>
 29. [Tasks candidates report](content/course/28-interview-challenges/29-tasks-candidates-report) <sub>advanced</sub>
@@ -934,16 +998,18 @@ can wait for a second pass. The full map, with the reason each chapter matters, 
 </details>
 
 <details>
-<summary><b>Woven through the parts</b> · 33 lessons · 5 h 28 min</summary>
+<summary><b>Woven through the parts</b> · 52 lessons · 8 h 35 min</summary>
 
-Short lessons on computer science, clean code and professional habits, each placed right after the lesson it builds on.
+Short lessons on computer science, clean code, professional habits, engineering judgment and explaining your work, each placed right after the lesson it builds on.
 
-| Chapter                                                              | Lessons | You can build                                                                                                                                 |
-| -------------------------------------------------------------------- | ------: | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| 17 · [CS fundamentals](content/course/17-cs-fundamentals)            |      10 | Five complexity analyses of real code, written up as notes.                                                                                   |
-| 26 · [Clean code](content/course/26-clean-code)                      |      10 | A messy module refactored under tests, with a written review explaining each change.                                                          |
-| 27 · [Code like a pro](content/course/27-code-like-a-pro)            |       9 | A before-and-after portfolio: one amateur snippet per language rewritten to a professional standard, with the reasons.                        |
-| 29 · [Next.js on the server](content/course/29-nextjs-on-the-server) |       4 | A Next.js app with a JSON endpoint, a form that saves safely, cached pages that refresh when data changes, and a deployment you run yourself. |
+| Chapter                                                              | Lessons | You can build                                                                                                                                         |
+| -------------------------------------------------------------------- | ------: | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 17 · [CS fundamentals](content/course/17-cs-fundamentals)            |      10 | Five complexity analyses of real code, written up as notes.                                                                                           |
+| 26 · [Clean code](content/course/26-clean-code)                      |      10 | A messy module refactored under tests, with a written review explaining each change.                                                                  |
+| 27 · [Code like a pro](content/course/27-code-like-a-pro)            |       9 | A before-and-after portfolio: one amateur snippet per language rewritten to a professional standard, with the reasons.                                |
+| 29 · [Next.js on the server](content/course/29-nextjs-on-the-server) |       4 | A Next.js app with a JSON endpoint, a form that saves safely, cached pages that refresh when data changes, and a deployment you run yourself.         |
+| 32 · [Engineering judgment](content/course/32-engineering-judgment)  |      11 | A review of an AI-written pull request covering security, efficiency, regressions and tests, with a pre-mortem, a ranked plan and a workflow diagram. |
+| 33 · [Explaining your work](content/course/33-explaining-your-work)  |       8 | A one-page design doc, an incident update and a recorded walkthrough of a diagram, each explained to two different audiences.                         |
 
 <details>
 <summary>17 · CS fundamentals</summary>
@@ -1002,13 +1068,45 @@ Short lessons on computer science, clean code and professional habits, each plac
 
 </details>
 
+<details>
+<summary>32 · Engineering judgment</summary>
+
+1. [What to check before you trust code](content/course/32-engineering-judgment/01-what-to-verify)
+2. [Finding what breaks](content/course/32-engineering-judgment/02-what-breaks) <sub>advanced</sub>
+3. [Will it hold at 10x?](content/course/32-engineering-judgment/03-what-scales) <sub>advanced</sub>
+4. [What confuses the next person](content/course/32-engineering-judgment/04-next-reader) <sub>advanced</sub>
+5. [Following the data](content/course/32-engineering-judgment/05-what-leaks) <sub>advanced</sub>
+6. [What could this change break?](content/course/32-engineering-judgment/06-regressions) <sub>advanced</sub>
+7. [Pressure-testing a design](content/course/32-engineering-judgment/07-pressure-testing) <sub>advanced</sub>
+8. [Making the call](content/course/32-engineering-judgment/08-trade-offs) <sub>advanced</sub>
+9. [From intent to a ranked list](content/course/32-engineering-judgment/09-intents-and-priorities) <sub>advanced</sub>
+10. [Drawing the workflow](content/course/32-engineering-judgment/10-workflows-on-paper) <sub>advanced</sub>
+11. [Reviewing a whole change](content/course/32-engineering-judgment/11-reviewing-a-change) <sub>advanced</sub>
+
+</details>
+
+<details>
+<summary>33 · Explaining your work</summary>
+
+1. [Saying it plainly](content/course/33-explaining-your-work/01-say-it-plainly)
+2. [Asking a question people can answer](content/course/33-explaining-your-work/02-asking-for-help)
+3. [Walking someone through code](content/course/33-explaining-your-work/03-walking-through-code)
+4. [Explaining a decision](content/course/33-explaining-your-work/04-explaining-a-decision) <sub>advanced</sub>
+5. [Same idea, different listeners](content/course/33-explaining-your-work/05-audiences) <sub>advanced</sub>
+6. [Writing an incident update](content/course/33-explaining-your-work/06-incident-updates) <sub>advanced</sub>
+7. [A one-page design doc](content/course/33-explaining-your-work/07-design-docs) <sub>advanced</sub>
+8. [Talking through a diagram](content/course/33-explaining-your-work/08-talking-through-a-diagram) <sub>advanced</sub>
+
+</details>
+
 </details>
 
 ## Read it instead
 
 Some days you want to read, not click. Every lesson is also a lecture: the explanation, the
-worked examples with their reasons, every exercise with its full solution, the pitfalls and
-the interview answers to remember.
+worked examples with their reasons, every exercise with its full solution, the pitfalls, a
+**Before you ship** checklist (what breaks, what scales, what confuses the next reader, what
+leaks, how to test it) and the interview answers to remember.
 
 <p align="center">
   <picture>
@@ -1050,11 +1148,13 @@ coding tests**. It looks, runs and scores like the real thing, so on the day not
 - **Guided mode.** A coach walks each task step by step: what to read first, what to ask
   the AI and why, what to write yourself, what to let the AI write, when to optimise and
   when to submit. The build proves every guide ends in a solution that scores 100%.
-- **30 original tasks** across the classic assessment topics, in JavaScript, TypeScript
-  and Python, with 120-minute training on any task and custom tests.
-- **Ten tests, named for what they hold**, grouped as Start here (a one-task warm-up), Short
-  screens, With the AI assistant, and Full mocks, including one task in four levels. Each
-  path stage lists the tests and tasks it prepares you for.
+- **40 original tasks** across the classic assessment topics, plus practical engineering
+  and agent tasks, in JavaScript, TypeScript and Python, with 120-minute training on any
+  task and custom tests.
+- **Twelve tests, named for what they hold**, grouped as Start here (a one-task warm-up),
+  Short screens (among them a practical screen), With the AI assistant (among them an agent
+  screen), and Full mocks, including one task in four levels. Each path stage lists the
+  tests and tasks it prepares you for.
 
 The assistant is Scout, on the same connection to your own Claude
 ([Meet Scout](#meet-scout-your-ai-tutor)). Here it knows the task, your code and the last
@@ -1167,7 +1267,7 @@ Every decision, with its reason, is in [`docs/ARCHITECTURE.md`](docs/ARCHITECTUR
 ```text
 content/
   course/<chapter>/<lesson>/   lesson.yaml, notes.yaml, and solutions
-  tracks/                      the seven learning paths
+  tracks/                      the nine learning paths
   online-tests/                the simulator's tasks and preset tests
   capstones/                   worked solutions for each part's capstone
   feeds.yaml                   the news sources

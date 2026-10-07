@@ -8,14 +8,12 @@
  *    route that runs `claude -p`;
  *  - `mcp`: the candidate's own Claude app (Claude Code, Claude Desktop), connected to the
  *    simulator's MCP endpoint; the app reads the task and code and answers through a tool.
- *  - `openai-compatible`: an OpenAI-compatible endpoint (Ollama, LM Studio, Mistral, Groq,
- *    OpenRouter, OpenAI) with a base URL, model and optional key.
  *
  * Every provider sees the same context and yields the reply as it arrives, so the panel
  * and the transcript in the report do not care which one answered.
  */
 
-export type AssistantProviderId = 'api-key' | 'claude-cli' | 'mcp' | 'openai-compatible';
+export type AssistantProviderId = 'api-key' | 'claude-cli' | 'mcp';
 
 export interface AssistantTurn {
   role: 'user' | 'assistant';

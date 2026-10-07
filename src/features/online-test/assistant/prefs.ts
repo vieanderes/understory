@@ -28,9 +28,6 @@ export const PROVIDER_STORAGE = 'understory:assistant:provider';
 export const MODEL_STORAGE = 'understory:assistant:model';
 export const PAIRING_STORAGE = 'understory:assistant:pairing';
 export const CLAUDE_CLIENT_STORAGE = 'understory:assistant:claude-client';
-export const OPENAI_URL_STORAGE = 'understory:assistant:openai:url';
-export const OPENAI_KEY_STORAGE = 'understory:assistant:openai:key';
-export const OPENAI_MODEL_STORAGE = 'understory:assistant:openai:model';
 
 type Area = 'local' | 'session';
 
@@ -96,9 +93,6 @@ export const keyStore = createStringStore(KEY_STORAGE, 'local');
 export const providerStore = createStringStore(PROVIDER_STORAGE, 'local');
 export const modelStore = createStringStore(MODEL_STORAGE, 'local');
 export const claudeClientStore = createStringStore(CLAUDE_CLIENT_STORAGE, 'local');
-export const openAiUrlStore = createStringStore(OPENAI_URL_STORAGE, 'local');
-export const openAiKeyStore = createStringStore(OPENAI_KEY_STORAGE, 'local');
-export const openAiModelStore = createStringStore(OPENAI_MODEL_STORAGE, 'local');
 // Per tab: two tabs of the simulator are two candidates as far as the app is concerned.
 const pairingStore = createStringStore(PAIRING_STORAGE, 'session');
 
@@ -108,24 +102,7 @@ export function useApiKey(): string {
   return useSyncExternalStore(keyStore.subscribe, keyStore.get, noServer);
 }
 
-export function useOpenAiUrl(): string {
-  return useSyncExternalStore(openAiUrlStore.subscribe, openAiUrlStore.get, noServer);
-}
-
-export function useOpenAiKey(): string {
-  return useSyncExternalStore(openAiKeyStore.subscribe, openAiKeyStore.get, noServer);
-}
-
-export function useOpenAiModel(): string {
-  return useSyncExternalStore(openAiModelStore.subscribe, openAiModelStore.get, noServer);
-}
-
-const PROVIDERS: readonly AssistantProviderId[] = [
-  'api-key',
-  'claude-cli',
-  'mcp',
-  'openai-compatible',
-];
+const PROVIDERS: readonly AssistantProviderId[] = ['api-key', 'claude-cli', 'mcp'];
 
 /** A Claude account needs no key, so MCP comes first; a key is for those who have one. */
 export const DEFAULT_PROVIDER: AssistantProviderId = 'mcp';

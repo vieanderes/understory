@@ -65,7 +65,7 @@ function text(value: string): ToolResult {
  * is broken up, so the text cannot end the fence early and speak as the server.
  */
 export function untrusted(source: string, body: string): string {
-  const safe = body.replace(/<\/?untrusted/gi, (tag) => tag.replace('<', '<\u200b'));
+  const safe = body.replace(/<(?=\/?untrusted)/gi, '<\u200b');
   return `<untrusted source="${source}">\n${safe}\n</untrusted>`;
 }
 

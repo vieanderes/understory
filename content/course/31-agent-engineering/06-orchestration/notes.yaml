@@ -1,0 +1,186 @@
+summary: >-
+  Most jobs too big for one model call don't need many agents. They need a shape. A
+  **chain** runs calls in a fixed order with checks between them. A **router** classifies
+  the input and sends it down one branch. **Parallel sections** split independent parts and
+  run them at once, and **voting** runs the same check several times to catch a wrong
+  answer. All four keep the path in code, so they're cheap, fast and testable.
+
+
+  An **orchestrator with workers** is the step up: a model decides the parts at run time,
+  hands each to a worker with its own fresh context, and combines what comes back. It fits
+  broad work whose parts can't be listed ahead and really can run apart, such as checking
+  every class in a school or researching a question from many angles.
+
+
+  The price is tokens and failure points. Every worker carries its own instructions and
+  documents through its own turns, and every handoff can drop a constraint. So a fan-out
+  gets a brief per worker, a cap on how many run, a token budget, and a merge that doesn't
+  depend on which worker finished first.
+remember:
+  - Start with a chain or a router, and reach for an orchestrator only when the parts appear at run time and can run independently.
+  - Every extra agent re-reads its own context through its own turns, so tokens multiply far faster than the number of agents.
+  - A handoff carries a brief with the goal, every constraint the user set and the reply shape, never only the last message.
+  - Cap a fan-out twice, by how many workers run at once and by a token budget, because the model's plan sets the count.
+  - Merge worker results in task order, not finishing order, so the same input always gives the same output.
+  - One failing worker is reported and the rest still return, so a partial answer beats no answer.
+  - Voting buys accuracy with repeated calls, so use it where a wrong answer is costly and an exact check doesn't exist.
+sections:
+  - title: Choosing a shape, from cheapest to dearest
+    body: |-
+      Walk the shapes in order and stop at the first that fits.
+
+      1. **One call.** The job fits in one prompt with its documents. Most do.
+      2. **A chain.** The job has fixed stages, and a check in code can catch a bad stage
+         early: extract, validate, then write. The checks are what make it better than one
+         long prompt.
+      3. **A router.** Inputs come in kinds that need different prompts, models or people.
+         The classifier can be a small, cheap model, and an unknown label goes to a safe
+         default.
+      4. **Parallel sections or voting.** The parts are known ahead and independent, or one
+         answer needs a second and third opinion.
+      5. **An orchestrator with workers.** The parts are only known once the model has read
+         the input, and each part needs a few turns of its own.
+
+      A free-running single agent sits beside the last two. It suits work where every step
+      depends on the last, such as debugging, because splitting that across workers loses
+      the thread. Parallel workers suit breadth: many similar, separate pieces.
+
+      Two questions settle most debates. Can I draw the flow chart? Then it's a workflow.
+      Do the parts need to know about each other while they work? Then it's one agent, not
+      many.
+  - title: Voting without fooling yourself
+    body: |-
+      Voting runs the same check several times and combines the verdicts. The threshold is
+      the design decision, and it should follow the cost of being wrong.
+
+      ```python
+      import asyncio
+      from collections import Counter
+
+      VERDICTS = ["safe", "safe", "breaks a rule"]  # what three independent checks returned
+
+      async def check_move(i, move):
+          await asyncio.sleep(0.01)  # stands in for one model call
+          return VERDICTS[i]
+
+      async def vote(move, n=3, needed=1.0):
+          verdicts = await asyncio.gather(*(check_move(i, move) for i in range(n)))
+          label, count = Counter(verdicts).most_common(1)[0]
+          return label if count / n >= needed else "ask a person"
+
+      print(asyncio.run(vote("Year 9 maths to Friday P5")))              # ask a person
+      print(asyncio.run(vote("Year 9 maths to Friday P5", needed=0.6)))  # safe
+      ```
+
+      For a timetable move that breaks a safeguarding rule if wrong, require all three to
+      agree and send any split to a person. For a cheap, reversible choice, a majority is
+      enough.
+
+      Votes are only independent if the calls differ. Three identical prompts at a low
+      temperature tend to make the same mistake three times. Vary the prompt wording, the
+      order of the evidence or the model, and the votes start to carry information.
+  - title: Where the tokens go in a fan-out
+    body: |-
+      A worker isn't one call. It's a small loop, and each turn resends its context. A
+      rough model makes the cost visible:
+
+      ```python
+      def run_cost(context, turns, added_per_turn):
+          # Each turn resends the context plus everything added so far.
+          return sum(context + added_per_turn * t for t in range(turns))
+
+      single = run_cost(context=39_000, turns=12, added_per_turn=1_500)
+      workers = 5 * run_cost(context=39_000, turns=6, added_per_turn=1_500)
+      orchestrator = run_cost(context=9_000, turns=4, added_per_turn=4_000)
+      print(single, workers + orchestrator, round((workers + orchestrator) / single, 1))
+      # 567000 1342500 2.4
+      ```
+
+      Even with each worker taking half the turns, five workers that each carry all 39,000
+      tokens cost more than twice the single agent. The fix is a smaller context per
+      worker: hand Year 8's worker Year 8's timetable and the rules, not the whole school.
+      That's the real win of workers, a small clean context each, and it's lost when every
+      worker gets everything.
+
+      Prompt caching helps when workers share an identical prefix, such as the same rules
+      first. It cuts the price of the repeated part, not the number of tokens read, so the
+      cap still matters.
+  - title: Handoffs and the state that crosses them
+    body: |-
+      A handoff is where multi-agent systems lose information. The receiving agent knows
+      only what the brief says. Three shapes are common:
+
+      - **Last message only.** Cheap, and it drops every constraint stated earlier. That's
+        the bug in the lesson.
+      - **Full transcript.** Safe for facts, but every worker pays for every turn so far,
+        and the task gets buried in old chatter.
+      - **A structured brief.** The goal, the constraints, what's already done, what not
+        to touch, and the reply schema. The harness keeps the constraints as state while
+        the conversation runs, so it can hand them on without asking a model to remember.
+
+      The reply side needs the same care. Ask workers for a fixed schema, such as a list of
+      clashes with day, period and class, so the orchestrator can merge with code. Merging
+      free text with another model call adds cost and a fresh chance to drop something.
+
+      When a handoff transfers control, such as a general assistant passing a customer to a
+      specialist, also pass who the user is from the session, never from the transcript, so
+      a confused model can't hand someone else's account across.
+pitfalls:
+  - '**Reaching for many agents first.** A five-agent design looks thorough and costs several times more. Try a chain or a router, and add workers only where parts appear at run time.'
+  - '**Letting the plan set the fan-out.** The orchestrator decides how many parts exist, so 140 classes become 140 workers. Cap the count and the concurrency in code.'
+  - '**Handing every worker everything.** The point of a worker is a small, clean context. Pass each one only its part and the shared rules.'
+  - '**Passing only the last message.** Constraints stated early vanish at the handoff. Keep them as harness state and put them in every brief.'
+  - '**Merging in finishing order.** The same input then gives different output run to run. Merge by task order or a stable key.'
+  - '**Voting with identical calls.** Three copies of the same prompt share the same blind spot. Vary the prompt, the evidence order or the model.'
+verify:
+  - lens: scales
+    check: A plan with ten times the usual parts still starts no more workers than the cap, and stops at the token budget.
+  - lens: breaks
+    check: One worker that raises or times out leaves the others' results intact and is named in the output.
+  - lens: confuses
+    check: Each brief states the goal, the user's constraints and the reply schema, so a worker's mistake can be traced to its brief.
+  - lens: tests
+    check: A test runs the fan-out with a counting fake worker and asserts the peak concurrency, the order and the skipped tasks.
+  - lens: leaks
+    check: A handoff passes the user's identity from the session, never from model-written text, so no worker acts for the wrong account.
+interview:
+  - question: When would you use a multi-agent system rather than one agent?
+    answer: >-
+      When the work is broad, its parts only appear once the input is read, and the parts
+      can run without talking to each other. Checking every class in a school, or
+      researching a question from many angles, fits. Each worker gets a small, clean
+      context for its part, and they run in parallel. Where every step depends on the last,
+      like debugging, one agent keeps the thread better. And before either, I'd check
+      whether a chain or a router does the job, because many tasks have a flow chart. The
+      trade-off is cost and failure points: every worker carries its own context through
+      its own turns, so tokens can multiply several times over, and every handoff can drop
+      a detail.
+  - question: An orchestrator's workers keep ignoring a rule the user stated early on. How do you fix it?
+    answer: >-
+      The workers only know what their brief says, so the rule is being lost at the
+      handoff. Usually the orchestrator passes the latest message or a one-line goal. I'd
+      have the harness keep the user's constraints as explicit state from the start, and
+      put them into every brief alongside the goal and the reply schema. I would not pass
+      the whole transcript to every worker: it's expensive and buries the task. Then I'd
+      add an eval case with an early constraint and check every worker's output against
+      it, and ideally check the merged result in code, for example that no PE lesson
+      follows lunch.
+  - question: How do you keep the cost of a fan-out under control?
+    answer: >-
+      Cap it in code in two ways. A ceiling on how many workers exist and a semaphore on
+      how many run at once, because the model's plan sets the count and can produce a
+      hundred parts. And a token budget: admit work against estimates, track what each
+      worker really spends, and stop starting new workers once the total passes the
+      limit. Then shrink each worker's context to its own part, since every turn resends
+      it, and put shared text first so prompt caching can price the repeated prefix
+      lower. I'd also watch cost per run in production, because a fan-out's worst case
+      is many times its average.
+  - question: How do you make the output of parallel workers deterministic?
+    answer: >-
+      Fix everything that depends on timing. Decide which tasks run before starting any,
+      from estimates in input order, not from whichever finished first. Collect results by
+      task, for example with `gather`, which returns them in the order given, and merge by
+      task order or a stable sort key. Ask workers for a fixed schema so the merge is code,
+      not another model call. The model's text itself will still vary run to run, so
+      determinism here means the same set of results always combines the same way, which
+      is what makes diffs, tests and replays meaningful.

@@ -1,0 +1,184 @@
+summary: >-
+  Prompt injection can't be filtered out reliably, so an agent's safety comes from what it
+  can reach, not from what it was told. This lesson is about that reach: which tools exist,
+  what each tool's credentials can touch, where data may go, how much a run may spend, and
+  the record of every action.
+
+
+  The sharpest threat is **indirect prompt injection**: instructions hidden in content a
+  tool brings in, such as a web page, a PDF, an email or another customer's ticket. The
+  user is honest; the content does the asking. Combined with private data and a way to
+  send data out, that is the **lethal trifecta**, and a fooled agent will leak.
+
+
+  The practical answer is a policy that looks at each call in the light of the whole run.
+  Once untrusted content has entered the context, calls that write or send data out need a
+  person or are refused. Credentials are scoped per tool and per run, egress is checked by
+  host, a kill switch and spend limits sit outside the model, and an append-only audit log
+  says who allowed what, and why.
+remember:
+  - Assume some injection gets through, and limit in code what a fooled agent can reach.
+  - Indirect injection arrives in tool results, so everything a tool brings back is data that may carry instructions.
+  - Scope credentials per tool and per run, read-only where possible, with the user taken from the session.
+  - Private data, untrusted content and a way out together let an agent leak, so the policy removes or gates one leg on every call.
+  - The same call can be safe early in a run and dangerous later, so the policy tracks what has entered the context.
+  - Check egress by parsed host against an exact allow-list, never by string prefix, and recheck after redirects.
+  - A kill switch and spend limits are checked before every tool call, not only when a run starts.
+  - Every action goes to an append-only audit log the agent can't touch, with who, what, the decision and why.
+sections:
+  - title: Least privilege in practice
+    body: |-
+      Least privilege starts with the action space from The harness around the model:
+      tools that don't exist can't be misused. Then each remaining tool gets the narrowest
+      credentials its job needs.
+
+      - **Per tool.** The search tool connects with a read-only database role. The renewal
+        tool can update one table. The email tool can only send to addresses already on
+        file, never a free-text recipient.
+      - **Per run.** When a run starts, the harness mints a short-lived token scoped to
+        this user and this task, for example "read loans for patron p-311 for 15 minutes".
+        Tools use that token, so even an allowed tool can only reach this patron.
+      - **Per argument.** Identity never comes from model-written arguments. A tool that
+        takes `patron_id` from the model will happily read anyone's loans when a page says
+        so. Read it from the session instead, as Designing tools a model uses well showed.
+
+      The test of a design is the blast radius: if the model followed the worst instruction
+      a page could contain, what is the most it could do? Write that answer down for each
+      tool. If it's "email every patron's history to anyone", the tool is too broad,
+      whatever the prompt says.
+  - title: Egress checks that hold
+    body: |-
+      An allow-list on hosts is the usual way to limit where data can go. The comparison
+      is where it fails.
+
+      ```python
+      from urllib.parse import urlsplit
+
+      ALLOWED_HOSTS = {"catalogue.library.example"}
+
+      def allowed(url):
+          parts = urlsplit(url)
+          return parts.scheme == "https" and parts.hostname in ALLOWED_HOSTS
+
+      for url in [
+          "https://catalogue.library.example/book/88",
+          "https://catalogue.library.example.evil.net/x",
+          "https://catalogue.library.example@evil.net/x",
+          "http://catalogue.library.example/book/88",
+          "https://CATALOGUE.library.example/book/88",
+      ]:
+          print(allowed(url), url.startswith("https://catalogue.library.example"), url)
+      # True True ... /book/88
+      # False True ... .evil.net/x
+      # False True ... @evil.net/x
+      # False False http:// ...
+      # True False https://CATALOGUE ...
+      ```
+
+      A prefix check passes both the lookalike subdomain and the `user@host` form, where
+      everything before `@` is a username and the real host is `evil.net`. `hostname` is
+      lower-cased by the parser, so case tricks fail too.
+
+      Two more gaps. A redirect can send an allowed request to another host, so either turn
+      redirects off or check the final URL. And provider-run tools, such as a hosted web
+      fetch, never pass through your sandbox: restrict them with their own domain settings.
+  - title: Breaking the trifecta call by call
+    body: |-
+      You can remove a leg of the trifecta permanently, or per run.
+
+      **Permanently** is simplest. A support agent that reads tickets needs no web access.
+      A research agent that browses needs no private data. If one agent needs all three,
+      split it: a reader worker with no private data and no way out reads the untrusted
+      content, and returns a short summary in a fixed schema. The main agent never sees the
+      raw text.
+
+      **Per run** means taint tracking. The harness keeps two facts for each run: the most
+      sensitive data read so far, and whether untrusted content has arrived. Both only go
+      up. The policy then decides each call from the tool's effect, whether it sends data
+      out, and those two facts. That's the challenge's `decide`, and it's why the same
+      email can be allowed at 10:02 and need a person at 10:05.
+
+      Asking a person isn't free. If every call after a web fetch needs approval, people
+      start clicking yes without reading, which Designing the human's part tackles. So deny
+      outright where no approval could make the call safe, such as secret data leaving, and
+      keep asks for the cases a person can really judge.
+  - title: Spend limits, the kill switch and the audit log
+    body: |-
+      These controls exist for the day the others fail.
+
+      **Spend limits** cap money per run, per user and per tenant per day, checked before
+      every model call and every paid tool call. A per-run cap from Loops that run for hours
+      stops one runaway. A per-tenant cap stops one customer's traffic, or one attacker,
+      from spending everyone's budget.
+
+      **The kill switch** is one flag, read before every tool call. Reading it only at the
+      start of a run is the common bug: runs already in flight carry on for as long as their
+      step cap allows. Keep a narrower switch per tool as well, so you can turn off
+      `cancel_membership` without stopping every lookup.
+
+      **The audit log** answers who allowed what, and why. Each record holds the time, the
+      run, the user from the session, the tool, redacted arguments, the policy's decision
+      and reason, the policy version, and who approved it if a person did. Write it to an
+      append-only store the agent's credentials can't reach. Log the call before it runs
+      and the result after, so a crash mid-call still leaves a trace.
+pitfalls:
+  - '**Trusting the system prompt to stop injection.** A rule the model reads can be argued with by text it reads later. Put the limits in tools, credentials and the policy.'
+  - '**Hiding an admin key behind the tool.** The model never sees the key, but every injected request still runs with admin rights. Scope credentials per tool and per run.'
+  - '**Checking egress by string prefix.** Lookalike hosts and `user@host` URLs pass. Parse the URL and compare the hostname against an exact set.'
+  - '**Judging a call without its run.** A write is safe in a clean run and risky after a web page arrives. Track what has entered the context.'
+  - '**Reading the kill switch once.** In-flight runs never look again. Check it before every tool call.'
+  - '**Logging where the agent can write.** A fooled agent with write access to its own log can hide what it did. Keep the log append-only and out of reach.'
+verify:
+  - lens: leaks
+    check: A planted test page asking the agent to email private data out is refused or sent to a person, and nothing leaves.
+  - lens: breaks
+    check: Lookalike hosts, `user@host` URLs and redirects to other hosts all fail the egress check.
+  - lens: tests
+    check: The policy is tested for every combination of tool effect, sensitivity and untrusted content, including the deny that beats an ask.
+  - lens: scales
+    check: A per-tenant daily spend cap holds when one tenant's runs loop, so others keep their budget.
+  - lens: confuses
+    check: Every audit record names the policy version and reason, so a reviewer can tell why a call ran months later.
+interview:
+  - question: What is indirect prompt injection, and how would you defend an agent against it?
+    answer: >-
+      It's instructions hidden in content a tool brings into the context, such as a web
+      page, a document or an email, rather than typed by the user. The model can't reliably
+      tell those instructions from yours, so filters and system prompt rules only reduce
+      the rate. I'd defend in layers outside the model. Least privilege per tool and per
+      run, so a fooled agent can reach little. Taint tracking, so once untrusted content
+      arrives, writes and anything that sends data out need a person or are refused. Egress
+      checked by exact host. And an audit log. Then I'd red-team it with planted pages and
+      measure how often a leak gets through. The trade-off is friction: too many approval
+      prompts and people stop reading them.
+  - question: Explain the lethal trifecta and how you'd break it for an email assistant.
+    answer: >-
+      An agent with access to private data, exposure to untrusted content and a way to send
+      data out can be steered into leaking: the untrusted content carries the instruction,
+      and the other two legs carry it out. An email assistant has all three by nature,
+      since incoming mail is untrusted and sending is the job. I'd break it per run. Reading
+      mail marks the run as tainted, and from then on sending needs explicit approval, with
+      the recipient and body shown. Recipients outside the user's contacts are refused
+      outright. For summarising untrusted mail, a separate worker with no send tool returns
+      a fixed-schema summary. The cost is a confirmation step on sends, which users accept
+      for email.
+  - question: What would you put in an agent's audit log, and where would you keep it?
+    answer: >-
+      One record per action: time, run id, the user and tenant from the session, the tool,
+      redacted arguments, the policy's decision and reason, the policy and harness versions,
+      who approved it if a person did, and the result. I'd write the intent before the call
+      and the result after, so a crash mid-call still leaves evidence. It goes to an
+      append-only store that the agent's credentials can't write to or delete from, with
+      its own retention rules, because personal data in arguments is still personal data.
+      The log should answer "who allowed this, and why" without reading model transcripts,
+      which may be kept for less time.
+  - question: An on-call engineer flipped the kill switch, but the agent kept acting for forty minutes. What went wrong?
+    answer: >-
+      Almost certainly the switch was read only when a run started. Runs already in flight
+      never looked again, so they continued until their step cap or their task ended. The
+      fix is to read the flag before every tool call, and ideally before every model call
+      too, so the longest delay is one step. I'd also add per-tool switches, so you can
+      stop one dangerous action without stopping all lookups, and a test that flips the
+      flag mid-run with a scripted model and asserts no further tool call executes. Finally,
+      the incident review would use the audit log to list every action taken after the
+      flip, so they can be reversed.

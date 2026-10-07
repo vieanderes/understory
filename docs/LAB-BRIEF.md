@@ -105,8 +105,8 @@ export NEXT_DIST_DIR=.next-<your-lab-id> PW_PORT=<your port>
 pnpm exec next build --experimental-build-mode compile && pnpm exec playwright test tests/e2e/labs/<id>.spec.ts
 ```
 
-Delete your `.next-<id>` directory when you are done. If Next adds your directory to the
-`include` list of `tsconfig.json`, remove that line again before you report.
+Delete your `.next-<id>` directory when you are done. Your build type-checks with its own
+generated `tsconfig.next-<id>.json`, which git ignores, so `tsconfig.json` stays unchanged.
 
 ## Budget
 

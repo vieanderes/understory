@@ -172,7 +172,7 @@ export async function checkContent(
       interestLessonIds: readInterestLessonIds(root),
     }),
   ].filter((issue) => !(unreadable && NEEDS_WHOLE_CATALOG.has(issue.rule)));
-  // A content tree without a ladder (a test fixture) has nothing to check.
+  // A content tree without placement (a test fixture) has nothing to check.
   const hasPlacement = fs.existsSync(path.join(root ?? contentRoot(), PLACEMENT_PATH));
   const placementIssues = hasPlacement && !unreadable ? checkPlacementContent(catalog, root) : [];
   return {

@@ -99,9 +99,12 @@ describe('conceptView', () => {
   it('shows a placement assumption as assumed', () => {
     const state = reduce([
       event('2026-09-17T10:00:00Z', 'placement_completed', {
+        scope: 'all',
         startedAs: 'experienced',
+        levelByArea: { languages: 2 },
         thetaByModule: { js: 1400 },
         assumedConcepts: ['js.equality'],
+        unassumedConcepts: [],
       }),
     ]);
     expect(conceptView(catalog.concepts[1]!, state, new Date('2026-09-17T10:00:00Z')).state).toBe(
@@ -166,9 +169,12 @@ describe('overview', () => {
       catalog,
       reduce([
         event('2026-09-17T10:00:00Z', 'placement_completed', {
+          scope: 'all',
           startedAs: 'new',
+          levelByArea: {},
           thetaByModule: {},
           assumedConcepts: [],
+          unassumedConcepts: [],
         }),
       ]),
       new Date('2026-09-17T10:00:00Z'),

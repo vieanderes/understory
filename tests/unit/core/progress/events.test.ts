@@ -85,14 +85,18 @@ describe('makeEvent', () => {
       placement_answered: {
         itemId: 'html-1',
         moduleId: 'html',
-        rung: 1,
+        areaId: 'firstcode',
+        level: 1,
         correct: true,
         confidence: 'guess',
       },
       placement_completed: {
+        scope: 'all',
         startedAs: 'new',
+        levelByArea: { firstcode: 1 },
         thetaByModule: { html: 900 },
         assumedConcepts: ['html.tags'],
+        unassumedConcepts: [],
       },
       step_answered: {
         lessonId: 'js.closures',

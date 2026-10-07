@@ -29,7 +29,7 @@ const CONTRACTS: Contract[] = [
   { file: 'manifest.schema.json', title: 'Bundle manifest', schema: manifestSchema, io: 'output' },
   {
     file: 'compiled-placement.schema.json',
-    title: 'Compiled placement ladder',
+    title: 'Compiled placement',
     schema: compiledPlacementSchema,
     io: 'output',
   },

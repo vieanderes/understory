@@ -1,22 +1,42 @@
 export {
-  initialLadderState,
-  runLadder,
-  stepLadder,
-  type LadderDirection,
-  type LadderState,
-} from './ladder';
+  AREA_LEVELS,
+  areaLevel,
+  runAreaSearch,
+  startAreaSearch,
+  stepAreaSearch,
+  type AreaSearch,
+} from './area';
+export {
+  focusArea,
+  overallLevel,
+  placementOutcome,
+  thetaForLevel,
+  type OverallLevel,
+  type OverallStage,
+  type PlacementOutcome,
+} from './outcome';
+export {
+  placedOut,
+  placementKnows,
+  recommendPath,
+  type Recommendation,
+  type RecommendInput,
+} from './recommend';
 export {
   answerPlacement,
+  areaSearchOf,
+  checkedAreas,
   currentPlacementItem,
-  placementOutcome,
-  START_RUNG,
+  defaultRatings,
+  placementProgress,
   startPlacement,
   undoPlacement,
-  thetaForBand,
+  type AreaRating,
   type CurrentPlacementItem,
   type PlacementAnswer,
-  type PlacementOutcome,
-  type PlacementRungSpec,
+  type PlacementAreaSpec,
+  type PlacementProgress,
+  type PlacementScope,
   type PlacementSession,
   type StartedAs,
 } from './session';

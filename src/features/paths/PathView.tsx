@@ -57,7 +57,7 @@ export function PathView({
   tools?: React.ReactNode;
   drawer?: React.ReactNode;
 }) {
-  const progress = usePathProgress(path.lessonIds);
+  const progress = usePathProgress(path);
   const { status, state } = useProgress();
   const best = useMemo(() => bestTestScores(state.onlineTests), [state.onlineTests]);
   const testResult = (test: PathTest): string | undefined => {
@@ -176,6 +176,7 @@ export function PathView({
                         lesson={lesson}
                         done={progress.isDone(lesson.id)}
                         next={lesson.id === progress.nextId}
+                        known={progress.isPlacedOut(lesson.id)}
                       />
                     ))}
                   </ol>
@@ -413,12 +414,15 @@ function PathLessonRow({
   lesson,
   done,
   next,
+  known = false,
   optional = false,
 }: {
   pathId: string;
   lesson: PathLesson;
   done: boolean;
   next: boolean;
+  /** Placement showed it: still on the path, open to anyone, passed over by Next. */
+  known?: boolean;
   optional?: boolean;
 }) {
   const body = (
@@ -439,7 +443,7 @@ function PathLessonRow({
       <span
         className={cn(
           'min-w-0 flex-1',
-          done ? 'text-muted' : next ? 'font-semibold' : 'font-medium',
+          done || known ? 'text-muted' : next ? 'font-semibold' : 'font-medium',
         )}
       >
         <InlineCode text={lesson.title} />
@@ -447,11 +451,13 @@ function PathLessonRow({
       <span className={cn('t-figure shrink-0 text-sm', next ? 'text-fg' : 'text-muted')}>
         {done
           ? 'Done'
-          : next
-            ? `Next · ${lesson.minutes} min`
-            : lesson.href
-              ? `${lesson.minutes} min`
-              : 'Soon'}
+          : known
+            ? 'Known'
+            : next
+              ? `Next · ${lesson.minutes} min`
+              : lesson.href
+                ? `${lesson.minutes} min`
+                : 'Soon'}
       </span>
     </>
   );

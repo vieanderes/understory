@@ -22,8 +22,8 @@ import type { UnknownEvent } from './upcast';
 
 /** 2: `capstoneAdrs` joined the state. 3: `pathExams`. 4: `onlineTests`. 5: `plan`.
  * 6: `profile`, `newsRead`, `customPath`, and XP for timed tests. 7: `lessonCompletedOn`.
- * 8: `customPath` became `ownPaths`, several named paths. */
-export const REDUCER_VERSION = 8;
+ * 8: `customPath` became `ownPaths`, several named paths. 9: `placementByArea`. */
+export const REDUCER_VERSION = 9;
 
 /** A day's worth of XP by 24-hour cooldown key, so "no grinding" can be checked. One
  * day of slack either side of midnight is not modelled; a plain 24h window from the
@@ -130,8 +130,12 @@ export interface ProgressState {
   /** The paths the learner made, by id, in the order they were first made. */
   readonly ownPaths: ReadonlyMap<string, OwnPath>;
   readonly assumedConcepts: ReadonlySet<string>;
-  /** How many placement ladders were finished. A later ladder rotates its items. */
+  /** How many placements were finished. A later one rotates its items. */
   readonly placementsCompleted: number;
+  /** The latest placed level per area, 0 to 3, and when. A check of one area updates only it. */
+  readonly placementByArea: Readonly<
+    Record<string, { readonly level: number; readonly at: string }>
+  >;
   readonly collectedReadings: ReadonlySet<string>;
   readonly aiReviewsPassed: number;
   /** Internal bookkeeping for the "same item within 24h" XP rule. Not part of the
@@ -165,6 +169,7 @@ export function initialProgressState(): ProgressState {
     ownPaths: new Map(),
     assumedConcepts: new Set(),
     placementsCompleted: 0,
+    placementByArea: {},
     collectedReadings: new Set(),
     aiReviewsPassed: 0,
     lastGradedAt: {},
@@ -245,6 +250,12 @@ export function applyEvent(state: ProgressState, event: StoryEvent | UnknownEven
     case 'placement_completed': {
       const assumedConcepts = new Set(state.assumedConcepts);
       const concepts = { ...state.concepts };
+      // A later placement that did not show a concept takes back an earlier assumption.
+      for (const concept of event.payload.unassumedConcepts) {
+        if (!assumedConcepts.delete(concept)) continue;
+        const record = concepts[concept];
+        if (record) concepts[concept] = { ...record, assumed: false };
+      }
       for (const concept of event.payload.assumedConcepts) {
         assumedConcepts.add(concept);
         concepts[concept] = { ...(concepts[concept] ?? emptyConceptRecord()), assumed: true };
@@ -254,6 +265,15 @@ export function applyEvent(state: ProgressState, event: StoryEvent | UnknownEven
         assumedConcepts,
         concepts,
         placementsCompleted: state.placementsCompleted + 1,
+        placementByArea: {
+          ...state.placementByArea,
+          ...Object.fromEntries(
+            Object.entries(event.payload.levelByArea).map(([area, level]) => [
+              area,
+              { level, at: event.at },
+            ]),
+          ),
+        },
         thetaByModule: { ...state.thetaByModule, ...event.payload.thetaByModule },
       };
     }

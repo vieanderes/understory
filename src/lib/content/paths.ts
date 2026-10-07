@@ -19,6 +19,8 @@ export interface PathLesson {
   minutes: number;
   /** Null while the lesson is planned but not written. */
   href: string | null;
+  /** What the lesson teaches, so placement can say it is already known. */
+  concepts: string[];
 }
 
 export interface PathStage {
@@ -74,12 +76,20 @@ async function readPath(id: string): Promise<PathSummary> {
           objective: lesson.objective,
           minutes: lesson.minutes,
           href: `/learn/${module.slug}/${lesson.slug}`,
+          concepts: lesson.concepts,
         } satisfies PathLesson,
       ]),
     ),
   );
   const lesson = (lessonId: string): PathLesson =>
-    lessons.get(lessonId) ?? { id: lessonId, title: lessonId, objective: '', minutes: 0, href: null };
+    lessons.get(lessonId) ?? {
+      id: lessonId,
+      title: lessonId,
+      objective: '',
+      minutes: 0,
+      href: null,
+      concepts: [],
+    };
 
   const stages = plan.days.map((day, i) => ({
     title: day.title,

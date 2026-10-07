@@ -1,121 +1,190 @@
 /*
- * One placement session (LEARNING-SCIENCE.md B1): the staircase from `ladder.ts`, walked
- * over the rungs and items of the ladder content, and turned into what the rest of the
- * app needs, a starting theta per module and the concepts it may assume.
+ * One placement session (LEARNING-SCIENCE.md B1): the areas the learner chose to check,
+ * in course order, each searched on its own with `area.ts`. The session holds only the
+ * facts, the ratings and the answers; where each search stands is replayed from them, so
+ * undo is dropping the last answer.
  *
- * Nothing is shown between items, so the session holds no feedback, only facts.
+ * Nothing is shown between items, so the session holds no feedback.
  */
 
 import { moduleOfConcept } from '@/core/content/placement-schema';
 import type { Confidence } from '@/core/progress/events';
-import { initialLadderState, stepLadder, type LadderState } from './ladder';
+import { AREA_LEVELS, startAreaSearch, stepAreaSearch, type AreaSearch } from './area';
 
 export type StartedAs = 'new' | 'ai-builder' | 'experienced';
 
 /**
- * B1: the one opening question "sets only the starting rung". Someone new starts at the
- * bottom. Someone who builds with AI has read a lot of code but may have skipped the
- * fundamentals, so they start on the last chapter 0 rung, where a gap still shows. An
- * experienced developer starts in the middle and the staircase finds the rest.
+ * How the learner rates an area before the check. "new" skips it: asking someone about
+ * what they say they have never done costs time and tells us nothing. "confident" starts a
+ * level higher, so a strong learner is not walked through the basics.
  */
-export const START_RUNG: Readonly<Record<StartedAs, number>> = {
-  new: 1,
-  'ai-builder': 3,
-  experienced: 5,
+export type AreaRating = 'new' | 'some' | 'confident';
+
+const START_LEVEL: Readonly<Record<Exclude<AreaRating, 'new'>, number>> = {
+  some: 1,
+  confident: 2,
 };
 
-/** The part of a ladder rung the session needs. Compiled rungs fit this shape. */
-export interface PlacementRungSpec {
-  readonly rung: number;
-  readonly moduleBand: readonly string[];
-  readonly concepts: readonly string[];
-  readonly items: readonly { readonly id: string; readonly concept: string }[];
+/**
+ * The ratings the opening question fills in, by area position in course order. Someone
+ * new checks only the first area; someone who builds with AI the first three, where gaps
+ * hide under working code; someone experienced checks everything, the first two from the
+ * middle. The learner can change any of them.
+ */
+export function defaultRatings(
+  startedAs: StartedAs,
+  areaIds: readonly string[],
+): Record<string, AreaRating> {
+  const rate = (index: number): AreaRating => {
+    if (startedAs === 'new') return index === 0 ? 'some' : 'new';
+    if (startedAs === 'ai-builder') return index < 3 ? 'some' : 'new';
+    return index < 2 ? 'confident' : 'some';
+  };
+  return Object.fromEntries(areaIds.map((id, index) => [id, rate(index)]));
+}
+
+/** The part of a placement area the session needs. Compiled areas fit this shape. */
+export interface PlacementAreaSpec {
+  readonly id: string;
+  readonly modules: readonly string[];
+  readonly levels: readonly {
+    readonly level: number;
+    readonly concepts: readonly string[];
+    readonly items: readonly { readonly id: string; readonly concept: string }[];
+  }[];
 }
 
 export interface PlacementAnswer {
   readonly itemId: string;
-  readonly rung: number;
+  readonly areaId: string;
+  readonly level: number;
   readonly concept: string;
   readonly moduleId: string;
   readonly correct: boolean;
   readonly confidence: Confidence;
 }
 
+/** "all" checks every area not rated new; an area id checks that one area in depth. */
+export type PlacementScope = 'all' | (string & {});
+
 export interface PlacementSession {
-  readonly startedAs: StartedAs;
-  /** How many ladders this learner finished before. It rotates the items. */
+  readonly startedAs?: StartedAs;
+  /** How many placements this learner finished before. It rotates the items. */
   readonly attempt: number;
-  readonly ladder: LadderState;
+  readonly scope: PlacementScope;
+  /** Shown answers a level needs: 1 in the quick check, 2 in the check of one area. */
+  readonly itemsToPass: number;
+  readonly ratings: Readonly<Record<string, AreaRating>>;
   readonly answers: readonly PlacementAnswer[];
 }
 
 export interface CurrentPlacementItem {
   readonly id: string;
-  readonly rung: number;
+  readonly areaId: string;
+  readonly level: number;
   readonly concept: string;
   readonly moduleId: string;
 }
 
-export function startPlacement(
-  startedAs: StartedAs,
-  attempt = 0,
-  topRung = Number.POSITIVE_INFINITY,
-): PlacementSession {
+export function startPlacement(input: {
+  ratings: Readonly<Record<string, AreaRating>>;
+  startedAs?: StartedAs;
+  attempt?: number;
+  scope?: PlacementScope;
+  itemsToPass?: number;
+}): PlacementSession {
   return {
-    startedAs,
-    attempt,
-    ladder: initialLadderState(START_RUNG[startedAs], topRung),
+    ...(input.startedAs ? { startedAs: input.startedAs } : {}),
+    attempt: input.attempt ?? 0,
+    scope: input.scope ?? 'all',
+    itemsToPass: input.itemsToPass ?? 1,
+    ratings: input.ratings,
     answers: [],
   };
 }
 
-function rungAt(rungs: readonly PlacementRungSpec[], rung: number) {
-  return rungs.find((r) => r.rung === rung);
+/** The areas this session checks, in course order. */
+export function checkedAreas<A extends PlacementAreaSpec>(
+  session: PlacementSession,
+  areas: readonly A[],
+): A[] {
+  if (session.scope !== 'all') return areas.filter((a) => a.id === session.scope);
+  return areas.filter((a) => (session.ratings[a.id] ?? 'new') !== 'new');
+}
+
+function startLevel(session: PlacementSession, areaId: string): number {
+  const rating = session.ratings[areaId] ?? 'some';
+  // Asking for one area is itself a rating of at least "some".
+  return START_LEVEL[rating === 'new' ? 'some' : rating];
+}
+
+/** Where the search of one area stands after the answers given in it. */
+export function areaSearchOf(session: PlacementSession, areaId: string): AreaSearch {
+  let search = startAreaSearch(startLevel(session, areaId), session.itemsToPass);
+  for (const a of session.answers) {
+    if (a.areaId !== areaId) continue;
+    search = stepAreaSearch(search, a.correct && a.confidence !== 'guess');
+  }
+  return search;
 }
 
 /**
- * The item to show now, or null when the ladder is over. Items on a rung are taken in
- * turn from an offset that moves with each attempt, so a second ladder opens on a
- * different snippet. A rung whose items are all used ends the ladder early: showing an
- * item twice would measure memory of the item, not skill.
+ * The item an area would ask next, or null when its search is over. Items at a level are
+ * taken in turn from an offset that moves with each attempt. A level with no unseen item
+ * left ends the area: showing an item twice would measure memory of it, not skill.
  */
-export function currentPlacementItem(
+function nextItemIn(
   session: PlacementSession,
-  rungs: readonly PlacementRungSpec[],
+  area: PlacementAreaSpec,
 ): CurrentPlacementItem | null {
-  if (session.ladder.done) return null;
-  const rung = rungAt(rungs, session.ladder.rung);
-  if (!rung || rung.items.length === 0) return null;
-  const visits = session.answers.filter((a) => a.rung === rung.rung).length;
-  if (visits >= rung.items.length) return null;
-  const item = rung.items[(session.attempt + visits) % rung.items.length];
+  const search = areaSearchOf(session, area.id);
+  if (search.done) return null;
+  const level = area.levels.find((l) => l.level === search.level);
+  if (!level || level.items.length === 0) return null;
+  const visits = session.answers.filter(
+    (a) => a.areaId === area.id && a.level === level.level,
+  ).length;
+  if (visits >= level.items.length) return null;
+  const item = level.items[(session.attempt + visits) % level.items.length];
   /* v8 ignore next -- the index is always in range after the length checks above */
   if (!item) return null;
   return {
     id: item.id,
-    rung: rung.rung,
+    areaId: area.id,
+    level: level.level,
     concept: item.concept,
     moduleId: moduleOfConcept(item.concept),
   };
 }
 
+/** The item to show now, or null when the session is over. */
+export function currentPlacementItem(
+  session: PlacementSession,
+  areas: readonly PlacementAreaSpec[],
+): CurrentPlacementItem | null {
+  for (const area of checkedAreas(session, areas)) {
+    const item = nextItemIn(session, area);
+    if (item) return item;
+  }
+  return null;
+}
+
 /** Records one answer. An answer to anything but the current item changes nothing. */
 export function answerPlacement(
   session: PlacementSession,
-  rungs: readonly PlacementRungSpec[],
+  areas: readonly PlacementAreaSpec[],
   answer: { readonly itemId: string; readonly correct: boolean; readonly confidence: Confidence },
 ): PlacementSession {
-  const item = currentPlacementItem(session, rungs);
+  const item = currentPlacementItem(session, areas);
   if (!item || item.id !== answer.itemId) return session;
-  const topRung = Math.max(...rungs.map((r) => r.rung));
   return {
     ...session,
-    ladder: stepLadder(session.ladder, answer.correct, topRung),
     answers: [
       ...session.answers,
       {
         itemId: item.id,
-        rung: item.rung,
+        areaId: item.areaId,
+        level: item.level,
         concept: item.concept,
         moduleId: item.moduleId,
         correct: answer.correct,
@@ -126,84 +195,34 @@ export function answerPlacement(
 }
 
 /**
- * Takes back the last answer: the ladder is replayed from the start without it, so the
- * same item comes back on the rung it was asked on. The answer event already recorded
- * stays in the log as a fact; the result is built from the session, which no longer has it.
+ * Takes back the last answer. The answer event already recorded stays in the log as a
+ * fact; the result is built from the session, which no longer has it.
  */
-export function undoPlacement(session: PlacementSession, topRung: number): PlacementSession {
+export function undoPlacement(session: PlacementSession): PlacementSession {
   if (session.answers.length === 0) return session;
-  const answers = session.answers.slice(0, -1);
-  let ladder = initialLadderState(START_RUNG[session.startedAs], topRung);
-  for (const a of answers) ladder = stepLadder(ladder, a.correct, topRung);
-  return { ...session, ladder, answers };
+  return { ...session, answers: session.answers.slice(0, -1) };
 }
 
-/**
- * B5 rates items `800 + 200 * d` for difficulty 1 to 5, within a module. A module whose
- * band is the final rung starts in the middle of that scale (d 3). Each rung the band
- * sits below the final rung adds a step, each rung above takes one away, clamped to the
- * scale, so a learner is neither flattered nor buried by one short ladder.
- */
-const ITEM_RATING_BASE = 800;
-const ITEM_RATING_STEP = 200;
-const MIDDLE_DIFFICULTY = 3;
-const MIN_DIFFICULTY = 1;
-const MAX_DIFFICULTY = 5;
-
-export function thetaForBand(finalRung: number, bandRung: number): number {
-  const d = Math.min(
-    MAX_DIFFICULTY,
-    Math.max(MIN_DIFFICULTY, MIDDLE_DIFFICULTY + finalRung - bandRung),
-  );
-  return ITEM_RATING_BASE + ITEM_RATING_STEP * d;
+export interface PlacementProgress {
+  /** The area under way, 0-based; equal to `areaCount` once every area is settled. */
+  readonly areaIndex: number;
+  readonly areaCount: number;
+  readonly asked: number;
+  /** The most items the session can still ask in total, for a "3 / 24" ceiling. */
+  readonly maxItems: number;
 }
 
-export interface PlacementOutcome {
-  readonly finalRung: number;
-  readonly stopReason: 'reversals' | 'items' | 'exhausted';
-  readonly thetaByModule: Readonly<Record<string, number>>;
-  /** B1: "Concepts below the final rung are marked assumed." */
-  readonly assumedConcepts: readonly string[];
-}
-
-export function placementOutcome(
+export function placementProgress(
   session: PlacementSession,
-  rungs: readonly PlacementRungSpec[],
-): PlacementOutcome {
-  const finalRung = session.ladder.rung;
-
-  // A module in two bands is rated by the higher band, the more demanding claim.
-  const bandRungByModule = new Map<string, number>();
-  for (const rung of rungs) {
-    for (const moduleId of rung.moduleBand) {
-      bandRungByModule.set(moduleId, Math.max(bandRungByModule.get(moduleId) ?? 0, rung.rung));
-    }
-  }
-  const thetaByModule: Record<string, number> = {};
-  for (const [moduleId, bandRung] of bandRungByModule) {
-    thetaByModule[moduleId] = thetaForBand(finalRung, bandRung);
-  }
-
-  // Assuming a concept the learner just got wrong would hide the very gap placement found.
-  const missed = new Set(
-    session.answers
-      .filter((a) => !a.correct)
-      .map((a) => a.concept)
-      .filter((concept) => !session.answers.some((a) => a.correct && a.concept === concept)),
-  );
-  const assumedConcepts = [
-    ...new Set(
-      rungs
-        .filter((r) => r.rung < finalRung)
-        .flatMap((r) => r.concepts)
-        .filter((concept) => !missed.has(concept)),
-    ),
-  ];
-
+  areas: readonly PlacementAreaSpec[],
+): PlacementProgress {
+  const checked = checkedAreas(session, areas);
+  const current = currentPlacementItem(session, areas);
+  const index = current ? checked.findIndex((a) => a.id === current.areaId) : checked.length;
   return {
-    finalRung,
-    stopReason: session.ladder.stopReason ?? 'exhausted',
-    thetaByModule,
-    assumedConcepts,
+    areaIndex: index,
+    areaCount: checked.length,
+    asked: session.answers.length,
+    maxItems: checked.length * AREA_LEVELS * session.itemsToPass,
   };
 }

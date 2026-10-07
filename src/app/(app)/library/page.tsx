@@ -68,8 +68,8 @@ export default async function LibraryPage() {
       href: '/start',
       icon: SHELF_ICONS.level,
       title: 'Find your level',
-      note: 'Ten questions that find where to start',
-      count: '8 min',
+      note: 'A short check per area, a level for each and a path to start',
+      count: '8 areas',
     },
   ];
   const pathShelves: Shelf[] = paths.map((path) => ({

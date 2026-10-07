@@ -12,7 +12,7 @@ import {
 import type { CourseTree } from '@/features/paths/custom';
 
 function lesson(id: string, minutes = 10) {
-  return { id, title: id, objective: '', minutes, href: `/learn/x/${id}` };
+  return { id, title: id, objective: '', minutes, href: `/learn/x/${id}`, concepts: [] };
 }
 
 const tree: CourseTree = {

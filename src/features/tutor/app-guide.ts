@@ -28,7 +28,10 @@ export const LIBRARY_SHELVES: readonly (readonly [label: string, href: string])[
   ['your progress: what you have done, what you know and what to work on next', '/progress'],
   ['the news archive', '/signal/archive'],
   ['decision records', '/decisions'],
-  ['find your level, a placement check', '/start'],
+  [
+    'find your level, a placement check of each area of the course, with a level per area, an overall level and a recommended path; /start?area=<id> checks one area in depth',
+    '/start',
+  ],
   ['every learning path', '/paths'],
 ];
 

@@ -17,6 +17,8 @@ export interface PlannerSituationInput {
     deadline?: string;
   };
   interests?: readonly string[];
+  /** The latest placement level per area, 0 new to 3 advanced, in course order. */
+  placement?: readonly { area: string; level: number }[];
   /** Per chapter, in course order. Chapters with nothing done are left out. */
   done: readonly { chapter: string; id: string; done: number; total: number }[];
   lessons: number;
@@ -69,6 +71,14 @@ export function plannerSituation(input: PlannerSituationInput): string {
     `Today is ${input.today}.`,
     ...(input.setup ? [setupLine(input.setup)] : []),
     ...(input.interests?.length ? [`Interests: ${input.interests.join(', ')}.`] : []),
+    ...(input.placement?.length
+      ? [
+          `Placement by area (0 new, 1 foundations, 2 working, 3 advanced): ${input.placement
+            .map((p) => `${p.area} ${p.level}`)
+            .join(', ')}.`,
+          'Leave out lessons an area at 2 or 3 already covers, unless they ask for them.',
+        ]
+      : []),
     doneTotal > 0 ? `Lessons done: ${doneTotal} of ${input.lessons}.` : 'Lessons done: none yet.',
     ...begun.map(
       (c) =>

@@ -15,7 +15,15 @@ export interface CourseTree {
       id: string;
       slug: string;
       title: string;
-      lessons: { id: string; title: string; objective: string; minutes: number; href: string }[];
+      lessons: {
+        id: string;
+        title: string;
+        objective: string;
+        minutes: number;
+        href: string;
+        /** What the lesson teaches, so placement can say it is already known. */
+        concepts: string[];
+      }[];
     }[];
   }[];
 }
@@ -51,6 +59,7 @@ export function courseTree(manifest: Manifest): CourseTree {
               objective: l.objective,
               minutes: l.minutes,
               href: `/learn/${chapter.slug}/${l.slug}`,
+              concepts: l.concepts,
             })),
           },
         ];
@@ -118,12 +127,13 @@ function locate(tree: CourseTree): Map<string, Located> {
   return found;
 }
 
-const pathLesson = ({ id, title, objective, minutes, href }: TreeLesson) => ({
+const pathLesson = ({ id, title, objective, minutes, href, concepts }: TreeLesson) => ({
   id,
   title,
   objective,
   minutes,
   href,
+  concepts,
 });
 
 /** One stage per chapter the learner chose from, in course order: a path built by ticking. */

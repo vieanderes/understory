@@ -70,6 +70,34 @@ describe('upcast', () => {
     expect(isUnknownEvent(result)).toBe(false);
     expect(result).toEqual(v2);
   });
+
+  it('reads a v1 placement answer, a rung of the one ladder, as a level with no area', () => {
+    const facts = { itemId: 'r3-chat-loop', moduleId: 'basics', correct: false } as const;
+    const v2 = makeEvent(deps, 'placement_answered', { ...facts, level: 3, confidence: 'fairly' });
+    const v1 = { ...v2, v: 1, payload: { ...facts, rung: 3, confidence: 'fairly' } };
+    expect(upcast(v1)).toEqual(v2);
+  });
+
+  it('reads a v1 placement as a check of every area with no area levels', () => {
+    const v2 = makeEvent(deps, 'placement_completed', {
+      scope: 'all',
+      startedAs: 'experienced',
+      levelByArea: {},
+      thetaByModule: { js: 1400 },
+      assumedConcepts: ['js.equality'],
+      unassumedConcepts: [],
+    });
+    const v1 = {
+      ...v2,
+      v: 1,
+      payload: {
+        startedAs: 'experienced',
+        thetaByModule: { js: 1400 },
+        assumedConcepts: ['js.equality'],
+      },
+    };
+    expect(upcast(v1)).toEqual(v2);
+  });
 });
 
 describe('applyUpcastChain (proves the generic chaining mechanism with a synthetic type)', () => {

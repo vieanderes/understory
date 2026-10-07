@@ -72,18 +72,27 @@ export const sessionMinutesSchema = z.union([
 // Payload schemas
 // ---------------------------------------------------------------------------
 
+/** v2 placement measures areas, each in levels 1 to 3; v1 named a rung of one ladder. */
 export const placementAnsweredPayloadSchema = z.strictObject({
   itemId: z.string().min(1),
   moduleId: moduleIdSchema,
-  rung: z.int().min(1),
+  /** Absent on answers from the single ladder before areas. */
+  areaId: moduleIdSchema.optional(),
+  level: z.int().min(1),
   correct: z.boolean(),
   confidence: confidenceSchema,
 });
 
 export const placementCompletedPayloadSchema = z.strictObject({
-  startedAs: z.enum(['new', 'ai-builder', 'experienced']),
+  /** "all" for the check of every area, else the one area checked in depth. */
+  scope: moduleIdSchema,
+  startedAs: z.enum(['new', 'ai-builder', 'experienced']).optional(),
+  /** 0 to 3 per area placed. Empty on the single ladder before areas. */
+  levelByArea: z.record(moduleIdSchema, z.int().min(0).max(3)),
   thetaByModule: z.record(moduleIdSchema, z.number()),
   assumedConcepts: z.array(idSchema),
+  /** Concepts this placement did not show, so an earlier placement stops assuming them. */
+  unassumedConcepts: z.array(idSchema),
 });
 
 export const stepAnsweredPayloadSchema = z.strictObject({
@@ -371,8 +380,8 @@ function envelope<Type extends string, Payload extends z.ZodTypeAny>(
  * upcaster (progress/upcast.ts) and bumps the number here; old stored events are
  * never rewritten. */
 export const LATEST_VERSION = {
-  placement_answered: 1,
-  placement_completed: 1,
+  placement_answered: 2,
+  placement_completed: 2,
   step_answered: 1,
   review_graded: 1,
   lesson_completed: 1,

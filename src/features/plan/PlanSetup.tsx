@@ -314,7 +314,7 @@ export function PlanSetup({
           <p className="text-muted text-sm">
             Not sure?{' '}
             <Link href="/start" className="text-fg underline underline-offset-4">
-              Find your level in 8 minutes
+              Find your level, area by area
             </Link>
             .
           </p>

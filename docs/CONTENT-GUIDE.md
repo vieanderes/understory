@@ -91,6 +91,24 @@ content/harness.d.ts
 - The module folder number equals `number` in `module.yaml`.
 - Every object is strict. A misspelt key is an error, not a silent no-op.
 
+### placement.yaml
+
+Find your level (`docs/LEARNING-SCIENCE.md` B1). Schema: `placementFileSchema` in
+`src/core/content/placement-schema.ts`.
+
+- `areas`: in course order. Each has an `id`, a `title`, the `part` it mirrors (optional,
+  for the test-out link), its `modules`, and exactly three `levels`. Every module belongs to
+  one area.
+- A level holds at least three alternative `items`. What a pass lets the course assume is
+  derived at build time, never written: the concepts of the lessons the items' concepts come
+  from. So an item's `concept` picks the lesson a right answer marks known; choose it from
+  the lesson the item really tests. It must belong to the area and be taught by a lesson.
+- An item is a `predict-output`, `multiple-choice` or `bug-hunt` step (no `verify`) that
+  reads in under 45 seconds, with exactly one correct choice. Ids read `<area>-<level>-<slug>`.
+  Run every snippet first, and say how in a comment above the item.
+- `paths`: rules from the area to work on to a written path, `{ area, below, path }`. The
+  first rule whose area matches and whose `below` is above the learner's level wins.
+
 ### course.yaml and module.yaml
 
 | File          | Keys                                                                                                                      |

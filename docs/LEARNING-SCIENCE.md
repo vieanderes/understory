@@ -75,25 +75,48 @@ actions, the illusion of competence from rereading, split attention, seductive d
 
 ## B. Core loop
 
-### B1. First session (8 minutes, no quiz)
+### B1. First session: find your level (no quiz)
 
-1. **One question:** "New to code / I build with AI / Experienced". This sets only the
-   starting rung.
-2. **Reading ladder.** The learner gets 8 to 10 short, realistic snippets, one per rung, in
-   varied settings.
-   - The rungs run HTML, CSS, JS closure, async order, React render, SQL join, a
-     check-then-act race.
-   - Each asks "what does this print", "which line is wrong" or "what happens when two
-     requests arrive at once".
-   - It is a staircase: two correct moves up two rungs, one wrong moves down one. It stops at
-     three reversals or 10 items.
-   - Confidence is captured on every item.
-3. **Output.** The ladder sets a starting rating theta per module band. Concepts below the
-   final rung are marked **assumed**, which the map shows as outlined and not filled.
-4. **Nothing is locked.** Assumed concepts are verified by probes mixed into the first two
+The course holds several skills that do not move together: someone strong in React can be
+new to Python. One staircase over the whole course can only measure one of them, so
+placement measures **area by area** (`content/placement.yaml`). The eight areas follow the
+course parts: First code, JavaScript and TypeScript, Interfaces, Servers and data,
+Production, Python and AI, Senior engineer, and Craft and judgement.
+
+1. **One question, then a rating per area.** "New to code / I build with AI / Experienced"
+   fills in a rating for each area: New, Some or Confident. Someone new checks First code
+   only, someone who builds with AI the first three areas, someone experienced all of them,
+   the first two as Confident. The learner can change any rating. New skips the area: asking
+   about what someone has never done costs time and tells us nothing.
+2. **A short search in each area.** An area has three levels, 1 Foundations, 2 Working,
+   3 Advanced, each holding alternative items: short, realistic snippets that ask "what does
+   this print", "which line is wrong" or "what happens when two requests arrive at once".
+   - The search starts at level 1, or level 2 for Confident. A shown answer passes the level
+     and climbs; a miss fails it and drops. It stops when a passed level sits right under a
+     failed one, so it asks at most one item per level.
+   - **A right answer marked as a guess does not count.** It is recorded as right for
+     calibration, but a lucky pick is evidence of nothing.
+   - Confidence is captured on every item. Nothing is shown between items.
+3. **One area in depth.** `/start?area=<id>` checks one area and needs two shown answers per
+   level, up to six items, so a lucky pick counts for less. It updates that area only.
+4. **Output.**
+   - A **level per area**, 0 to 3, kept as the latest result per area.
+   - An **overall level**, the area levels added up out of 24, named Starting out, Building,
+     Working or Strong by quarter.
+   - A starting rating theta for each module of a checked area (decisions, below).
+   - Concepts of the levels passed are marked **assumed**, which the map shows as outlined
+     and not filled. A level assumes only the lessons its own items come from: about four
+     lessons, never a whole chapter. A later placement that does not show a concept takes the
+     assumption back.
+5. **Nothing is locked.** Assumed concepts are verified by probes mixed into the first two
    weeks of practice, so placement continues quietly. A wrong probe flips the concept to "gap".
-5. **Ending.** The first screen after placement is the map with three marked entry points.
-   Then the learner chooses a weekly goal, and the session is over.
+6. **Ending: a path and its first lesson.** The area to work on is the first in course order
+   below Working, among the first two areas and those not rated New. A rule in
+   `placement.yaml` names the written path for that area and level; an area with no rule gets
+   a path built from its own lessons. The result offers the first lesson on it that is not
+   done and not **placed out** (every concept assumed), a link to the path, and Refine with
+   Scout, which opens the builder with the path less the placed-out lessons. Paths pass over
+   placed-out lessons when they pick the next one, and show them as Known.
 
 ### B2. Returning, 10 minutes, phone
 
@@ -598,15 +621,25 @@ entry is the simplest reading chosen, not a change to the rule itself.
   timestamp) per module; a caller that does hold the catalog (for example the practice
   session builder) is expected to apply `mastery.TEST_OUT_PASS_SKILL_P` and
   `mastery.TEST_OUT_INITIAL_STABILITY_DAYS` to that module's concepts when a pass is present.
-- **Rung-to-theta mapping.** B5 defines theta only through placement and the Elo update; B1
-  does not give a formula from a ladder rung to a starting theta. `thetaForBand` keeps theta
-  on the item scale (`800 + 200 * d`, d 1 to 5): a module whose band is the final rung starts
-  at d 3, each rung below the final rung adds a step and each rung above takes one away,
-  clamped to the scale. A module in two bands is rated by the higher one. Concepts on rungs
-  below the final rung are assumed, except a concept the learner answered wrong and never
-  right. The opening question sets the start: new at rung 1, builds with AI at rung 3,
-  experienced at rung 5. A rung with no unseen item left ends the ladder, and a later attempt
-  rotates which item each rung shows first.
+- **Area level to theta.** B5 defines theta only through placement and the Elo update; B1
+  does not give a formula from a placement level to a starting theta. `thetaForLevel` keeps
+  theta on the item scale (`800 + 200 * d`): New starts at d 1, Foundations d 2, Working d 4,
+  Advanced d 5, so a learner answers the items at their level about three times in four. A
+  module the learner missed an item in starts one step lower. Areas the session did not
+  check keep whatever rating they had. Concepts on levels at or below the placed level are
+  assumed, except a concept answered wrong and never right.
+- **What a level assumes.** B1 says concepts below the final level are assumed but not
+  which. A hand-written list per level drifted towards whole chapters (one level claimed 109
+  concepts from one answer). So the build derives it (`assumedByLevel`): the concepts of every
+  lesson that teaches a concept one of the level's items tests, and nothing else. Neither
+  prerequisites nor earlier lessons of the chapter are added: following prerequisites back
+  reached 87 concepts for one level, because chains run through whole chapters. A quick check
+  asks one item per level, yet the level assumes the lessons of all its alternatives: they
+  are interchangeable measures of the same height, and each is three to five lessons. A level with no unseen item left
+  ends its area, and a later attempt rotates which item each level shows first.
+- **Placed out.** A lesson is placed out when every concept it names is assumed and practice
+  has not since answered one of them with mastery below 0.4. A lesson that names no concept
+  is never placed out.
 - **Target band shift step.** B5 names the trigger thresholds (running first-try rate above
   0.9 or below 0.65) but not how far the 0.70-0.90 target band moves. A step of 0.1 is used,
   clamped to `[0, 1]`.

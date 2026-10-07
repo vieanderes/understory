@@ -43,6 +43,26 @@ export function applyUpcastChain(
 
 /** `chain[n]` lifts version n to n + 1; version 0 was never written, so it passes through. */
 const UPCASTERS: Partial<Record<EventType, readonly Upcaster[]>> = {
+  // v2 placed by area and level; a v1 answer named a rung of the one ladder.
+  placement_answered: [
+    (raw) => raw,
+    (raw) => {
+      const { rung, ...payload } = raw.payload as Record<string, unknown>;
+      return { ...raw, payload: { ...payload, level: rung } };
+    },
+  ],
+  placement_completed: [
+    (raw) => raw,
+    (raw) => ({
+      ...raw,
+      payload: {
+        scope: 'all',
+        levelByArea: {},
+        unassumedConcepts: [],
+        ...(raw.payload as Record<string, unknown>),
+      },
+    }),
+  ],
   // v2 gave own paths an id and a name: the one path from before is "My path".
   custom_path_set: [
     (raw) => raw,

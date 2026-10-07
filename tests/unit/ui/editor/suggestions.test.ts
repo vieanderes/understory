@@ -7,7 +7,7 @@ import { suggest, type AssistMode } from '@/features/editor/suggestions';
 function at(source: string): EditorState {
   const caret = source.indexOf('|');
   return EditorState.create({
-    doc: source.replace('|', ''),
+    doc: source.slice(0, caret) + source.slice(caret + 1),
     selection: EditorSelection.cursor(caret),
   });
 }

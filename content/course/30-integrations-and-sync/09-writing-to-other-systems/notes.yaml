@@ -1,0 +1,176 @@
+summary: >-
+  Reading from a vendor can go wrong in many ways, but mostly it costs you a stale screen.
+  Writing into a vendor costs real things: a second delivery of flour, a duplicate invoice, a
+  booking for a slot that's gone. And the vendor's system is the one place you can't add a
+  unique constraint.
+
+
+  The core problem is the same as in the idempotency lesson. A write that times out may have
+  landed. Where a vendor supports idempotency keys, use them. Many don't. Then you lean on an
+  **external reference**: a field on the vendor's record that holds your own id. You set it
+  on create, and before any retry you look the record up by it, after giving the vendor's
+  search time to catch up.
+
+
+  Around that sit three habits. Map every vendor error to one of four answers (retry, fix
+  the data, reconnect, give up) and explain the fixable ones in your user's words. Keep
+  per-item results from bulk writes, so a retry sends only what didn't land. After each
+  write, run a targeted sync of that record so your own pages show it. Prefer explicit write
+  actions over two-way sync, which loses edits and loops.
+remember:
+  - A timed-out write may have landed, so never retry a create without checking first.
+  - With no idempotency keys, write your own id into a reference field and look it up before every retry.
+  - Vendor search often lags behind writes, so wait before the lookup, or filter on the reference exactly.
+  - Map vendor errors to retry, fix the data, reconnect or give up, and never retry a validation error.
+  - Show users your own message for a vendor error, never the vendor's raw text or code.
+  - A bulk write that half succeeds reports per item, and the retry sends only the retryable failures.
+  - After a write, sync that one record, so your pages show what the vendor now holds.
+  - Write by explicit actions and read by sync, rather than syncing both ways.
+sections:
+  - title: When the vendor does offer idempotency keys
+    body: |-
+      Check the vendor's docs before anything else. Some APIs accept an `Idempotency-Key`
+      header, some a request id in the body, some a unique client reference that rejects a
+      repeat with `409 Conflict`. Each is stronger than lookup before retry, because the
+      vendor makes the check atomic on its side.
+
+      The danger is assuming. An unknown HTTP header is ignored, not rejected, so sending
+      `Idempotency-Key` to a vendor that doesn't support it looks fine forever. Only a test
+      against the vendor's real API, or its test environment, shows the truth: send the same
+      create twice with one key and count the records.
+
+      A unique reference that the vendor enforces turns a duplicate into an error you can
+      handle:
+
+      ```ts
+      async function createWithUniqueRef(vendor: Vendor, order: OrderRequest) {
+        try {
+          return await vendor.createOrder(order);
+        } catch (error) {
+          // The vendor refuses a second record with the same reference.
+          if (error instanceof VendorError && error.status === 409) {
+            const existing = await vendor.findByRef(order.ref);
+            if (existing) return existing;
+          }
+          throw error;
+        }
+      }
+      ```
+
+      When the vendor offers none of these, the lesson's pattern applies. Record on your side
+      that the order is being placed, before the first call, so a crash mid-way leaves a row a
+      later run can finish. That row is also where you keep the vendor's id once you have it.
+  - title: Turning vendor errors into actions and words
+    body: |-
+      A vendor error has two audiences. Your code needs to know what to do next. Your user
+      needs to know what happened and what they can do. Neither is served by
+      `ERR_VALIDATION_FAILED: field lines[0].sku`.
+
+      Keep one mapping per vendor, inside its adapter, from the vendor's status and code to
+      your own small set of outcomes:
+
+      ```ts
+      type Outcome =
+        | { kind: 'retry' }
+        | { kind: 'fix-data'; field?: string; message: string }
+        | { kind: 'reconnect' }
+        | { kind: 'give-up'; reference: string };
+
+      const SKU_GONE = "One of the products isn't sold by the wholesaler any more.";
+
+      function fromWholesaler(status: number, code: string, field?: string): Outcome {
+        if (status === 429 || status >= 500) return { kind: 'retry' };
+        if (status === 401 || status === 403) return { kind: 'reconnect' };
+        if (code === 'unknown_sku') return { kind: 'fix-data', field, message: SKU_GONE };
+        return { kind: 'give-up', reference: `${status}:${code}` };
+      }
+      ```
+
+      A field path, when the vendor gives one, lets the form highlight the exact line. The
+      `give-up` reference goes into the log and the support screen, so a person can look up
+      the vendor's code without the user ever seeing it. Count each outcome per vendor: a
+      sudden rise in `fix-data` after a vendor release usually means a new validation rule,
+      not a wave of bad input.
+
+      Retry only what can change. A `422` fails the same way every time, and retrying it
+      burns rate limit and delays the message the user needs.
+  - title: Bulk writes and partial results
+    body: |-
+      Bulk endpoints save round trips and rate limit, at the price of a more complex reply.
+      Some answer `207 Multi-Status` with one result per item. Others answer `200` with an
+      `errors` array, and a few accept the batch with `202` and report results later.
+
+      Whatever the shape, turn it into three lists and act on each:
+
+      ```js
+      const results = [
+        { line: 1, status: 'created', id: 'wl-901' },
+        { line: 2, status: 'error', code: 'rate_limited' },
+        { line: 3, status: 'error', code: 'unknown_sku' },
+      ];
+      const RETRYABLE = new Set(['rate_limited', 'temporarily_unavailable']);
+
+      const landed = results.filter((r) => r.status === 'created');
+      const retry = results.filter((r) => r.status === 'error' && RETRYABLE.has(r.code));
+      const fix = results.filter((r) => r.status === 'error' && !RETRYABLE.has(r.code));
+      console.log(landed.length, retry.map((r) => r.line), fix.map((r) => r.line)); // 1 [ 2 ] [ 3 ]
+      ```
+
+      Store the vendor ids for the landed lines straight away, before retrying anything, so
+      a crash can't lose them. Give each item its own external reference too, such as the
+      order id plus the line number. Then the retry of line 2 can be checked by reference like
+      any single create.
+
+      Tell the user the truth in one place: "47 lines sent, 3 need attention", with the three
+      listed. An all-or-nothing message for a half-done batch is how people end up placing
+      the same order twice by hand.
+pitfalls:
+  - '**Retrying a timed-out create blindly.** The first one may have landed, and the retry duplicates it. Look up by reference first.'
+  - '**Looking up straight after the timeout.** Search lags behind writes and misses the order that has only now landed. Wait, or filter on the reference exactly.'
+  - '**Sending headers the vendor never documented.** Unknown headers are ignored, so a made-up idempotency key protects nothing. Test against the real API.'
+  - '**Showing the vendor''s error text to users.** It''s written for developers and can leak internals. Map it to your own message and log the original.'
+  - '**Retrying validation errors.** They fail the same way every time and burn rate limit. Send them back to a person.'
+  - '**Treating a half-successful batch as all or nothing.** Retrying everything duplicates what landed. Keep per-item results and retry only the retryable failures.'
+  - '**Two-way sync.** Concurrent edits are lost and writes echo back and forth. Write by explicit action and read by sync.'
+verify:
+  - lens: breaks
+    check: Make the first create land and then time out, and confirm exactly one vendor record exists afterwards.
+  - lens: tests
+    check: Send two creates with one idempotency key to the vendor's test system, and count the records, before trusting any key.
+  - lens: confuses
+    check: Show users your own message for each vendor error code, and keep the vendor's code only in logs and the support view.
+  - lens: scales
+    check: In a bulk write, confirm a retry sends only the retryable failures, so a large batch with one bad line isn't resent whole.
+  - lens: leaks
+    check: Keep the vendor's raw error bodies out of user-facing screens, since they can name internal fields, accounts or other customers' data.
+interview:
+  - question: How do you avoid duplicate records when writing to an API with no idempotency support?
+    answer: >-
+      I give every record my own stable id before the first attempt and write it into a
+      reference field the vendor stores, such as an external reference or a PO number. Before
+      any retry, I look the record up by that reference. If it's there, the earlier attempt
+      landed and I take its id. If not, I create again. Two details make it work. Vendor search
+      often lags behind writes, so I wait a few seconds before the lookup, or use an exact
+      filter on the field if the API has one. And I record on my side that the create is in
+      progress, so a crash can be resumed. If a duplicate slips through anyway, reconciliation
+      spots two records with one reference and flags them.
+  - question: A partner API sometimes returns errors on writes. How do you handle them?
+    answer: >-
+      I map each error to one of four outcomes, inside the adapter for that partner. Timeouts,
+      `429` and `5xx` are retryable, with backoff, but a create is only retried after checking
+      whether it landed. `400` and `422` mean the data is wrong, so I show the user a message
+      in our words, ideally pointing at the field, and never retry. `401` and `403`, or a
+      revoked grant, mean the connection needs to be re-authorised. Anything else is a give-up
+      with the partner's code logged and a reference shown to support. Counting outcomes per
+      partner also catches their releases: a jump in validation errors usually means they
+      added a rule.
+  - question: Why do many integrations avoid two-way sync?
+    answer: >-
+      Because it turns two sources of truth into a conflict machine. When both sides edit the
+      same record, one edit is lost, and there's no shared clock to decide which came first.
+      Your write triggers the vendor's webhook, which triggers your sync, which can write
+      back, so you need echo suppression. Deletions are ambiguous: did the other side delete
+      it, or did it never have it? So I prefer one owner per record. We read the vendor's
+      records by sync, and we change them only through explicit user actions like "send
+      order", each followed by a targeted sync. Where two-way sync is truly required, I'd
+      scope it to a few fields with clear ownership rules.

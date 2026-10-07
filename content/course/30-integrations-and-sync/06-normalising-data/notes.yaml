@@ -1,0 +1,174 @@
+summary: >-
+  Every vendor writes the same facts its own way. One sends dates as `05/06/2026`, another as
+  `2026-06-05`. One says "N/A" for nothing, another sends an empty string, a third leaves the
+  field out. One marks a flag with "Y", another with "X". **Normalising** is turning all of
+  that into one meaning, once, at the edge of your system, so the rest of the code sees a
+  single clean shape.
+
+
+  Three traps cause most of the damage, and none of them throws an error. A pure date such as
+  a birthday, pushed through `new Date`, becomes an instant and shifts a day for anyone west
+  or east of the server. An enum mapper that falls back to a real value, such as "present",
+  turns every new vendor code into confident nonsense. A CSV file read with the wrong
+  encoding, a byte order mark left on, or the wrong delimiter imports garbled names, lost
+  columns or one giant column.
+
+
+  Reach for this whenever data crosses into your system from somewhere you don't control: a
+  vendor API, a spreadsheet upload, a nightly file drop. The rule is the same each time:
+  convert on the way in, report what you couldn't convert, and never guess silently.
+remember:
+  - A pure date is a calendar day with no zone, so keep it as `YYYY-MM-DD` text and a `date` column, never a timestamp.
+  - '`new Date("2014-03-09")` is midnight UTC, so it shows the 8th anywhere behind UTC.'
+  - A date format like `05/06/2026` can't be read from the data, so its order is a per-connection setting.
+  - An unknown vendor code maps to `null` or an explicit unknown, never to a real value, and is counted.
+  - Map every spelling of "nothing" (empty, "N/A", "-", missing) to `null` before any other rule runs.
+  - A flag has three outcomes, true, false and unknown, so a spelling you don't recognise is not `false`.
+  - A CSV file doesn't say its encoding, byte order mark or delimiter, so the connection's settings must.
+  - '`readFileSync(path, "utf8")` keeps a byte order mark, while `TextDecoder` drops it by default.'
+sections:
+  - title: Dates, instants and the parser's two rules
+    body: |-
+      An instant is a point on the world's timeline. A pure date is a box on a wall calendar.
+      They need different types because they answer different questions: "when did the
+      register close?" against "which day is her birthday?".
+
+      JavaScript's `Date` only holds instants. Give it a pure date and it has to invent a
+      time and a zone. The spec's choice depends on the shape of the text:
+
+      ```bash
+      $ TZ=Asia/Tokyo node -e '
+        console.log(new Date("2014-03-09").toISOString());
+        console.log(new Date("2014-03-09T00:00").toISOString());
+      '
+      2014-03-09T00:00:00.000Z
+      2014-03-08T15:00:00.000Z
+      ```
+
+      The first is read as UTC midnight, the second as local midnight. Neither is a birthday.
+      Then the display side applies the viewer's zone again, so the same pupil can show
+      different birthdays on two laptops.
+
+      The fix is boring on purpose. Convert the vendor's format to `YYYY-MM-DD` text at the
+      edge, keep it as text through your code, store it in a PostgreSQL `date` column, and
+      send it out as text. Comparing two such strings sorts correctly, because the format puts
+      the largest unit first. If you need date arithmetic, such as a pupil's age on the first
+      day of term, do it on the year, month and day numbers, not on milliseconds.
+
+      Tests rarely catch the shift, because CI machines usually run in UTC, where nothing
+      moves. Run the suite once with `TZ=America/New_York` and once with `TZ=Pacific/Auckland`.
+      A date that survives both is a date you handled correctly.
+  - title: Codes, empties and flags
+    body: |-
+      A mapping table turns the vendor's vocabulary into yours. Several vendor codes can land
+      on one of your values, and that's normal: one system splits "enrolled" into "on roll"
+      and "active", another doesn't.
+
+      ```ts
+      const STATUSES: Record<string, 'enrolled' | 'left'> = { ACT: 'enrolled', ONR: 'enrolled', LFT: 'left' };
+      const unmapped = new Map<string, number>();
+
+      function toStatus(code: string): 'enrolled' | 'left' | null {
+        const mapped = STATUSES[code];
+        if (mapped === undefined) unmapped.set(code, (unmapped.get(code) ?? 0) + 1);
+        return mapped ?? null;
+      }
+
+      ['ACT', 'SUSP', 'LFT', 'SUSP'].map(toStatus);
+      console.log(unmapped); // Map(1) { 'SUSP' => 2 }
+      ```
+
+      The counter matters as much as the `null`. After each run, log the unmapped codes with
+      their counts, and alert when a new one appears. That turns a vendor change into a
+      ticket the same morning.
+
+      Empty values come in many spellings: `""`, `" "`, `"N/A"`, `"-"`, `"null"`, `null` and a
+      missing key. Collapse them all to `null` first, so a later rule never has to ask.
+      Booleans are the same story: `"Y"`, `"yes"`, `"1"`, `"X"` and `"true"` for yes, and
+      their opposites for no. Keep an explicit list of each, and treat anything else as
+      unknown with a warning. Watch out for `Boolean("0")` and `Boolean("false")`, which are
+      both `true` in JavaScript, because any non-empty string is truthy.
+
+      Some values have international standard forms, and converting to them at the edge saves
+      every later comparison. Phone numbers go to E.164, countries to ISO 3166-1 alpha-2
+      codes and currencies to ISO 4217 codes.
+  - title: Reading CSV for real
+    body: |-
+      CSV looks simple and isn't. RFC 4180 describes the common form: comma-separated fields,
+      CRLF line endings, and double quotes around any field that holds a comma, a quote or a
+      line break, with inner quotes doubled. Spreadsheets bend each rule. Many save with the
+      local list separator, which is a semicolon in much of Europe. Many older exports use
+      Windows-1252 rather than UTF-8. Some add a UTF-8 byte order mark so the spreadsheet
+      itself can tell the file is UTF-8.
+
+      Here is what each wrong guess looks like, from the same two files:
+
+      ```js
+      const utf8WithMark = Uint8Array.from([0xef, 0xbb, 0xbf, 0x52, 0x65, 0x6e, 0xc3, 0xa9, 0x65]);
+      const windows1252 = Uint8Array.from([0x52, 0x65, 0x6e, 0xe9, 0x65]);
+
+      console.log(new TextDecoder('utf-8').decode(utf8WithMark));        // Renée
+      console.log(new TextDecoder('windows-1252').decode(utf8WithMark)); // ï»¿RenÃ©e
+      console.log(new TextDecoder('utf-8').decode(windows1252));         // Ren�e
+      console.log(new TextDecoder('latin1').encoding);                   // windows-1252
+      ```
+
+      `Ã©` where you expected `é` means UTF-8 read as Windows-1252. A `�` means the reverse.
+      Those two patterns are worth recognising on sight in a support ticket.
+
+      Don't guess per file. Store `encoding` and `delimiter` on the connection, set when the
+      customer uploads their first file and checks a preview of the first rows. Use a real CSV
+      parser that understands quotes, give it the delimiter, and decode with `TextDecoder`,
+      which strips the mark. Then check the header row against the columns you expect, by
+      exact name, and refuse the file with a clear message if one is missing. A missing `id`
+      column caught at the header is one error, not ten thousand rows of `undefined`.
+pitfalls:
+  - '**Parsing a birthday with `new Date`.** It looks right on a UTC machine and shifts a day for users in other zones. Keep pure dates as `YYYY-MM-DD` text.'
+  - '**Guessing the date order from the data.** A rule like "day first if a part is over 12" works until a file holds only early days of the month. Make the order a connection setting.'
+  - '**Falling back to a real value.** `?? "present"` hides every new code as plausible data. Fall back to `null` or an explicit unknown, and count it.'
+  - '**Throwing on an unknown code.** One new value stops the whole sync for every record. Map it to unknown, warn, and carry on.'
+  - '**Treating an unknown flag as false.** `"maybe"` isn''t "no". Keep three outcomes and warn on the third.'
+  - '**Splitting CSV lines on commas.** The first quoted field with a comma inside shifts every column after it. Use a parser with the connection''s delimiter.'
+  - '**Reading CSV with `readFileSync(path, "utf8")`.** It keeps the byte order mark, so the first header never matches. Decode with `TextDecoder`, or strip a leading `﻿`.'
+verify:
+  - lens: breaks
+    check: Run the mapping tests with TZ set to New York and to Auckland, and confirm every pure date comes out unchanged.
+  - lens: breaks
+    check: Feed a record with a status code the vendor never documented, and confirm the run finishes with that field null and one warning.
+  - lens: tests
+    check: Import three fixture files, one with a byte order mark, one in Windows-1252 and one with semicolons, and assert identical rows.
+  - lens: confuses
+    check: Name the setting `dateOrder` with values `DMY` and `MDY`, so nobody reads `05/06` as a locale guess.
+  - lens: scales
+    check: Report unmapped codes as counts per code per run, not one log line per record, so a new code can't flood the logs.
+interview:
+  - question: A user in Canada says the app shows their child's birthday a day early. What's going on?
+    answer: >-
+      Almost certainly a pure date was treated as an instant. The birthday arrived as
+      `2014-03-09`, something passed it through `new Date`, and the engine read it as midnight
+      UTC. Displayed in Toronto, five hours behind, that instant falls on the 8th. It never
+      showed up in testing because CI runs in UTC, where nothing moves. The fix is to keep
+      birthdays as calendar dates end to end: `YYYY-MM-DD` text in code, a `date` column in
+      PostgreSQL, and formatting that never applies a zone. I'd add a test run under a zone
+      behind UTC and one ahead of it, so the class of bug can't come back. Instants, like
+      when a record was updated, stay as `timestamptz`.
+  - question: How do you handle a vendor adding a new enum value you don't know?
+    answer: >-
+      Map it to an explicit unknown, keep processing, and make it visible. Throwing is wrong,
+      because one new value would stop the whole sync for every other record. Falling back to
+      a real value is worse, because it turns the new value into confident wrong data, like
+      sick pupils marked present. So the mapper returns `null` or an `unknown` member, keeps
+      the raw value for later, and increments a counter per unknown code. After the run we log
+      the counts and alert when a code is new. Then a person decides what it means, adds it to
+      the table, and a re-sync fixes the stored rows. The trade-off is a short window of
+      unknowns, which is honest, instead of a window of wrong values.
+  - question: You're building a CSV import for customers. What do you get wrong the first time?
+    answer: >-
+      Assuming every file looks like my test file. Real files differ in encoding, with older
+      spreadsheet exports in Windows-1252 rather than UTF-8. They may start with a byte order
+      mark that glues itself to the first header. They may use semicolons, which spreadsheets
+      in much of Europe use. And fields contain commas and line breaks inside quotes, which
+      breaks any `split(",")`. None of these throws: the import succeeds with garbled names or
+      shifted columns. So I store encoding and delimiter per connection, show a preview of the
+      first rows before importing, use a real CSV parser, check the header by exact name, and
+      keep a fixture file for each quirk in the test suite.

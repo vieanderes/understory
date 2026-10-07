@@ -1,0 +1,334 @@
+id: integrations.adapters-and-models
+title: Many vendors, one model
+objective: Put each vendor behind an adapter to one common data model, record what each supports, and keep the raw payload and custom fields.
+level: advanced
+minutes: 10
+concepts: [integrations.vendor-adapters, integrations.capability-matrix, integrations.common-data-model, integrations.custom-field-mapping]
+prerequisites: [arch.hexagonal, integrations.normalising-data]
+opening:
+  text: >-
+    You'll hide three different vendors behind one interface your app talks to. It's how you
+    add the tenth vendor without touching the first nine.
+
+steps:
+  - type: prose
+    id: one-port-many-vendors
+    body: >-
+      A cinema app lists screenings from many cinemas. Each cinema sells tickets through one
+      of three ticketing vendors, and each vendor has its own API.
+
+
+      In Ports and adapters, the domain owned a port and an adapter filled it. Same move here:
+      one `ListingsSource` interface, and one **vendor adapter** per vendor. The rest of the
+      app never learns which vendor it's talking to.
+
+  - type: multiple-choice
+    id: pick-what-changes
+    concept: integrations.vendor-adapters
+    difficulty: 1
+    question: A fourth ticketing vendor signs up. What should you have to write?
+    choices:
+      - text: One new adapter for that vendor
+        correct: true
+        feedback: >-
+          Right. The interface stays, and nothing else learns the vendor exists.
+      - text: A new branch in every page that lists films
+        feedback: >-
+          That's the code adapters exist to spare you. Pages talk to the interface, never to a
+          vendor.
+      - text: A new table for its screenings
+        feedback: >-
+          Screenings from every vendor share one shape, so they can share one table.
+      - text: A copy of the sync job for it
+        feedback: >-
+          The sync job only calls the interface. It runs the same way for every adapter.
+
+  - type: prose
+    id: capability-matrix
+    body: |-
+      Vendors aren't equal. One can send only what changed since a time. One has webhooks. One
+      never says how many seats are left. Write that down as data, a **capability matrix**:
+
+      ```ts
+      const capabilities = {
+        vendorA: { updatedSince: true, seatCounts: true, webhooks: true },
+        vendorB: { updatedSince: false, seatCounts: false, webhooks: false },
+        vendorC: { updatedSince: true, seatCounts: false, webhooks: true },
+      };
+      ```
+
+      The sync reads it to pick delta or full. The page reads it to hide a seats badge.
+
+  - type: predict-output
+    id: predict-seats-default
+    concept: integrations.common-data-model
+    difficulty: 2
+    language: ts
+    code: |
+      // Vendor C's adapter. Vendor C never sends a seat count.
+      function toScreening(show: VendorCShow): Screening {
+        return {
+          remoteId: show.id,
+          film: show.film_title,
+          startsAt: show.starts,
+          seatsLeft: show.seats_remaining ?? 0,
+        };
+      }
+
+      // On the listings page:
+      const badge = screening.seatsLeft === 0 ? "Sold out" : "Book now";
+    question: What do customers see on every screening at vendor C's cinemas?
+    choices:
+      - text: '"Sold out"'
+        correct: true
+        feedback: >-
+          Yes. `?? 0` turned "we don't know" into "none left".
+      - text: '"Book now"'
+        feedback: >-
+          The default isn't missing, it's `0`. To the page, zero means sold out.
+      - text: No badge at all
+        feedback: >-
+          The page always picks one of two badges. Nothing tells it the count is unknown.
+      - text: A type error at build time
+        feedback: >-
+          `0` is a perfectly good number. The types are happy and the data is wrong.
+
+  - type: prose
+    id: superset-raw-custom
+    body: >-
+      So the **common data model** is a superset: what vendors offer between them, nullable
+      where coverage is patchy. Keeping only shared fields would drop seats for everyone.
+
+
+      Keep each record's raw payload beside it, too. And cinemas add their own fields, like an
+      age rating in `cf_17`. That's **custom-field mapping**: each connection maps them in
+      settings, never in code.
+
+  - type: parsons
+    id: arrange-adapter-map
+    concept: integrations.common-data-model
+    difficulty: 3
+    language: ts
+    prompt: >-
+      Arrange vendor A's mapping into the common model. It keeps the raw payload, and reads
+      custom fields through this connection's map.
+    blocks:
+      - id: signature
+        code: 'function toScreening(show: VendorAShow, fieldMap: FieldMap): Screening {'
+        subgoal: Take the show and this connection's map
+      - id: custom-start
+        code: '  const custom: Record<string, string> = {};'
+        indent: 1
+        subgoal: Map custom fields from settings
+      - id: loop
+        code: '  for (const [theirs, ours] of Object.entries(fieldMap)) {'
+        indent: 1
+      - id: read-value
+        code: '    const value = show.extra[theirs];'
+        indent: 2
+      - id: copy-value
+        code: '    if (value !== undefined) custom[ours] = value;'
+        indent: 2
+      - id: loop-end
+        code: '  }'
+        indent: 1
+      - id: return-start
+        code: '  return { remoteId: show.ref, film: show.name, startsAt: show.time,'
+        indent: 1
+        subgoal: Map the common fields and keep the raw
+      - id: return-end
+        code: '    seatsLeft: show.seats ?? null, custom, raw: show };'
+        indent: 2
+      - id: close
+        code: '}'
+    distractors:
+      - id: seats-zero
+        code: '    seatsLeft: show.seats ?? 0, custom, raw: show };'
+        feedback: >-
+          `0` claims the screening is sold out. Unknown is `null`.
+      - id: hardcoded-rating
+        code: '  custom.ageRating = show.extra.cf_17;'
+        feedback: >-
+          That's one cinema's field, applied to every connection. It belongs in that cinema's
+          field map.
+
+  - type: ai-review
+    id: review-hardcoded-field
+    concept: integrations.custom-field-mapping
+    difficulty: 4
+    language: ts
+    request: Cinema 12 says its age ratings are missing. Fix it in vendor B's adapter.
+    flawClass: regression
+    code: |
+      function toScreening(show: RawShow, fieldMap: FieldMap): Screening {
+        const custom: Record<string, string> = {};
+        for (const [theirs, ours] of Object.entries(fieldMap)) {
+          const value = show.fields[theirs];
+          if (value !== undefined) custom[ours] = value;
+        }
+        // Cinema 12 keeps its age rating in cf_17.
+        custom.ageRating = show.fields.cf_17 ?? "";
+        return { remoteId: String(show.show_id), film: show.title, startsAt: show.start_utc,
+          seatsLeft: null, custom, raw: show };
+      }
+    prompt: >-
+      The fix shipped, and cinema 12's ratings appeared. Its test passed. The next morning,
+      cinema 40's films were rated "Step-free access". Tap the line at fault.
+    lines: [8]
+    reasons:
+      - text: '`?? ""` should be `?? null`'
+        feedback: >-
+          A tidier default, but cinema 40 would still get its access note as a rating.
+      - text: One cinema's field is hardcoded for every connection
+        correct: true
+        feedback: >-
+          Yes. `cf_17` means something else elsewhere. Add it to cinema 12's field map.
+      - text: The loop overwrites the mapped fields
+        feedback: >-
+          The loop only writes names each connection chose. Line 8 then writes one for
+          everybody.
+      - text: '`raw: show` leaks cinema 12''s data'
+        feedback: >-
+          The raw payload belongs to the same show. It's the custom field that's wrong.
+    fix: |
+      // No adapter change. Cinema 12's connection settings get:
+      // fieldMap: { cf_17: "ageRating" }
+    verify:
+      question: Which test would have caught this before it shipped?
+      choices:
+        - text: One show mapped under two connections' field maps
+          correct: true
+          feedback: >-
+            Cinema 40's map has no `ageRating`, so the hardcoded line shows up.
+        - text: Cinema 12's show has its age rating
+          feedback: >-
+            That's the test that passed. It checks the one customer the fix was for.
+        - text: The adapter type-checks against the interface
+          feedback: >-
+            `custom` is a `Record<string, string>`. Any key type-checks.
+        - text: A snapshot of cinema 12's listings page
+          feedback: >-
+            It shows cinema 12 correctly. The damage is at every other cinema.
+
+  - type: code-challenge
+    id: write-vendor-b-adapter
+    concept: integrations.capability-matrix
+    difficulty: 4
+    language: ts
+    editable: '46-60'
+    prompt: >-
+      Write `vendorBSource(client, fieldMap)`, the adapter for vendor B. It returns a
+      `ListingsSource`. Vendor B can't filter by update time, sends no seat counts and has no
+      webhooks. Its `capabilities` must say exactly that.
+
+
+      `listScreenings()` maps each show. `show_id` becomes a string `remoteId`, `title` goes to
+      `film` and `start_utc` to `startsAt`. `seatsLeft` is `null`, and `raw` is the show itself. `custom`
+      holds only the fields this connection's `fieldMap` names, under your names. Asked for
+      `updatedSince`, throw `new UnsupportedError('updatedSince')` before calling the vendor.
+
+
+      For example, with `{ cf_17: 'ageRating' }`, a show whose fields include `cf_17: '15'`
+      gets `custom: { ageRating: '15' }`.
+    hints:
+      - Start with `capabilities`. The starter copied vendor A's and claims two things vendor B can't do.
+      - Silently ignoring `updatedSince` returns everything, and the caller thinks it ran a delta. Check `options` first.
+      - "For `custom`, loop over `Object.entries(fieldMap)` and copy `show.fields[theirs]` into `custom[ours]` when it's defined."
+
+  - type: explain-back
+    id: defend-superset-model
+    concept: integrations.common-data-model
+    difficulty: 4
+    audience: teammate
+    kind: decide
+    prompt: >-
+      A teammate proposes keeping only the fields all three vendors share, so nothing is ever
+      `null`. Defend the superset model with nullable fields instead.
+    rubric:
+      - Keeping only shared fields drops useful data, like seat counts, for every vendor.
+      - A nullable field says "unknown" honestly, and the capability matrix tells pages what to hide.
+      - The cost is handling `null` in every reader, which the types force, plus the raw payload for the rest.
+    modelAnswer: >-
+      If we keep only shared fields, nobody gets seat counts, because one vendor lacks them. A
+      superset keeps what each vendor can give. Where coverage is patchy the field is
+      nullable, so `null` means "this vendor doesn't say", never "zero". The capability
+      matrix tells the page to hide the badge there. The cost is that every reader handles
+      `null`, but TypeScript makes that impossible to forget. The raw payload covers anything
+      we didn't model.
+
+recap:
+  - Put each vendor behind one interface, so a new vendor means one new adapter.
+  - Record what each vendor supports as data, and let the sync and the pages read it.
+  - Model the superset with nullable fields, keep the raw payload, and map custom fields per connection.
+
+recall:
+  - id: card-what-app-knows
+    concept: integrations.vendor-adapters
+    front: What does the rest of the app know about which vendor a cinema uses?
+    back: >-
+      Nothing. It calls the shared interface, and the adapter for that connection does the
+      vendor-specific work.
+  - id: card-capability-matrix
+    concept: integrations.capability-matrix
+    front: What is a capability matrix for?
+    back: >-
+      It records what each vendor supports, such as webhooks or update filters, so the sync
+      and the product can adapt per vendor.
+  - id: card-null-not-zero
+    concept: integrations.common-data-model
+    front: Why should `seatsLeft` be `number | null` instead of defaulting to `0`?
+    back: >-
+      Zero means sold out. `null` means the vendor doesn't say, so the page can hide the badge
+      instead of lying.
+  - id: card-custom-field-home
+    concept: integrations.custom-field-mapping
+    front: Where does one customer's custom-field mapping belong?
+    back: >-
+      In that connection's settings, as data. Hardcoded in the adapter, it applies to every
+      customer of that vendor.
+
+references:
+  - kind: essay
+    title: Hexagonal architecture
+    authors: Alistair Cockburn
+    year: 2005
+    venue: alistair.cockburn.us
+    url: https://alistair.cockburn.us/hexagonal-architecture/
+    note: Ports and adapters in the author's words, including several adapters for one port.
+    primary: true
+    verified: false
+  - kind: book
+    title: 'Design Patterns: Elements of Reusable Object-Oriented Software'
+    authors: Erich Gamma, Richard Helm, Ralph Johnson, John Vlissides
+    year: 1994
+    venue: Addison-Wesley
+    note: The Adapter pattern, which makes one interface out of another.
+    primary: true
+    verified: false
+  - kind: book
+    title: Patterns of Enterprise Application Architecture
+    authors: Martin Fowler
+    year: 2002
+    venue: Addison-Wesley
+    note: The Gateway pattern, an object that wraps access to an external system.
+    verified: false
+
+deepDive: >-
+  No common model covers everything a vendor can do. So many integration layers add a
+  **passthrough**: a method such as `passthrough({ method, path, body })` that sends a raw
+  request to the vendor through the connection's own credentials. A customer who needs a
+  vendor feature you never modelled can reach it without waiting for you. Its replies aren't
+  normalised, and it's scoped to that one connection, so it can't become a back door to
+  another customer's data.
+
+
+  Test adapters with one shared contract suite. The same tests run against every adapter,
+  and each test that needs a capability skips where the matrix says `false`. A new adapter
+  then passes the suite before it ships, and the matrix can't drift from what the code
+  really does.
+
+
+  The raw payload earns its keep later. When you add a field to the common model, you can
+  re-map every stored record from its raw payload instead of re-fetching from the vendor.
+  It holds the same personal data as the mapped record, so it needs the same retention and
+  deletion rules.

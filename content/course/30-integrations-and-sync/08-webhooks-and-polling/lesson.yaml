@@ -1,0 +1,329 @@
+id: integrations.webhooks-and-polling
+title: Webhooks for speed, polling for truth
+objective: Treat an incoming webhook as a hint that triggers a sync, reconcile by polling, and send webhooks with retries, disabling and SSRF checks.
+level: advanced
+minutes: 10
+concepts: [integrations.thin-events, integrations.reconciliation, integrations.outgoing-webhooks]
+prerequisites: [backend.webhooks, security.injection-and-ssrf, integrations.full-and-delta-sync, scale.failure-handling]
+opening:
+  text: >-
+    You'll use webhooks for speed without trusting them for truth, and send your own so
+    customers can rely on them. Both sides of a webhook fail in ways a quick test never shows.
+
+steps:
+  - type: prose
+    id: hint-not-truth
+    body: >-
+      A bike-share app shows how many bikes each dock holds. The dock vendor sends webhooks,
+      which you met in Webhooks: signed, delivered at least once, sometimes out of order.
+
+
+      Some events carry the data: `{ dockId: "d-42", bikes: 3 }`. A **thin event** carries
+      only the news, `{ dockId: "d-42" }`, and your code fetches the dock's current state.
+
+  - type: predict-output
+    id: predict-reordered-events
+    concept: integrations.thin-events
+    difficulty: 1
+    language: js
+    code: |
+      const docks = new Map();
+      function onEvent(event) {
+        docks.set(event.dockId, event.bikes);
+      }
+
+      // Sent at 10:00, then at 10:01. They arrive the other way round.
+      onEvent({ dockId: "d-42", bikes: 3, sentAt: "10:01" });
+      onEvent({ dockId: "d-42", bikes: 5, sentAt: "10:00" });
+      console.log(docks.get("d-42"));
+    question: The dock really holds 3 bikes now. What does the app show?
+    choices:
+      - text: '`5`'
+        correct: true
+        feedback: >-
+          Right. The older event arrived last, so it won.
+      - text: '`3`'
+        feedback: >-
+          That's the truth, but the handler stores whatever arrives last. Here that's the 10:00
+          event.
+      - text: '`undefined`, the events conflict'
+        feedback: >-
+          Two writes to one key don't cancel out. The second replaces the first.
+
+  - type: prose
+    id: fetch-then-reconcile
+    body: >-
+      So treat every event as a hint. Fetch the dock's current state, and store that. Order
+      stops mattering, and a duplicate costs one extra read.
+
+
+      Events still get lost, though. So a **reconciliation** job polls every dock on a
+      schedule, compares it with your copy, and repairs any drift. Webhooks for speed,
+      polling for truth.
+
+  - type: parsons
+    id: arrange-thin-handler
+    concept: integrations.thin-events
+    difficulty: 2
+    language: ts
+    prompt: >-
+      Arrange the webhook handler and its worker. The handler answers fast. The worker fetches
+      the dock's current state.
+    blocks:
+      - id: handler-start
+        code: 'async function onDockWebhook(request: Request) {'
+        subgoal: Take the hint
+      - id: verify
+        code: '  const event = await verifiedEvent(request); // HMAC on the raw body'
+        indent: 1
+      - id: enqueue
+        code: '  await syncQueue.add({ dockId: event.dockId });'
+        indent: 1
+        subgoal: Queue a sync of that one dock
+      - id: answer
+        code: '  return new Response(null, { status: 202 });'
+        indent: 1
+      - id: handler-end
+        code: '}'
+      - id: worker-start
+        code: 'async function syncDock(job: { dockId: string }) {'
+        subgoal: Fetch the truth and store it
+      - id: fetch-current
+        code: '  const dock = await vendor.getDock(job.dockId);'
+        indent: 1
+      - id: store
+        code: '  await docks.upsert(dock);'
+        indent: 1
+      - id: worker-end
+        code: '}'
+    distractors:
+      - id: store-event-copy
+        code: '  await docks.upsert({ id: event.dockId, bikes: event.bikes });'
+        feedback: >-
+          That stores the event's copy, which can be stale or out of order.
+      - id: sync-everything
+        code: '  await syncQueue.add({ allDocks: true });'
+        feedback: >-
+          A full sync for every event is slow. One dock changed, so sync that one.
+
+  - type: multiple-choice
+    id: pick-alarming-signal
+    concept: integrations.reconciliation
+    difficulty: 3
+    question: Which reading from last night's sync should page someone?
+    choices:
+      - text: Bike counts changed at 300 docks
+        feedback: >-
+          Bikes move all day. Hundreds of changed counts is an ordinary night.
+      - text: Docks fell from 812 to 95
+        correct: true
+        feedback: >-
+          Yes. Docks don't vanish overnight. That's a broken read, not real change.
+      - text: Reconciliation repaired four docks
+        feedback: >-
+          A few repairs is reconciliation doing its job. Watch the trend, not one night.
+      - text: The sync took four minutes, not three
+        feedback: >-
+          Worth a glance, not a page. The data itself still looks sane.
+
+  - type: prose
+    id: sending-webhooks
+    body: |-
+      Now flip it. Your bike-share sends webhooks to its own customers, such as a city that
+      wants `dock.empty` events. Each delivery needs:
+
+      - a signature over the body and an event id, so they can verify and dedupe
+      - retries on a growing schedule, spread over hours
+      - a delivery log the customer can replay from
+      - a switch-off after repeated failures, with an email to the owner
+
+  - type: ai-review
+    id: review-follows-redirect
+    concept: integrations.outgoing-webhooks
+    difficulty: 4
+    language: ts
+    request: Deliver a signed event to the customer's URL, and block internal addresses.
+    flawClass: security
+    code: |
+      async function deliver(endpoint: Endpoint, event: WebhookEvent) {
+        const body = JSON.stringify(event);
+        // Resolves the host and throws for private and loopback ranges.
+        await assertPublicHost(endpoint.url);
+        return fetch(endpoint.url, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "webhook-id": event.id,
+            "webhook-signature": sign(body, endpoint.secret),
+          },
+          body,
+          signal: AbortSignal.timeout(10_000),
+        });
+      }
+    prompt: >-
+      The SSRF tests passed: `http://169.254.169.254` is refused. Then one customer's endpoint
+      answered `302`, pointing at the metadata address. Its reply appeared in their delivery
+      log. Tap the line at fault.
+    lines: [5]
+    reasons:
+      - text: '`fetch` follows the redirect to an unchecked address'
+        correct: true
+        feedback: >-
+          Yes. Set `redirect: "manual"`, and count any 3xx as a failed delivery.
+      - text: The signature should cover the headers too
+        feedback: >-
+          Signing the body with an id is the norm. It doesn't decide where the request goes.
+      - text: A ten-second timeout is too generous
+        feedback: >-
+          A shorter wait helps throughput, but the request still reaches the internal address.
+      - text: '`assertPublicHost` should run after `fetch`'
+        feedback: >-
+          Afterwards is too late. By then the request has already gone.
+    fix: |
+      const response = await fetch(endpoint.url, { method: "POST", headers, body,
+        redirect: "manual", signal: AbortSignal.timeout(10_000) });
+      if (response.status >= 300) return { delivered: false, status: response.status };
+    verify:
+      question: Which test would have caught this?
+      choices:
+        - text: A URL whose host is `169.254.169.254`
+          feedback: >-
+            That one is refused already, and the test passed. The trouble is where the reply
+            points.
+        - text: An endpoint that redirects to an internal address
+          correct: true
+          feedback: >-
+            That's the path production took. It must count as a failed delivery.
+        - text: An endpoint that never answers
+          feedback: >-
+            The timeout covers that. It says nothing about redirects.
+        - text: A hostname that resolves to a public address
+          feedback: >-
+            That's the happy path. A redirect only shows up if the endpoint sends one.
+
+  - type: code-challenge
+    id: write-delivery-policy
+    concept: integrations.outgoing-webhooks
+    difficulty: 4
+    language: ts
+    editable: '29-33'
+    prompt: >-
+      Write `afterAttempt(endpoint, attempt, outcome, now)`. It runs after each delivery
+      attempt and returns the decision and the endpoint's new state.
+
+
+      Only a 2xx is delivered, and it resets `consecutiveFailures` to 0. Anything else,
+      including a redirect, a timeout or a network error, adds one failure. At
+      `DISABLE_AFTER` failures in a row, return `disable` with `notifyOwner: true` and mark
+      the endpoint disabled.
+
+
+      Otherwise retry at `now` plus `RETRY_DELAYS_MS[attempt - 1]`, or plus `retryAfterMs`
+      if that's longer. When the schedule has no entry left, `give-up`. For example, attempt
+      1 failing with `500` retries one minute later.
+    hints:
+      - Decide delivered first. Check for a status from 200 to 299, not anything under 400.
+      - The failure count belongs to the endpoint, so the disable check comes before the schedule.
+      - "Read the delay with `RETRY_DELAYS_MS[attempt - 1]`. When it's `undefined`, the schedule has run out."
+
+  - type: explain-back
+    id: risk-drop-reconciliation
+    concept: integrations.reconciliation
+    difficulty: 4
+    audience: reviewer
+    kind: risk
+    prompt: >-
+      A reviewer asks: webhooks now update docks within seconds, so can we delete the nightly
+      reconciliation job? What could go wrong, and how would you check?
+    rubric:
+      - Webhooks get lost, through downtime past the vendor's retries or a vendor bug, and nothing resends them.
+      - Without reconciliation, drift stays until a rider notices a wrong dock.
+      - Keep it, count how many docks it repairs each night, and alert on spikes and sudden drops.
+    modelAnswer: >-
+      Webhooks are fast, not guaranteed. Our endpoint may be down past the vendor's retries, or
+      the vendor may have a bug. Then those events are gone, and nothing resends them. Without
+      reconciliation, a dock stays wrong until a rider complains. I'd keep the job and track
+      how many docks it repairs each night. Near zero means webhooks are healthy. A spike
+      means we're losing events. I'd also alert on a sudden drop in the dock count.
+
+recap:
+  - Treat a webhook as a hint, and fetch the current state before you store anything.
+  - Keep a reconciliation poll that repairs drift, and alert on sudden drops in what it reads.
+  - Send webhooks signed, with an event id, retries over hours, no redirects and a switch-off rule.
+
+recall:
+  - id: card-why-fetch
+    concept: integrations.thin-events
+    front: Why does fetching the current state make out-of-order webhooks harmless?
+    back: >-
+      Whatever order events arrive in, each one triggers a read of the latest state, so what
+      you store is always current.
+  - id: card-reconciliation
+    concept: integrations.reconciliation
+    front: What does a reconciliation job catch that webhooks can't?
+    back: >-
+      Drift from events that were lost or never sent. It compares your copy with the source on
+      a schedule and repairs the difference.
+  - id: card-quality-signals
+    concept: integrations.reconciliation
+    front: Name two data-quality signals worth an alert after a sync.
+    back: >-
+      A sudden drop in the record count, and a field that used to be filled now always empty.
+  - id: card-no-redirects
+    concept: integrations.outgoing-webhooks
+    front: Why must a webhook sender refuse to follow redirects?
+    back: >-
+      A customer's endpoint can redirect to an internal address. Following it is server-side
+      request forgery that slips past your URL check.
+
+references:
+  - kind: spec
+    title: Standard Webhooks
+    authors: Standard Webhooks contributors
+    venue: standardwebhooks.com
+    url: https://www.standardwebhooks.com/
+    note: An open specification for sending webhooks, with signed payloads, message ids and retries.
+    primary: true
+    verified: false
+  - kind: docs
+    title: Server-Side Request Forgery Prevention Cheat Sheet
+    authors: OWASP
+    venue: OWASP Cheat Sheet Series
+    url: https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html
+    note: Why to disable redirects and check resolved addresses when fetching a URL a user supplied.
+    primary: true
+    verified: false
+  - kind: spec
+    title: Fetch Standard
+    authors: WHATWG
+    venue: fetch.spec.whatwg.org
+    url: https://fetch.spec.whatwg.org/
+    note: The `redirect` option, whose default is `"follow"`.
+    verified: false
+  - kind: rfc
+    title: 'RFC 9110: HTTP Semantics'
+    authors: R. Fielding, M. Nottingham, J. Reschke
+    year: 2022
+    venue: IETF
+    url: https://www.rfc-editor.org/rfc/rfc9110
+    note: The `Retry-After` header, which a polite sender honours on 429 and 503.
+    verified: false
+
+deepDive: >-
+  The URL check has a second gap: **DNS rebinding**. `assertPublicHost` resolves the name,
+  then `fetch` resolves it again. An attacker's DNS server can answer with a public address
+  the first time and `127.0.0.1` the second. The fix is to connect to the exact address you
+  checked. Better still, send every delivery through an egress proxy that enforces the rule
+  as it opens the connection.
+
+
+  Thin events cost a read each, and a busy dock can fire dozens a minute. Coalesce them:
+  queue one sync per dock and drop duplicates while one is waiting. Many queues can do this
+  with a job id such as `dock-d-42`. Reads then grow with the number of changed docks, not
+  with the number of events.
+
+
+  On the sending side, add jitter to the retry schedule, so a thousand deliveries that failed
+  in the same outage don't all retry in the same second. Keep each delivery's request,
+  status and timing in the log, but cap the stored response body: it's the customer's
+  server talking, and it can be large or sensitive.

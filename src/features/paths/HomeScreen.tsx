@@ -14,6 +14,7 @@ import type { PlanCatalog } from '@/core/plan';
 import { cn } from '@/lib/cn';
 import { onPath } from './links';
 import { placementKnows } from '@/core/placement';
+import { LevelLine } from '@/features/placement/LevelLine';
 import { CHOSEN_PATH, chosenPathIds, currentPath, nextOnPath } from './current';
 import { withOwnPaths, type CourseTree } from './custom';
 
@@ -250,6 +251,10 @@ export function HomeScreen({
                 Just start coding
               </Link>
             ) : null}
+            {/* For someone who already codes: a few minutes of questions finds where to start. */}
+            <Link href="/start" className={buttonClass('quiet')}>
+              Already code? Find your level
+            </Link>
           </div>
         </section>
         {news ? <NewsToday news={news} /> : null}
@@ -332,7 +337,7 @@ export function HomeScreen({
                 <>
                   <p className="text-lg font-semibold">Choose what to learn</p>
                   <p className="text-muted text-sm">
-                    Pick one or more paths, or build your own from the course.
+                    Pick one or more paths, or find your level and get one picked for you.
                   </p>
                 </>
               )}
@@ -351,6 +356,7 @@ export function HomeScreen({
           </div>
         )}
       </section>
+      <LevelLine />
       <PracticeLine />
       {showNews ? <NewsToday news={news} /> : null}
       <LibraryLink progress />

@@ -1,0 +1,173 @@
+summary: >-
+  Webhooks are the fast path. A vendor tells you within seconds that something changed, and
+  you don't have to poll thousands of records to find out. But webhooks are delivered at
+  least once, in no promised order, and sometimes not at all: your endpoint was down past the
+  vendor's retries, a deploy dropped a route, the vendor had a bug. So a webhook is a **hint**,
+  not the truth.
+
+
+  The pattern that follows is simple. On each event, fetch the record's current state from
+  the vendor and store that, so order and duplicates stop mattering. Then run a
+  **reconciliation** job on a schedule that compares your copy with the source and repairs
+  drift. Watch what the sync reads, too: a sudden drop in record count or a field that
+  suddenly goes empty is a broken read, not real change.
+
+
+  The same lessons apply in reverse when you send webhooks to your own customers. Sign every
+  payload and give it an event id. Retry on a schedule that grows over hours, and honour
+  `Retry-After`. Switch off an endpoint that keeps failing and tell its owner. Keep a
+  delivery log they can replay from. And treat the customer's URL as hostile input, because
+  your server will fetch it from inside your network.
+remember:
+  - A webhook is a hint that something changed, so fetch the current state before storing anything.
+  - Fetching current state makes reordered and duplicated events harmless, at the cost of one read per event.
+  - Webhooks get lost, so a scheduled reconciliation poll compares and repairs drift.
+  - A sudden drop in record count, or a field that suddenly goes empty, means a broken read and should stop the sync or page someone.
+  - An outgoing webhook carries a signature over the raw body and a unique event id the receiver can dedupe on.
+  - Retries grow from minutes to hours, a longer `Retry-After` wins, and an endpoint that keeps failing is switched off with a message to its owner.
+  - A sender never follows redirects and checks the resolved address, because the customer's URL is an SSRF vector.
+sections:
+  - title: Reconciliation and data-quality signals
+    body: |-
+      Reconciliation is a full or windowed read that compares the source with your copy.
+      The earlier lessons gave you the parts: a paged read, change detection by hash, and
+      mark and sweep for deletions. What's new is the attitude. Reconciliation isn't a
+      fallback for emergencies. It runs every night, and its repair count is a health
+      metric for the fast path.
+
+      ```ts
+      type Report = { read: number; repaired: number; previousRead: number };
+
+      function healthCheck({ read, repaired, previousRead }: Report): string[] {
+        const alerts: string[] = [];
+        if (previousRead > 0 && read < previousRead * 0.5) alerts.push(`read dropped from ${previousRead} to ${read}`);
+        if (read > 0 && repaired / read > 0.05) alerts.push(`repaired ${repaired} of ${read}: webhooks are being lost`);
+        return alerts;
+      }
+
+      console.log(healthCheck({ read: 95, repaired: 0, previousRead: 812 }));
+      // [ 'read dropped from 812 to 95' ]
+      console.log(healthCheck({ read: 810, repaired: 120, previousRead: 812 }));
+      // [ 'repaired 120 of 810: webhooks are being lost' ]
+      ```
+
+      A drop in what you read should also stop anything destructive, which is the safety
+      valve from Noticing what disappeared. Track field fill rates too. If `capacity` was
+      filled on 99% of docks last week and on none today, the vendor changed a field name
+      or a scope was revoked. Your mapper didn't crash; it read `undefined` and mapped it to
+      `null`. Only a per-field fill rate, compared run to run, shows that.
+
+      Pick the thresholds from your own history, not from a blog post. Start loose, log
+      every alert, and tighten once you know what a normal night looks like.
+  - title: What a good outgoing webhook looks like
+    body: |-
+      Customers build on your webhooks the way you build on a vendor's, so give them what
+      you wish vendors gave you. Each message has a unique id, a timestamp and a signature.
+      The Standard Webhooks specification uses three headers, `webhook-id`,
+      `webhook-timestamp` and `webhook-signature`, and signs the id, the timestamp and the
+      raw body together. The timestamp lets a receiver reject old replays; the id lets it
+      drop duplicates.
+
+      ```ts
+      import { createHmac } from 'node:crypto';
+
+      function signedHeaders(id: string, body: string, secret: string, now: Date) {
+        const timestamp = Math.floor(now.getTime() / 1000).toString();
+        const signature = createHmac('sha256', secret).update(`${id}.${timestamp}.${body}`).digest('base64');
+        return { 'webhook-id': id, 'webhook-timestamp': timestamp, 'webhook-signature': `v1,${signature}` };
+      }
+
+      console.log(signedHeaders('evt_81', '{"dockId":"d-42"}', 'secret', new Date(0)));
+      ```
+
+      The id stays the same across every retry of one event, or deduplication is
+      impossible. Keep payloads small and stable: a thin event with a type and an id is
+      simple to version, and the customer fetches details from your API with their own
+      permissions. If you send fat events, version them like any other API.
+
+      The delivery log is a product feature. Show each attempt's time, status and latency,
+      and let the owner replay one event or everything since a time. Replay sends the same
+      event id, so a receiver that dedupes treats it safely. When you switch an endpoint off,
+      email the owner with the last error and a link to turn it back on, and keep queuing
+      events for a while so they can replay the gap.
+  - title: Customer URLs and SSRF
+    body: |-
+      A webhook URL is a URL a customer typed, fetched by your server, from inside your
+      network. That's server-side request forgery waiting to happen, and the earlier
+      lesson's allow-list doesn't fit, because you can't list every customer's host. So you
+      check where the URL really goes, every time, at the moment of connecting.
+
+      Three gaps matter. First, redirects: `fetch` follows them by default, even for a
+      `POST`, and re-issues the request as a `GET` to the new location.
+
+      ```js
+      // A local server whose /hook answers 302 to /internal.
+      const followed = await fetch(`${base}/hook`, { method: 'POST', body: '{}' });
+      console.log(followed.status, followed.redirected); // 200 true
+      const manual = await fetch(`${base}/hook`, { method: 'POST', body: '{}', redirect: 'manual' });
+      console.log(manual.status, manual.headers.get('location')); // 302 /internal
+      ```
+
+      Second, DNS rebinding: a name that resolved to a public address when you checked can
+      resolve to a private one when you connect. Third, address spellings: decimal, octal
+      and IPv6-mapped forms of the same private address. Checking the resolved address as
+      bytes, not as a string, closes the third.
+
+      The sturdy answer is architectural: send every delivery through an egress proxy that
+      resolves, checks and connects in one step, with no route to internal ranges or the
+      metadata address. Then a mistake in application code can't reach anything that
+      matters. Validate the URL when it's saved as well, for a fast error message, but never
+      rely on that check alone.
+pitfalls:
+  - '**Storing the data an event carries.** A late, older event overwrites a newer state. Fetch the current state on each event, or compare a version before writing.'
+  - '**Dropping reconciliation once webhooks work.** Lost events then leave drift for ever. Keep the poll and watch its repair count.'
+  - '**Trusting a sudden drop in what the sync read.** It''s almost always a broken read. Stop destructive steps and alert instead.'
+  - '**A new event id on each retry.** The receiver can''t tell a retry from a new event. Keep one id per event across every attempt.'
+  - '**Counting a 3xx as delivered.** It hides a misconfigured endpoint and invites redirect-based SSRF. Only a 2xx is delivered.'
+  - '**Retrying for ever.** A dead endpoint burns workers and fills queues. Cap the schedule, switch the endpoint off after repeated failures, and tell the owner.'
+  - '**Checking the URL only when it''s saved.** DNS can change afterwards. Check the resolved address when connecting, ideally in an egress proxy.'
+verify:
+  - lens: breaks
+    check: Deliver the same dock event twice and out of order, and confirm the stored dock matches the vendor's current state.
+  - lens: breaks
+    check: Point a test endpoint at a URL that answers 302 to an internal address, and confirm the delivery fails without following it.
+  - lens: scales
+    check: Fire a hundred events for one dock in a second, and confirm the worker fetches that dock a handful of times, not a hundred.
+  - lens: tests
+    check: Stop the webhook endpoint for an hour, then confirm the next reconciliation repairs every dock that changed meanwhile.
+  - lens: leaks
+    check: Cap and sanitise response bodies stored in the delivery log, so a customer's server can't make you store or show internal data.
+interview:
+  - question: Webhooks or polling for keeping data in sync with a vendor?
+    answer: >-
+      Both, with different jobs. Webhooks give freshness: a change reaches us in seconds
+      without scanning everything. But they're delivered at least once, out of order, and
+      sometimes never, so I treat each one as a hint and fetch the record's current state
+      before storing it. That makes duplicates and reordering harmless. Polling gives
+      correctness: a scheduled reconciliation reads the source, compares with our copy and
+      repairs drift from lost events. Its repair count tells me how healthy the webhooks
+      are. If a vendor has no webhooks, the poll becomes the only path and runs more often,
+      within its rate limits. The trade-off is extra reads, which coalescing events per
+      record keeps small.
+  - question: Design the webhook delivery system for your product.
+    answer: >-
+      Events go into a durable outbox in the same transaction as the change, and workers
+      deliver them. Each message has a stable id, a timestamp and an HMAC signature over the
+      id, timestamp and raw body, with a per-endpoint secret the customer can rotate.
+      Workers POST with a short timeout, never follow redirects, and connect through an
+      egress proxy that blocks private and metadata addresses. Only a 2xx counts. Failures
+      retry on a growing schedule with jitter over about a day, honouring a longer
+      `Retry-After`. Consecutive failures per endpoint are counted, and past a threshold the
+      endpoint is switched off and its owner emailed. Every attempt goes in a delivery log
+      the customer can browse and replay from. Per-endpoint queues stop one slow customer
+      from delaying the rest.
+  - question: A customer's webhook URL could point anywhere. How do you stop SSRF?
+    answer: >-
+      Assume the URL is hostile and check where each request really goes, at connection
+      time. An allow-list doesn't work for customer endpoints, so I check the resolved
+      address against private, loopback, link-local and metadata ranges as parsed bytes, not
+      strings. I disable redirects, because a public endpoint can bounce the request to an
+      internal one, and I count any 3xx as a failure. To close DNS rebinding I connect to the
+      exact address I checked, or better, route all deliveries through an egress proxy with
+      no route to internal networks. I'd also limit ports to 443 and 80, cap response sizes,
+      and never show raw internal error details in the delivery log.

@@ -1,4 +1,4 @@
-import { z } from 'zod';
+import * as z from '@/core/zod';
 import { idSchema, localIdSchema } from '@/core/content/ids';
 import { cardStateSchema, ratingSchema } from '@/core/scheduling/card-state';
 import { PLAN_GOALS } from '@/core/plan/plan';

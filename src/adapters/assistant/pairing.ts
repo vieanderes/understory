@@ -1,4 +1,4 @@
-import { z } from 'zod';
+import * as z from '@/core/zod';
 
 /*
  * The pairing code joins a simulator tab to the Claude app the candidate connected over

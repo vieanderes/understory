@@ -1,0 +1,369 @@
+id: backend.long-running-and-bulk
+title: Long and bulk operations
+objective: Run slow work behind a 202 with a status URL, return per-item results from a bulk endpoint, and choose JSON Merge Patch or JSON Patch.
+level: advanced
+minutes: 10
+concepts: [backend.async-202, backend.bulk-per-item-results, backend.patch-formats]
+prerequisites: [backend.http-in-depth, backend.error-responses, backend.realtime]
+opening:
+  text: >-
+    You'll keep slow jobs from timing out, big imports from failing whole and partial updates
+    from wiping data. Nearly every real API meets all three sooner or later.
+
+steps:
+  - type: prose
+    id: what-202-means
+    body: |-
+      Zipping a photo album takes three minutes. Many proxies give up on a request after 60
+      seconds. So the server answers at once with **`202 Accepted`**: "I've taken the job, it
+      isn't done yet."
+
+      ```http
+      HTTP/1.1 202 Accepted
+      Location: /exports/81
+      Retry-After: 5
+
+      {"id":81,"status":"queued"}
+      ```
+
+      The client polls `/exports/81` until the job reports done or failed. That address is the
+      **status URL**.
+
+  - type: multiple-choice
+    id: pick-what-202-promises
+    concept: backend.async-202
+    difficulty: 1
+    question: The export answered `202`. What does the client know so far?
+    choices:
+      - text: The zip is ready at `/exports/81`
+        feedback: >-
+          That address is the job, not the zip. The job will say when the zip exists.
+      - text: The job was accepted, not finished
+        correct: true
+        feedback: >-
+          Right. Accepted means queued. The status URL tells the rest.
+      - text: The export is sure to succeed
+        feedback: >-
+          Accepted isn't a promise of success. The job can still fail, and its status URL will
+          say so.
+
+  - type: fill-blank
+    id: fill-start-export
+    concept: backend.async-202
+    difficulty: 2
+    language: js
+    prompt: >-
+      Queue the export, then answer "accepted" with the status URL. Ask the client to wait
+      five seconds before the first poll. Fill the gaps.
+    template: |
+      async function startExport(albumId) {
+        const job = await queue.add("export-album", { albumId });
+        return new Response(JSON.stringify({ id: job.id, status: "queued" }), {
+          status: {{1}},
+          headers: { {{2}}: `/exports/${job.id}`, {{3}}: "5" },
+        });
+      }
+    blanks:
+      - key: '1'
+        answer: '202'
+      - key: '2'
+        answer: '"Location"'
+      - key: '3'
+        answer: '"Retry-After"'
+    bank: ['202', '200', '204', '"Location"', '"Retry-After"', '"Expires"', '"Content-Location"']
+
+  - type: bug-hunt
+    id: hunt-poll-forever
+    concept: backend.async-202
+    difficulty: 3
+    language: ts
+    code: |
+      const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+      async function waitForExport(statusUrl: string): Promise<string> {
+        while (true) {
+          const response = await fetch(statusUrl);
+          const job = await response.json();
+          if (job.status === "succeeded") return job.downloadUrl;
+          await sleep(5000);
+        }
+      }
+    prompt: >-
+      One album held a corrupt photo, so its export failed. The page showed "Preparing your
+      zip" all night. Tap the line to fix.
+    lines: [7]
+    reasons:
+      - text: A failed job never ends the loop
+        correct: true
+        feedback: >-
+          Yes. The job said `failed` on every poll, and nobody was listening for it.
+      - text: Polling every five seconds is too often
+        feedback: >-
+          A slower poll would still loop all night. The loop needs a way out when the job fails.
+      - text: '`fetch` needs a timeout here'
+        feedback: >-
+          Each poll returned quickly with an answer. The answer was `failed`, and the code ignored it.
+    fix: |
+      async function waitForExport(statusUrl: string): Promise<string> {
+        while (true) {
+          const response = await fetch(statusUrl);
+          const job = await response.json();
+          if (job.status === "succeeded") return job.downloadUrl;
+          if (job.status === "failed") throw new Error(job.error ?? "Export failed");
+          await sleep(Number(response.headers.get("Retry-After") ?? 5) * 1000);
+        }
+      }
+
+  - type: prose
+    id: per-item-results
+    body: |-
+      A plant nursery uploads 500 stock rows, and row 37 has no SKU. Answering `400` for the
+      whole file means fixing one row and resending 499 good ones.
+
+      A bulk endpoint can report on **each item** instead:
+
+      ```json
+      {"results":[{"index":0,"status":201},{"index":37,"status":422,"detail":"Missing SKU"}]}
+      ```
+
+      Many APIs send that with `200`. Some use **`207 Multi-Status`**, borrowed from WebDAV,
+      which means "the answers are inside".
+
+  - type: ai-review
+    id: review-insert-many
+    concept: backend.bulk-per-item-results
+    difficulty: 4
+    language: ts
+    request: Speed up the stock import with one query instead of 500 inserts.
+    flawClass: regression
+    code: |
+      async function importStock(rows: StockRow[]) {
+        const results: RowResult[] = [];
+        const valid: StockRow[] = [];
+        rows.forEach((row, index) => {
+          if (!row.sku || row.quantity < 0) {
+            results.push({ index, status: 422, detail: "Needs a SKU and a quantity of 0 or more" });
+          } else {
+            valid.push(row);
+            results.push({ index, status: 201 });
+          }
+        });
+        await db.stock.insertMany(valid);
+        return { status: 207, body: { results } };
+      }
+    prompt: >-
+      The old version inserted each row in its own `try`. Tests with clean files passed, 20
+      times faster. Then a file with one SKU already in stock got a `500` and saved nothing.
+      Tap the line at fault.
+    lines: [11]
+    reasons:
+      - text: One database clash now fails every row
+        correct: true
+        feedback: >-
+          Yes. A multi-row insert is one statement, so one clash fails it whole.
+      - text: Validation belongs inside the database
+        feedback: >-
+          Checking rows first is cheap and fine. A duplicate SKU passes that check, and only
+          the database can see it.
+      - text: '`207` is the wrong status for this reply'
+        feedback: >-
+          `207` is a fair choice for per-item results. This request never got that far.
+    fix: |
+      try {
+        await db.stock.insertMany(valid);
+      } catch {
+        // A clash somewhere, and the insert saved nothing. Go row by row and report each one.
+        for (const result of results.filter((r) => r.status === 201)) {
+          try {
+            await db.stock.insert(rows[result.index]);
+          } catch {
+            Object.assign(result, { status: 409, detail: "SKU already in stock" });
+          }
+        }
+      }
+    verify:
+      question: Which test would have caught this before release?
+      choices:
+        - text: A file with one SKU already in stock
+          correct: true
+          feedback: >-
+            That row passes validation and clashes in the database, which fails the whole insert.
+        - text: A file with one row missing its SKU
+          feedback: >-
+            Validation drops that row before the database, so the single insert still works.
+        - text: A file of 5,000 clean rows
+          feedback: >-
+            That measures speed. With no clash the single insert succeeds, and the flaw stays hidden.
+
+  - type: prose
+    id: two-patch-formats
+    body: |-
+      `PATCH` changes part of a thing. **JSON Merge Patch**, sent as
+      `application/merge-patch+json`, lists the fields to change. A `null` deletes a field:
+
+      ```json
+      {"price": 9, "discount": null}
+      ```
+
+      **JSON Patch**, sent as `application/json-patch+json`, is a list of operations such as
+      `add`, `remove` and `test`. If one fails, none apply.
+
+  - type: predict-output
+    id: predict-merge-array
+    concept: backend.patch-formats
+    difficulty: 2
+    language: http
+    code: |
+      GET /plants/12
+      {"name":"Fern","tags":["shade","indoor"],"price":8}
+
+      PATCH /plants/12
+      Content-Type: application/merge-patch+json
+
+      {"tags":["pet-safe"]}
+    question: The app wanted to add a tag. What are the fern's tags now?
+    choices:
+      - text: '`["shade","indoor","pet-safe"]`'
+        feedback: >-
+          Most people expect a merge here. Merge Patch replaces an array whole, so the old tags
+          are gone.
+      - text: '`["pet-safe"]`'
+        correct: true
+        feedback: >-
+          Right. Arrays are replaced, never merged. JSON Patch can append instead.
+      - text: Unchanged, as Merge Patch can't touch arrays
+        feedback: >-
+          It can, but only by sending the whole new array. Edits inside one need JSON Patch.
+
+  - type: code-challenge
+    id: write-merge-patch
+    concept: backend.patch-formats
+    difficulty: 4
+    language: ts
+    editable: '9-11'
+    prompt: >-
+      Write `applyMergePatch(target, patch)`, which returns the patched document and leaves
+      `target` unchanged.
+
+
+      If `patch` isn't an object, it replaces the target whole. Otherwise start from a copy of
+      the target, or `{}` if the target isn't an object. Then go through the patch's fields. A
+      `null` deletes the field, and any other value is merged into it by the same rule.
+
+
+      So `{ price: 9, discount: null }` applied to `{ price: 8, discount: 2 }` gives
+      `{ price: 9 }`.
+    hints:
+      - Handle the non-object patch first. Everything else is a loop over `Object.entries(patch)`.
+      - Merging a field uses the very same rule as merging the document, so the function can call itself.
+      - 'Inside the loop: `if (value === null) delete result[name]; else result[name] = applyMergePatch(result[name] ?? null, value);`'
+
+  - type: explain-back
+    id: defend-per-item-results
+    concept: backend.bulk-per-item-results
+    difficulty: 4
+    audience: reviewer
+    kind: decide
+    prompt: >-
+      A reviewer asks why the stock import answers with a result per row, not `400` for the
+      whole file. Defend the choice.
+    rubric:
+      - One bad row no longer sinks the good ones, and the client learns which row failed and why.
+      - The cost is that clients must read every result, and a file can end up half imported.
+      - All-or-nothing still fits when rows depend on each other, so name when you'd choose it.
+    modelAnswer: >-
+      Rows are independent, so one missing SKU shouldn't block 499 good ones. Per-row results
+      tell the nursery exactly which row to fix and why. The trade-off: a client that checks
+      only the top status thinks everything worked, and the file lands half imported. So we
+      document it and return counts. If rows depended on each other, like an order and its
+      lines, I'd use one transaction and reject the lot.
+
+recap:
+  - Answer slow work with `202`, a status URL and `Retry-After`, and poll until done or failed.
+  - Report each item of a bulk request, so one bad row neither hides nor sinks the rest.
+  - Use Merge Patch for simple field changes, and JSON Patch for arrays and all-or-nothing edits.
+
+recall:
+  - id: card-202-parts
+    concept: backend.async-202
+    front: What goes in a `202 Accepted` response for a slow job?
+    back: >-
+      Where to check on the job, usually a status URL in `Location` and the body, and often
+      `Retry-After` saying when to poll.
+  - id: card-job-ends
+    concept: backend.async-202
+    front: What must a polling client handle besides success?
+    back: >-
+      A job that fails. Stop polling on `failed`, show the error, and cap how long you wait.
+  - id: card-207-trap
+    concept: backend.bulk-per-item-results
+    front: Why can a client think a `207` bulk reply fully worked when it didn't?
+    back: >-
+      `207` is a 2xx status, so a check like `response.ok` passes. Only the per-item results
+      say which items failed.
+  - id: card-merge-vs-json-patch
+    concept: backend.patch-formats
+    front: What can JSON Patch do that JSON Merge Patch can't?
+    back: >-
+      Edit inside an array, set a field to `null`, and `test` a value before changing it, all
+      applied together or not at all.
+
+references:
+  - kind: rfc
+    title: 'RFC 7396: JSON Merge Patch'
+    authors: P. Hoffman and J. Snell
+    year: 2014
+    venue: IETF
+    url: https://www.rfc-editor.org/rfc/rfc7396
+    note: The merge algorithm in a dozen lines, `null` as delete, and worked examples.
+    primary: true
+    verified: false
+  - kind: rfc
+    title: 'RFC 9110: HTTP Semantics'
+    authors: R. Fielding, M. Nottingham and J. Reschke (eds)
+    year: 2022
+    venue: IETF
+    url: https://www.rfc-editor.org/rfc/rfc9110
+    note: '`202 Accepted` (15.3.3), `Location` (10.2.2) and `Retry-After` (10.2.3).'
+    primary: true
+    verified: false
+  - kind: rfc
+    title: 'RFC 6902: JavaScript Object Notation (JSON) Patch'
+    authors: P. Bryan and M. Nottingham (eds)
+    year: 2013
+    venue: IETF
+    url: https://www.rfc-editor.org/rfc/rfc6902
+    note: The six operations, JSON Pointer paths, and why a failed operation stops the whole patch.
+    verified: false
+  - kind: rfc
+    title: 'RFC 4918: HTTP Extensions for Web Distributed Authoring and Versioning (WebDAV)'
+    authors: L. Dusseault (ed)
+    year: 2007
+    venue: IETF
+    url: https://www.rfc-editor.org/rfc/rfc4918
+    note: Where `207 Multi-Status` comes from, with an XML body of one status per resource.
+    verified: false
+
+deepDive: >-
+  RFC 9110 says a `202` response ought to describe the request's current status and point to
+  a status monitor. It doesn't say which header carries that pointer. Sending the status URL
+  in `Location` and in the body is a widespread convention, and so is `Retry-After` on a
+  `202`. RFC 9110 describes `Retry-After` for `503` and redirects, and RFC 6585 adds `429`.
+
+
+  When the job is done, the status URL can answer `200` with a link to the result, or `303
+  See Other` with the result in `Location`. Keep finished jobs for a stated time, then answer
+  `404`. Let clients cancel with `DELETE` on the job. Put an idempotency key on the `POST`, so
+  a retried "start export" doesn't zip the album twice. A webhook can tell the client when
+  the job ends, but keep the status URL as the source of truth.
+
+
+  `207` was defined by WebDAV with an XML `multistatus` body. JSON APIs that borrow it keep
+  only the idea: one status per item. Whichever you choose, return counts too, and cap the
+  batch size, answering `413 Content Too Large` above it.
+
+
+  JSON Patch paths are JSON Pointers: `/tags/-` appends to the array, and `/` inside a key is
+  written `~1`. A `test` operation first makes a patch conditional, so it fails rather than
+  overwrite a change made by someone else. RFC 5789 requires a server to apply any `PATCH`
+  atomically, never leaving a half-applied document.

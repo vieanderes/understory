@@ -1,0 +1,351 @@
+id: agents.watching-agents
+title: Watching agents in production
+objective: Trace an agent with a span per step and tool, tag versions, measure cost per run and tenant, and sort failures into a taxonomy.
+level: advanced
+minutes: 10
+concepts: [agents.agent-spans, agents.cost-per-run, agents.agent-error-taxonomy, agents.agent-replay]
+prerequisites: [aisys.llmops, agents.long-running-loops, agents.evals-for-agents]
+opening:
+  text: >-
+    You'll find the one agent run that burned the budget overnight, and name what went
+    wrong with it. Agents fail quietly, so watching them is a skill of its own.
+
+steps:
+  - type: prose
+    id: name-the-span-tree
+    body: |-
+      Prompts and evals as code gave each model call a span. An agent run needs a tree: one
+      span for the run, a child for every model call and every tool call.
+
+      ```text
+      invoke_agent timetable     run r-7  school oakfield  harness v12
+      ├─ chat                    in 5,200  out 310  stop tool_use
+      ├─ execute_tool find_room  140 ms
+      └─ chat                    in 6,100  out 220  stop end_turn
+      ```
+
+      Tag the run with the prompt, model and harness versions.
+
+  - type: multiple-choice
+    id: pick-latency-span
+    concept: agents.agent-spans
+    difficulty: 1
+    question: A head teacher says the timetable agent took four minutes. Where do you look first?
+    choices:
+      - text: The child spans of that run, with their durations
+        correct: true
+        feedback: >-
+          Yes. Each model and tool call shows its own time. The slow one stands out.
+      - text: The average latency across all runs
+        feedback: >-
+          An average hides the one slow run. You need this run's spans.
+      - text: The model's final reply
+        feedback: >-
+          The reply says what it concluded, not where four minutes went.
+      - text: The server's CPU graph
+        feedback: >-
+          The time is usually spent waiting on models and tools, which CPU barely shows.
+
+  - type: fill-blank
+    id: fill-tool-span
+    concept: agents.agent-spans
+    difficulty: 2
+    language: python
+    prompt: >-
+      Wrap each tool call in a span. Mark the operation, link it to the model's tool call,
+      and tag the harness version. Fill the gaps.
+    template: |
+      with tracer.start_as_current_span(f"execute_tool {call.name}") as span:
+          span.set_attribute("gen_ai.operation.name", {{1}})
+          span.set_attribute("gen_ai.tool.name", call.name)
+          span.set_attribute("gen_ai.tool.call.id", {{2}})
+          span.set_attribute("app.harness.version", {{3}})
+          result = run_tool(call)
+    blanks:
+      - key: '1'
+        answer: '"execute_tool"'
+      - key: '2'
+        answer: call.id
+      - key: '3'
+        answer: HARNESS_VERSION
+    bank: ['"execute_tool"', '"chat"', call.id, call.input, HARNESS_VERSION, 'time.time()']
+
+  - type: prose
+    id: name-cost-and-replay
+    body: |-
+      Add up each run's token cost, and roll it up per **tenant**, here each school. One
+      runaway loop or one heavy school then shows at once.
+
+      Store each run's inputs and tool results, and you can **replay** it against a new
+      version. And alert on what users feel: failed tasks, handovers and slow runs, not CPU.
+      Watching those drift week by week is **drift detection**.
+
+  - type: multiple-choice
+    id: pick-tail-cost
+    concept: agents.cost-per-run
+    difficulty: 2
+    question: Daily spend doubled. Runs per day and the median cost per run are flat. Why?
+    choices:
+      - text: A few runs in the tail cost far more
+        correct: true
+        feedback: >-
+          Right. A median ignores the tail, and a looping run lives there.
+      - text: The provider raised its prices
+        feedback: >-
+          Then every run would cost more, and the median would rise with it.
+      - text: More schools started using the agent
+        feedback: >-
+          More use means more runs. Runs per day are flat.
+      - text: The dashboard double-counts spans
+        feedback: >-
+          Possible, but the bill doubled too. Look for the expensive outliers first.
+
+  - type: ai-review
+    id: review-sampled-cost
+    concept: agents.cost-per-run
+    difficulty: 3
+    language: python
+    request: Add a nightly cost report per school from the agent's traces.
+    flawClass: logic
+    code: |
+      provider = TracerProvider(sampler=TraceIdRatioBased(0.01))   # keep 1% of traces
+
+      def nightly_cost_report(store):
+          totals = {}
+          for span in store.spans(name="chat", since=yesterday()):
+              school = span.attributes["app.tenant"]
+              totals[school] = totals.get(school, 0) + span.attributes["app.cost_gbp"]
+          return totals
+    prompt: >-
+      An assistant wrote this. In staging, with every trace kept, the totals matched the
+      bill. In production the report showed Elm Park at £3 last night. The bill said £410.
+      Tap the line at fault.
+    lines: [5]
+    reasons:
+      - text: It adds up a 1% sample of the spans
+        correct: true
+        feedback: >-
+          Yes. Most runs, including the runaway, were never stored. Count cost on every call.
+      - text: The sample rate should be 10%
+        feedback: >-
+          A bigger sample still misses most runs. Money needs a full count, not a sample.
+      - text: The tenant should come from the user's name
+        feedback: >-
+          The tenant tag was fine. The spans it tagged were mostly dropped.
+      - text: Costs should be stored in pence
+        feedback: >-
+          Pence avoid rounding, but £3 against £410 isn't rounding. Spans are missing.
+    fix: |
+      # every call, before any sampling: a counter, not a trace
+      cost_counter.add(cost_gbp, {"tenant": tenant, "harness": HARNESS_VERSION})
+
+      # traces stay sampled, but always keep costly or failed runs
+      keep = run.cost_gbp > 1.0 or run.status != "done" or random() < 0.01
+    verify:
+      question: Which check would have caught this before the bill did?
+      choices:
+        - text: Compare one day's report with the provider's usage
+          correct: true
+          feedback: >-
+            Right. A gap of a hundred times shows at once.
+        - text: Rerun the report in staging
+          feedback: >-
+            Staging keeps every trace, so it matches there. That's how the bug hid.
+        - text: Check every school appears in the report
+          feedback: >-
+            Elm Park appeared, at £3. Presence isn't the same as a correct total.
+
+  - type: bug-hunt
+    id: hunt-end-turn-ok
+    concept: agents.agent-error-taxonomy
+    difficulty: 3
+    language: python
+    code: |
+      def classify(run):
+          if run["stop_reason"] == "end_turn":
+              return "ok"
+          if run["stop_reason"] == "refusal":
+              return "refusal"
+          if run["stop_reason"] == "max_tokens":
+              return "truncation"
+          if repeats(run["calls"], times=3):
+              return "loop"
+          return "tool_misuse"
+    prompt: >-
+      The agent told a school it had booked the hall for parents' evening. No booking call
+      appears in the trace. The dashboard filed the run as `ok`. Tap the line to fix.
+    lines: [2]
+    reasons:
+      - text: Ending normally doesn't mean the claims are true
+        correct: true
+        feedback: >-
+          Yes. A hallucinated booking ends with `end_turn` too. Check claims against tool results first.
+      - text: Refusals should be checked before everything
+        feedback: >-
+          Order among stop reasons barely matters. The early `ok` hides every claim problem.
+      - text: Three repeats is too strict for a loop
+        feedback: >-
+          The run never reached that check. It was filed as ok on line 2.
+      - text: Unknown cases shouldn't default to tool misuse
+        feedback: >-
+          A fair point for later. This run never got that far.
+    fix: |
+      def classify(run):
+          if claims_without_tool_result(run):     # "booked the hall", no booking call
+              return "hallucination"
+          if repeats(run["calls"], times=3):
+              return "loop"
+          if run["stop_reason"] in ("refusal", "max_tokens"):
+              return {"refusal": "refusal", "max_tokens": "truncation"}[run["stop_reason"]]
+          return "tool_misuse" if run["tool_errors"] else "ok"
+
+  - type: multiple-choice
+    id: pick-replay
+    concept: agents.agent-replay
+    difficulty: 3
+    question: A prompt change should stop Tuesday's loop. How do you check it before another bad night?
+    choices:
+      - text: Replay stored runs with recorded tool results
+        correct: true
+        feedback: >-
+          Right. Same inputs, new version, no live side effects. Then compare the outcomes.
+      - text: Rerun the school's request against live tools
+        feedback: >-
+          Live tools book real rooms. Replay feeds the recorded results instead.
+      - text: Watch the dashboard after the next deploy
+        feedback: >-
+          That tests it on real schools, overnight. Replay finds out in minutes.
+      - text: Ask the model whether it would loop
+        feedback: >-
+          A model can't predict its own loops reliably. Running the inputs shows it.
+
+  - type: code-challenge
+    id: write-find-costly-run
+    concept: agents.agent-error-taxonomy
+    difficulty: 4
+    language: python
+    starter: traces.starter.py
+    solution: traces.solution.py
+    tests: traces.tests.py
+    prompt: >-
+      Write `find_costly_run(spans, prices)`. Each span has `"run"`, `"tenant"` and `"kind"`.
+      A `"model"` span has `"input_tokens"`, `"output_tokens"` and `"stop_reason"`. A `"tool"`
+      span has `"tool"`, `"args"` and `"error"`. `prices` gives `"input"` and `"output"` per
+      million tokens.
+
+
+      Cost each run from its model spans. Pick the costliest run and classify it, first
+      match wins: `"loop"` if one tool with equal args appears 3 or more times. Then
+      `"truncation"` or `"refusal"` from its last model span's stop reason. Then
+      `"tool_misuse"` for any tool error. Otherwise `"none"`.
+
+
+      Return `{"run", "tenant", "cost", "failure", "by_tenant"}`, with costs rounded to 4
+      places and `by_tenant` totalling every run. No model spans gives `None`.
+    hints:
+      - Group the spans by run first. Cost and classification both work on one run's spans.
+      - Args can arrive with keys in any order. `json.dumps(args, sort_keys=True)` gives one spelling.
+      - '`max(cost, key=cost.get)` picks the costliest run id from a dict of run costs.'
+
+  - type: explain-back
+    id: explain-green-dashboard
+    concept: agents.cost-per-run
+    difficulty: 4
+    audience: incident
+    kind: explain
+    prompt: >-
+      Post to the incident channel: why did every dashboard stay green while one school's
+      agent run cost £400 overnight?
+    rubric:
+      - Latency, error rate and median cost barely move when one run loops in the tail.
+      - Cost was counted from sampled traces, so the runaway run was never counted.
+      - Cost per run and per tenant, counted on every call with an alert, would have caught it.
+    modelAnswer: >-
+      One run at Elm Park looped on `find_room` all night. Each call succeeded, so error
+      rates stayed flat. Medians ignore one outlier, so latency and median cost looked
+      normal. Our cost report summed a 1% trace sample, which missed that run. We're now
+      counting cost on every call, per run and per school, and alerting when one run passes
+      £5.
+
+recap:
+  - Trace each run as a tree of model and tool spans, tagged with every version.
+  - Count cost on every call, per run and per tenant, and alert on the tail.
+  - Name failures by type, check claims against tool results, and replay runs to test fixes.
+
+recall:
+  - id: card-span-tree
+    concept: agents.agent-spans
+    front: What spans does one agent run produce, and what tags belong on the run?
+    back: >-
+      A parent span for the run, with a child for each model call and each tool call. Tag it
+      with the prompt, model and harness versions.
+  - id: card-cost-counting
+    concept: agents.cost-per-run
+    front: Why must cost be counted on every call rather than from traces?
+    back: >-
+      Traces are usually sampled, so totals from them miss most runs, including the rare
+      runaway that matters most.
+  - id: card-taxonomy
+    concept: agents.agent-error-taxonomy
+    front: Name five kinds of agent failure worth separating on a dashboard.
+    back: >-
+      Hallucination, tool misuse, loops, refusals and truncation.
+  - id: card-replay
+    concept: agents.agent-replay
+    front: What makes replaying a stored agent run safe?
+    back: >-
+      It feeds the recorded tool results to the new version instead of calling live tools, so
+      nothing is booked or sent again.
+
+references:
+  - kind: spec
+    title: Semantic conventions for generative AI systems
+    authors: OpenTelemetry
+    venue: OpenTelemetry
+    url: https://opentelemetry.io/docs/specs/semconv/gen-ai/
+    note: Span names and attributes for model calls, agents and tool calls. Still in development, so names may change.
+    primary: true
+    verified: false
+  - kind: docs
+    title: Sampling
+    authors: OpenTelemetry
+    venue: OpenTelemetry documentation
+    url: https://opentelemetry.io/docs/concepts/sampling/
+    note: Head and tail sampling, and why sampled traces can't give exact totals.
+    primary: true
+    verified: false
+  - kind: paper
+    title: "Why do multi-agent LLM systems fail?"
+    authors: Mert Cemri and others
+    year: 2025
+    venue: arXiv
+    url: https://arxiv.org/abs/2503.13657
+    note: A taxonomy of failures from hundreds of agent traces, from specification to verification.
+    verified: false
+
+deepDive: >-
+  The challenge ran in Python 3.13 on made-up spans. No model was called.
+
+
+  **Names from the conventions.** The OpenTelemetry generative AI conventions describe an
+  agent span, a model call span and a tool span, each marked by `gen_ai.operation.name`.
+  Token counts go in `gen_ai.usage.input_tokens` and `gen_ai.usage.output_tokens`. The
+  conventions are still marked as in development. Map your fields through one function, so
+  a rename touches one file, and check the current names before you rely on them.
+
+
+  **Message text stays out by default.** Prompts and tool results carry personal data. Keep
+  ids, versions, token counts and stop reasons on spans. Store full transcripts separately,
+  redacted, with access control and shorter retention, for replay and debugging.
+
+
+  **Tail sampling.** Head sampling decides at the start of a trace, before you know if the
+  run will be interesting. Tail sampling decides at the end, so it can keep every failed,
+  slow or costly run and a small share of the rest. It costs memory in the collector,
+  which must hold each trace until it finishes.
+
+
+  **Replay needs recorded results.** A replay feeds the new version the same user input and
+  the tool results recorded last time. Once the new version asks for a different tool call,
+  the recording has no answer. Stop there and grade the divergence, or switch to the eval
+  sandbox from Evaluating an agent.

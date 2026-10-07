@@ -1,0 +1,258 @@
+summary: >-
+  Scheduled jobs run on a timetable instead of a request: a nightly digest, an hourly price
+  sync, a weekly clean-up of expired sessions. The scheduler is the simple part, and the part
+  people trust too much. Cron starts a command when the clock matches and knows
+  nothing else. It doesn't know whether the last run finished, whether three other servers
+  started the same job, or whether the machine was off at 03:00.
+
+
+  So the safety lives in the job. Three questions cover it. **Does exactly one copy run each
+  slot?** A claim row keyed by job and slot answers that. **Can two runs overlap?** A lease, a
+  lock with an expiry, or a Postgres advisory lock answers that. **What if a run is missed,
+  repeated or fails halfway?** A watermark answers that, because each run covers everything
+  since the last success.
+
+
+  These notes add a lease table with fencing tokens, Postgres advisory locks and their
+  catches, the late-commit hole in naive watermarks, and the pattern most production systems
+  settle on: the scheduler only enqueues a job, and ordinary queue workers run it. Reach for a
+  scheduled job for work that is periodic by nature. If the work is really a reaction to
+  something happening, such as sending a receipt, trigger it from the event instead of
+  scanning for it on a timer.
+remember:
+  - Cron starts a job at every matching time, whether or not the previous run has finished.
+  - Several copies of an app each fire the same schedule, so each run is claimed first, and only the copy that wins runs it.
+  - A lease must last longer than the slowest run, and a long run should renew it rather than guess a huge expiry.
+  - A watermark records how far the last successful run got, so a late run fills the gap and a repeat finds nothing new.
+  - Move the watermark only after the work succeeds, and lag it behind now by more than your longest write transaction.
+  - A session-level advisory lock frees itself when its connection closes, and breaks under transaction-mode connection pooling.
+  - Schedule in UTC, and when users choose local times, store their IANA time zone and decide what happens in the skipped and repeated hour.
+  - Let the scheduler enqueue a job and workers run it, so scheduled work gets retries, dead letters and monitoring for free.
+sections:
+  - title: Claim, lease or advisory lock?
+    body: |-
+      The lesson met two tools. They answer different questions, and Postgres adds a third.
+
+      - **A claim row** per job and slot, inserted with `ON CONFLICT DO NOTHING`, answers
+        "has this slot run?". It never expires, so it doubles as a history of runs. It
+        doesn't stop the 03:05 run overlapping a slow 03:00 run, because they're different
+        slots.
+      - **A lease** answers "is anyone running this job right now?". It expires, so a
+        crashed holder can't block the job for ever. The cost is choosing the expiry, and the
+        risk that a paused holder outlives it.
+      - **An advisory lock** also answers "is anyone running this now?", but it's tied to a
+        database connection instead of a clock. It frees itself when the connection closes,
+        so there's no expiry to guess. A hung process whose connection stays open keeps it,
+        though, for as long as that connection lives.
+
+      Real jobs often combine two. A nightly billing run claims its slot, so four copies bill
+      once. It also holds a lease, so a slow run can't overlap a manual rerun. And it works
+      from a watermark, so a failed night is covered by the next.
+
+      None of these makes the scheduler exact. Kubernetes, for example, documents that a
+      `CronJob` can occasionally create two jobs for one schedule, or none, and asks for
+      idempotent jobs. Your job should be safe to run late, twice, or on two machines. The
+      tools above make that cheap to guarantee.
+  - title: A lease table with a fencing token
+    body: |-
+      A lease fits in one table and three statements. `INSERT ... ON CONFLICT DO UPDATE` with
+      a `WHERE` does take-or-take-over in one atomic step: it creates the lease if it's new,
+      takes it over if it has expired, and returns no row if someone holds it.
+
+      ```sql
+      CREATE TABLE leases (
+        name text PRIMARY KEY,
+        holder text NOT NULL,
+        token bigint NOT NULL,
+        expires_at timestamptz NOT NULL
+      );
+
+      -- Take: insert if new, take over if expired, otherwise no row.
+      INSERT INTO leases (name, holder, token, expires_at)
+      VALUES ('sync-prices', 'copy-2', 1, now() + interval '15 minutes')
+      ON CONFLICT (name) DO UPDATE
+      SET holder = excluded.holder,
+          token = leases.token + 1,
+          expires_at = excluded.expires_at
+      WHERE leases.expires_at <= now()
+      RETURNING token;
+
+      -- Renew: only the current holder, named by its token.
+      UPDATE leases SET expires_at = now() + interval '15 minutes'
+      WHERE name = 'sync-prices' AND token = 1
+      RETURNING expires_at;
+
+      -- Release: expire it rather than delete it, so the token keeps rising.
+      UPDATE leases SET expires_at = now()
+      WHERE name = 'sync-prices' AND token = 1;
+      ```
+
+      The first take returns token 1. A second copy running the same take while the lease is
+      live gets no row, and returns quietly. After the release, the next take returns token 2.
+
+      The token is a **fencing token**. Renewals and releases name it, so a holder that lost
+      the lease can't extend or free the new holder's. Pass it on to anything the job writes
+      that can check it, and a paused old holder is refused there too.
+
+      Releasing by `DELETE` looks tidier and quietly breaks the fence. The next take would
+      insert a fresh row with token 1 again, and an old holder with token 1 would look
+      current. Keep the row, move its expiry.
+
+      A renewal that returns no row means the lease is gone. Stop the job there, because
+      another copy may already be running it.
+  - title: Advisory locks in Postgres
+    body: |-
+      An advisory lock is a lock on a number that means whatever your application decides.
+      Postgres doesn't tie it to any table. It comes in two lifetimes.
+
+      ```sql
+      -- Session-level: held until unlocked or the connection closes.
+      SELECT pg_try_advisory_lock(4201) AS got;              -- true
+      SELECT pg_try_advisory_lock(4201) AS again;            -- true: same session
+      SELECT pg_advisory_unlock(4201), pg_advisory_unlock(4201);  -- true, true
+      SELECT pg_advisory_unlock(4201);                       -- false: not held
+
+      -- Transaction-level: released at COMMIT or ROLLBACK, with no unlock call.
+      BEGIN;
+      SELECT pg_try_advisory_xact_lock(4202) AS got;         -- true
+      -- ... the job's work, in this transaction ...
+      COMMIT;
+      ```
+
+      The `try` versions return `false` at once when another session holds the lock, which is
+      what a scheduled job wants: skip this run. The versions without `try` wait instead.
+
+      Three catches. First, a session lock is re-entrant: the same session can take it again,
+      and must unlock it as many times as it locked it, or the lock stays held. Second,
+      session locks don't mix with a connection pooler in transaction mode, such as PgBouncer
+      configured that way. Your next statement may run on another server connection. The
+      unlock can land on the wrong one, and the lock can stay held by a pooled connection
+      nobody is using. Transaction-level locks avoid that, at the cost of keeping a
+      transaction open for the whole job. Third, the numbers share one space across the whole
+      database, so keep a registry of which feature owns which key.
+
+      There's a quiet strength too. If the job does its writes through the same connection
+      that holds the lock, a dropped connection frees the lock and fails those writes
+      together. That's a built-in fence, which a lease in another system doesn't give you.
+  - title: Watermarks and rows that commit late
+    body: |-
+      The lesson's watermark has a hole that only shows under load. A row's `created_at`
+      defaults to `now()`, which in Postgres is the start of its transaction, not its commit.
+
+      Picture a checkout transaction that starts at 02:59:58 and commits at 03:00:03. The
+      digest runs at 03:00:01. It can't see the row, which hasn't committed, and it moves the
+      watermark to 03:00:01. The next run looks for rows after 03:00:01. The row says
+      02:59:58, so no run ever sends it.
+
+      The fix is to lag the upper bound behind now by more than your longest write
+      transaction, and to compute it once:
+
+      ```sql
+      BEGIN;
+      -- now() is fixed for the whole transaction, so both statements share one bound.
+      SELECT i.id, now() - interval '5 minutes' AS upper_bound
+      FROM items AS i, job_state AS s
+      WHERE s.job = 'digest'
+        AND i.created_at > s.watermark
+        AND i.created_at <= now() - interval '5 minutes'
+      ORDER BY i.created_at;
+
+      -- After the send worked:
+      UPDATE job_state SET watermark = now() - interval '5 minutes' WHERE job = 'digest';
+      COMMIT;
+      ```
+
+      A new row from two minutes ago waits for the next run instead of being skipped for
+      good. When the send is an external call, don't keep the transaction open across it.
+      Read the rows and the bound, send, then store that same bound as the new watermark.
+
+      Two more details. Take times from the database, never from the app server, so one clock
+      decides both sides. And if a repeat would still hurt, such as billing, give each item's
+      charge an idempotency key derived from the item id. A crash between the charge and
+      the watermark save then makes the next run repeat the call, and the provider replays
+      the first result instead of charging again.
+  - title: Where scheduled work should run
+    body: |-
+      Cron's five fields have one quirk worth knowing. When both day of month and day of week
+      are restricted, the job runs when either matches. `30 4 1,15 * 5` runs on the 1st, the
+      15th and every Friday, not on Fridays that fall on the 1st or 15th.
+
+      In a deployed app, schedules usually come from the platform instead: a Kubernetes
+      `CronJob`, whose `concurrencyPolicy` can be `Allow`, `Forbid` or `Replace`, or the
+      pg_cron extension, which runs schedules inside Postgres. An in-process timer, such as
+      `setInterval` in your web server, fires on every replica, so it needs the claim above
+      even more.
+
+      The sturdiest pattern keeps the scheduler dumb. At each tick it only enqueues a job,
+      keyed by job and slot so a double tick enqueues once. Workers run it like any other job,
+      with retries, backoff, a dead-letter queue and the same dashboards. The scheduler then
+      has almost nothing to get wrong.
+
+      Schedules that users choose are different, because "8:00 every morning" is local. Store
+      the time and the user's IANA zone, such as `Europe/London`, and compute each next run
+      as a UTC instant. Then decide the edge cases on purpose:
+
+      ```js
+      const london = new Intl.DateTimeFormat('en-GB', {
+        timeZone: 'Europe/London',
+        hour: '2-digit',
+        minute: '2-digit',
+        timeZoneName: 'short',
+      });
+      const show = (iso) => console.log(iso, '->', london.format(new Date(iso)));
+
+      show('2026-03-29T00:30:00Z'); // 00:30 GMT
+      show('2026-03-29T01:30:00Z'); // 02:30 BST: 01:30 London never happened
+      show('2026-10-25T00:30:00Z'); // 01:30 BST
+      show('2026-10-25T01:30:00Z'); // 01:30 GMT: the same wall time, an hour later
+      ```
+
+      A common policy is to run a skipped time at the first valid moment after it, and a
+      repeated time only once, at its first occurrence.
+pitfalls:
+  - '**Running the job in every copy of the app.** Timers in the web process or identical crontabs fire once per replica. Claim each slot in the database, or let one scheduler enqueue it.'
+  - '**Releasing a lease without checking you still hold it.** A holder whose lease expired can delete the new holder''s lease, and a third run starts. Release and renew by token.'
+  - '**Session advisory locks behind a transaction-mode pooler.** The lock and the unlock can run on different server connections, so the lock leaks or protects nothing. Use transaction-level locks, or a lease row.'
+  - '**Moving the watermark to the exact moment of the run.** Rows whose transactions started earlier but commit later fall behind it and are never processed. Lag the bound by more than the longest write transaction.'
+  - '**Relying on the scheduler to catch up.** Cron doesn''t rerun a slot the machine missed, and platforms differ. Make every run cover everything since the last success, so catching up is automatic.'
+  - '**Doing the heavy work inside the scheduler.** A long run blocks the next tick and fails without retries. Enqueue a job and let workers do it.'
+verify:
+  - lens: breaks
+    check: Every scheduled run claims its slot in a shared table first, so copies with the same crontab run it once.
+  - lens: breaks
+    check: A lease lasts longer than the slowest run ever seen, or a slow run loses it and a second run starts beside it.
+  - lens: confuses
+    check: Schedules are written in UTC, with the intended local time in a comment, so nobody reads 03:00 as London time.
+  - lens: tests
+    check: A test runs the digest twice, then again after a missed day, and expects no duplicates and no gap.
+interview:
+  - question: How do you make sure a nightly job runs exactly once when your app runs on many servers?
+    answer: >-
+      Make the run claimable, and make the work safe to repeat, because the scheduler alone
+      can't promise exactly once. Each copy tries `INSERT INTO job_runs (job, slot) ... ON
+      CONFLICT DO NOTHING RETURNING`, and only the one that gets a row runs the job. If the
+      run can be slow, it also holds a lease with a fencing token, renewed while it works,
+      so a rerun can't overlap it. The job itself works from a watermark, moved only after
+      success, so a missed night is covered by the next run and a repeat finds nothing new.
+      Better still, the tick only enqueues a job keyed by slot, and queue workers run it with
+      retries. The trade-off is a little more state for a job that can't double-send or skip.
+  - question: Compare a lease row, a Postgres advisory lock and a Redis lock for stopping overlapping runs.
+    answer: >-
+      All three give mutual exclusion that frees itself after a crash. They differ in what
+      ends it. A lease row ends at a time, so you pick an expiry longer than the slowest run
+      and renew it. Incrementing a column gives you a fencing token. An advisory lock
+      ends with its connection, so there's no expiry to tune, but a hung process holds it
+      and session locks break behind transaction pooling. A Redis `SET key value NX PX` lock
+      is fast and suits high-frequency jobs. But it lives in a different system from your
+      data, so it needs a token check where the job writes. For ordinary scheduled jobs on
+      Postgres I'd pick the lease row, because it's visible, inspectable and fenced.
+  - question: Your daily digest sends "the last 24 hours". What goes wrong, and what would you build?
+    answer: >-
+      It's wrong whenever a run isn't exactly 24 hours after the last one. A missed night
+      leaves a day nobody sends. A rerun sends the same items twice. A late run overlaps the
+      previous window. I'd store a watermark, the time up to which everything has been sent.
+      Each run reads from the watermark to a bound a few minutes before now, sends, and only
+      then saves the bound as the new watermark. A failed send leaves it in place for the
+      next run. The lag matters because rows committed late carry a `created_at` from
+      when their transaction began. For billing, I'd also charge each item with an idempotency
+      key derived from its id, so a crash between charging and saving can't bill twice.

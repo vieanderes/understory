@@ -1,0 +1,154 @@
+summary: >-
+  "What could break?" sounds open-ended, but it has a short list of answers. Code fails
+  through input from outside, through the dependencies it calls, through two things happening
+  at once, and through resources running out. Edges such as an empty list, a limit or
+  midnight hide inside all four. Writing that list for one function finds most of its bugs
+  on paper, before a user does.
+
+
+  Two kinds of failure deserve their own attention. A **partial failure** is a sequence that
+  stops halfway: the deposit is taken, the bike stays locked. Most code handles "it worked"
+  and "it failed at the start", and forgets "it failed in the middle". **Time** is the other:
+  days that are not 24 hours long, hours that cross midnight, users in other time zones. The
+  happy path never reaches these edges, so a test has to name them on purpose.
+
+
+  The point of the list is not to test everything. It is to pick the one test that would
+  fail if the likeliest, costliest failure were present, and write that one first.
+remember:
+  - List failure modes in four families, input from outside, dependencies, concurrency and resources, and check the edges inside each.
+  - For every step in a sequence, ask what has already happened if this step throws, and what undoes it.
+  - A timeout is an unknown outcome, so the code must work out what happened instead of assuming it failed.
+  - Record a half-done operation as pending before its first side effect, so something can find and settle it later.
+  - A day with a clock change has 23 or 25 hours, so add calendar days rather than 24 hours of milliseconds.
+  - Pass the current time into a function instead of reading the clock inside it, so tests can choose 23:59 or the clock-change day.
+  - The test worth writing first is the one that would fail if the likeliest, costliest failure mode were present.
+sections:
+  - title: A failure-mode list for one function
+    body: |-
+      Take `startRide(rider, bikeId)` from the lesson and walk the four families. Each line
+      is a failure and the test that would show it.
+
+      - **Input:** an unknown `bikeId`, or a rider with no card on file. Test that both are refused before any money moves.
+      - **Dependencies:** the payment provider declines, times out or is down; the dock is offline, slow, or times out after unlocking. Test each with a fake that throws or hangs.
+      - **Concurrency:** two riders tap the same bike in the same second, or one rider double-taps. Test two calls at once and check that only one ride starts and only one deposit is held.
+      - **Resources:** the provider's rate limit, or the database's connection pool, is used up at the morning peak. A load test shows this; a unit test can't.
+
+      Then rank them by likelihood times cost, as in risk-based testing. A dock outage is
+      likely, since docks sit outdoors on mobile networks, and it costs riders money. That
+      makes "a dock that throws" the first test to write, which is the one the lesson's
+      ai-review was missing.
+
+      The list also shows what *not* to test at this level. A rate limit is a property of the
+      whole system under load, so it belongs in a load test, not in a unit test of
+      `startRide`. Writing the list stops you mixing the two.
+  - title: Partial failure, compensation and the pending record
+    body: |-
+      A try and catch that undoes the step that worked closes the most common gap:
+
+      ```js
+      async function startRide(rider, bikeId, { payments, docks, rides }) {
+        const ride = await rides.create({ riderId: rider.id, bikeId, status: "pending" });
+        const hold = await payments.hold(rider.cardId, 500);
+        try {
+          await docks.unlock(bikeId);
+        } catch (error) {
+          if (error.name !== "TimeoutError") {
+            await payments.release(hold.id);
+            await rides.update(ride.id, { status: "failed" });
+          }
+          throw error; // a timeout stays pending: the bike may be free
+        }
+        return rides.update(ride.id, { status: "active" });
+      }
+      ```
+
+      Three ideas sit in it. The ride is recorded as `pending` before money moves, so a
+      crash at any point leaves a row that says what was in flight. A clear failure is
+      compensated: the hold is released and the ride marked failed. A timeout is treated as
+      unknown and left pending, because releasing the hold could give away a free ride.
+
+      A reconciliation job then settles pending rides. Every few minutes it asks the dock for
+      the state of each bike with an old pending ride, and either activates the ride or
+      releases the hold. That job is what turns "we hope nothing crashed" into "anything
+      half-done is found within five minutes".
+
+      The compensation can fail too, so it should be safe to run twice. A release keyed by
+      the hold id does nothing the second time, which lets the job retry it freely.
+  - title: Time, tested on purpose
+    body: |-
+      Most time bugs come from three habits: reading the clock inside a function, doing date
+      maths in milliseconds, and assuming the server's time zone is the user's.
+
+      Pass `now` in, and the function becomes testable at any instant:
+
+      ```js
+      function reminderTime(lastReminder) {
+        const next = new Date(lastReminder);
+        next.setDate(next.getDate() + 1); // a calendar day, not 24 hours
+        return next;
+      }
+
+      const before = new Date(2026, 2, 28, 9, 0);
+      console.log(reminderTime(before).getHours());
+      ```
+
+      Run it with `TZ=Europe/London node reminder.js` and it prints `9`, while adding 24
+      hours of milliseconds gives `10`. Setting `TZ` for the test run is how you pin the time
+      zone, so the test means the same on a laptop in Lisbon and a server in Virginia.
+
+      Store instants, such as when a booking was made, in UTC. Store wall-clock rules, such
+      as "the bakery opens at 22:00", as local times together with the place's time zone,
+      such as `Europe/London`. Converting between them happens at the edge, once.
+
+      The edges to test by name: the minute before and after midnight, the last day of a
+      month, 29 February, the night the clocks go forward, the night they go back, and a
+      user whose time zone is many hours from yours.
+pitfalls:
+  - '**Testing only with a dependency that always works.** A fake that never throws hides every partial failure. Give each fake a mode that throws, and one that hangs until a timeout.'
+  - '**Treating a timeout as a failure.** The other side may have finished the work. Record the operation as pending and find out what happened before compensating.'
+  - '**Moving a step instead of undoing it.** Taking the deposit after the unlock just moves the half-done state elsewhere. Keep the order that makes sense and add the compensation.'
+  - '**Adding 24 hours for tomorrow.** On a clock-change day that lands an hour off. Use calendar arithmetic, such as `setDate(getDate() + 1)`, in the right time zone.'
+  - '**Comparing times as if a day never wraps.** `opens <= now && now < closes` fails for hours that cross midnight. Handle the wrapped case explicitly and test both sides of midnight.'
+verify:
+  - lens: breaks
+    check: Every multi-step operation has an answer to what happens when each step throws, and the half-done state is undone or recorded as pending.
+  - lens: breaks
+    check: A timeout from another service is treated as an unknown outcome and reconciled, never assumed to mean the work did not happen.
+  - lens: tests
+    check: Each dependency's fake can throw and can time out, and at least one test runs the path where the second step fails.
+  - lens: tests
+    check: Time-dependent code takes `now` as an argument and has tests at midnight, at a month end and on a clock-change day.
+  - lens: confuses
+    check: Stored times say whether they are UTC instants or local times, and local rules carry their time zone name.
+interview:
+  - question: How do you decide which tests to write for a new function?
+    answer: >-
+      I list its failure modes first, then write the tests for the ones that are likeliest and
+      costliest. The list comes from four families: input from outside, dependencies,
+      concurrency and resources, plus the edges inside each, such as an empty list or
+      midnight. For a function that takes a deposit and unlocks a bike, the top risk is the
+      dock failing after the money moved, so the first test uses a fake dock that throws and
+      checks the deposit is released. Rate limits and pool exhaustion also matter, but they
+      belong in a load test, not a unit test. The trade-off is that a list takes ten minutes
+      up front, which is cheap next to finding a stranded deposit in production.
+  - question: What is a partial failure, and how do you handle one?
+    answer: >-
+      It's when an operation with several side effects stops after some have happened, like a
+      payment taken but the order not saved. Handling it has three parts. Record the operation
+      as pending before the first side effect, so a crash leaves evidence. When a later step
+      fails clearly, compensate the earlier ones: release the hold, cancel the reservation.
+      When a step times out, treat the outcome as unknown and reconcile it later rather than
+      guessing. Compensations must be safe to repeat, because they can fail and be retried.
+      This is the saga pattern. It doesn't make the operation atomic, since others can see the
+      in-between state, so the design has to tolerate that state being visible briefly.
+  - question: What are the time-related bugs you look for in review?
+    answer: >-
+      Three habits cause most of them. First, reading the clock inside a function, which makes
+      midnight and clock changes untestable; I ask for `now` to be passed in. Second, date
+      maths in milliseconds, such as adding 86,400,000 for tomorrow, which is an hour off on
+      a clock-change day; calendar arithmetic in the right time zone fixes it. Third, assuming
+      the server's zone is the user's: instants belong in UTC, while rules like opening hours
+      belong in local time with a zone name. Beyond those, I look for ranges that cross
+      midnight, month ends and 29 February. The tests should pin the time zone, for example
+      with the `TZ` environment variable, so they behave the same on every machine.

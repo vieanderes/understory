@@ -1,0 +1,167 @@
+summary: >-
+  Reviewing a whole change is where every judgment habit meets one diff. You read the intent,
+  check the shape of the change against it, and then ask the five questions in turn: what
+  could this expose, what could break, how is it proved, will it hold at 10x, and what will
+  confuse the next person. Readability comes last, because a well-named leak is still a leak.
+
+
+  AI-written pull requests make this routine more important, not less. They look finished,
+  they come with passing tests, and they fail in recognisable ways: changes outside the
+  stated scope, tests that check something came back rather than what, whole rows returned
+  with `SELECT *`, and work that grows with the data on a hot path.
+
+
+  The review ends with a **verdict** the author can act on in seconds: request changes,
+  comment or approve, then each must-fix with why it matters and the test that proves the
+  fix, then the lighter findings in proportion. The person who merges owns the change, and a
+  clear verdict is how a reviewer shares that ownership honestly.
+remember:
+  - Read the intent and the diffstat first, and look hardest at any file the stated intent doesn't explain.
+  - Ask the five questions in order of what it costs to miss, and leave naming and style to last.
+  - '`SELECT *` in a reply sends every column, including ones added later, so name the fields a caller may see.'
+  - A test that checks for a 200 and a non-empty list can't see a leak, a missing filter or a wrong order.
+  - A shared helper changed for one page breaks every other caller, including data already printed or stored.
+  - Work on a hot path, such as a header shown on every page, must not grow with the user's history.
+  - Lead the summary with the verdict, then must-fixes with reasons and proof, then suggestions, questions and nits.
+  - Approve when the change makes the code healthier, and mark matters of taste as nits so they don't block.
+sections:
+  - title: One pass, lens by lens
+    body: |-
+      A full review has an order, and the order is about cost: check first what would hurt
+      most to miss.
+
+      1. **Intent.** Read the title, the description and the request that started it. Know
+         what the change claims to do before you read a line of it.
+      2. **Shape.** Read the diffstat. Every file should be explained by the intent. A file
+         that isn't, like `seat-label.ts` in a bookings feature, gets the closest look,
+         because nobody is checking its callers.
+      3. **What could this expose?** Follow each new field from where it enters to where it
+         leaves: replies, logs, URLs, analytics, prompts. Look for `SELECT *`, whole objects
+         passed to `res.json`, and error messages that echo input.
+      4. **What could break?** Who calls the changed code, which contracts does it touch,
+         what data is stored in the old shape? Treat a changed shared helper as a contract
+         change.
+      5. **How would you prove it works, and what could it regress?** Read the tests as
+         closely as the code. Would each test fail if the code were wrong in the way that
+         matters? Were any existing tests weakened, skipped or deleted?
+      6. **Will it hold at 10x?** Look for work that grows with the data: loops of queries,
+         whole tables loaded to count a few rows, anything on a hot path such as every page
+         or every request.
+      7. **What will confuse the next person?** Names, surprising behaviour, missing comments
+         on a non-obvious why. Most of these are suggestions or nits.
+
+      Time-box it. If a careful pass would take more than an hour, the change is too big:
+      ask for it split. With an agent's pull request, ask the agent to list its own risks
+      first, then check them yourself. Its list is a starting point, never the review.
+  - title: Proving the leak is closed
+    body: |-
+      The best review comments come with the test that proves the fix. For an exposure, that
+      test pins exactly which fields a reply may contain, so a column added next year can't
+      slip out unnoticed:
+
+      ```ts
+      type Row = Record<string, unknown>;
+
+      // The fields the bookings page is allowed to receive. Anything else is a leak.
+      const allowed = new Set(['id', 'film', 'startsAt', 'seat']);
+
+      const extraKeys = (rows: Row[]) =>
+        [...new Set(rows.flatMap((row) => Object.keys(row)))].filter((key) => !allowed.has(key));
+
+      const fromSelectStar = [
+        { id: 1, film: 'The Long Field', startsAt: '2026-11-02T19:30', seat: 'F12', payment_token: 'tok_9', staff_note: 'VIP' },
+      ];
+      const fromNamedColumns = [{ id: 1, film: 'The Long Field', startsAt: '2026-11-02T19:30', seat: 'F12' }];
+
+      console.log(extraKeys(fromSelectStar));
+      console.log(extraKeys(fromNamedColumns));
+      // [ 'payment_token', 'staff_note' ]
+      // []
+      ```
+
+      In a real test suite this becomes one assertion: `expect(extraKeys(res.body)).toEqual([])`.
+      Notice what the agent's own test checked: that the page showed the right films. The
+      page never displays the token, so that test passed with the leak in place. The leak
+      lived in the JSON, and only a test on the JSON could see it.
+
+      The same idea works for each finding. For the seat label, a test that pins
+      `seatLabel('F', 12)` to `F12`. For the badge, a test that counts a member's upcoming
+      bookings without loading the past ones, or a check on the query plan. A must-fix with
+      its proving test is a comment the author can close in one go.
+  - title: Writing a verdict people can act on
+    body: |-
+      The summary comment is read first and sometimes read alone. Lead with the decision,
+      then the work, in order:
+
+      ```text
+      Request changes.
+
+      must-fix (leaks): the query uses SELECT *, so payment_token and staff_note
+      reach the browser. Name the columns, and add a test that pins the reply's keys.
+
+      must-fix (breaks): revert the seatLabel change. Printed tickets and the door
+      scanners expect F12. Format on the bookings page instead.
+
+      suggestion (scales): count upcoming bookings in SQL. The header runs on every page.
+
+      The film filter is parameterised and well tested. Nice.
+      ```
+
+      Three habits make it work. **One decision, stated first**, so nobody has to infer
+      whether they can merge. **Each must-fix carries its reason and its proof**, so the
+      author doesn't have to guess what "fixed" means. **Proportion**: suggestions and nits
+      are labelled as such, and a list of twelve nits doesn't bury two must-fixes.
+
+      Say what's good. It isn't politeness for its own sake: it tells the author which
+      patterns to keep, and it makes the hard comments easier to hear.
+
+      Review the code, not the person or the tool. "The query returns every column" lands
+      better than "you leaked tokens", and "the agent wrote it" is never part of a verdict.
+      Whoever merges owns it.
+pitfalls:
+  - '**Starting with the first file.** Reading top to bottom spends your attention on whatever comes first. Read the intent and diffstat, then go to the riskiest file.'
+  - '**Trusting the tests because they pass.** An agent''s test often checks that something came back. Ask of each test: would it fail if the code were wrong in the way that matters?'
+  - '**Skimming the out-of-scope change.** A two-line change to a shared helper can break more than the whole feature. Treat it as a contract change.'
+  - '**Burying must-fixes in nits.** Twenty comments of equal weight hide the two that matter. Label each one, and lead the summary with the verdict.'
+  - '**Approving what you couldn''t review.** A change too big to read well shouldn''t get an approval. Ask for it split.'
+verify:
+  - lens: leaks
+    check: Every reply names its fields explicitly, and a test pins the reply's keys, so a new column can never reach the browser by default.
+  - lens: breaks
+    check: Any shared helper the pull request touches is checked against all its callers, including printed or stored data in the old format.
+  - lens: scales
+    check: Code on a hot path, such as the site header, does work that stays flat as a user's history grows.
+  - lens: tests
+    check: For each must-fix, the review names the test that would fail without the fix, and checks no existing test was weakened.
+  - lens: confuses
+    check: The summary leads with one decision and labels every comment, so the author knows what blocks the merge.
+interview:
+  - question: How do you review a large pull request written by a coding agent?
+    answer: >-
+      I start with the intent and the diffstat, not the first file. Any file the stated
+      intent doesn't explain gets the closest look, because agents change shared code while
+      they're there. Then I go lens by lens: what the change could expose, what it could
+      break for existing callers and contracts, whether the tests would fail if the code
+      were wrong, whether it holds at ten times the load, and finally readability. I read
+      the test diff as closely as the code, because agents sometimes weaken tests to get
+      green. If a careful pass would take more than an hour, I ask for the change to be
+      split. I end with a verdict and must-fixes that each name the test proving the fix.
+  - question: How do you prioritise and communicate review findings?
+    answer: >-
+      By what it costs to miss, and with labels the author can act on. Security and data
+      exposure first, then correctness and regressions, then tests, then performance, then
+      readability. Each comment gets a label: must-fix blocks the merge, questions and
+      suggestions don't, nits are optional polish. The summary leads with one decision:
+      request changes, comment or approve. Then each must-fix with why it matters and how to
+      prove the fix, ideally a specific test. I also say what's good. The goal is that the
+      author knows in ten seconds what to do first, and doesn't spend a day on a nit while a
+      leak waits.
+  - question: What do you look for in the tests when you review a change?
+    answer: >-
+      Whether they'd fail if the code were wrong in the way that matters. A test that checks
+      for a 200 and a non-empty list passes whether the rows belong to the right member or
+      leak private fields. So I look for assertions on the exact output: which fields, whose
+      data, what order, what happens on the edge cases and errors. For a bug fix, I want a
+      test that fails without the fix. I check the diff of existing tests for anything
+      skipped, loosened or deleted. And I ask what the change could regress, then look for a
+      test that pins that behaviour, adding one if it's missing.

@@ -1,0 +1,161 @@
+summary: >-
+  A copy of a vendor's data has to lose records when the vendor loses them, and that's harder
+  than it sounds. A delta sync asks what changed, and a deleted record is absent from
+  every answer. Some vendors send tombstones or deletion webhooks. Many don't, and then the
+  only way to notice is a full pass that sees everything and compares.
+
+
+  **Mark and sweep** does that. Each row the full pass sees is stamped with the run's number.
+  When the pass completes, active rows with an older stamp are gone at the source, and the
+  sweep marks them with a soft delete, so history survives and mistakes can be undone. Rows
+  are matched by the vendor's id, scoped to the customer's connection, never by the vendor's
+  id alone.
+
+
+  The dangerous part is that absence is also what failure looks like. A pass that died on
+  page 7 never saw pages 8 to 30. An API user that lost its permissions sees nobody, with a
+  clean `200`. So the sweep has a safety valve: it refuses to run after an incomplete pass, and
+  stops for a person when it would remove more than a set share of active rows. An empty
+  answer is a question, not a fact.
+remember:
+  - A delta sync can't see deletions, because absent records appear in no answer.
+  - Mark and sweep stamps every row a full pass sees, then soft-deletes active rows with an older stamp.
+  - Sweep only after a pass that completed, because a pass that stopped early makes everyone after the failure look deleted.
+  - Stop for a person when a sweep would remove more than a set share of active rows, since that's usually a permissions fault.
+  - Key copied rows by `(connection_id, remote_id)`, because two customers' vendor accounts can share ids.
+  - Soft-delete with `deleted_at`, and clear it when a row reappears, so a vendor glitch heals itself on the next pass.
+  - Prefer the vendor's explicit deletes when they exist, and keep mark and sweep as the slower safety net.
+sections:
+  - title: Mark and sweep in SQL
+    body: |-
+      The whole cycle fits in three statements. The upsert marks, and also brings back anyone
+      who was swept by mistake and reappears:
+
+      ```sql
+      -- 1. Mark: for each person the pass reads, in run 42.
+      INSERT INTO staff (connection_id, remote_id, name, last_seen_run)
+      VALUES ($1, $2, $3, $4)
+      ON CONFLICT (connection_id, remote_id) DO UPDATE
+      SET name = EXCLUDED.name, last_seen_run = EXCLUDED.last_seen_run, deleted_at = NULL;
+
+      -- 2. Before sweeping: how much would go?
+      SELECT count(*) FILTER (WHERE last_seen_run < $2) AS unseen, count(*) AS active
+      FROM staff WHERE connection_id = $1 AND deleted_at IS NULL;
+
+      -- 3. Sweep, only if the pass completed and the valve allows it.
+      UPDATE staff SET deleted_at = now()
+      WHERE connection_id = $1 AND last_seen_run < $2 AND deleted_at IS NULL
+      RETURNING remote_id;
+      ```
+
+      Run on four staff, where run 42 saw Ana, Chen and Dara, who had been swept in May and
+      came back, the count returns `unseen: 1, active: 4`. The sweep returns `s-102`, Ben.
+      Dara's `deleted_at` was cleared by the upsert, so she's active again.
+
+      Record each run in a `sync_runs` table with its status, and let the sweep check that
+      its run is `completed`. That way "the pass finished" is a fact in the database, not a
+      variable that a refactor can lose. Run steps 2 and 3 in one transaction, so nothing
+      changes between the count and the sweep.
+
+      Where you can, sweep per connection. One customer's broken permissions should stop that
+      customer's sweep, not everyone's.
+  - title: Designing the safety valve
+    body: |-
+      A share alone misjudges both ends. One person leaving a team of five is 20%, which is
+      normal. And for a huge table, 10% can still be thousands of rows. So most valves combine
+      a share with a floor:
+
+      ```ts
+      interface Valve {
+        maxShare: number; // the share of active rows a sweep may remove
+        floor: number; // removals up to this many always pass
+      }
+
+      export function sweepAllowed(unseen: number, active: number, valve: Valve): boolean {
+        if (unseen <= valve.floor) return true;
+        return unseen <= active * valve.maxShare;
+      }
+
+      const valve = { maxShare: 0.1, floor: 20 };
+      sweepAllowed(1, 5, valve); // true: one person leaves a team of five
+      sweepAllowed(150, 3000, valve); // true: 5% of a big company
+      sweepAllowed(3000, 3000, valve); // false: everyone, at once
+      sweepAllowed(400, 3000, valve); // false: 13%, needs a person
+      ```
+
+      What happens when it trips matters as much. The sync keeps the data as it was, marks the
+      run `held`, and raises an alert with the numbers: "Connection 7 would remove 3,000 of
+      3,000 staff." A person then approves the sweep, if the company really did close a branch,
+      or fixes the cause, usually a changed role or scope. The next run after the fix finds
+      everyone again, and nothing was lost.
+
+      Two more signals catch faults the valve misses. A drop compared with the last run, such
+      as the vendor's total count halving overnight. And a pass that read far fewer pages than
+      usual. Both point at the same root: the vendor's answer is incomplete, not your data.
+  - title: Remote ids, internal ids and what leaves your system
+    body: |-
+      Every copied row carries two ids. Your own `id` is what the rest of your system, your
+      foreign keys and your API use. The vendor's `remote_id` is only for matching the next
+      sync's records to existing rows. Keeping them apart pays off in three ways.
+
+      First, vendor ids aren't unique across customers. Each customer's account at the vendor
+      may count from 1, so the unique key is `(connection_id, remote_id)`. A global key lets
+      one customer's sync write into another's row, which is a data leak.
+
+      Second, vendor ids change meaning. A vendor that merges two duplicate records keeps one
+      id and drops the other, which your sweep sees as a deletion. Some reuse ids after a
+      delete. Keep your own id stable, and treat the remote id as a lookup key you may need to
+      repair.
+
+      Third, your API shouldn't expose the vendor's ids. They can reveal which vendor a
+      customer uses and how many records they hold, and they tie your public contract to
+      someone else's numbering. Show your own ids outside, and translate at the edge when you
+      write back to the vendor.
+pitfalls:
+  - '**Sweeping after a pass that failed partway.** Everyone after the failure looks deleted. Sweep only when the run is recorded as complete.'
+  - '**No limit on how much a sweep may delete.** A lost permission or an empty `200` deletes the whole customer list. Abort above a share of active rows and ask a person.'
+  - '**Hard deletes in the sweep.** A wrong sweep can''t be undone and foreign keys break. Soft-delete with `deleted_at`, and purge later on a schedule.'
+  - '**A unique key on `remote_id` alone.** Two customers share vendor ids, and one sync overwrites the other''s rows. Key on `(connection_id, remote_id)`.'
+  - '**Never clearing `deleted_at`.** A record swept by mistake stays hidden even after the vendor shows it again. Clear it in the upsert.'
+  - '**Counting soft-deleted rows as active.** The valve''s share is then measured against people who left long ago. Count only rows with `deleted_at` null.'
+verify:
+  - lens: breaks
+    check: Make the vendor return zero records with a 200, and confirm the sweep aborts and an alert names the connection and the counts.
+  - lens: breaks
+    check: Fail the full pass on a middle page, and confirm no row is swept for that run.
+  - lens: leaks
+    check: Sync two connections whose vendor ids overlap, and confirm neither customer can see or overwrite the other's rows.
+  - lens: tests
+    check: Sweep a record, then return it in the next pass, and assert its `deleted_at` is cleared.
+  - lens: scales
+    check: Check the sweep's count and update use an index on `(connection_id, last_seen_run)`, so a large customer's sweep isn't a full table scan.
+interview:
+  - question: How do you detect records deleted in a source system that doesn't tell you about deletions?
+    answer: >-
+      With mark and sweep during a full sync. Every record the full pass reads is upserted with
+      the run's number. When the pass completes, active rows still carrying an older number
+      weren't seen, so they're gone at the source, and I soft-delete them. Two guards make it
+      safe. The sweep runs only if the run is recorded as complete, because a pass that died
+      halfway makes everyone after the failure look deleted. And a safety valve stops it when it
+      would remove more than a share of active rows, because an empty answer is usually lost
+      permissions, not mass deletion. If the vendor offers tombstones or deletion events, I use
+      those first and keep the sweep as a weekly safety net.
+  - question: Overnight, your sync tried to delete every employee for one customer. What do you do?
+    answer: >-
+      Hold the deletion and treat it as a fault until proven otherwise. A whole company
+      disappearing overnight is almost always an access problem: the API user's role changed,
+      a scope was removed, or the token now points at an empty sandbox. With a safety valve the
+      sweep never ran, so nothing is lost. I'd check the token's granted scopes, the vendor's
+      own count for that account and the raw reply, then contact the customer's admin. Once
+      access is restored, the next full pass finds everyone again. If it turns out to be real,
+      say a branch closed, a person approves the held sweep. Afterwards I'd check the valve's
+      thresholds and add an alert for sudden count drops.
+  - question: Why keep both a remote id and an internal id for synced records?
+    answer: >-
+      They do different jobs. The remote id matches the vendor's next record to the existing
+      row, so it's unique per connection, `(connection_id, remote_id)`, since different
+      customers' vendor accounts can reuse the same ids. The internal id is what my own tables
+      reference and what my API exposes, and it never changes. That separation survives vendor
+      behaviour I don't control, such as merging duplicates or reusing ids, without breaking my
+      foreign keys. It also keeps vendor ids out of my public contract, where they could reveal
+      which vendor a customer uses or how many records they have.

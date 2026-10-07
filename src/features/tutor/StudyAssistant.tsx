@@ -8,15 +8,21 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
   useSyncExternalStore,
 } from 'react';
-import { Segmented } from '@/components/ui/Segmented';
 import type { AssistantContext } from '@/core/ports/assistant';
 import { cn } from '@/lib/cn';
 import type { PathIndexEntry } from './learner-situation';
 import { pageGuide } from './page-guide';
-import { PLANNER_KEY, resetPlanner, setScoutMode, useScoutMode } from './planner/planner-store';
+import {
+  isPlanRoute,
+  PLANNER_KEY,
+  resetPlanner,
+  setScoutMode,
+  useScoutMode,
+} from './planner/planner-store';
 import { ScoutMark } from './ScoutMark';
 import {
   appendMessage,
@@ -44,17 +50,15 @@ const PlannerPanel = lazy(() =>
   import('./planner/PlannerPanel').then((m) => ({ default: m.PlannerPanel })),
 );
 
-const MODES = [
-  { value: 'ask', label: 'Ask' },
-  { value: 'plan', label: 'Plan' },
-] as const;
-
 const TUTOR_STARTERS = [
   'Explain this step in plain words',
   'Show me a smaller example',
   'Why does this work?',
   'Give me a hint, not the answer',
 ];
+
+/** Below md Scout is a full screen, not a card. */
+const PHONE = '(max-width: 47.99rem)';
 
 const FOCUS = 'focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent';
 
@@ -161,10 +165,10 @@ export function StudyAssistant({
   // A question a page asked on the learner's behalf (askTutor), waiting for the panel.
   const queued = useQueuedQuestion();
 
-  // Plan mode has one conversation, the same on every page, so planning goes on while the
-  // learner looks around the course.
+  // Scout plans only where a "Plan with Scout" control opened it, on Learn or the builder.
+  // Its conversation is kept, so planning again from there picks up where it was left.
   const mode = useScoutMode();
-  const planning = mode === 'plan';
+  const planning = mode === 'plan' && isPlanRoute(pathname);
   const key = planning ? PLANNER_KEY : (scope?.key ?? `page:${pathname}`);
   const history = useHistory(key);
   // "New chat" never loses a conversation by surprise: the cleared one waits here until the
@@ -199,10 +203,40 @@ export function StudyAssistant({
     if (open) settleTutorFocus();
   }, [open]);
 
-  // A question asked from the page is a question about the page: it goes to Ask mode.
+  // Planning ends when Scout closes or the learner leaves Learn and the builder, and a
+  // question asked from the page is a question about the page. Either way: the usual Scout.
   useEffect(() => {
-    if (queued && planning) setScoutMode('ask');
-  }, [queued, planning]);
+    if (mode === 'plan' && (!open || queued || !isPlanRoute(pathname))) setScoutMode('ask');
+  }, [mode, open, queued, pathname]);
+
+  // On a phone Scout fills the screen. The keyboard covers the bottom of the layout
+  // viewport without resizing it (iOS), so the panel follows the visual viewport: its
+  // question box stays just above the keys and nothing behind it scrolls into view.
+  const sheet = useRef<HTMLElement>(null);
+  useEffect(() => {
+    const element = sheet.current;
+    const viewport = window.visualViewport;
+    if (!open || !element || !viewport) return;
+    const phone = window.matchMedia(PHONE);
+    const fit = () => {
+      if (!phone.matches) {
+        element.style.removeProperty('top');
+        element.style.removeProperty('height');
+        return;
+      }
+      element.style.top = `${viewport.offsetTop}px`;
+      element.style.height = `${viewport.height}px`;
+    };
+    fit();
+    viewport.addEventListener('resize', fit);
+    viewport.addEventListener('scroll', fit);
+    phone.addEventListener('change', fit);
+    return () => {
+      viewport.removeEventListener('resize', fit);
+      viewport.removeEventListener('scroll', fit);
+      phone.removeEventListener('change', fit);
+    };
+  }, [open]);
 
   // In a lesson Scout tutors the step on screen; anywhere else it guides: which option on
   // the page fits, where to start, what each part is for.
@@ -260,16 +294,8 @@ export function StudyAssistant({
         </span>
       )}
       {open ? (
-        // On a phone the sheet covers the page: the dimmed page behind marks where it ends,
-        // and a tap there closes it. Desktop keeps the page in view and usable.
-        <div
-          aria-hidden
-          onClick={close}
-          className="scout-scrim bg-scrim fixed inset-0 z-40 md:hidden print:hidden"
-        />
-      ) : null}
-      {open ? (
         <aside
+          ref={sheet}
           aria-label="Scout AI"
           data-from={docked ? 'top' : 'bottom'}
           // From lg up the panel docks beside the page instead of floating over it
@@ -277,13 +303,13 @@ export function StudyAssistant({
           data-dock={shell ? 'shell' : 'focus'}
           data-enter={opening ? '' : undefined}
           className={cn(
-            'scout-sheet bg-surface text-fg shadow-float rounded-t-panel md:rounded-panel pb-safe fixed z-40 flex flex-col overflow-hidden md:pb-0 print:hidden',
-            // A bottom sheet on a phone, edge to edge and clear of the home indicator. On
-            // a tablet a card that grows from the button that opened it:
-            // up from the bottom-right corner, or down from a lesson's bar.
+            'scout-sheet bg-surface text-fg md:shadow-float md:rounded-panel pt-safe pb-safe fixed z-40 flex flex-col overflow-hidden md:pt-0 md:pb-0 print:hidden',
+            // The whole screen on a phone, clear of the notch and the home indicator. On a
+            // tablet a card that grows from the button that opened it: up from the
+            // bottom-right corner, or down from a lesson's bar.
             docked
-              ? 'inset-x-0 bottom-0 md:inset-x-auto md:top-9 md:right-3 md:bottom-auto md:w-50'
-              : 'inset-x-0 bottom-0 md:inset-x-auto md:right-3 md:bottom-3 md:w-50',
+              ? 'inset-0 md:inset-x-auto md:top-9 md:right-3 md:bottom-auto md:left-auto md:w-50'
+              : 'inset-0 md:inset-x-auto md:top-auto md:right-3 md:bottom-3 md:left-auto md:w-50',
             // Docked: a second card on the shell's desk, or a full-height column beside a
             // focus screen, ruled off from it and flat, since it no longer floats.
             shell
@@ -300,17 +326,10 @@ export function StudyAssistant({
           >
             <ScoutMark size={20} />
             <h2 className="text-sm font-semibold">Scout AI</h2>
-            <Segmented
-              label="Scout mode"
-              hideLabel
-              inline
-              options={MODES}
-              value={mode}
-              onChange={setScoutMode}
-              className="ml-0.5 w-15 shrink-0"
-            />
             <p className="text-muted min-w-0 flex-1 truncate text-sm">
-              {planning ? null : (
+              {planning ? (
+                'Planning a path'
+              ) : (
                 <>
                   <span className="sr-only">on </span>
                   {scope?.title ?? guide?.title}

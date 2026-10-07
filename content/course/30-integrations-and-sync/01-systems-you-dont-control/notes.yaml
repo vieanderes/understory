@@ -1,0 +1,158 @@
+summary: >-
+  An integration is your code reading and writing someone else's system. Calling the API is
+  the small part. Most of the work is what happens between two systems that change, fail and
+  disagree on their own schedules, and the first place that shows is the reply.
+
+
+  Vendors break their own specs. A gateway sends an HTML page with `200`, a framework wraps
+  errors in a `200`, a validation failure comes back as `500`, a promised field is missing from
+  one record in ten thousand, and an enum grows a value nobody announced. Code that trusts the
+  status and casts the body turns each of these into wrong data far from where it entered.
+
+
+  The defence is a parser at the boundary. Every reply becomes either a typed value your code
+  can trust, or an error that says whether a retry could help. Inside that parser you are
+  strict about the fields you depend on and tolerant of everything else, so the vendor can
+  grow without breaking you.
+remember:
+  - Read the body before you trust the status, because vendors send errors with `200` and input errors with `500`.
+  - Parse every vendor reply with a schema where it enters your code, and never pass on a cast like `as Booking[]`.
+  - Decide whether to retry from the vendor's error code when there is one, and from the status only when there isn't.
+  - A body that won't parse as JSON is usually a proxy or maintenance page, so treat it as a passing, retryable fault.
+  - Be strict about the fields you use and tolerant of fields and enum values you don't, mapping unknown values to a fallback.
+  - Count every fallback you apply, so a vendor change shows up on a dashboard before it shows up in a complaint.
+  - A missing field must never quietly become a default such as `[]` or `0`, because that turns an error into believable wrong data.
+sections:
+  - title: A reply parser with zod, from text to result
+    body: |-
+      The lesson's challenge checks by hand, because the sandbox has no zod. In a real
+      service, a schema does the field checks and you keep the order of decisions: parse,
+      then look for an error envelope, then the status, then the data.
+
+      ```ts
+      import { z } from 'zod';
+
+      const VendorError = z.object({ error: z.object({ code: z.string(), message: z.string().optional() }) });
+      const Parcel = z.object({
+        id: z.string().min(1),
+        status: z.enum(['in_transit', 'delivered', 'returned', 'unknown']).catch('unknown'),
+        delivered_at: z.string().nullish(),
+      });
+
+      type Result = { ok: true; parcel: z.infer<typeof Parcel> } | { ok: false; retryable: boolean; reason: string };
+
+      export async function readParcel(response: Response): Promise<Result> {
+        const text = await response.text();
+        let body: unknown;
+        try {
+          body = JSON.parse(text);
+        } catch {
+          return { ok: false, retryable: true, reason: `not-json (${response.status})` };
+        }
+        const error = VendorError.safeParse(body);
+        if (error.success) {
+          const retryable = ['rate_limited', 'temporarily_unavailable'].includes(error.data.error.code);
+          return { ok: false, retryable, reason: `vendor:${error.data.error.code}` };
+        }
+        if (!response.ok) return { ok: false, retryable: response.status >= 500, reason: `http-${response.status}` };
+        const parcel = Parcel.safeParse(body);
+        if (!parcel.success) return { ok: false, retryable: false, reason: `bad-shape: ${parcel.error.issues[0]?.path.join('.')}` };
+        return { ok: true, parcel: parcel.data };
+      }
+      ```
+
+      Fed a new status (`held_at_customs`), a `200` with an error, an HTML page and a record
+      without an id, it prints:
+
+      ```text
+      { ok: true, parcel: { id: 'p-1', status: 'unknown' } }
+      { ok: false, retryable: true, reason: 'vendor:rate_limited' }
+      { ok: false, retryable: true, reason: 'not-json (200)' }
+      { ok: false, retryable: false, reason: 'bad-shape: id' }
+      ```
+
+      Reading `response.text()` first, then `JSON.parse`, keeps the raw text in hand for a
+      log line. Calling `response.json()` directly loses it, because a body can be read once.
+  - title: Retrying when the status can't be trusted
+    body: |-
+      Failure handling taught you to retry `429`, `5xx` and timeouts, and never `400`, `401`
+      or `422`. That rule assumes an honest status. With a vendor that sends `500` for a bad
+      postcode, you retry a request that will fail identically, burn your rate limit, and
+      delay the real error by the length of your backoff.
+
+      So build a small table per vendor, from their docs and from what you see in your logs:
+
+      - error codes that mean "try later", such as `rate_limited` or `temporarily_unavailable`
+      - error codes that mean "your input is wrong", which go straight to the caller or a
+        dead-letter queue
+      - error codes that mean "your credentials are wrong", which mark the connection as
+        broken instead of retrying, as the next lessons show
+
+      Only when the body carries no error code do you fall back to the status. When a vendor
+      sends `Retry-After`, honour it over your own backoff: it's the only part of the reply
+      that knows when capacity returns.
+
+      Retrying a write is a separate question. A `POST` that timed out may have succeeded, so
+      it's only safe to repeat with an idempotency key or a lookup first, which the lesson on
+      writing into other systems covers.
+  - title: Keeping a record of what vendors really send
+    body: |-
+      Fixtures copied from the docs only test the API the vendor meant to build. The useful
+      fixtures are the strange replies you've met in production: the HTML page, the `200`
+      with an error, the record without an id. Save each one, with personal data removed,
+      the first time it surprises you, and add a test that the parser turns it into the right
+      result.
+
+      Two signals then tell you the vendor changed before your customers do. Count parse
+      failures per vendor and per reason, and alert on a rise. And count every fallback the
+      tolerant reader applies, such as each unknown `status` value, with the value itself in
+      the log. A new value appearing a hundred times an hour is a vendor release you weren't
+      told about, and it's far cheaper to read in a metric than in a support ticket.
+pitfalls:
+  - '**Checking `response.ok` and stopping there.** It reflects only the status line. A `200` can carry an error body or an HTML page, so parse the body before you believe it.'
+  - '**Casting instead of parsing.** `as Booking[]` changes what the compiler believes and checks nothing. Parse with a schema at the boundary, so a changed shape fails there with a clear message.'
+  - '**Defaulting a missing list to `[]`.** It turns an error reply into "no bookings", which looks real and gets acted on. A missing required field is an error, not an empty value.'
+  - '**An exhaustive `switch` that throws on an unknown enum value.** The vendor adds a status and every record using it crashes the sync. Map unknown values to a fallback and log them.'
+  - '**Retrying by status alone.** A vendor that sends `500` for invalid input makes you retry a request that can never succeed. Read the error code first.'
+verify:
+  - lens: breaks
+    check: Feed the client an HTML page with status 200 and confirm it reports a retryable error instead of throwing a raw SyntaxError.
+  - lens: breaks
+    check: Send a reply with an enum value the client has never seen, and confirm the record still syncs with the fallback value.
+  - lens: tests
+    check: Keep a fixture for each strange reply met in production, and test that each maps to the right result and retry decision.
+  - lens: confuses
+    check: Name each failure reason after the vendor's own error code, so the person on call can search the vendor's docs for it.
+  - lens: leaks
+    check: Log the reason and status of a failed parse, but strip tokens and personal fields before logging the raw body.
+interview:
+  - question: How do you make a client resilient to a third-party API changing without notice?
+    answer: >-
+      Parse at the boundary and be strict only where you depend on the data. Every reply
+      goes through a schema that produces a typed value or a clear error, so a changed shape
+      fails where it enters rather than three services later. Inside that schema I read only
+      the fields I need, drop unknown ones, and map unknown enum values to a fallback such as
+      "unknown", so additions don't break me. Then I make change visible: metrics for parse
+      failures and for each fallback applied, and fixtures recorded from real odd replies.
+      The trade-off is that tolerance can hide a real break, which is why every fallback is
+      counted and alerted on rather than silent.
+  - question: The vendor returns 200 with an error body. How do you handle retries?
+    answer: >-
+      I stop trusting the status and decide from the body. The parser looks for the vendor's
+      error envelope before anything else, whatever the status. Each error code is classed
+      as transient, such as rate limiting, or permanent, such as invalid input or bad
+      credentials, from the vendor's docs and from what we've seen. Transient codes retry
+      with backoff and jitter, honouring `Retry-After` if present. Permanent ones fail at
+      once with the vendor's message. Credential errors mark the connection as needing
+      attention. Only a reply with no error code falls back to status rules. And a retried
+      write needs an idempotency key or a lookup, because a lost reply may hide a success.
+  - question: What's the difference between a cast and a runtime validation in TypeScript?
+    answer: >-
+      A cast is a compile-time claim and a validation is a runtime check. `data as Parcel`
+      tells the compiler to treat the value as a parcel, and emits no code at all, so a wrong
+      shape travels on until something reads a missing field. A schema such as zod's
+      `safeParse` inspects the actual value and returns either typed data or an error listing
+      what's wrong. At a trust boundary, a request body or a vendor reply, you need the
+      runtime check, because the data was produced by code the compiler never saw. Inside
+      your own code, types are enough, which is why you validate once at the edge rather
+      than everywhere.

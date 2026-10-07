@@ -1,0 +1,335 @@
+id: integrations.writing-to-other-systems
+title: Writing into someone else's system
+objective: Create a record in a vendor exactly once without idempotency keys, by external reference and lookup before retry, and map its errors.
+level: advanced
+minutes: 10
+concepts: [integrations.external-reference, integrations.vendor-error-mapping, integrations.partial-results]
+prerequisites: [scale.idempotency, backend.calling-other-apis, integrations.webhooks-and-polling]
+opening:
+  text: >-
+    You'll place an order in someone else's system exactly once, even when it times out and
+    offers no idempotency keys. Writing is where integrations go from annoying to expensive.
+
+steps:
+  - type: prose
+    id: your-reference-on-their-record
+    body: >-
+      A bakery's app places orders in its flour wholesaler's system. In Idempotency you were
+      the server, so you stored the keys. This wholesaler offers none, and a timed-out create
+      may have landed.
+
+
+      Most systems do let you set a reference field on a record. Put your own order id there,
+      and search by it before any retry. That's an **external reference**.
+
+  - type: fill-blank
+    id: fill-external-ref
+    concept: integrations.external-reference
+    difficulty: 1
+    language: ts
+    prompt: >-
+      Create the order in the wholesaler's system with a reference you can search for later.
+      Fill the gap.
+    template: |
+      const order = await orders.insert({ lines, status: "placing" });
+
+      await wholesaler.createOrder({
+        lines,
+        external_ref: {{1}},
+      });
+    blanks:
+      - key: '1'
+        answer: order.id
+    bank: [order.id, crypto.randomUUID(), Date.now(), '"bakery"']
+
+  - type: predict-output
+    id: predict-search-lag
+    concept: integrations.external-reference
+    difficulty: 2
+    language: ts
+    code: |
+      // The wholesaler's search shows a new order a few seconds after it's created.
+      async function placeOrder(order: Order) {
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          if (await wholesaler.findByRef(order.id)) return;
+          try {
+            return await wholesaler.createOrder({ lines: order.lines, external_ref: order.id });
+          } catch {
+            // timed out: go round and look it up again
+          }
+        }
+      }
+    question: The first create landed, then timed out. What happens next?
+    choices:
+      - text: A second order is created
+        correct: true
+        feedback: >-
+          Yes. Search hadn't caught up, so the lookup found nothing and it created again.
+      - text: The lookup finds it, and the loop stops
+        feedback: >-
+          It would, a few seconds later. This loop looks at once, before search has caught up.
+      - text: The wholesaler refuses a duplicate reference
+        feedback: >-
+          Nothing told it references must be unique. It accepts the same one twice.
+
+  - type: prose
+    id: four-answers
+    body: |-
+      When a write fails, turn the vendor's error into something your code and your user can
+      act on. That's **vendor error mapping**, and there are four answers:
+
+      - **retry**: a timeout, `429` or `5xx`, after checking the reference
+      - **fix the data**: `400` or `422`, explained in your user's words
+      - **reconnect**: `401` or `403`, or a revoked grant
+      - **give up**: anything else, with the vendor's code logged
+
+  - type: fill-blank
+    id: fill-classify
+    concept: integrations.vendor-error-mapping
+    difficulty: 3
+    language: ts
+    prompt: >-
+      Classify the wholesaler's errors. A baker should understand the message for an unknown
+      product. Fill the gaps.
+    template: |
+      function classify(error: VendorError): Action {
+        if (error.status === "timeout" || error.status === 429 || error.status >= 500) {
+          return { kind: "{{1}}" };
+        }
+        if (error.status === 401 || error.status === 403) return { kind: "{{2}}" };
+        if (error.status === 422 && error.code === "unknown_sku") {
+          return { kind: "fix-data", message: {{3}} };
+        }
+        return { kind: "give-up" };
+      }
+    blanks:
+      - key: '1'
+        answer: retry
+      - key: '2'
+        answer: reconnect
+      - key: '3'
+        answer: '"One product isn''t sold any more."'
+    bank: [retry, reconnect, give-up, '"One product isn''t sold any more."', error.message]
+
+  - type: ai-review
+    id: review-idempotency-header
+    concept: integrations.external-reference
+    difficulty: 4
+    language: ts
+    request: Make creating a wholesaler order safe to retry.
+    flawClass: hallucinated-api
+    code: |
+      // Safe to retry: the wholesaler ignores a repeat with the same key.
+      async function createOrder(order: Order): Promise<{ id: string }> {
+        const response = await fetch(`${WHOLESALER}/orders`, {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${token}`,
+            "idempotency-key": order.id,
+          },
+          body: JSON.stringify({ lines: order.lines }),
+          signal: AbortSignal.timeout(10_000),
+        });
+        if (!response.ok) throw new VendorError(response.status, await response.text());
+        return response.json();
+      }
+    prompt: >-
+      The tests used a mock wholesaler that honoured the header, and all passed. On a slow
+      Friday, six orders arrived twice. The wholesaler's docs never mention idempotency keys.
+      Tap the line at fault.
+    lines: [7]
+    reasons:
+      - text: '`order.id` is a poor key, it should be random'
+        feedback: >-
+          A stable id per order is right for a key. The trouble is that nobody reads it.
+      - text: The wholesaler ignores a header it doesn't support
+        correct: true
+        feedback: >-
+          Yes. Unknown headers are dropped silently. Set `external_ref` and look it up instead.
+      - text: The timeout should be longer
+        feedback: >-
+          A longer wait means fewer timeouts, not none. Any retry after one can still double
+          the order.
+      - text: '`response.json()` needs an `await`'
+        feedback: >-
+          Returning the promise from an async function is fine. The caller awaits it.
+    fix: |
+      body: JSON.stringify({ lines: order.lines, external_ref: order.id }),
+      // ...and before any retry: await wholesaler.findByRef(order.id)
+    verify:
+      question: Which test would have caught this before production?
+      choices:
+        - text: Two creates with one key on the wholesaler's test system
+          correct: true
+          feedback: >-
+            The real API would make two orders, and the test would fail.
+        - text: A unit test with the mock wholesaler
+          feedback: >-
+            That mock honoured a header the real one ignores. The mock was the thing that was
+            wrong.
+        - text: A test that the header is sent
+          feedback: >-
+            The header went out every time. Nobody on the other side was reading it.
+        - text: A load test of order creation
+          feedback: >-
+            Load shows speed, not duplicates. Each request looks like a fresh order.
+
+  - type: prose
+    id: half-landed
+    body: >-
+      Some writes are batches. Send fifty order lines in one call, and the wholesaler might
+      accept forty-seven. A good bulk API answers with one result per item, and some use
+      `207 Multi-Status` for it. Those are **partial results**.
+
+
+      Keep that detail. Report which lines landed, and retry only the rest. And after any
+      write, sync that record, so your own pages show it.
+
+  - type: multiple-choice
+    id: pick-retry-set
+    concept: integrations.partial-results
+    difficulty: 3
+    code: |
+      {
+        "results": [
+          { "line": 1, "status": "created", "id": "wl-901" },
+          { "line": 2, "status": "error", "code": "rate_limited" },
+          { "line": 3, "status": "error", "code": "unknown_sku" }
+        ]
+      }
+    language: json
+    question: The job retries this batch. Which lines should the retry send?
+    choices:
+      - text: All three lines again
+        feedback: >-
+          Line 1 would be ordered twice. Per-item results exist so you resend only the rest.
+      - text: Only line 2
+        correct: true
+        feedback: >-
+          Right. Line 1 landed, and line 3 fails the same way every time.
+      - text: Lines 2 and 3
+        feedback: >-
+          Line 3 is bad data. It needs the baker to fix it, not another try.
+      - text: None, the call returned 207
+        feedback: >-
+          A 207 is mixed news, not success. Line 2 still needs to go.
+
+  - type: code-challenge
+    id: write-create-once
+    concept: integrations.external-reference
+    difficulty: 4
+    language: ts
+    editable: '48-57'
+    prompt: >-
+      Write `createOnce(vendor, order, deps)`. It places `order` in the wholesaler exactly
+      once. First, look it up with `findByRef(order.ref)`: if it's there, it already exists.
+
+
+      Otherwise call `createOrder`, at most `MAX_CREATES` times. For `401` or `403`, return
+      `reconnect`. For `400` or `422`, return `fix-data` with the message from `MESSAGES` for
+      the error's code, or `FALLBACK_MESSAGE`. Any other error may have landed, so
+      `deps.sleep(SEARCH_LAG_MS)`, then look it up again before the next create.
+
+
+      Call `deps.refresh(vendorId)` whenever you return success, and set `existed` to whether
+      a lookup found it. When every create has failed, return `retry-later`.
+    hints:
+      - Start before the loop with one `findByRef`. An earlier run of this job may have placed the order already.
+      - A lookup straight after a timeout can miss an order that landed. Sleep first, then look.
+      - "Inside `catch`, check the status in order: `401` or `403`, then `400` or `422`, and only then sleep and call `findByRef` again."
+
+  - type: explain-back
+    id: defend-check-before-resend
+    concept: integrations.external-reference
+    difficulty: 4
+    audience: non-technical
+    kind: decide
+    prompt: >-
+      The bakery owner asks why, when the wholesaler is slow, the app waits and checks before
+      sending an order again. Defend that choice, in their words.
+    rubric:
+      - A slow reply doesn't mean the order failed; it may already be with the wholesaler.
+      - Sending it again straight away could order the flour twice.
+      - Checking by our own order number costs a few seconds and prevents the duplicate.
+    modelAnswer: >-
+      When the wholesaler is slow, we can't tell whether your order got through. Often it did,
+      and only the answer was lost. If we sent it again straight away, you might get two
+      deliveries of flour. So every order carries our own order number. Before resending, we
+      wait a few seconds and ask the wholesaler whether that number is there. It costs a short
+      wait, and one order always means one delivery.
+
+recap:
+  - Put your own id in the vendor's reference field, and look it up before any retry.
+  - Map each vendor error to retry, fix the data, reconnect or give up, in words your users understand.
+  - Keep per-item results from bulk writes, retry only what failed, and sync each record after writing.
+
+recall:
+  - id: card-create-once
+    concept: integrations.external-reference
+    front: How do you create a record exactly once in a system with no idempotency keys?
+    back: >-
+      Write your own id into a reference field when creating, and search by it before any
+      retry.
+  - id: card-search-lag
+    concept: integrations.external-reference
+    front: Why wait before looking up the reference after a timeout?
+    back: >-
+      Search often lags behind writes. An immediate lookup can miss the order that has only now landed,
+      and the retry makes a duplicate.
+  - id: card-four-answers
+    concept: integrations.vendor-error-mapping
+    front: What four answers does a vendor error map to?
+    back: >-
+      Retry, fix the data, reconnect, or give up.
+  - id: card-partial-retry
+    concept: integrations.partial-results
+    front: A bulk write returns some items created and some failed. What does the retry send?
+    back: >-
+      Only the failed items with retryable errors. Created ones would duplicate, and invalid
+      ones would fail again.
+
+references:
+  - kind: paper
+    title: Idempotence Is Not a Medical Condition
+    authors: Pat Helland
+    year: 2012
+    venue: ACM Queue, 10(4)
+    url: https://doi.org/10.1145/2181796.2187821
+    note: Why every message across a boundary gets retried, and why the receiver must cope.
+    primary: true
+    verified: false
+  - kind: rfc
+    title: 'RFC 9110: HTTP Semantics'
+    authors: R. Fielding, M. Nottingham, J. Reschke
+    year: 2022
+    venue: IETF
+    url: https://www.rfc-editor.org/rfc/rfc9110
+    note: Why `POST` isn't idempotent, and what `401`, `403`, `422` and `429` mean.
+    primary: true
+    verified: false
+  - kind: rfc
+    title: 'RFC 4918: HTTP Extensions for Web Distributed Authoring and Versioning (WebDAV)'
+    authors: L. Dusseault
+    year: 2007
+    venue: IETF
+    url: https://www.rfc-editor.org/rfc/rfc4918
+    note: Where `207 Multi-Status` comes from, now borrowed by many bulk APIs.
+    verified: false
+
+deepDive: >-
+  Why not keep both systems in step both ways, so an order edited in either one copies
+  across? Two-way sync sounds friendly and rarely ends well. When both sides change the same
+  order, someone's edit is lost, and there's no shared clock to say which came first. Your
+  write fires the vendor's webhook, which triggers your sync, which can write back: an echo
+  loop. And a deletion on one side is ambiguous on the other.
+
+
+  So most integrations read by sync and write by explicit action. The baker presses "Send
+  order", your code calls `createOnce`, and a targeted sync brings the vendor's version back.
+  The vendor stays the source of truth for its records, and your app for its own.
+
+
+  An external reference works best when the vendor can filter on it exactly, such as
+  `GET /orders?external_ref=bk-1042`. A full-text search is weaker: it lags, and it can
+  match `bk-10420` too. If a duplicate slips through anyway, reconciliation can spot two
+  vendor orders with one reference and flag them for a person.

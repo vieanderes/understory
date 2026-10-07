@@ -1,0 +1,298 @@
+id: aisys.evals-in-depth
+title: Evals in depth
+objective: Check an LLM judge against human labels, grow an eval set from production traces, compare versions pairwise, and run evals online.
+level: advanced
+minutes: 10
+concepts: [aisys.eval-set-building, aisys.judge-calibration, aisys.pairwise-comparison, aisys.online-evals]
+prerequisites: [ai.evals, aisys.pii-and-privacy]
+opening:
+  text: >-
+    You'll know when a model judge can be trusted, and when its score is noise. And you'll
+    keep your eval set honest by feeding it what real users send.
+
+steps:
+  - type: prose
+    id: recall-judge
+    body: |-
+      A quick reminder from chapter 20. An **LLM judge** is a model that grades another
+      model's output against a rubric: pass or fail, or which of two answers is better. It
+      scales to thousands of outputs a night.
+
+      But a judge is a model too, so it can be wrong. Before trusting it, you grade a sample
+      yourself and compare its verdicts with yours.
+
+  - type: multiple-choice
+    id: pick-lazy-judge
+    concept: aisys.judge-calibration
+    difficulty: 1
+    language: python
+    code: |
+      human = ["pass", "pass", "fail", "pass", "pass", "pass", "fail", "pass", "pass", "pass"]
+      judge = ["pass"] * 10
+
+      agreement = sum(h == j for h, j in zip(human, judge)) / len(human)
+      print(agreement)   # 0.8
+    question: The judge agrees with people 80% of the time. How many failures did it catch?
+    choices:
+      - text: None
+        correct: true
+        feedback: >-
+          Right. It said pass to everything and still scored 80%.
+      - text: Two
+        feedback: >-
+          People found two failures. The judge said pass to both of them.
+      - text: Eight
+        feedback: >-
+          Eight is how often it agreed, all on passes. Failures caught: zero.
+
+  - type: prose
+    id: kappa
+    body: |-
+      Raw agreement flatters a judge whenever one label is common. Statistics has a fix:
+      **agreement beyond chance**. It scores 1 for perfect agreement, and 0 for a coin flip
+      or a judge that always says pass.
+
+      The more useful habit is simpler. Read every disagreement, and above all count how
+      many of people's failures the judge caught. That's what it's for.
+
+  - type: code-challenge
+    id: write-judge-misses
+    concept: aisys.judge-calibration
+    difficulty: 3
+    language: python
+    starter: misses.starter.py
+    solution: misses.solution.py
+    tests: misses.tests.py
+    prompt: >-
+      Write `judge_report(items)`. Each item is like `{"id": "r3", "human": "fail", "judge":
+      "pass"}`. Return a dict with three keys:
+
+
+      `"missed"`, the ids people failed and the judge passed. `"false_alarms"`, the ids
+      people passed and the judge failed. `"fail_recall"`, the share of people's failures
+      the judge also failed, or `None` when people failed nothing. Keep the ids in order.
+    hints:
+      - Two list comprehensions give the two lists of ids.
+      - Count people's failures separately. The judge caught all of them except the missed ones.
+      - Check for zero failures before you divide.
+
+  - type: prose
+    id: grow-from-production
+    body: |-
+      Good eval sets grow from production. Sample traces, especially the ones with a bad
+      signal: a thumbs down, a retry, an edit, a handover to a person. Redact the PII first.
+
+      A person labels each one and tags its **slice**, like `billing` or `refunds`. Keep some
+      items back as a held-out test, so you can't tune the prompt to the set itself.
+
+  - type: bug-hunt
+    id: hunt-happy-eval-set
+    concept: aisys.eval-set-building
+    difficulty: 2
+    language: python
+    code: |
+      def new_eval_items(traces, n=50):
+          liked = [t for t in traces if t["feedback"] == "thumbs_up"]
+          picked = random.sample(liked, n)
+          return [{"input": redact_pii(t["input"]), "slice": t["slice"]} for t in picked]
+    prompt: >-
+      This job adds 50 items to the eval set every week. The set passes at 0.97 for months,
+      while complaints about refunds pile up. Tap the line to fix.
+    lines: [2]
+    reasons:
+      - text: It only samples chats that already went well
+        correct: true
+        feedback: >-
+          Right. The failures users flagged never reach the set, so it can't see them.
+      - text: '`random.sample` can pick the same trace twice'
+        feedback: >-
+          It picks without repeats. The pool it picks from is the problem.
+      - text: PII should be redacted before sampling
+        feedback: >-
+          Redacting the picked items is enough. Nothing unpicked leaves the job.
+    fix: |
+      def new_eval_items(traces, n=50):
+          flagged = [t for t in traces if t["feedback"] == "thumbs_down" or t["retried"]
+                     or t["handed_over"]]
+          picked = random.sample(flagged, min(n, len(flagged)))
+          return [{"input": redact_pii(t["input"]), "slice": t["slice"]} for t in picked]
+
+  - type: ai-review
+    id: review-swap-aggregation
+    concept: aisys.pairwise-comparison
+    difficulty: 3
+    language: python
+    request: Compare two answers pairwise. Ask the judge twice, with the order swapped, to cancel its bias for the first answer.
+    flawClass: logic
+    code: |
+      def compare(question, a, b):
+          one = judge(question, a, b)   # "first" means a wins
+          two = judge(question, b, a)   # "first" means b wins
+          if one == "first" and two == "first":
+              return "a"
+          if one == "second" and two == "second":
+              return "b"
+          return "tie"
+    prompt: >-
+      An assistant wrote this. Its test used a stub judge that always answers `"first"`,
+      and `a` won as expected. Tap the lines at fault.
+    lines: [4, 6]
+    reasons:
+      - text: They read the swapped verdict the wrong way round
+        correct: true
+        feedback: >-
+          Yes. `a` wins on "first" then "second". Two "first"s means position won.
+      - text: The two judge calls should run in parallel
+        feedback: >-
+          That would save time, but the answer would still be wrong.
+      - text: A tie should never be returned
+        feedback: >-
+          Ties are the honest result when the verdict flips with the order.
+    verify:
+      question: Which test would have caught this?
+      choices:
+        - text: A stub judge that always answers "first", expecting a tie
+          correct: true
+          feedback: >-
+            Yes. A judge that only follows position must never pick a winner.
+        - text: The same stub, expecting `a` to win
+          feedback: >-
+            That's the test it passed. It wrote the bug into the expected result.
+        - text: Running the two judge calls in parallel
+          feedback: >-
+            That changes speed, not the verdict. The swapped answer would still be misread.
+    fix: |
+      if one == "first" and two == "second":
+          return "a"
+      if one == "second" and two == "first":
+          return "b"
+      return "tie"
+
+  - type: prose
+    id: online-evals
+    body: |-
+      Offline sets only hold yesterday's questions. **Online evals** score a sample of live
+      traffic every day, with cheap checks and a judge you've checked.
+
+      Add the signals users give for free: edits, retries, thumbs, handovers. Chart them per
+      slice, and alert on a drop, the way you'd alert on an error rate. That catches
+      **drift**: live traffic slowly changing away from what you tested.
+
+  - type: multiple-choice
+    id: pick-online
+    concept: aisys.online-evals
+    difficulty: 2
+    question: Offline evals pass at 0.95, yet complaints rise after a new product launches. What catches this?
+    choices:
+      - text: Scoring a daily sample of live traffic
+        correct: true
+        feedback: >-
+          Yes. Live traffic holds the new product's questions. The offline set doesn't.
+      - text: Rerunning the offline set every night
+        feedback: >-
+          The same old questions pass every night. None ask about the new product.
+      - text: A bigger model as the judge
+        feedback: >-
+          A better judge scores the same old items. The missing questions stay missing.
+
+  - type: explain-back
+    id: explain-judge-trust
+    concept: aisys.judge-calibration
+    difficulty: 3
+    audience: interviewer
+    kind: explain
+    prompt: >-
+      An interviewer asks: "Your judge agrees with human labels 90% of the time. Why might it
+      still be useless, and how would you find out?"
+    rubric:
+      - If most items pass, a judge that passes everything also agrees most of the time.
+      - Count how many of people's failures the judge caught, and read every disagreement.
+      - Recheck on a held-out labelled sample after any change to the judge's prompt or model.
+    modelAnswer: >-
+      Say nine in ten answers are good. A judge that always says pass then agrees 90% of the
+      time and catches nothing. I'd look at the items people failed and count how many the
+      judge failed too, then read each disagreement. I'd repeat that on held-out labels
+      whenever the judge's prompt or model changes.
+
+recap:
+  - Grow an eval set from real failures, redacted, labelled and tagged by slice.
+  - Trust a judge only after it catches people's failures, and read every disagreement.
+  - Swap the order in pairwise judging, and score live traffic online.
+recall:
+  - id: card-kappa
+    concept: aisys.judge-calibration
+    front: Why is raw agreement a poor test of an LLM judge?
+    back: >-
+      When one label is common, a judge that always gives it agrees often. Count the
+      failures it caught, or measure agreement beyond chance.
+  - id: card-eval-sources
+    concept: aisys.eval-set-building
+    front: Which production traces are worth turning into eval items first?
+    back: >-
+      Ones with a bad signal: thumbs down, retries, edits and handovers to a person.
+  - id: card-pairwise-swap
+    concept: aisys.pairwise-comparison
+    front: What does it mean when a pairwise verdict flips after swapping the order?
+    back: >-
+      The judge followed position, not quality. Count that pair as a tie.
+  - id: card-online
+    concept: aisys.online-evals
+    front: What do online evals catch that an offline set can't?
+    back: >-
+      New kinds of questions and drift in live traffic, which the fixed offline set never
+      contains.
+
+references:
+  - kind: paper
+    title: A Coefficient of Agreement for Nominal Scales
+    authors: Jacob Cohen
+    year: 1960
+    venue: Educational and Psychological Measurement 20(1)
+    url: https://doi.org/10.1177/001316446002000104
+    note: The original definition of kappa.
+    primary: true
+    verified: true
+  - kind: paper
+    title: 'Who Validates the Validators? Aligning LLM-Assisted Evaluation of LLM Outputs with Human Preferences'
+    authors: Shreya Shankar, J.D. Zamfirescu-Pereira, Björn Hartmann, Aditya G. Parameswaran and Ian Arawjo
+    year: 2024
+    venue: arXiv 2404.12272
+    url: https://arxiv.org/abs/2404.12272
+    note: Why judge criteria drift, and how to align them with human grades.
+    primary: true
+    verified: true
+  - kind: paper
+    title: Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena
+    authors: Lianmin Zheng et al.
+    year: 2023
+    venue: arXiv 2306.05685
+    url: https://arxiv.org/abs/2306.05685
+    note: Position and verbosity bias in pairwise judging, and swapping as a fix.
+    verified: true
+  - kind: essay
+    title: Your AI Product Needs Evals
+    authors: Hamel Husain
+    year: 2024
+    venue: hamel.dev
+    url: https://hamel.dev/blog/posts/evals/
+    note: A practical loop of traces, labels, tests and judges.
+    verified: true
+
+deepDive: >-
+  **Kappa.** Agreement beyond chance is usually measured with Cohen's kappa:
+  `(observed - chance) / (1 - chance)`, where chance is the agreement two raters would reach
+  by guessing at their own pass rates. The always-pass judge above scores exactly 0. Kappa
+  has cousins. With more than two raters, Fleiss' kappa generalises it. With ordered
+  scores, such as 1 to 5, a weighted kappa counts a 4 against a 5 as a smaller miss than a
+  1 against a 5. Rough bands are often quoted, with 0.6 to 0.8 called substantial, but they
+  are conventions, not laws.
+
+
+  A judge also needs its own held-out set. If you tune the judge prompt on the same items
+  you measure it on, its kappa will look better than it is. Split the labelled items, tune
+  on one part, and report on the other.
+
+
+  For online evals, sample by slice rather than uniformly. A rare slice, such as refunds,
+  may be 2% of traffic and most of the risk. Oversample it, and weight it back when you
+  report an overall number.

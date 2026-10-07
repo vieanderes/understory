@@ -1,0 +1,197 @@
+summary: >-
+  A shared queue in arrival order is fair to jobs and unfair to people. When one tenant
+  enqueues 50,000 jobs, every tenant who arrives after it waits for all of them, even though
+  the workers are healthy and the system has capacity. That's the **noisy neighbour**, and it
+  shows up in every multi-tenant system that shares workers: email platforms, export
+  services, sync engines, AI pipelines.
+
+
+  The cure is to schedule by tenant rather than by arrival. Keep a queue per tenant and serve
+  them in turn, so a small tenant waits for one job per busy tenant, not for the whole
+  backlog. Add priorities so that work a person is waiting for goes ahead of background work,
+  and guard the low priority against starvation with ageing or a reserved share. Then add
+  bulkheads, caps on how many workers one tenant or one dependency may hold, so a flood or a
+  slow provider stays in its own compartment.
+
+
+  These notes cover weighted fairness when tenants pay for different shares or jobs differ in
+  cost, the two cures for starvation, bulkheads and shuffle sharding, and how to tell from
+  your metrics whether the queue is actually fair. Reach for all of this once more than one
+  customer shares a worker pool. A single-tenant batch system needs none of it.
+remember:
+  - One first-in, first-out queue lets the biggest backlog decide everyone's wait, so schedule by tenant, not by arrival.
+  - Per-tenant round robin takes one job from each tenant with work in turn and remembers where it stopped.
+  - Round robin is work-conserving, so a lone busy tenant still gets every idle worker.
+  - Strict priority starves low work whenever high work keeps arriving, so add ageing or reserve a share of picks.
+  - Weights give some tenants a bigger share, and deficit round robin keeps that share fair when jobs differ in cost.
+  - A bulkhead caps the workers one tenant or dependency may hold, and its slot must be released on failure too.
+  - Alert on the age of the oldest waiting job per tenant and per priority, because a healthy average hides a starved tenant.
+sections:
+  - title: Weights, and jobs that aren't the same size
+    body: |-
+      Plain round robin gives every tenant one job per turn. That breaks down in two ways.
+      A paid plan may promise a bigger share. And one tenant's jobs may be ten times the work
+      of another's, so equal turns mean unequal time.
+
+      **Deficit round robin** fixes both with one counter per tenant. Each round, a tenant
+      earns its weight in credit, then runs jobs while its credit covers the next job's cost.
+      Leftover credit carries over, so a costly job runs once enough has built up.
+
+      ```ts
+      type Job = { id: string; cost: number };
+      type Tenant = { name: string; weight: number; credit: number; queue: Job[] };
+
+      // One round: each tenant earns its weight, then spends it on jobs.
+      function round(tenants: Tenant[]): string[] {
+        const ran: string[] = [];
+        for (const t of tenants) {
+          if (t.queue.length === 0) { t.credit = 0; continue; } // idle tenants don't hoard
+          t.credit += t.weight;
+          while (t.queue.length > 0 && t.queue[0]!.cost <= t.credit) {
+            const job = t.queue.shift()!;
+            t.credit -= job.cost;
+            ran.push(job.id);
+          }
+        }
+        return ran;
+      }
+
+      const jobs = (prefix: string, n: number, cost: number) =>
+        Array.from({ length: n }, (_, i) => ({ id: `${prefix}${i + 1}`, cost }));
+
+      const tenants: Tenant[] = [
+        { name: 'paid', weight: 3, credit: 0, queue: jobs('p', 6, 1) },
+        { name: 'free', weight: 1, credit: 0, queue: jobs('f', 6, 1) },
+        { name: 'export', weight: 1, credit: 0, queue: jobs('x', 2, 2) },
+      ];
+      console.log(round(tenants).join(' ')); // p1 p2 p3 f1
+      console.log(round(tenants).join(' ')); // p4 p5 p6 f2 x1
+      ```
+
+      The paid tenant gets three picks to the free tenant's one. The export, whose jobs cost
+      two, runs nothing in the first round and its first job in the second. Resetting an idle
+      tenant's credit matters: without it, a tenant that was quiet for an hour could return
+      with a pile of credit and grab a burst of workers.
+
+      Cost can be anything you can estimate before running the job: rows to export, tokens to
+      send to a model, minutes of audio. A rough estimate is enough to stop one huge job from
+      counting the same as one tiny one.
+  - title: Starvation, ageing and reserved shares
+    body: |-
+      Strict priority is quick to write and correct in every test with a few jobs. It fails
+      only under sustained high load, which is the day it matters. The two standard cures
+      take different views of fairness.
+
+      **Ageing** raises a job's priority once it has waited long enough. A scheduled email
+      that has sat for ten minutes is treated as urgent. Ageing does nothing while high work
+      is light, so low work runs promptly most of the time, and it caps the worst wait when
+      high work is heavy. The cap is approximate: if many jobs age at once, they now compete
+      with high work and each other.
+
+      A **reserved share** gives low work a fixed slice regardless of age: one pick in five,
+      or ten of a hundred workers. It's simpler to reason about under load, because low work
+      always moves at a known minimum rate. The cost is that high work waits a little even
+      when it's urgent and the low queue holds nothing important.
+
+      Many systems combine them. Background syncs get a reserved minimum so they always make
+      progress, and anything that waits past a deadline is promoted. Whatever you choose,
+      write the test the launch-day incident needed: a steady stream of high jobs for many
+      picks, with one low job waiting, and an assertion on when it comes out.
+
+      Keep the number of priority levels small. Two or three levels are simple to explain and to
+      monitor. Ten levels invite everyone to mark their work as the top one, and then nothing
+      is a priority.
+  - title: Bulkheads and shuffle sharding
+    body: |-
+      Fair picking decides who goes next. It doesn't stop the jobs it picks from all getting
+      stuck in the same place. If one mail provider slows to 30 seconds a send, a fair
+      scheduler will still feed it workers until every worker is waiting there.
+
+      A **bulkhead** caps concurrency per compartment. Typical compartments:
+
+      - per tenant, so no customer holds more than a fifth of the pool;
+      - per dependency, so one slow vendor gets at most its own small pool;
+      - per kind of work, so interactive jobs have workers that background jobs can't use.
+
+      The cap is a counter checked before a job starts and released when it ends, in a
+      `finally`, because a failure that leaks a slot slowly turns a cap into a ban. When a
+      job is refused by its bulkhead, leave it queued and pick someone else. Don't spin on it.
+
+      Caps per tenant protect the others from one tenant, but a bad tenant still shares
+      every worker with everyone. **Shuffle sharding** goes further. Each tenant is assigned a
+      small random subset of workers or queues, say two of twenty. A tenant that floods its
+      two hurts only the few others who share both, and with many possible pairs, most
+      tenants share at most one. It's how large services keep one customer's outage from
+      becoming everyone's.
+
+      Bulkheads cost utilisation: a capped tenant may wait while workers sit idle. That's the
+      trade. You give up a little throughput in the good case to keep the bad case from
+      spreading.
+  - title: How to tell whether the queue is fair
+    body: |-
+      Total throughput and average wait look fine during a noisy-neighbour incident. The
+      big tenant's jobs are flowing, and they dominate both numbers. You need metrics that
+      can see the small tenants.
+
+      The most useful is **the age of the oldest waiting job**, broken down by priority and,
+      for your largest tenants, by tenant. A starved tenant shows as a line that climbs while
+      the others stay flat. Add jobs started per tenant per minute, to check that the shares
+      match the weights you meant.
+
+      Per-tenant labels can explode a metrics system when there are thousands of tenants. A
+      common shape is per-tenant metrics for the top few hundred by volume, plus one
+      "everyone else" series, plus the oldest job overall with the tenant id in a log line or
+      trace when it crosses a threshold.
+
+      Then alert on what users feel: confirmations older than a minute, background jobs older
+      than an hour. A queue depth of a million can be healthy, and a depth of three can hide a
+      job that has waited all afternoon.
+pitfalls:
+  - '**Adding workers to fix a noisy neighbour.** More workers drain the big backlog faster, but small tenants still queue behind it, and the next big batch fills the new workers too. Fix the order, not the capacity.'
+  - '**Strict priority with no ageing.** It passes every test with two jobs and starves background work on the busiest day. Promote jobs that wait too long, or reserve a share for low work.'
+  - '**Releasing a bulkhead slot only on success.** Every failure leaks a slot until the tenant can never run again. Decrement in a `finally`.'
+  - '**Letting users choose their own priority.** If any client can mark a job urgent, every client will. Derive priority on the server from what triggered the job.'
+  - '**Measuring only averages.** One big tenant dominates throughput and mean wait. Watch the oldest waiting job per priority and per large tenant.'
+verify:
+  - lens: breaks
+    check: Under a steady stream of high-priority jobs, does a waiting low-priority job still come out within its promised time?
+  - lens: scales
+    check: When the largest tenant enqueues a hundred times its usual volume, how long does a new tenant's first job wait?
+  - lens: breaks
+    check: If one downstream provider slows tenfold, how many workers can it hold before the bulkhead refuses more?
+  - lens: tests
+    check: A test that fails a tenant's jobs repeatedly, then checks its running count returns to zero, proves slots are freed on failure.
+  - lens: confuses
+    check: Is it written down who sets a job's priority and weight, so nobody marks bulk work urgent to get it out faster?
+interview:
+  - question: Many customers share one job queue, and one of them has uploaded a huge batch. How do you keep everyone else's jobs moving?
+    answer: >-
+      Schedule by tenant instead of by arrival. In one first-in, first-out queue, the batch
+      sits ahead of everyone who comes later, so their wait is the size of the batch. I'd
+      keep a queue per tenant, or a tenant column that the claim query groups by, and take
+      the next job from each tenant with work in turn. The batch then drains at full speed
+      when nobody else is busy, and shares workers when they are. I'd add a per-tenant cap
+      on running jobs so one tenant can't hold the whole pool, and weights if plans promise
+      different shares. The cost is a more complex claim than `ORDER BY created_at`, and a
+      little lost throughput when a capped tenant waits beside idle workers.
+  - question: What's the problem with priority queues, and how do you fix it?
+    answer: >-
+      Strict priority starves low work. If high jobs keep arriving, the low queue never gets
+      a turn, and that only shows under sustained load. Two fixes are common. Ageing promotes
+      a job once it has waited past a threshold, which keeps low work prompt when high work is
+      light. A reserved share gives low work a fixed fraction of picks or workers, which is
+      predictable under heavy load but delays urgent work slightly. I often combine a small
+      reserved share with a deadline-based promotion. I'd also keep the levels few, derive
+      priority on the server rather than from the client, and test with a long stream of high
+      jobs while one low job waits.
+  - question: What is a bulkhead, and where would you put one in a worker system?
+    answer: >-
+      A bulkhead caps how much of a shared resource one compartment can use, so a failure in
+      one doesn't sink the rest. In a worker system I'd cap running jobs per tenant, so one
+      customer can't hold every worker. I'd cap per dependency, so a vendor that slows down
+      ties up a few workers rather than all of them. And I'd keep a separate pool for
+      interactive work, so background syncs can't crowd it out. The counter must be released
+      in a `finally`, or failures leak slots. Refused jobs stay queued while the scheduler
+      picks another tenant. The trade-off is utilisation: capped work may wait while workers
+      sit idle, which I accept to keep one bad tenant or vendor from becoming everyone's
+      outage.

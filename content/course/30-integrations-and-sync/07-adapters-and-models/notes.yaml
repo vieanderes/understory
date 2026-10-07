@@ -1,0 +1,167 @@
+summary: >-
+  A product that integrates with one vendor can afford to let that vendor's shapes leak
+  everywhere. A product that integrates with five can't. Every page, job and report would
+  carry a branch per vendor, and the sixth vendor would mean touching all of them.
+
+
+  The answer is the ports and adapters idea applied at the edge. You define one interface
+  your product needs, such as `ListingsSource`, and write one **adapter** per vendor that
+  fills it. The adapter speaks the vendor's API and returns your **common data model**. Next
+  to the adapters sits a **capability matrix**: data that records what each vendor can and
+  can't do, so the sync and the product can adapt instead of pretending.
+
+
+  The common model is a superset with nullable fields, not the lowest common denominator.
+  Each record keeps its raw payload. Customers' own custom fields are mapped per connection,
+  in settings. A passthrough covers the long tail of vendor features you'll never model.
+  Reach for all of this from the second vendor on. With one vendor and no plans for a
+  second, a thin client and your own types are enough.
+remember:
+  - One interface, one adapter per vendor, and nothing outside the adapters knows which vendor it's talking to.
+  - The capability matrix is data the code reads, so the sync picks delta or full and the page hides what a vendor can't give.
+  - The common model is a superset, with fields nullable where vendors don't all provide them.
+  - '`null` means "this vendor doesn''t say" and a default like `0` means something else, so never default an unknown.'
+  - An adapter refuses a capability it lacks with a clear error rather than quietly doing something weaker.
+  - Keep the raw payload beside the mapped record, so you can re-map later without re-fetching.
+  - Custom-field mappings live in each connection's settings, never in an adapter's code.
+  - A passthrough lets a customer reach vendor features the model lacks, scoped to their own connection.
+sections:
+  - title: Designing the common model
+    body: |-
+      Two pulls fight over the model. The lowest common denominator keeps only the fields
+      every vendor has. It's simple, and nothing is ever missing, but the product can only
+      be as good as the weakest vendor. The superset keeps every field any vendor offers
+      that the product needs, and pays with `null`.
+
+      Start from what the product needs, not from what vendors send. List the screens and
+      jobs, list the fields they use, and check each against the vendors. A field most
+      vendors have becomes nullable in the model. A field one vendor has and nobody needs
+      stays in the raw payload.
+
+      ```ts
+      interface Screening {
+        remoteId: string;        // every vendor: required
+        film: string;            // every vendor: required
+        startsAt: string;        // an instant, ISO 8601 in UTC
+        seatsLeft: number | null;    // two vendors of three
+        audioDescribed: boolean | null; // one vendor sends it, the page shows it
+        custom: Record<string, string>;
+        raw: unknown;
+      }
+      ```
+
+      Name things in your product's words, not one vendor's. `film` beats `title`, `name`
+      and `film_title` because it means the same thing everywhere. Pick one representation
+      per kind of value too: instants in UTC, pure dates as `YYYY-MM-DD`, money as integer
+      minor units with an ISO 4217 code. The previous lesson's normalising happens inside
+      each adapter, so the model never sees a vendor's spelling.
+
+      When two vendors mean slightly different things by the same idea, write it down. If
+      one vendor's "seats left" includes held seats and another's doesn't, the model's
+      field needs one definition and the adapters convert to it.
+  - title: Capabilities as data, and adapters that don't pretend
+    body: |-
+      The matrix answers questions the product asks at runtime: can I run a delta here? Can
+      I rely on webhooks, or must I poll? Can I show a seat count? Keep it next to the
+      adapters, typed, and expose it through the interface so callers never consult a
+      separate list that can drift.
+
+      ```ts
+      async function syncCinema(source: ListingsSource, since: string | null) {
+        const delta = since !== null && source.capabilities.updatedSince;
+        const screenings = await source.listScreenings(delta ? { updatedSince: since } : {});
+        return { mode: delta ? 'delta' : 'full', count: screenings.length };
+      }
+      ```
+
+      An adapter asked for something its vendor can't do must say so. Quietly doing
+      something weaker is the dangerous choice. An adapter that ignores `updatedSince` and
+      returns everything looks harmless, but the caller then records a delta watermark and
+      skips its full sync's deletion sweep, believing it saw only changes. An adapter that
+      emulates a filter client-side is fine when it really can, for example by filtering on
+      a reliable timestamp in the raw records. If it can't, it throws.
+
+      Capabilities can also differ per connection, not only per vendor. A customer on a
+      cheaper plan of the vendor may lack webhooks, or may have granted fewer scopes. Store
+      the matrix's defaults per vendor, and let a connection override them when you
+      discover the difference.
+  - title: Custom fields and the passthrough
+    body: |-
+      Most business systems let customers add their own fields. The vendor exposes them as
+      opaque keys such as `cf_17` or `custom_field_4471`. To your product, `cf_17` means
+      nothing until a customer says what it is, and it means something different for each
+      customer.
+
+      So the mapping is configuration owned by the connection:
+
+      ```json
+      {
+        "connectionId": "cinema-12",
+        "fieldMap": { "cf_17": "ageRating", "cf_31": "director" }
+      }
+      ```
+
+      The settings screen lists the vendor's custom fields, read from the vendor's metadata
+      endpoint where it has one, and lets the customer pick a target. Validate the targets
+      against your own list, so a typo can't invent a field. When a mapping changes, re-map
+      from the stored raw payloads rather than waiting for every record to change.
+
+      Hardcoding one customer's mapping in the adapter is the classic regression. It fixes
+      the customer who complained, passes their test, and writes their meaning onto every
+      other customer of that vendor. The test that catches it maps the same record under
+      two different connections.
+
+      A passthrough is the last escape hatch: a raw request through the connection's
+      credentials to any vendor endpoint. It must be scoped to the caller's own connection,
+      logged, and rate limited like any other call. Treat its replies as untouched vendor
+      data: nothing downstream should depend on their shape.
+pitfalls:
+  - '**Defaulting a missing value.** `?? 0` or `?? false` turns "unknown" into a claim. Make the field nullable and let the page decide.'
+  - '**Modelling one vendor and calling it common.** The first vendor''s names and quirks become the model, and the second vendor is forced into them. Design from the product''s needs and check every vendor.'
+  - '**Ignoring a filter the vendor can''t apply.** The caller believes it got a delta and skips work it needed. Throw, or emulate it only when you really can.'
+  - '**A capability list kept apart from the adapters.** It drifts from the code. Expose capabilities through the interface and test them in the contract suite.'
+  - '**Hardcoding one customer''s custom field.** It writes that customer''s meaning onto everyone else. Put the mapping in the connection''s settings.'
+  - '**Dropping the raw payload.** A new model field then means re-fetching every record from the vendor. Store it, with the same retention rules as the rest.'
+verify:
+  - lens: breaks
+    check: Map the same vendor record under two connections with different field maps, and confirm each gets only its own custom fields.
+  - lens: breaks
+    check: Ask each adapter for every capability its matrix marks false, and confirm it throws instead of returning a weaker result.
+  - lens: tests
+    check: Run one shared contract suite against every adapter, skipping per capability, so a new adapter proves itself before it ships.
+  - lens: confuses
+    check: Document each nullable field with which vendors fill it, so nobody reads `null` as zero or as a bug.
+  - lens: leaks
+    check: Scope the passthrough to the caller's own connection and log each call, so it can't reach another customer's vendor account.
+interview:
+  - question: You need to integrate with five similar vendors. How do you structure the code?
+    answer: >-
+      One interface for what the product needs, one adapter per vendor behind it, and a
+      common data model the adapters return. Everything outside the adapters, from pages to
+      sync jobs, talks only to the interface. Next to the adapters I'd keep a typed
+      capability matrix, exposed through the interface, so the sync can choose delta or full
+      and the UI can hide features a vendor lacks. Each record keeps its raw payload, and
+      custom fields are mapped per connection in settings. A shared contract test suite runs
+      against every adapter and skips per capability. The trade-off is upfront design and a
+      model that's a compromise, but adding the sixth vendor becomes one adapter and one row
+      in the matrix.
+  - question: Lowest common denominator or superset for a unified data model?
+    answer: >-
+      Usually a superset with nullable fields, scoped by what the product actually needs. The
+      lowest common denominator is tempting because nothing is ever missing, but the product
+      can then only offer what the weakest vendor supports, and one limited vendor drags
+      everyone down. A superset keeps each vendor's useful data, and `null` honestly says
+      "this vendor doesn't provide it". The capability matrix tells the UI when to hide a
+      field rather than show it empty. The cost is null handling everywhere, which strict
+      types enforce. I wouldn't model every field every vendor has: the rare ones stay in the
+      raw payload, reachable if needed, without bloating the model.
+  - question: A customer asks you to support a field only their vendor setup has. What do you do?
+    answer: >-
+      I'd make it configuration, not code. If it's one of the vendor's custom fields, the
+      customer maps it in their connection's settings to a custom field in our product, and
+      the adapter copies values through that map. Nothing in the adapter names their field,
+      because the same key means something else for another customer. If it's a vendor
+      feature our model doesn't cover at all, a scoped passthrough lets them call it
+      directly with their own credentials. If many customers ask for the same thing, that's
+      the signal to promote it into the common model, re-mapping existing records from the
+      stored raw payloads.

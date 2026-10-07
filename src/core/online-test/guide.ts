@@ -1,4 +1,4 @@
-import { z } from 'zod';
+import * as z from '@/core/zod';
 
 /*
  * Guided mode (docs/ONLINE-TEST.md, "Guided mode"): a coach beside the IDE that walks one

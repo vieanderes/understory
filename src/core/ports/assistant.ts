@@ -63,6 +63,18 @@ export const NAVIGATION_RULES = [
   'When asked what to do next, use the learner’s situation in the guide and link the one next step.',
 ].join('\n');
 
+/**
+ * Away from the planner Scout does not plan in the chat: it offers the planner, where the
+ * path is drafted, checked against the course and saved. The block is drawn as a button.
+ */
+export const PLAN_OFFER = [
+  'When the learner asks what to learn, which path to take, or how to plan their learning (for a role, interviews, a project, a test, or just time they have), answer in a sentence or two, say that you can plan a path with them in the path planner, and end the reply with this block, the brief being one line of what they told you:',
+  '```scout-plan',
+  '{"brief": "Backend interviews in six weeks, Python, about 5 hours a week"}',
+  '```',
+  'Use it at most once per reply, and only for planning, never for a single lesson or page.',
+].join('\n');
+
 function appSection(context: AssistantContext): string[] {
   return context.app ? ['', 'About Understory:', context.app] : [];
 }
@@ -141,6 +153,7 @@ function tutorSystemPrompt(context: AssistantContext): string {
       ? [
           'If the learner asks about the app rather than the lesson, answer as its guide.',
           NAVIGATION_RULES,
+          PLAN_OFFER,
         ]
       : []),
     '',
@@ -166,6 +179,7 @@ function guideSystemPrompt(context: AssistantContext): string {
     'Answer in two or three sentences, then name one concrete next step. Offer more rather than writing an essay.',
     'Use Markdown sparingly. Use British English.',
     NAVIGATION_RULES,
+    PLAN_OFFER,
     '',
     `Page: ${context.taskTitle}`,
     ...(context.statement ? ['On screen now:', context.statement] : []),

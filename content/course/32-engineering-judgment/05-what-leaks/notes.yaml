@@ -1,0 +1,151 @@
+summary: >-
+  Most data leaks are not break-ins. A customer's email ends up in an analytics tool run by
+  another company. A card token lands in an error message that reaches the browser and an
+  error tracker. A profile is cached by a CDN and served to the next visitor. Nobody
+  attacked anything; the data walked out through a side door.
+
+
+  The skill that finds these is **tracing a field**: pick one sensitive value, note where it
+  enters, and follow it to every place it is stored, sent or printed. The usual places, the
+  **sinks**, are few: logs, error messages, URLs, caches, analytics events and model
+  prompts. Each holds a copy with more readers, or a longer life, than the database the data
+  was meant to live in.
+
+
+  Closing a leak works best at the sink, where one fix protects every caller. Proving there
+  is no leak works best with canaries: fake, unique values planted in a test, then searched
+  for in every output.
+remember:
+  - Trace one sensitive field at a time, from where it enters to every place it is stored, sent or printed.
+  - The usual sinks are logs, error messages, URLs, caches, analytics events and model prompts.
+  - Every copy of a value has its own readers and its own lifetime, usually wider and longer than the database's.
+  - "A reply with personal data must say `Cache-Control: private` or `no-store`, because `public` lets a shared cache serve it to others."
+  - Error messages go to the browser and to trackers, so they carry a generic sentence while the detail goes to a log with an id, not the record.
+  - Send analytics and model providers only the fields the task needs, never a whole record.
+  - Fix leaks at the sink, with a logger, error handler or analytics wrapper that only lets known-safe fields through.
+  - A canary test plants fake unique values and fails if any output contains them, raw or encoded.
+sections:
+  - title: Tracing one field, end to end
+    body: |-
+      Take a cinema customer's email and walk it through the system. For each place, ask who
+      can read the copy and how long it lives.
+
+      - **Enters:** the sign-up form, as JSON in a request body.
+      - **Stored:** the `users` table. Read by the app and by anyone with database access. Lives until the account is deleted, plus however long backups are kept.
+      - **Printed:** a `console.log` in the sign-up handler. Read by everyone with log access, often the whole engineering team. Lives for the log retention period, which nobody remembers setting.
+      - **Sent:** the analytics event, now at another company under their retention terms. The welcome email, through an email provider. A support-ticket summary, through a model provider.
+      - **Exposed by URL:** a "manage booking" link of the form `/booking?email=...`, now in access logs and browser history.
+
+      Five copies, each with a different audience and lifetime, for one field. When someone
+      asks to have their data deleted, every one of those copies is part of the answer. That
+      is why data minimisation at each sink matters as much as protecting the database.
+
+      Doing this for every field would take forever. Do it for the few that hurt most when
+      leaked: passwords and tokens, payment details, contact details, anything about health
+      or children, and free text that customers type, which can contain all of the above.
+  - title: Fixing at the sink, not at every call site
+    body: |-
+      Telling every developer "don't log the email" fails the first time someone forgets.
+      A wrapper at the sink protects every caller, including the ones not written yet.
+
+      ```js
+      const ALLOWED = new Set(["userId", "plan", "showId", "seats"]);
+
+      function track(event, fields) {
+        const safe = Object.fromEntries(
+          Object.entries(fields).filter(([key]) => ALLOWED.has(key)),
+        );
+        return { event, ...safe }; // in real code: send it to the analytics tool
+      }
+
+      console.log(track("signed_up", { userId: 5531, email: "ana@example.com", plan: "film-club" }));
+      // { event: 'signed_up', userId: 5531, plan: 'film-club' }
+      ```
+
+      An allowlist is stronger than a blocklist here. A blocklist of `email` and `phone`
+      misses the field someone adds next month, called `contact`. An allowlist drops
+      anything nobody has approved.
+
+      The same idea applies to each sink. The error handler sends the browser a generic
+      message with a reference id, and puts the detail in the log under that id. The logger
+      masks known secret paths, as the logging lesson built. Personal API replies set
+      `Cache-Control: private, no-store` in one middleware rather than per route. Prompts are
+      built by one function that takes named fields, never a whole record.
+
+      Each of these is a small piece of code in one place. Together they turn "remember not
+      to leak" into "it can't leak through here".
+  - title: Canary tests
+    body: |-
+      Reviews find leaks you think to look for. A canary test finds the ones you didn't. The
+      test signs up a customer whose details are fake and unique, runs the flow, and searches
+      everything the system emitted.
+
+      ```js
+      const canaries = ["ana.canary@example.com", "tok_canary_7Q2"];
+      const emitted = [
+        { name: "log", text: "signup ok user=5531" },
+        { name: "url", text: "GET /confirm?email=ana.canary%40example.com 302" },
+        { name: "analytics", text: '{"event":"signed_up","userId":5531}' },
+      ];
+
+      const needles = canaries.flatMap((c) => [c, encodeURIComponent(c)]).map((n) => n.toLowerCase());
+      const leaks = emitted.filter((sink) => needles.some((n) => sink.text.toLowerCase().includes(n)));
+
+      console.log(leaks.map((sink) => sink.name)); // [ 'url' ]
+      ```
+
+      In a real suite, the logs come from a logger that writes to an array during tests, the
+      URLs from the test server's request log, and analytics and prompts from fakes that
+      record what they were sent. The search runs after every flow that touches personal
+      data, and any match fails the build.
+
+      The limits are worth knowing. A canary is found only in the encodings you search for,
+      so add base64 or a hash if your system uses them. It is found only on paths the test
+      runs, so a canary test complements tracing by hand rather than replacing it.
+pitfalls:
+  - '**Masking by key name only.** A value can leak under any name, inside a message string or a URL. Trace values, not just keys, and test with canaries.'
+  - '**Putting a whole record into a message, event or prompt.** `JSON.stringify(customer)` copies every field, including ones added later. Name the fields you send.'
+  - '**Marking personal replies `public`.** A shared cache can then hand one person''s data to the next. Set `private` or `no-store` on anything personal.'
+  - '**Secrets and emails in query strings.** Access logs, proxies and browser history keep full URLs. Send them in a `POST` body or a header.'
+  - '**Trusting the error tracker or analytics vendor to scrub.** Their defaults may not match your data. Remove what they shouldn''t see before it leaves your code.'
+verify:
+  - lens: leaks
+    check: No log line, error message or analytics event is built from a whole record, only from fields named one by one.
+  - lens: leaks
+    check: Every reply containing personal data sets `Cache-Control` to `private` or `no-store`, never `public`.
+  - lens: leaks
+    check: Tokens, emails and other personal values never appear in a URL's path or query string.
+  - lens: leaks
+    check: Prompts and analytics events receive only the fields the task needs, through one function with an allowlist.
+  - lens: tests
+    check: A canary test plants fake unique values and searches logs, errors, URLs, analytics and prompts after each flow that handles personal data.
+interview:
+  - question: How would you find out whether a service leaks personal data?
+    answer: >-
+      I'd trace the sensitive fields, then prove it with a test. Tracing means taking one
+      field, such as an email, and following it from where it enters to every place it is
+      stored, sent or printed: the database, logs, error messages, URLs, caches, analytics
+      and any model prompts. For each copy I'd ask who can read it and how long it lives. Then
+      I'd add a canary test: sign up a user with fake unique values, run the main flows, and
+      search everything emitted for those values, including URL-encoded forms. Any match fails
+      the build. The trade-off is that a canary test only covers the paths it exercises, so
+      the manual trace still matters for rarely used paths.
+  - question: Why shouldn't an API return detailed error messages to the client?
+    answer: >-
+      Because error messages travel further than people expect. They reach the browser, the
+      user's screenshots, support tickets and error trackers, and they often contain whatever
+      the developer had to hand, such as a whole record or a SQL fragment. That can expose
+      personal data or details an attacker can use. The pattern I use is a generic message and
+      a reference id for the client, and the full detail in the server log under the same id,
+      with only the identifiers needed, not the record. Support can then find the exact
+      failure from the id without the message carrying anything sensitive.
+  - question: What are the risks of sending user data to a third-party AI model, and how do you reduce them?
+    answer: >-
+      The data leaves your control. The provider may keep requests for some period under its
+      terms, staff or systems there may process them, and anything in the prompt can surface
+      in logs on either side. The risk grows when code sends whole records, or free text that
+      customers typed, which often contains addresses, phone numbers or health details.
+      I reduce it by building prompts from named fields the task needs, never a whole record,
+      by masking obvious identifiers in free text before sending, and by checking the
+      provider's retention and data-processing terms. A canary test that inspects what the
+      fake model client received catches regressions when someone later adds a field.

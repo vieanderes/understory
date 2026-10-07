@@ -1,0 +1,281 @@
+id: integrations.full-and-delta-sync
+title: Copying data you don't own
+objective: Choose between full and delta sync, take the watermark at sync start with an overlap window, and detect changes by a stable hash.
+level: advanced
+minutes: 10
+concepts: [integrations.full-vs-delta, integrations.watermarks, integrations.overlap-window, integrations.change-hashing]
+prerequisites: [integrations.paging-through, scale.cron, db.constraints]
+opening:
+  text: >-
+    You'll keep a copy of a vendor's data in step with the original, night after night. You'll
+    copy only what changed, and never lose an edit made while the sync was running.
+
+steps:
+  - type: prose
+    id: ask-or-copy
+    body: >-
+      A plant nursery shows its supplier's stock and prices. It can ask the supplier on every
+      page view: **pass-through**. That's always fresh, but slow, rate-limited, and down when
+      they are.
+
+
+      Or it copies the data into its own database on a schedule. A **full sync** reads
+      everything each time. A **delta sync** reads only what changed since last time.
+
+  - type: multiple-choice
+    id: pick-full-sync
+    concept: integrations.full-vs-delta
+    difficulty: 1
+    question: The supplier has 800 plants and no way to filter by change time. How do you stay fresh?
+    choices:
+      - text: Read all 800 each night, a full sync
+        correct: true
+        feedback: >-
+          Right. Without a change filter, reading everything is the only way. 800 is cheap.
+      - text: Ask for plants changed since last night
+        feedback: >-
+          That's a delta sync. It needs a filter the supplier doesn't offer.
+      - text: Copy them once, then keep that copy
+        feedback: >-
+          Prices and stock change daily. A copy nobody refreshes is wrong by Tuesday.
+
+  - type: predict-output
+    id: predict-watermark-at-end
+    concept: integrations.watermarks
+    difficulty: 2
+    language: ts
+    code: |
+      // Nightly delta sync. The vendor pages through plants in id order.
+      const plants = vendor.plantsChangedSince(watermark); // starts at 02:00
+      for await (const plant of plants) await upsertPlant(plant);
+      await saveWatermark(new Date());                     // 02:20
+    question: At 02:05 a fern's price changes, on a page already read. When does your copy get it?
+    choices:
+      - text: Never, unless the fern changes again
+        correct: true
+        feedback: >-
+          Yes. Tonight passed it, and tomorrow asks from 02:20. The edit fell between.
+      - text: In tomorrow night's sync
+        feedback: >-
+          Tomorrow asks for changes since 02:20. The 02:05 edit is older, so it's skipped.
+      - text: Later tonight, in the same run
+        feedback: >-
+          The pages go in id order, and the fern's page is behind us. Nothing goes back.
+
+  - type: prose
+    id: start-and-overlap
+    body: >-
+      So read the clock **before** the first request, and save that time once the run
+      succeeds. In Scheduled jobs you saved `now` for the same reason.
+
+
+      Then reach back a little further: an **overlap window**. The vendor's clock may differ
+      from yours, and a row can commit seconds after its `updated_at` was stamped. Ask from
+      a few minutes early, and let the upsert absorb repeats.
+
+  - type: fill-blank
+    id: fill-watermark-overlap
+    concept: integrations.overlap-window
+    difficulty: 3
+    language: ts
+    prompt: >-
+      Take the watermark at the start, and ask from five minutes before the last one. Then save
+      the right time at the end. Fill the gaps.
+    template: |
+      const OVERLAP_MS = 5 * 60_000;
+
+      const startedAt = {{1}};
+      const since = new Date(watermark.getTime() - {{2}});
+      for await (const plant of vendor.plantsChangedSince(since)) {
+        await upsertPlant(plant);
+      }
+      await saveWatermark({{3}});
+    blanks:
+      - key: '1'
+        answer: new Date()
+      - key: '2'
+        answer: OVERLAP_MS
+      - key: '3'
+        answer: startedAt
+    bank: [new Date(), OVERLAP_MS, startedAt, watermark, since, '0']
+
+  - type: prose
+    id: hash-to-skip
+    body: >-
+      The overlap, and every full sync, re-reads plants that haven't changed. Rewriting them
+      costs writes, and fires your own "plant changed" events for nothing.
+
+
+      So store a **hash** of each record: a short fingerprint of its content. Same content,
+      same hash. Hash the fields you store, with keys sorted. `JSON.stringify` keeps whatever
+      order the keys arrived in.
+
+  - type: ai-review
+    id: review-hash-raw-payload
+    concept: integrations.change-hashing
+    difficulty: 3
+    language: ts
+    request: Skip the write when a synced plant hasn't changed.
+    flawClass: performance
+    code: |
+      async function syncPlant(raw: VendorPlant): Promise<void> {
+        const hash = sha256(canonical(raw));
+        if ((await db.plantHash(raw.id)) === hash) return;
+        await db.upsertPlant(toPlant(raw), hash);
+        await events.publish("plant.changed", { id: raw.id });
+      }
+    prompt: >-
+      Tested on fixture files: an unchanged plant was skipped. In production, every night
+      rewrites all 50,000 plants. Each vendor record carries a `served_at` time. Tap the line
+      at fault.
+    lines: [2]
+    reasons:
+      - text: It hashes the raw record, `served_at` and all
+        correct: true
+        feedback: >-
+          Yes. That field changes on every request. Hash the normalised plant instead.
+      - text: SHA-256 is too slow for 50,000 plants
+        feedback: >-
+          Hashing 50,000 small records takes well under a second. The writes are the cost.
+      - text: The hash check belongs after the upsert
+        feedback: >-
+          Then every plant is written before the check. The skip has to come first.
+    fix: |
+      const plant = toPlant(raw);
+      const hash = sha256(canonical(plant));
+    verify:
+      question: Which test would have caught this?
+      choices:
+        - text: One plant fetched twice, with a new `served_at`
+          correct: true
+          feedback: >-
+            That's production. Nothing real changed, so it should write nothing.
+        - text: A plant whose price changed
+          feedback: >-
+            It's written either way. The flaw is writing plants that didn't change.
+        - text: The same fixture file synced twice
+          feedback: >-
+            A file never changes its `served_at`, so the hash matches and the test passes.
+
+  - type: code-challenge
+    id: write-detect-changes
+    concept: integrations.change-hashing
+    difficulty: 4
+    language: ts
+    editable: '19-27'
+    prompt: >-
+      Write `canonical(value)`: the same JSON text whatever order object keys arrive in. Sort
+      keys at every level, keep array order, and let `JSON.stringify` write keys and plain
+      values.
+
+
+      Then write `detectChanges(stored, records)`. `stored` maps an id to last night's hash.
+      Hash each record's `data` with `fnv1a(canonical(data))`. Return `{ changed, hashes }`:
+      the ids that are new or whose hash differs, and a map of every record's new hash. For
+      example, `{ price: 450, name: "Fern" }` and `{ name: "Fern", price: 450 }` aren't a
+      change.
+    hints:
+      - '`canonical` calls itself: once for each array item, and once for each value of an object.'
+      - For an object, `Object.keys(value).sort()` gives a stable order. Then build `"key":value` pairs yourself.
+      - Start with arrays. Map each item through `canonical`, join with commas, and wrap the result in `[` and `]`.
+
+  - type: explain-back
+    id: defend-delta-plus-full
+    concept: integrations.full-vs-delta
+    difficulty: 4
+    audience: interviewer
+    kind: decide
+    prompt: >-
+      An interviewer asks: a supplier has 2 million products, and about 1% change each day.
+      Full sync or delta? Defend your choice and its trade-off.
+    rubric:
+      - A nightly delta reads about 20,000 records instead of 2 million, from a start watermark with an overlap.
+      - A delta can't see deletions or edits it missed, so a slower full sync reconciles now and then.
+      - The trade-off is two code paths and trust in the vendor's `updated_at`, against cost and rate limits.
+    modelAnswer: >-
+      Both. Nightly, a delta sync reads the 20,000 changed products, not 2 million. Its
+      watermark is the start time, and it asks from a few minutes early. But a delta trusts the
+      vendor's `updated_at`, and it can't see deletions. So a weekly full sync reads
+      everything, catches what the delta missed, and finds what disappeared. Hashes keep both
+      from rewriting unchanged rows. The cost is two code paths, which is cheaper than 2
+      million reads a night.
+
+recap:
+  - Pick pass-through, full or delta by size, freshness and what the vendor can filter.
+  - Save the time the sync started as the watermark, and ask from a few minutes earlier.
+  - Hash each normalised record with sorted keys, and write only when the hash changes.
+
+recall:
+  - id: card-watermark-start
+    concept: integrations.watermarks
+    front: Why is a delta sync's watermark the time it started, not the time it finished?
+    back: >-
+      Changes made during the run, on pages already read, are newer than the start. Saving the
+      end time would skip them for good.
+  - id: card-overlap
+    concept: integrations.overlap-window
+    front: What does an overlap window protect against?
+    back: >-
+      Clock differences between you and the vendor, and rows that commit after their
+      `updated_at` was stamped. Asking from a few minutes early catches them.
+  - id: card-stable-hash
+    concept: integrations.change-hashing
+    front: Why sort keys before hashing a record?
+    back: >-
+      `JSON.stringify` keeps insertion order, so the same data in a new key order would hash
+      differently and look changed.
+  - id: card-full-vs-delta
+    concept: integrations.full-vs-delta
+    front: What can a full sync see that a delta sync can't?
+    back: >-
+      Records that disappeared, and changes the delta missed. That's why a delta usually runs
+      alongside an occasional full sync.
+
+references:
+  - kind: rfc
+    title: 'RFC 8785: JSON Canonicalization Scheme (JCS)'
+    authors: A. Rundgren, B. Jordan, S. Erdtman
+    year: 2020
+    venue: IETF
+    url: https://www.rfc-editor.org/rfc/rfc8785
+    note: A full spec for a canonical JSON text, including key sorting and number output.
+    primary: true
+    verified: false
+  - kind: docs
+    title: Date/Time Functions and Operators
+    authors: PostgreSQL Global Development Group
+    venue: PostgreSQL documentation
+    url: https://www.postgresql.org/docs/current/functions-datetime.html
+    note: '`now()` returns the start time of the current transaction, which is why rows can commit late.'
+    primary: true
+    verified: false
+  - kind: book
+    title: Designing Data-Intensive Applications
+    authors: Martin Kleppmann
+    year: 2017
+    venue: O'Reilly Media
+    note: Derived data and change data capture, the bigger picture behind keeping a copy in step.
+    verified: false
+
+deepDive: >-
+  Whose clock is the watermark? The filter compares against the vendor's `updated_at`, so
+  your server's clock is only an estimate. Two safer sources: the largest `updated_at` you
+  read, minus the overlap, or the `Date` header of the vendor's first response. Both measure
+  time the way the filter does.
+
+
+  Late commits are real. In PostgreSQL, `now()` returns the start of the current transaction.
+  A transaction that begins at 01:59:58 and commits at 02:00:03 stamps rows with 01:59:58. A
+  sync that read at 02:00:00 couldn't see them yet, and the next one asks from 02:00:00. The
+  overlap is what saves them.
+
+
+  `JSON.stringify` has one more ordering quirk. Integer-like keys always come first, in
+  ascending order: `{ b: 1, 2: "x", 1: "y" }` prints as `{"1":"y","2":"x","b":1}`. Sorting
+  every key yourself removes the surprise. RFC 8785 goes further: it fixes how numbers are
+  written and sorts keys by UTF-16 code units, so two languages produce the same bytes.
+
+
+  Store the hash in a column beside the record. Then "has it changed?" is one indexed read,
+  and the upsert can carry the check itself: `ON CONFLICT (id) DO UPDATE ... WHERE
+  plants.hash IS DISTINCT FROM EXCLUDED.hash`.

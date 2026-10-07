@@ -3,16 +3,26 @@
 import { Check, ChevronDown, Minus, X } from 'lucide-react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { Fragment, useEffect, useId, useState, type ReactNode } from 'react';
+import { Fragment, useEffect, useId, useMemo, useState, type ReactNode } from 'react';
 import { ActionBar } from '@/components/layout/ActionBar';
 import { Button } from '@/components/ui/Button';
 import { InlineCode } from '@/components/ui/InlineCode';
 import { formatMinutes } from '@/core/insight';
+import { draftFromBlock, draftLessonIds, renameDraft, type Draft } from '@/core/planner/draft';
+import type { PlannerCourse } from '@/core/planner/course';
 import { cleanPathName, MAX_NAME } from '@/core/planner/name';
 import { coverage, toggleGroup, type Coverage } from '@/core/profile';
 import { useProgress, useStore } from '@/features/store/StoreProvider';
 import { ScoutMark } from '@/features/tutor/ScoutMark';
-import { openScoutPlanner } from '@/features/tutor/planner/planner-store';
+import {
+  draftFromOwnPath,
+  draftKey,
+  editDraft,
+  openScoutPlanner,
+  startPlanning,
+  usePlanner,
+} from '@/features/tutor/planner/planner-store';
+import { useSavePlannedPath } from '@/features/tutor/planner/useSavePlannedPath';
 import { dockTutorTrigger } from '@/features/tutor/tutor-store';
 import { cn } from '@/lib/cn';
 import {
@@ -358,24 +368,90 @@ export function PathBuilder({ tree }: { tree: CourseTree }) {
   const existing =
     status === 'ready' && asked && isOwnPathId(asked) ? state.ownPaths.get(asked) : undefined;
   const saved = new Set(existing?.lessonIds ?? []);
-  const chosen = edited ?? saved;
-  const hasPath = existing !== undefined;
-  const name = named ?? existing?.name ?? 'My path';
   const nameId = useId();
   // The save bar owns the bottom edge, so Scout opens from the header instead of the corner.
   useEffect(() => dockTutorTrigger(), []);
 
+  // Ticking by hand and planning with Scout edit one draft. While a Scout session belongs to
+  // the path on this page, the ticks are its draft: Scout's changes show here, and a tick
+  // here is a change Scout sees with the next question.
+  const planner = usePlanner();
+  const { save: savePlanned, saving: savingPlanned } = useSavePlannedPath();
+  const lookup = useMemo(() => treeCourse(tree), [tree]);
+  const scoutDraft = useMemo(
+    () =>
+      planner.edited ?? (planner.block ? draftFromBlock(planner.block, lookup).draft : undefined),
+    [planner.edited, planner.block, lookup],
+  );
+  const linked = status === 'ready' && scoutDraft !== undefined && planner.pathId === existing?.id;
+
+  const chosen = linked ? new Set(draftLessonIds(scoutDraft)) : (edited ?? saved);
+  const name = named ?? (linked ? scoutDraft.name : (existing?.name ?? 'My path'));
+
   const sum = totals(tree, chosen);
   const line = totalsLine(sum.lessons, sum.minutes);
   const everything = allLessonIds(tree);
-  const dirty =
-    (edited !== undefined && !sameChoice(edited, saved)) ||
-    (named !== undefined && named.trim() !== (existing?.name ?? '') && sum.lessons > 0);
-  const removing = sum.lessons === 0 && hasPath;
+  const dirty = linked
+    ? sum.lessons > 0 && (named !== undefined || planner.savedAs !== draftKey(scoutDraft))
+    : (edited !== undefined && !sameChoice(edited, saved)) ||
+      (named !== undefined && named.trim() !== (existing?.name ?? '') && sum.lessons > 0);
+  const removing = sum.lessons === 0 && existing !== undefined;
 
-  const toggle: Toggle = (ids) => setEdited(toggleGroup(chosen, ids));
+  const setChosen = (next: ReadonlySet<string>) => {
+    if (!linked) return setEdited(new Set(next));
+    const ids = totals(tree, next).lessonIds;
+    editDraft({ ...scoutDraft, stages: restageDraft(scoutDraft.stages, ids) });
+  };
+  const toggle: Toggle = (ids) => setChosen(toggleGroup(chosen, ids));
+
+  const commitName = () => {
+    if (linked && named !== undefined) {
+      editDraft(renameDraft(scoutDraft, named));
+      setNamed(undefined);
+    }
+  };
+
+  /**
+   * Scout plans from what the page shows: the path being edited, or the ticks so far. The
+   * builder's own button carries on a conversation about this path; "Plan again with Scout"
+   * from a path's page (`fresh`) starts a new one about it.
+   */
+  const planWithScout = (fresh = false) => {
+    if (fresh || !linked) {
+      const draft = existing?.stages
+        ? draftFromOwnPath(existing)
+        : chosen.size > 0
+          ? chapterDraft(tree, chosen, cleanPathName(name), existing?.summary)
+          : undefined;
+      startPlanning(draft, existing);
+    }
+    openScoutPlanner();
+  };
+
+  // "Plan again with Scout" and Scout's own offer arrive as ?plan=1 and ?plan=new.
+  useEffect(() => {
+    if (status !== 'ready') return;
+    const params = new URLSearchParams(window.location.search);
+    const plan = params.get('plan');
+    if (!plan) return;
+    params.delete('plan');
+    const rest = params.toString();
+    window.history.replaceState(null, '', `${window.location.pathname}${rest ? `?${rest}` : ''}`);
+    if (plan === 'new') {
+      startPlanning(undefined);
+      openScoutPlanner();
+    } else planWithScout(existing !== undefined);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- once, when the page has read the progress
+  }, [status]);
 
   async function save() {
+    if (linked && sum.lessons > 0) {
+      const draft = named !== undefined ? renameDraft(scoutDraft, named) : scoutDraft;
+      setNamed(undefined);
+      const pathId = await savePlanned(draft);
+      router.push(`/paths?path=${pathId}`);
+      return;
+    }
     setSaving(true);
     const pathId = existing?.id ?? newOwnPathId();
     const stages = restage(existing?.stages, sum.lessonIds);
@@ -398,8 +474,8 @@ export function PathBuilder({ tree }: { tree: CourseTree }) {
     <Button
       variant="primary"
       onClick={() => void save()}
-      loading={saving}
-      disabled={!dirty || (sum.lessons === 0 && !hasPath)}
+      loading={saving || savingPlanned}
+      disabled={!dirty || (sum.lessons === 0 && existing === undefined)}
       className={cn(wide && 'w-full')}
     >
       {removing ? 'Remove this path' : 'Save path'}
@@ -422,7 +498,7 @@ export function PathBuilder({ tree }: { tree: CourseTree }) {
           <Button
             variant="quiet"
             size="md"
-            onClick={() => openScoutPlanner(existing)}
+            onClick={() => planWithScout()}
             className="text-muted hover:text-fg -mr-1"
           >
             <ScoutMark size={16} />
@@ -437,9 +513,12 @@ export function PathBuilder({ tree }: { tree: CourseTree }) {
       >
         <div className="flex flex-col gap-4 lg:col-span-8">
           <div className="flex flex-col gap-2">
-            <h1 className="t-title">{hasPath ? `Edit ${existing.name}` : 'Build your own path'}</h1>
+            <h1 className="t-title">
+              {existing ? `Edit ${existing.name}` : 'Build your own path'}
+            </h1>
             <p className="text-muted prose-measure text-lg">
-              Tick a whole part, or open it to choose chapters and single lessons.
+              Tick a whole part, or open it to choose chapters and single lessons. Or plan it with
+              Scout: say what you are learning for, and it ticks the lessons with you.
             </p>
             <div className="flex max-w-md flex-col gap-0.5">
               <label htmlFor={nameId} className="text-sm font-medium">
@@ -451,6 +530,7 @@ export function PathBuilder({ tree }: { tree: CourseTree }) {
                 value={name}
                 maxLength={MAX_NAME}
                 onChange={(event) => setNamed(event.target.value)}
+                onBlur={commitName}
                 // 16 px: iOS zooms the page when a smaller control takes focus.
                 className="border-border bg-surface rounded-control hover:border-border-strong h-5 w-full min-w-0 border px-1 text-base"
               />
@@ -460,7 +540,7 @@ export function PathBuilder({ tree }: { tree: CourseTree }) {
                 variant="quiet"
                 size="md"
                 className="disabled:bg-transparent"
-                onClick={() => setEdited(new Set(everything))}
+                onClick={() => setChosen(new Set(everything))}
                 disabled={sum.lessons === everything.length}
               >
                 Choose everything
@@ -469,7 +549,7 @@ export function PathBuilder({ tree }: { tree: CourseTree }) {
                 variant="quiet"
                 size="md"
                 className="disabled:bg-transparent"
-                onClick={() => setEdited(new Set())}
+                onClick={() => setChosen(new Set())}
                 disabled={sum.lessons === 0}
               >
                 Clear
@@ -499,4 +579,65 @@ export function PathBuilder({ tree }: { tree: CourseTree }) {
       </div>
     </div>
   );
+}
+
+/** The tree as the planner's course, enough to check Scout's lesson ids against it. */
+function treeCourse(tree: CourseTree): PlannerCourse {
+  return {
+    parts: [],
+    modules: tree.parts.flatMap((part) =>
+      part.chapters.map((chapter, number) => ({
+        id: chapter.id,
+        number,
+        title: chapter.title,
+        summary: '',
+        youCanBuild: '',
+        lessons: chapter.lessons.map((l) => ({
+          id: l.id,
+          title: l.title,
+          objective: l.objective,
+          level: 'essential' as const,
+          minutes: l.minutes,
+          prerequisites: [],
+        })),
+      })),
+    ),
+  };
+}
+
+/** Ticks as a draft for Scout: a stage per chapter, in course order. */
+function chapterDraft(
+  tree: CourseTree,
+  chosen: ReadonlySet<string>,
+  name: string,
+  summary = '',
+): Draft {
+  return {
+    name,
+    alternatives: [],
+    summary,
+    stages: tree.parts.flatMap((part) =>
+      part.chapters.flatMap((chapter) => {
+        const lessonIds = chapter.lessons.filter((l) => chosen.has(l.id)).map((l) => l.id);
+        return lessonIds.length > 0 ? [{ title: chapter.title, why: '', lessonIds }] : [];
+      }),
+    ),
+  };
+}
+
+const ADDED = 'Added lessons';
+
+/** A tick on a planned draft: lessons taken out leave their stage, new ones gather last. */
+function restageDraft(stages: Draft['stages'], lessonIds: readonly string[]): Draft['stages'] {
+  const chosen = new Set(lessonIds);
+  const kept = stages
+    .map((s) => ({ ...s, lessonIds: s.lessonIds.filter((id) => chosen.has(id)) }))
+    .filter((s) => s.lessonIds.length > 0);
+  const staged = new Set(kept.flatMap((s) => s.lessonIds));
+  const added = lessonIds.filter((id) => !staged.has(id));
+  if (added.length === 0) return kept;
+  const last = kept.at(-1);
+  if (last?.title === ADDED)
+    return [...kept.slice(0, -1), { ...last, lessonIds: [...last.lessonIds, ...added] }];
+  return [...kept, { title: ADDED, why: '', lessonIds: added }];
 }

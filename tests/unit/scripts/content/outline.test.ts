@@ -257,11 +257,16 @@ describe('the real outline', () => {
   const { outline: raw, issues } = loadOutline(REPO);
   const outline = raw?.data ?? { modules: [] };
 
-  it('is readable and holds the 30 modules and 370 lessons of docs/CURRICULUM.md', () => {
+  it('is readable and holds the 34 modules and 417 lessons of docs/CURRICULUM.md', () => {
     expect(issues).toEqual([]);
-    expect(outline.modules).toHaveLength(30);
-    expect(outline.modules.map((module) => Number(module.dir.slice(0, 2)))).toEqual([...Array(30).keys()]);
-    expect(outlineEntries(outline)).toHaveLength(370);
+    expect(outline.modules).toHaveLength(34);
+    // Folders are numbered in the order modules were added, and the file lists them in course
+    // order: Integrations follows Scale, and Agent engineering follows AI systems.
+    const numbers = outline.modules.map((module) => Number(module.dir.slice(0, 2)));
+    expect([...numbers].sort((a, b) => a - b)).toEqual([...Array(34).keys()]);
+    expect(numbers.indexOf(30)).toBe(numbers.indexOf(14) + 1);
+    expect(numbers.indexOf(31)).toBe(numbers.indexOf(21) + 1);
+    expect(outlineEntries(outline)).toHaveLength(417);
   });
 
   it('names every lesson id next to its title in docs/CURRICULUM.md, in order', () => {
@@ -270,7 +275,7 @@ describe('the real outline', () => {
     expect(listed).toEqual(outlineEntries(outline).map(({ lesson }) => lesson.id));
   });
 
-  it('weaves every cs, clean, pro and nextserver lesson, and only those, into the journey', () => {
+  it('weaves every cs, clean, pro, nextserver, judgment and explain lesson, and only those, into the journey', () => {
     const woven = outlineEntries(outline).filter(({ lesson }) => lesson.wovenAfter !== undefined);
     expect(woven.map(({ module }) => module.id)).toEqual([
       // ts.configuration needs the terminal and the checks from Tooling, so it follows them.
@@ -279,9 +284,11 @@ describe('the real outline', () => {
       ...Array(10).fill('clean'),
       ...Array(9).fill('pro'),
       ...Array(4).fill('nextserver'),
+      ...Array(11).fill('judgment'),
+      ...Array(8).fill('explain'),
     ]);
     const order = journeyOrder(outline).map(({ lesson }) => lesson.id);
-    expect(order).toHaveLength(370);
+    expect(order).toHaveLength(417);
     expect(order.indexOf('cs.complexity')).toBe(order.indexOf('js.arrays') + 1);
     expect(order.indexOf('cs.trees')).toBeLessThan(order.indexOf('db.indexes'));
     expect(order.indexOf('clean.naming')).toBe(order.indexOf('js.built-in-toolbox') + 1);
@@ -291,6 +298,12 @@ describe('the real outline', () => {
     expect(order.indexOf('clean.code-review')).toBe(order.indexOf('cloud.progressive-delivery') + 1);
     expect(order.indexOf('nextserver.route-handlers')).toBe(order.indexOf('backend.validation') + 1);
     expect(order.indexOf('nextserver.deploying')).toBe(order.indexOf('cloud.reverse-proxies') + 1);
+    expect(order.indexOf('judgment.what-to-verify')).toBe(order.indexOf('tooling.working-with-ai') + 1);
+    expect(order.indexOf('explain.say-it-plainly')).toBe(order.indexOf('basics.small-program') + 1);
+    // A woven lesson can follow another woven lesson: the diagram talk follows the drawing.
+    expect(order.indexOf('judgment.workflows-on-paper')).toBe(order.indexOf('judgment.intents-and-priorities') + 1);
+    expect(order.indexOf('explain.talking-through-a-diagram')).toBe(order.indexOf('judgment.workflows-on-paper') + 1);
+    expect(order.indexOf('integrations.systems-you-dont-control')).toBe(order.indexOf('scale.failure-handling') + 1);
   });
 
   // A full content check, solution gate included, which takes a while on a busy machine.

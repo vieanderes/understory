@@ -1,0 +1,179 @@
+summary: >-
+  Once a customer connects a vendor through OAuth, your system holds two tokens on their
+  behalf. The access token goes on every API call and expires within hours. The refresh token
+  lasts much longer and is spent at the vendor's token endpoint to get a new access token. A
+  sync that runs for months lives or dies by how it handles that exchange.
+
+
+  Three things go wrong. Tokens expire mid-job, so refresh ahead of the deadline with a
+  margin, and still handle a `401`. Refresh tokens rotate, so each one works once, and two
+  workers refreshing the same connection at the same moment spend it twice. The loser gets
+  `invalid_grant`, and a vendor with reuse detection revokes the connection. The fix is a
+  single-flight refresh per connection: in memory for one process, with a database lock across
+  several. And access can shrink without an error, when a customer grants fewer scopes or
+  changes an API user's role, so you read what was granted and watch for sudden drops.
+
+
+  When `invalid_grant` does arrive, retrying is pointless. Mark the connection as needing
+  reconnection, stop its jobs, and ask a person at the customer to sign in again.
+remember:
+  - Turn `expires_in` into an absolute deadline when the token arrives, and refresh about a minute before it.
+  - Ask for the access token per call, not once per job, so a long job never carries a dead token.
+  - Concurrent callers for one connection share a single refresh, because a rotated refresh token works only once.
+  - An in-memory single flight protects one process, so several workers need a per-connection lock in the database.
+  - Read the stored token after taking the lock, because another worker may have refreshed while you waited.
+  - '`invalid_grant` means the grant is dead: mark the connection as needing reconnect and stop retrying.'
+  - Save the new refresh token from every refresh reply, and keep the old one only when the reply has none.
+  - Compare the granted scopes with the requested ones, because vendors may return less data without any error.
+sections:
+  - title: One refresh across many workers
+    body: |-
+      The lesson's `Map` of promises makes concurrent callers in one process share a refresh.
+      Run four worker processes and each has its own `Map`, so four refreshes can still race.
+      The lock has to live where all workers can see it, which for most systems is the
+      database row that holds the tokens.
+
+      ```sql
+      BEGIN;
+      -- Waits here if another worker holds the row.
+      SELECT refresh_token, expires_at > now() + interval '60 seconds' AS fresh
+      FROM connections WHERE id = 'gym-1' FOR UPDATE;
+      -- fresh = true: another worker refreshed while we waited. Use its token, COMMIT.
+      -- fresh = false: call the token endpoint, then:
+      UPDATE connections
+      SET access_token = $2, refresh_token = $3, expires_at = now() + make_interval(secs => $4)
+      WHERE id = $1;
+      COMMIT;
+      ```
+
+      The re-read after `FOR UPDATE` is the important part. Worker B blocks while A refreshes.
+      When B gets the row, the token is already fresh, so B uses it instead of spending A's
+      brand new refresh token.
+
+      The cost is a transaction held open across an HTTP call. Give that call a short timeout,
+      a few seconds, so a slow token endpoint can't pile up locked rows. Keep the in-memory
+      single flight in front of the database lock, so a hundred callers in one process make one
+      trip to the database, not a hundred.
+
+      If the save fails after the vendor answered, the new refresh token is lost and the old
+      one is already dead. Retry the save before anything else, and alert if it can't be
+      written, because that connection will need a reconnect.
+  - title: Reading the token reply, scopes included
+    body: |-
+      A token reply is a vendor reply like any other, so parse it. RFC 6749 makes
+      `expires_in` recommended, not required, and `refresh_token` optional. It also says the
+      server may leave out `scope` when it granted exactly what you asked for, and must
+      include it when it granted something different.
+
+      ```ts
+      import { z } from 'zod';
+
+      const TokenReply = z.object({
+        access_token: z.string().min(1),
+        token_type: z.string(),
+        expires_in: z.number().int().positive().optional(),
+        refresh_token: z.string().optional(),
+        scope: z.string().optional(),
+      });
+
+      export function readTokenReply(body: unknown, requested: string[], now: number, defaultLifetimeS = 3600) {
+        const reply = TokenReply.parse(body);
+        // RFC 6749: scope may be left out when it equals what was requested.
+        const granted = reply.scope ? reply.scope.split(' ') : requested;
+        const missing = requested.filter((scope) => !granted.includes(scope));
+        return {
+          accessToken: reply.access_token,
+          refreshToken: reply.refresh_token,
+          expiresAt: now + (reply.expires_in ?? defaultLifetimeS) * 1000,
+          missing,
+        };
+      }
+      ```
+
+      Given a reply granting `bookings.read` when you asked for `bookings.read payments.read`,
+      it returns `missing: [ 'payments.read' ]`. Store that list with the connection and show
+      it in your product: "Payments aren't shared from your booking system". That turns a
+      silent gap into something the customer can fix.
+
+      The default lifetime is a guess for vendors that leave out `expires_in`. Read their docs
+      for the real number, and rely on the `401` path for the rest.
+  - title: Machine-to-machine tokens and API users
+    body: |-
+      Some integrations have no user to sign in. Your own worker calls a vendor as itself,
+      with the **client credentials** grant: it sends its client id and secret, and gets an
+      access token.
+
+      ```ts
+      export async function clientCredentialsToken(tokenUrl: string, clientId: string, clientSecret: string, scope: string) {
+        const response = await fetch(tokenUrl, {
+          method: 'POST',
+          headers: {
+            Authorization: `Basic ${btoa(`${encodeURIComponent(clientId)}:${encodeURIComponent(clientSecret)}`)}`,
+            'Content-Type': 'application/x-www-form-urlencoded',
+          },
+          body: new URLSearchParams({ grant_type: 'client_credentials', scope }),
+          signal: AbortSignal.timeout(10_000),
+        });
+        if (!response.ok) throw new Error(`token endpoint answered ${response.status}`);
+        return response.json();
+      }
+      ```
+
+      Against a local test server it sent `grant_type=client_credentials&scope=bookings.read`
+      with a Basic header, and got back an access token with `expires_in: 3600`. RFC 6749 says
+      such a reply should not include a refresh token. When the token expires, you ask again
+      with the same credentials. The proactive margin and the single flight still apply,
+      because a hundred jobs asking at once is a hundred calls to a rate-limited endpoint.
+
+      Other vendors skip OAuth and have the customer's admin create an **API user** with a
+      role and a key. Nothing tells you when that role changes. Guard it the way the next
+      lessons do: compare each sync's record count with the last one, and treat a sudden
+      large drop as a permissions problem until proven otherwise.
+pitfalls:
+  - '**Fetching the token once at the start of a long job.** It expires partway through and every later call fails with `401`. Ask for the token per call and let the cache decide.'
+  - '**Refreshing only after a `401`.** Every expiry costs a failed call and a retry, and a batch of parallel calls all fail together and all refresh together. Refresh ahead of the deadline.'
+  - '**Storing the in-flight promise after awaiting the refresh.** Every concurrent caller starts its own refresh before the first one is shared. Store the promise before any `await`.'
+  - '**Trusting an in-memory lock with several workers.** Each process has its own `Map`. Lock the connection row in the database, and re-read the token once the lock is held.'
+  - '**Retrying on `invalid_grant`.** The refresh token is dead and retries only add noise or trip reuse detection. Mark the connection for reconnect and tell the customer.'
+  - '**Dropping the rotated refresh token.** Saving only the new access token leaves a dead refresh token for the next refresh. Save every field the reply returns.'
+verify:
+  - lens: breaks
+    check: Start several worker processes refreshing one expired connection at once, and confirm the vendor sees exactly one refresh.
+  - lens: breaks
+    check: Make the token endpoint answer `invalid_grant`, and confirm the connection is marked for reconnect and its jobs stop retrying.
+  - lens: tests
+    check: Use an injected clock to move time into the refresh margin, and assert a refresh happens before any call returns `401`.
+  - lens: leaks
+    check: Search logs and error reports for access and refresh tokens, which must never appear, including inside logged request headers.
+  - lens: confuses
+    check: Show the connection's missing scopes and reconnect state in the product, so support can explain an empty sync without reading logs.
+interview:
+  - question: How do you handle OAuth token refresh in a system with many concurrent workers?
+    answer: >-
+      Refresh proactively and make sure only one refresh per connection runs at a time. I
+      store the access token's absolute expiry and refresh about a minute early, and still
+      treat a `401` as "refresh once and retry once". Within a process, callers share one
+      in-flight promise per connection. Across processes, the refresh runs under a lock on the
+      connection's row, and the worker re-reads the token after taking it, because someone else
+      may have refreshed meanwhile. That matters because refresh tokens usually rotate: a token
+      spent twice gives the loser `invalid_grant`, and with reuse detection the vendor revokes
+      the whole connection. The trade-off is a short transaction held across an HTTP call, so
+      the token call gets a tight timeout.
+  - question: What does `invalid_grant` mean on a refresh, and what should the client do?
+    answer: >-
+      It means the refresh token can't be used any more: expired, revoked, already used after
+      rotation, or the user withdrew consent. RFC 6749 groups those under one error. No retry
+      will fix it, so the client marks the connection as needing reconnection, stops scheduling
+      its jobs, and tells someone at the customer to sign in again, ideally with a clear message
+      and a reconnect button. It's also worth an alert if it happens to many connections at
+      once, because that pattern usually means a bug of ours, such as a refresh race or a
+      dropped rotated token, rather than many customers revoking access on the same night.
+  - question: A customer says the integration shows fewer records than their vendor's UI. Where do you look?
+    answer: >-
+      First at what we were granted, because silent filtering is common. I'd check the scopes
+      in the stored token reply against the ones we requested, and for vendors with API users,
+      the role assigned to ours. Many APIs return only what the token may see, with a `200` and
+      no hint. Then at the sync itself: whether the pager skipped rows at page boundaries,
+      stopped early on a capped page, or a filter such as `updated_since` excluded old records
+      we never fully loaded. The fix for the first is product as much as code: store the missing
+      scopes, show them to the customer, and alert when record counts drop sharply between runs.

@@ -197,7 +197,7 @@ test('a path stage offers practice, labs and tests, optional and with their XP',
 }) => {
   await page.goto('/paths/ai-coding-tests');
   const method = page.getByRole('region', { name: 'Try it: The method' });
-  await expect(method.getByText('Optional · recommended')).toBeVisible();
+  await expect(method.getByText('· optional, recommended')).toBeVisible();
   await expect(method.getByRole('link', { name: /Warm-up: one easy task/ })).toHaveAttribute(
     'href',
     '/practise/online-test/demo',

@@ -19,14 +19,14 @@ test('a learner chooses two paths and switches between them with tabs', async ({
   await page.getByRole('button', { name: /Start learning/ }).click();
   await expect(page.getByRole('heading', { level: 1 })).toHaveText('Start coding from zero');
   // One path: no tabs.
-  await expect(page.getByRole('navigation', { name: 'Your paths' })).toBeHidden();
+  await expect(page.getByRole('navigation', { name: 'Chosen paths' })).toBeHidden();
 
   await page.getByRole('button', { name: 'Switch path' }).click();
   const python = page.getByRole('button', { name: 'Python', exact: true });
   await python.click();
   await expect(python).toHaveAttribute('aria-pressed', 'true');
 
-  const tabs = page.getByRole('navigation', { name: 'Your paths' });
+  const tabs = page.getByRole('navigation', { name: 'Chosen paths' });
   await expect(tabs.getByRole('link')).toHaveCount(2);
   await expect(tabs.getByRole('link', { name: /Start coding/ })).toHaveAttribute(
     'aria-current',

@@ -111,12 +111,14 @@ steps:
   - type: prose
     id: name-failover
     body: |-
-      When the leader dies, a follower is promoted. That's **failover**. With async streaming,
+      When the leader dies, a follower is promoted: **failover**. With async streaming,
       writes the old leader confirmed but never shipped are gone.
 
-      Worse, the old leader may come back still thinking it leads. Two nodes then take
-      writes, which is **split brain**. So real setups **fence** the old leader: they make
-      sure it can't accept writes, for example by cutting it off the network.
+      The old leader may come back thinking it leads. Two nodes take writes: **split
+      brain**. So setups **fence** it, making sure it can't accept writes.
+
+      That's the choice the **CAP theorem** names. When the network splits, a copy either
+      refuses requests, staying **consistent**, or answers them, staying **available**.
 
   - type: predict-output
     id: predict-split-brain
@@ -143,6 +145,35 @@ steps:
       - text: The second insert fails with a duplicate key
         feedback: >-
           Each server checks only its own table. Neither knows the other has order 3.
+
+  - type: ai-review
+    id: review-partition-rules
+    concept: sysdesign.failover
+    difficulty: 3
+    language: yaml
+    request: Write down what each database node does when the network splits the cluster.
+    flawClass: logic
+    code: |
+      leader-cut-off: keep accepting writes, so the app stays up
+      follower-cut-off: wait for an election before taking writes
+      new-leader: needs votes from a majority, and gets a higher term
+      reads-during-split: replicas answer, marked as possibly stale
+    prompt: >-
+      An assistant drafted these rules. One of them lets split brain happen. Tap it.
+    lines: [1]
+    reasons:
+      - text: A cut-off leader must refuse writes
+        correct: true
+        feedback: >-
+          Yes. It gives up availability to stay consistent, so history can't fork.
+      - text: Writes should go to the nearest node
+        feedback: >-
+          Nearness doesn't help. Two nodes taking writes is what forks the data.
+      - text: The app should be told to retry later
+        feedback: >-
+          Retrying is fine for the app. The rule's flaw is that this node says yes at all.
+    fix: |
+      leader-cut-off: refuse writes until it can reach a majority again
 
   - type: ai-review
     id: review-hardcoded-primary
@@ -174,6 +205,19 @@ steps:
       - text: A pool can't be used for writes
         feedback: >-
           Pools serve writes fine. The problem is which server the pool points at.
+    verify:
+      question: How would you prove the fix works?
+      choices:
+        - text: Run a failover drill and check where new orders land
+          correct: true
+          feedback: >-
+            Yes. Only a real failover moves the primary.
+        - text: Unit-test `saveOrder` against a mocked pool
+          feedback: >-
+            The mock never moves, so it can't show which server takes the write.
+        - text: Check the name resolves before you deploy
+          feedback: >-
+            It resolves today. The bug only shows once the primary has moved.
     fix: |
       const primary = new Pool({ host: 'orders-primary.internal', database: 'orders' });
       // the name is moved to the new primary on failover, and the old one is fenced
@@ -182,19 +226,21 @@ steps:
     id: explain-async-failover-loss
     concept: sysdesign.failover
     difficulty: 4
+    audience: incident
+    kind: risk
     prompt: >-
-      With asynchronous replication, a failover can lose orders the customer was told were
-      saved. Why?
+      The primary database has died and a replica was promoted. Replication was
+      asynchronous. Warn the incident channel what may be lost, and how you'd check.
     rubric:
-      - With async replication the primary confirms a commit before any follower has it.
-      - Writes still in flight when the primary dies never reach the follower.
-      - The promoted follower starts from its own, older state, so those writes are gone.
+      - Orders confirmed in the last moments before the crash may never have reached the replica.
+      - The old primary must stay fenced, or it could take writes and split the data.
+      - Check by comparing the old primary's last orders with the new primary and the payment records, once it's isolated.
     modelAnswer: >-
-      An asynchronous primary says "saved" as soon as the order is on its own disk. It ships
-      the change to followers a moment later. If it dies in that moment, the follower never
-      gets the order. We promote that follower, and it carries on from what it had. The
-      customer's confirmed order isn't there. Synchronous replication closes the gap,
-      at the cost of slower commits.
+      Replication was async, so orders the old primary confirmed in its last seconds
+      may be missing on the new one. Some customers may hold confirmations for orders
+      we no longer have. Keep the old primary fenced: if it comes back taking writes,
+      we get split brain. If its disk survived, I'll compare its last orders with the
+      new primary and the payment records. Then we replay what's missing.
 
 recap:
   - Send writes to one leader and spread reads over followers.

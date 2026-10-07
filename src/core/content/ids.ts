@@ -1,4 +1,4 @@
-import { z } from 'zod';
+import * as z from '@/core/zod';
 
 /*
  * The id formats, apart from the lesson schema: the event log checks ids too, and it is

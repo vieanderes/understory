@@ -1,4 +1,4 @@
-import { z } from 'zod';
+import * as z from '@/core/zod';
 import { SQL_LIMITS } from './limits';
 import type { SqlRunReport } from './report';
 

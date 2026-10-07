@@ -1,0 +1,376 @@
+id: agents.the-harness
+title: The harness around the model
+objective: "Design the harness around an agent: its action space, sandbox and egress, permission modes and hooks, and the instruction files it reads."
+level: advanced
+minutes: 10
+concepts: [agents.action-space, agents.permission-modes, agents.hooks, agents.harness-regressions]
+prerequisites: [aisys.agent-harness, aisys.guardrails, aisys.coding-agents]
+opening:
+  text: >-
+    You'll build the gate every tool call passes through, with modes and hooks that hold
+    whatever the model was told. It's the part of an agent that decides what can go wrong.
+
+steps:
+  - type: prose
+    id: everything-but-the-model
+    body: |-
+      In Controlling the agent loop, the harness was the loop: caps, state, stopping. Now
+      widen it to everything around the model.
+
+      Which tools exist at all is the **action space**. Then come where they run, what they
+      may reach and who must approve them. The harness also picks what the model reads first:
+      instruction files like `AGENTS.md`, and **skills**, folders of instructions it opens
+      only when a task needs one.
+
+  - type: multiple-choice
+    id: pick-action-space
+    concept: agents.action-space
+    difficulty: 1
+    question: A library assistant must never delete a patron's account. What stops it most reliably?
+    choices:
+      - text: It has no tool that can delete accounts
+        correct: true
+        feedback: >-
+          Yes. An action outside the action space can't happen, whatever the prompt says.
+      - text: A system prompt rule against deleting
+        feedback: >-
+          Prompts can be argued with, as the injection lesson showed. A missing tool can't.
+      - text: A classifier that checks every reply
+        feedback: >-
+          A classifier catches most cases and misses some. Not offering the tool misses none.
+      - text: Asking the model to confirm before deleting
+        feedback: >-
+          The model confirming with itself adds no check. The tool is still there to call.
+
+  - type: prose
+    id: sandbox-and-modes
+    body: |-
+      Commands the agent runs go in a **sandbox**: a fenced room with its own files, limits
+      on CPU and time. Its **egress** rules name the hosts it may reach.
+
+      Then a **permission mode** sorts every call. *Always allow* runs it, like a catalogue
+      search. *Always ask* waits for a person, like emailing a patron. *Auto* runs safe calls,
+      refuses dangerous ones and escalates the unsure ones to a person.
+
+  - type: predict-output
+    id: predict-egress-gap
+    concept: agents.permission-modes
+    difficulty: 2
+    language: python
+    code: |
+      sandbox = {"egress": {"allow": ["api.library.example"]}}
+
+      tools = [
+          {"name": "search_catalogue", "input_schema": CATALOGUE_SCHEMA},  # your code runs it
+          {"type": "web_fetch_20260209", "name": "web_fetch"},           # the provider runs it
+      ]
+    question: The agent read a page from a host the sandbox never allows. What let it through?
+    choices:
+      - text: '`web_fetch` runs outside the sandbox'
+        correct: true
+        feedback: >-
+          Right. A tool that runs elsewhere never meets your egress rule. Limit it there.
+      - text: The allow-list also matches other hosts
+        feedback: >-
+          The list names one exact host. The request never passed through the sandbox at all.
+      - text: The model remembered the page from training
+        feedback: >-
+          Most people suspect this first. But the trace shows a real `web_fetch` call and result.
+      - text: The sandbox fails open when DNS is slow
+        feedback: >-
+          A sandbox that fails open would be a bug. Here it worked, and the call went elsewhere.
+
+  - type: prose
+    id: name-hooks
+    body: |-
+      A **hook** is code the harness runs before or after each tool call.
+
+      A *pre-tool hook* sees the tool name and arguments, then returns a verdict: no
+      objection, block with a reason, or rewrite the arguments. A *post-tool hook* sees the
+      result, then logs, trims or redacts it.
+
+      A rule in a hook holds whatever the model was told. That's why it belongs there.
+
+  - type: ai-review
+    id: review-hook-chain
+    concept: agents.hooks
+    difficulty: 3
+    language: python
+    request: Add an audit-log hook to the gym booking agent's pre-tool hooks.
+    flawClass: regression
+    code: |
+      def audit_log(call):
+          log.info("tool call", extra=call)
+          return {"action": "allow"}
+
+      HOOKS = [audit_log, cap_bookings, block_bulk_cancel]
+
+      def check(call):
+          for hook in HOOKS:
+              verdict = hook(call)
+              if verdict["action"] == "allow":
+                  break
+              if verdict["action"] == "block":
+                  return verdict
+              call = verdict.get("call", call)
+          return {"action": "allow", "call": call}
+    prompt: >-
+      An assistant wrote this. Each hook passed its own unit test. Two days after it shipped,
+      the agent cancelled 40 spin classes in one go. Tap the line at fault.
+    lines: [11]
+    reasons:
+      - text: One hook's allow skips every hook after it
+        correct: true
+        feedback: >-
+          Yes. The log hook allows, the loop stops, and the blocker never runs.
+      - text: The log hook should run last, not first
+        feedback: >-
+          Moving it hides the bug until the next allowing hook. Allow must never end the chain.
+      - text: A block should raise an exception
+        feedback: >-
+          Returning a block lets the model read the reason and recover. The chain is what's broken.
+      - text: Logging every call leaks members' data
+        feedback: >-
+          Worth checking, but logs didn't cancel any classes. The skipped blocker did.
+    fix: |
+      for hook in HOOKS:
+          verdict = hook(call)
+          if verdict["action"] == "block":
+              return verdict              # any block wins
+          call = verdict.get("call", call)
+      return {"action": "allow", "call": call}
+    verify:
+      question: Which test would have caught this?
+      choices:
+        - text: A blocking hook placed after an allowing one
+          correct: true
+          feedback: >-
+            Right. It exercises the chain, which is where the fault lives.
+        - text: Each hook tested on its own
+          feedback: >-
+            They already were, and all passed. Each hook was fine; the loop around them wasn't.
+        - text: A call that no hook objects to
+          feedback: >-
+            That call runs with or without the bug, so the test stays green.
+
+  - type: fill-blank
+    id: fill-auto-mode
+    concept: agents.permission-modes
+    difficulty: 2
+    language: python
+    prompt: >-
+      A tool missing from `MODES` is refused. In auto mode, low risk runs, high risk is
+      refused and the middle waits for a person. Fill the gaps.
+    template: |
+      MODES = {"search_catalogue": "allow", "renew_loan": "auto", "email_patron": "ask"}
+
+      def decide(name, risk):
+          mode = MODES.get(name, {{1}})
+          if mode == "deny":
+              return "refuse"
+          if mode == "auto" and risk < 0.2:
+              return "run"
+          if mode == "auto" and risk > 0.8:
+              return {{2}}
+          if mode == "auto":
+              return {{3}}
+          return "run" if mode == "allow" else "ask"
+    blanks:
+      - key: '1'
+        answer: '"deny"'
+      - key: '2'
+        answer: '"refuse"'
+      - key: '3'
+        answer: '"ask"'
+    bank: ['"deny"', '"allow"', '"refuse"', '"ask"', '"run"']
+
+  - type: bug-hunt
+    id: hunt-harness-regression
+    concept: agents.harness-regressions
+    difficulty: 3
+    language: python
+    code: |
+      MODEL = "claude-sonnet-5-5"   # unchanged for a month
+      HARNESS = "v41"               # was v40
+
+      def build_system(task):
+          rules = read("AGENTS.md")
+          skills = [read(path) for path in glob("skills/*/SKILL.md")]  # v40: descriptions
+          return "\n\n".join([rules, *skills, task])
+    prompt: >-
+      Since v41, the gym agent books the right class 71% of the time, down from 94%. The
+      model didn't change. Tap the line at fault.
+    lines: [6]
+    reasons:
+      - text: Every skill's full text now loads every run
+        correct: true
+        feedback: >-
+          Yes. Every skill in full crowds the task out. Load descriptions, then text on demand.
+      - text: The model name should carry a date
+        feedback: >-
+          The model is pinned and didn't change. The text around it did.
+      - text: AGENTS.md should be read after the skills
+        feedback: >-
+          Order matters a little. The jump comes from loading every skill in full.
+      - text: A glob can't read skill folders
+        feedback: >-
+          The glob works fine. That's the problem: it reads all of them.
+    fix: |
+      def build_system(task):
+          rules = read("AGENTS.md")
+          index = [describe(path) for path in glob("skills/*/SKILL.md")]  # one line each
+          return "\n\n".join([rules, *index, task])
+    verify:
+      question: How would you prove the fix, before shipping it?
+      choices:
+        - text: Run the agent eval on v40, v41 and v42
+          correct: true
+          feedback: >-
+            Right. Same model, same tasks, three harnesses: the scores show which change matters.
+        - text: Try a few bookings by hand
+          feedback: >-
+            A few chats can't show a drop from 94% to 71%. You need the whole eval set.
+        - text: Check the provider's status page
+          feedback: >-
+            The provider didn't change anything. The harness version did.
+        - text: Count the tokens in the new prompt
+          feedback: >-
+            Fewer tokens is a good sign, not proof. Only the eval shows bookings recovered.
+
+  - type: code-challenge
+    id: write-permission-gate
+    concept: agents.hooks
+    difficulty: 4
+    language: python
+    starter: gate.starter.py
+    solution: gate.solution.py
+    tests: gate.tests.py
+    prompt: >-
+      Write `gate(call, modes, hooks)`, the check every tool call passes. `call` is
+      `{"name": ..., "input": {...}}`. `modes` maps each tool to `"allow"` or `"ask"`.
+
+
+      A tool missing from `modes` is outside the action space. Block it, with a reason
+      containing `not in the action space`, and run no hooks.
+
+
+      Otherwise run each hook in order. A hook returns `None` for no objection,
+      `("block", reason)`, or `("rewrite", new_input)`. A block stops at once. Later hooks
+      see a rewrite. Never change the caller's `call`.
+
+
+      Return `{"decision": "run" | "ask" | "block", "input": ..., "reason": ...}`, with
+      `reason` `None` unless blocked. So `renew_loan` for 8 weeks, with a hook capping it
+      at 3, gives `{"decision": "run", "input": {"loan": "L-9", "weeks": 3}, "reason": None}`.
+    hints:
+      - Three stages, in order. First the action space, then the hooks, then the mode.
+      - Keep a working copy of the call. A rewrite replaces the copy's input, never the caller's.
+      - '`None` means carry on with the next hook. Only a block returns early.'
+
+  - type: explain-back
+    id: defend-harness-eval
+    concept: agents.harness-regressions
+    difficulty: 4
+    audience: reviewer
+    kind: decide
+    prompt: >-
+      A pull request renames `book_class` to `reserve_slot` and rewrites two skills. The
+      model is unchanged, so the author skips the agent eval. Defend running it before merge.
+    rubric:
+      - The agent's behaviour comes from tool names, descriptions and instructions, not only the model.
+      - A harness change can lower success with no error anywhere, such as worse tool choices.
+      - Version the harness and compare the eval on the old and new versions before merging.
+    modelAnswer: >-
+      The model reads the tool names, descriptions and skills on every run. Renaming a tool
+      or rewriting a skill changes what it sees, so its choices change too. That kind of
+      regression throws no error: bookings quietly go wrong more often. So the harness gets a
+      version number like code. I'd run the eval on the old and new version and merge only
+      if the scores hold.
+
+recap:
+  - Shape what an agent can do by its action space, sandbox, egress and permission modes.
+  - Enforce rules in pre-tool hooks, where any block wins and rewrites carry forward.
+  - Treat tool names, skills and instruction files as versioned code with an eval.
+
+recall:
+  - id: card-action-space
+    concept: agents.action-space
+    front: Why is leaving a tool out more reliable than a prompt rule against using it?
+    back: >-
+      A prompt can be argued with or injected. An action outside the action space can't be
+      taken, whatever the model believes.
+  - id: card-auto-mode
+    concept: agents.permission-modes
+    front: What does an auto permission mode do with a call it can't classify as safe or dangerous?
+    back: >-
+      It escalates the call to a person and waits. Safe calls run, dangerous ones are
+      refused.
+  - id: card-hook-chain
+    concept: agents.hooks
+    front: In a chain of pre-tool hooks, what must one hook's "no objection" never do?
+    back: >-
+      End the chain. Every hook gets its say, any block wins, and later hooks see earlier
+      rewrites.
+  - id: card-harness-regression
+    concept: agents.harness-regressions
+    front: Success fell but the model didn't change. Where do you look, and how do you prove it?
+    back: >-
+      At the harness diff: tool names, descriptions, skills, instruction files. Run the eval
+      on the old and new harness versions.
+
+references:
+  - kind: essay
+    title: Building effective agents
+    authors: Erik Schluntz and Barry Zhang
+    year: 2024
+    venue: Anthropic Engineering
+    url: https://www.anthropic.com/engineering/building-effective-agents
+    note: The agent-computer interface, and why tool design and testing deserve as much care as prompts.
+    primary: true
+    verified: false
+  - kind: essay
+    title: Equipping agents for the real world with Agent Skills
+    authors: Anthropic
+    year: 2025
+    venue: Anthropic Engineering
+    note: Skills as folders whose short description loads first and whose full text loads on demand.
+    verified: false
+  - kind: docs
+    title: Hooks reference
+    authors: Anthropic
+    venue: Claude Code Docs
+    note: Pre- and post-tool hooks in one real harness, with block, allow and rewrite outcomes.
+    primary: true
+    verified: false
+  - kind: docs
+    title: AGENTS.md
+    venue: agents.md
+    url: https://agents.md/
+    note: The open format for instruction files that many coding agents read at start-up.
+    verified: false
+
+deepDive: >-
+  The gate in the challenge ran in Python 3.12 against scripted calls. No model was called.
+
+
+  **Hooks in real harnesses.** One coding agent calls them `PreToolUse` and `PostToolUse`.
+  A pre-tool hook can allow, deny or ask, and can change the tool's input. Agent frameworks
+  offer the same idea as callbacks around each tool call. The shape is always the one you
+  built: deny beats allow, and rewrites feed the next check.
+
+
+  **Bash against dedicated tools.** A shell tool gives the agent huge reach, but the harness
+  sees only an opaque command string. A dedicated `send_email` tool has typed arguments a
+  hook can read, gate and log. Promote an action to its own tool when you need to gate,
+  render, audit or run it in parallel.
+
+
+  **Sub-agents are a harness choice too.** A sub-agent is a second loop the harness starts
+  with its own context, tools and permissions. Give it fewer tools than the parent, never
+  more. The context lessons later in this chapter use the same idea to keep the parent's
+  context small.
+
+
+  **Where server tools run.** A provider-run tool such as web fetch never touches your
+  sandbox, so your egress rule can't limit it. Restrict it where it runs, with its own
+  domain lists, or leave it out of the action space.

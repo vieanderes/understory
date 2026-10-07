@@ -1,4 +1,4 @@
-import { z } from 'zod';
+import * as z from '@/core/zod';
 
 /*
  * Scout's structured replies while it plans a path with the learner (docs/ONLINE-TEST.md,
@@ -13,6 +13,8 @@ import { z } from 'zod';
 
 export const ASK_FENCE = 'scout-ask';
 export const PATH_FENCE = 'scout-path';
+/** Away from the planner: Scout offers to plan a path together, as a button. */
+export const PLAN_FENCE = 'scout-plan';
 export const SCOUT_FENCES: readonly string[] = [ASK_FENCE, PATH_FENCE];
 
 const line = (max: number) => z.string().trim().min(1).max(max);
@@ -46,6 +48,12 @@ export const pathBlockSchema = z.object({
 });
 export type PathBlock = z.infer<typeof pathBlockSchema>;
 
+export const planOfferSchema = z.object({
+  /** What the learner said they want, in one line, to start the planner with. */
+  brief: z.string().trim().max(300).default(''),
+});
+export type PlanOffer = z.infer<typeof planOfferSchema>;
+
 function parseJson(body: string): unknown {
   try {
     return JSON.parse(body);
@@ -56,6 +64,12 @@ function parseJson(body: string): unknown {
 
 export function parseAskBlock(body: string): AskBlock | null {
   const parsed = askBlockSchema.safeParse(parseJson(body));
+  return parsed.success ? parsed.data : null;
+}
+
+/** An empty block is a plain offer, without a brief. */
+export function parsePlanOffer(body: string): PlanOffer | null {
+  const parsed = planOfferSchema.safeParse(body.trim() ? parseJson(body) : {});
   return parsed.success ? parsed.data : null;
 }
 

@@ -1,0 +1,265 @@
+id: arch.tenants
+title: Serving many customers
+objective: Keep each customer's data apart in one deployment, take the tenant from the session, and scope every query through one store.
+level: advanced
+minutes: 10
+concepts: [arch.multi-tenancy, arch.tenant-context]
+prerequisites: [arch.hexagonal, backend.authorisation, db.row-level-security]
+opening:
+  text: >-
+    You'll serve many customers from one app without ever showing one of them another's
+    data. It's the bug that ends a software business, and it's usually one missing `WHERE`.
+
+steps:
+  - type: prose
+    id: what-a-tenant-is
+    body: >-
+      Most business software serves many customers from one deployment: many clinics, many
+      shops, many schools. Each customer is a **tenant**, and serving them all at once is
+      **multi-tenancy**.
+
+
+      The cheapest way to keep them apart is a `tenant_id` column on every table. Every
+      query then needs a `WHERE tenant_id = ...`, and one forgotten filter is a leak.
+
+  - type: sql
+    id: fix-day-view
+    concept: arch.multi-tenancy
+    difficulty: 1
+    prompt: >-
+      Clinic 1's day view for 1 October shows another clinic's patient. Fix the query so
+      clinic 1 sees only its own.
+    setup: |
+      CREATE TABLE appointments (tenant_id integer, patient text, day date);
+      INSERT INTO appointments VALUES
+        (1, 'R. Patel', '2026-10-01'),
+        (1, 'J. Okafor', '2026-10-02'),
+        (2, 'M. Silva', '2026-10-01'),
+        (2, 'T. Nowak', '2026-10-03');
+    starter: |
+      SELECT patient FROM appointments WHERE day = '2026-10-01';
+    solution: |
+      SELECT patient FROM appointments WHERE day = '2026-10-01' AND tenant_id = 1;
+    checks:
+      ordered: false
+    showSchema: true
+    hints: ['Add a second condition with `AND`.']
+
+  - type: prose
+    id: tenant-context
+    body: >-
+      Where does the `1` come from? Never from the request: a URL or a body says whatever the
+      sender types. It comes from the signed-in session, on the server, as in the
+      authorisation lesson.
+
+
+      Then apply it once. Hand each handler a store that can only read one tenant's rows,
+      built from the session. A query that can't see other tenants can't leak them.
+
+  - type: bug-hunt
+    id: hunt-tenant-from-query
+    concept: arch.tenant-context
+    difficulty: 2
+    language: js
+    code: |
+      async function dayView(req, res) {
+        const tenantId = req.query.clinic;          // from ?clinic=1
+        const result = await db.query(
+          'SELECT patient FROM appointments WHERE tenant_id = $1 AND day = $2',
+          [tenantId, req.query.day]);
+        res.json(result.rows);
+      }
+    prompt: >-
+      A receptionist at clinic 1 changes `?clinic=1` to `?clinic=2` in the address bar, and
+      sees clinic 2's patients. Tap the line that let her in.
+    lines: [2]
+    reasons:
+      - text: The tenant comes from the request, not the session
+        correct: true
+        feedback: >-
+          Yes. Anyone can type a number. Read `req.session.tenantId` instead.
+      - text: The day isn't checked as a date
+        feedback: >-
+          Worth doing, but a bad date only gives an error. It doesn't open another clinic's
+          rows.
+      - text: The query should glue the values into the SQL
+        feedback: >-
+          That would add an injection hole. The `$1` parameters are right. The value going in
+          is the problem.
+    fix: |
+      const tenantId = req.session.tenantId;       // set at sign-in, on the server
+
+  - type: ai-review
+    id: review-export-without-tenant
+    concept: arch.multi-tenancy
+    difficulty: 3
+    language: js
+    request: Add an endpoint that exports one day's appointments as CSV.
+    flawClass: data-exposure
+    code: |
+      async function exportDay(req, res) {
+        const tenantId = req.session.tenantId;
+        const result = await db.query(
+          'SELECT patient, day FROM appointments WHERE day = $1',
+          [req.query.day],
+        );
+        log.info('export', { tenantId, rows: result.rowCount });
+        res.setHeader('Content-Type', 'text/csv');
+        res.end(toCsv(result.rows));
+      }
+    prompt: >-
+      An assistant wrote this. The test database holds one clinic, so the export matched the
+      screen exactly. In production it holds forty. Tap the line at fault.
+    lines: [4]
+    reasons:
+      - text: '`req.query.day` isn''t checked as a date'
+        feedback: >-
+          Worth fixing, but it's a parameter, so it can't inject. A bad date returns an error,
+          not other clinics.
+      - text: The query never filters by `tenantId`
+        correct: true
+        feedback: >-
+          Yes. It reads the tenant, logs it, and forgets to use it.
+      - text: CSV exports should need an admin role
+        feedback: >-
+          Perhaps, as a product rule. Even an admin should only get their own clinic's
+          patients.
+    verify:
+      question: Which test would have caught this?
+      choices:
+        - text: Seed two clinics and expect only your own clinic's rows
+          correct: true
+          feedback: >-
+            Yes. One clinic can't leak into itself. Two can.
+        - text: Compare the export with the screen on the test database
+          feedback: >-
+            That's the test it passed. With one clinic, every row is already yours.
+        - text: Export a day with an invalid date
+          feedback: >-
+            Good input checking, but it returns an error either way. It never asks whose
+            rows come back.
+    fix: |
+      const result = await db.query(
+        'SELECT patient, day FROM appointments WHERE tenant_id = $1 AND day = $2',
+        [tenantId, req.query.day],
+      );
+
+  - type: prose
+    id: rls-as-net
+    body: >-
+      Row-level security, from the databases chapter, is the net under all of this. A policy
+      on `tenant_id` makes Postgres itself refuse other tenants' rows, even to a query that
+      forgot.
+
+
+      Stronger walls cost more: a schema per tenant, or a database each. Large customers
+      sometimes pay for their own.
+
+  - type: code-challenge
+    id: write-scoped-store
+    concept: arch.tenant-context
+    difficulty: 3
+    language: ts
+    prompt: >-
+      `dayView` and `exportDay` each get every clinic's rows and filter by hand, and
+      `exportDay` forgot. Write `scopedTo(all, tenantId)`: a store whose `onDay(day)` returns
+      that tenant's rows for the day.
+
+
+      Then change both views to take `(store, day)` and read only through `store.onDay`.
+
+
+      So `exportDay(scopedTo(all, 1), '2026-10-01')` returns `'R. Patel,2026-10-01'`.
+    hints:
+      - The tenant filter should appear exactly once in the file, inside `scopedTo`.
+      - Filter when `onDay` is called, not when the store is made, so rows added later are covered too.
+      - 'Start with `return { onDay: (day) => all.filter((a) => a.tenantId === tenantId && ...) };`'
+
+  - type: explain-back
+    id: explain-rls-net
+    concept: arch.multi-tenancy
+    difficulty: 4
+    audience: newcomer
+    kind: explain
+    prompt: >-
+      A newcomer asks: every query already filters by tenant, through a scoped store, so why
+      do we also have a row-level security policy? Explain it to them.
+    rubric:
+      - Queries are written by people and assistants, and sooner or later one will skip the store or the filter.
+      - The policy is enforced by the database on every query, including ones written next year by someone who never saw the store.
+      - Two independent checks mean one mistake doesn't become a leak, which matters most for the worst bug a multi-tenant app can have.
+    modelAnswer: >-
+      Because the store only protects code that uses it. Someone will write a report script,
+      a migration or an admin page that talks to the database directly. An assistant will
+      happily write that query without the filter. A row-level security policy sits in
+      the database, so it applies to every query, whoever wrote it. It's a second,
+      independent wall. Showing one customer another's data is the worst bug a
+      multi-tenant app can ship, so it's worth two.
+
+recap:
+  - Separate tenants by a column, a schema or a database, and know what each costs.
+  - Take the tenant from the session on the server, never from the request.
+  - Scope every read through one store, and back it with a row-level security policy.
+
+recall:
+  - id: card-tenant
+    concept: arch.multi-tenancy
+    front: What is multi-tenancy, and what's its classic bug?
+    back: >-
+      One deployment serving many customers, each a tenant. The classic bug is a query that
+      forgets the tenant filter and shows another customer's rows.
+  - id: card-tenant-from-session
+    concept: arch.tenant-context
+    front: Where must the tenant id come from?
+    back: >-
+      From the signed-in session, on the server. A URL, a form field or a header says
+      whatever the sender types.
+  - id: card-scoped-store
+    concept: arch.tenant-context
+    front: Why hand handlers a store scoped to one tenant?
+    back: >-
+      The filter is written once, and code that can't see other tenants' rows can't leak
+      them.
+  - id: card-tenancy-models
+    concept: arch.multi-tenancy
+    front: Name three ways to keep tenants apart, from cheapest to strongest.
+    back: >-
+      A `tenant_id` column in shared tables, a schema per tenant, and a database per tenant.
+
+references:
+  - kind: docs
+    title: 5.9. Row Security Policies
+    authors: The PostgreSQL Global Development Group
+    venue: PostgreSQL 17 documentation
+    url: https://www.postgresql.org/docs/17/ddl-rowsecurity.html
+    note: The policy syntax used to keep each tenant to its own rows.
+    primary: true
+    verified: true
+  - kind: docs
+    title: 'A01:2021 Broken Access Control'
+    authors: OWASP Foundation
+    venue: OWASP Top 10
+    url: https://top10.owasp.org/2021/A01_2021-Broken_Access_Control/
+    note: Changing an account id in the URL to reach someone else's records is its first attack scenario.
+    verified: true
+
+deepDive: >-
+  The tenant outputs are from PostgreSQL 17. The unfiltered query returned R. Patel and M.
+  Silva. We then enabled row-level security with a policy comparing `tenant_id` to
+  `current_setting('app.tenant_id')`, as the databases chapter showed. Under a plain role,
+  the same unfiltered query returned R. Patel alone. With no tenant set, it didn't return
+  everything. It failed with `invalid input syntax for type integer`. That's failing
+  closed, which is what you want.
+
+
+  The three tenancy models trade cost for isolation. A shared table is cheap to run and
+  migrate, and one busy tenant can slow the rest: the noisy neighbour. A schema per tenant
+  isolates better, and every migration runs once per tenant. A database per tenant
+  isolates best and costs the most. It also lets one customer's data live in a region of
+  its own.
+
+
+  Tenancy reaches past the database. Caches need the tenant in every key, or one clinic
+  gets another's cached page. File storage needs a folder per tenant. Background jobs must
+  carry the tenant id with them, since there's no session in a queue. And logs should
+  record it, so you can answer "what did this customer see?"

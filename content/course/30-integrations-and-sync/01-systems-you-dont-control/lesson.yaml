@@ -1,0 +1,301 @@
+id: integrations.systems-you-dont-control
+title: Systems you don't control
+objective: Parse a vendor reply into a typed result or a clear error, even when it sends a 200 with an error body or HTML.
+level: advanced
+minutes: 10
+concepts: [integrations.spec-breaking-vendors, integrations.runtime-schema-validation, integrations.tolerant-reader]
+prerequisites: [backend.calling-other-apis, backend.validation, backend.api-evolution, scale.failure-handling]
+opening:
+  text: >-
+    You'll turn any reply from someone else's API into a typed result or a clear error. Calling
+    the API is a fifth of an integration, and this is the other four fifths.
+
+steps:
+  - type: prose
+    id: the-other-eighty-percent
+    body: >-
+      In Calling other APIs you gave `fetch` a deadline and turned failures into `502` or
+      `504`. That code trusted one thing: the status. If `response.ok` was true, the body was
+      good.
+
+
+      A **vendor** is a company whose system you call but don't run. Their docs describe the
+      API they meant to build. Your code meets the one they actually run.
+
+  - type: predict-output
+    id: predict-html-with-200
+    concept: integrations.spec-breaking-vendors
+    difficulty: 1
+    language: js
+    code: |
+      // The parcel vendor is mid-deploy. Its proxy answers for it.
+      const response = await fetch("https://parcels.example.com/v2/parcels/p-77");
+      console.log(response.status, response.ok); // 200 true
+      const parcel = await response.json();
+    question: The body is an HTML page saying "Down for maintenance". What does the last line do?
+    choices:
+      - text: Throws a `SyntaxError`
+        correct: true
+        feedback: >-
+          Right. `JSON.parse` meets `<` and gives up, even though the status said all was well.
+      - text: Returns the HTML as a string
+        feedback: >-
+          `json()` never falls back to text. It parses or throws, whatever the status was.
+      - text: Returns `null`, since there's no JSON
+        feedback: >-
+          A tempting guess. But an unparseable body is an error, not an empty result.
+      - text: Nothing, `fetch` already threw on the page
+        feedback: >-
+          `fetch` only throws when no reply arrives at all. A 200 with HTML counts as a reply.
+
+  - type: prose
+    id: how-vendors-break-the-spec
+    body: |-
+      That HTML page is one of a handful of lies you'll meet again and again:
+
+      - a `200` whose body is `{"error": "rate limited"}`
+      - a `500` for a request with one bad field
+      - a field the docs promise, missing from one record in a thousand
+      - a status value nobody told you about, like `held_at_customs`
+
+      So read the body before you believe the status.
+
+  - type: multiple-choice
+    id: pick-500-validation
+    concept: integrations.spec-breaking-vendors
+    difficulty: 2
+    question: 'The vendor answers `500 {"error":{"code":"invalid_postcode"}}`. Your client retries every 5xx. What happens?'
+    choices:
+      - text: It retries a request that can never succeed
+        correct: true
+        feedback: >-
+          Yes. The code says the input is wrong. Read it, and fail without retrying.
+      - text: The second try goes through
+        feedback: >-
+          A bad postcode is still bad a second later. Retries only help with passing faults.
+      - text: Nothing, a 500 is never worth retrying
+        feedback: >-
+          Many 500s do pass, as Failure handling showed. The trouble is that this one isn't one.
+
+  - type: prose
+    id: parse-at-the-edge
+    body: >-
+      In Validation and the trust boundary you parsed request bodies with zod. A vendor's reply
+      deserves the same, at the line where it enters your code. A cast like `as Parcel` is a
+      promise to the compiler. It checks nothing at runtime.
+
+
+      Parse only the fields you use, and map values you don't know to a safe fallback. That's
+      a **tolerant reader**: the vendor can grow without breaking you.
+
+  - type: fill-blank
+    id: fill-tolerant-status
+    concept: integrations.tolerant-reader
+    difficulty: 2
+    language: ts
+    prompt: >-
+      A parcel status the vendor adds next month must become `"unknown"`, not a failed parse.
+      Then check the reply before using it. Fill the gaps.
+    template: |
+      const Parcel = z.object({
+        id: z.string(),
+        status: z.enum(["in_transit", "delivered", "unknown"]).{{1}}("unknown"),
+      });
+
+      const result = Parcel.{{2}}(await response.json());
+      if (!result.{{3}}) throw new VendorError("Unexpected parcel shape");
+    blanks:
+      - key: '1'
+        answer: catch
+      - key: '2'
+        answer: safeParse
+      - key: '3'
+        answer: success
+    bank: [catch, default, optional, safeParse, parse, success, ok]
+
+  - type: ai-review
+    id: review-empty-list-default
+    concept: integrations.runtime-schema-validation
+    difficulty: 3
+    language: ts
+    request: Fetch a class's bookings from the booking vendor, safely.
+    flawClass: logic
+    code: |
+      async function fetchBookings(classId: string): Promise<Booking[]> {
+        const response = await fetch(`${BASE}/classes/${classId}/bookings`, {
+          headers: { Authorization: `Bearer ${token}` },
+          signal: AbortSignal.timeout(10_000),
+        });
+        if (!response.ok) throw new VendorError(response.status);
+        const body = await response.json();
+        return (body.bookings ?? []) as Booking[];
+      }
+    prompt: >-
+      A gym's sync. Tests used recorded replies, and all passed. One Monday every spin class
+      showed "No bookings yet", and the instructors cancelled them. Tap the line at fault.
+    lines: [8]
+    reasons:
+      - text: An error body becomes an empty list, silently
+        correct: true
+        feedback: >-
+          Yes. A 200 `{"error": ...}` has no `bookings`, so `?? []` reports zero.
+      - text: The timeout is too short for a slow vendor
+        feedback: >-
+          A timeout throws, which would have shown an error. Here the page looked normal and wrong.
+      - text: '`response.ok` lets 4xx replies through'
+        feedback: >-
+          `ok` is false for every 4xx and 5xx. The bad reply came with a 200.
+    fix: |
+      const body = BookingsReply.safeParse(await response.json());
+      if (!body.success) throw new VendorError("Unexpected bookings reply");
+      return body.data.bookings;
+    verify:
+      question: Which test would have caught this?
+      choices:
+        - text: A 200 reply whose body is an error
+          correct: true
+          feedback: >-
+            That's the reply that reached production. It must throw, not return `[]`.
+        - text: A 500 reply from the vendor
+          feedback: >-
+            Line 6 already throws on that, so the test passes against the flawed code.
+        - text: A reply with two bookings
+          feedback: >-
+            The happy path works fine. It can't show what an error body turns into.
+        - text: A vendor that never answers
+          feedback: >-
+            The timeout throws and the test passes. The flaw only shows with a reply that lies.
+
+  - type: code-challenge
+    id: write-parse-parcel-reply
+    concept: integrations.runtime-schema-validation
+    difficulty: 4
+    language: ts
+    editable: '17-19'
+    prompt: >-
+      Write `parseParcelReply(status, contentType, body)`. It returns `{ ok: true, parcel }` or
+      `{ ok: false, retryable, reason }`. The sandbox has no zod, so check by hand.
+
+
+      A non-JSON content type, or a body that won't parse, gives reason `"not-json"`,
+      retryable. A JSON `error` object gives `"vendor:<code>"`, retryable only for codes in
+      `RETRYABLE_CODES`, whatever the status. Any other non-2xx gives `"http-<status>"`,
+      retryable for 429 and 5xx.
+
+
+      Otherwise `id` must be a non-empty string and `status` a string, or it's `"bad-shape"`.
+      Map unknown statuses to `"unknown"`, `delivered_at` to `deliveredAt` (or `null`), and
+      drop the rest. For example, `200`, `{"id":"p-1","status":"lost_at_sea"}` gives a parcel
+      with status `"unknown"`.
+    hints:
+      - Work in the order the prompt lists. Each check returns early, so later ones can trust what came before.
+      - The error object outranks the status. A 200 and a 500 with the same error code get the same answer.
+      - "Start by wrapping `JSON.parse(body)` in `try`, and return `{ ok: false, retryable: true, reason: 'not-json' }` from the `catch`."
+
+  - type: explain-back
+    id: explain-why-parse-replies
+    concept: integrations.spec-breaking-vendors
+    difficulty: 4
+    audience: newcomer
+    kind: explain
+    prompt: >-
+      A new teammate asks why the parcel client parses every reply. "The vendor has docs, and
+      it sends 200 when things work." Explain why that isn't enough.
+    rubric:
+      - Vendors break their own spec, with error bodies on a 200 and HTML pages from proxies.
+      - A cast or a status check only trusts the reply; a schema checks it where it enters.
+      - Unknown enum values map to a fallback, so the vendor adding one doesn't break us.
+    modelAnswer: >-
+      The docs describe what the vendor meant to build. In practice a proxy can send an HTML
+      page with a 200, or the API sends `{"error": ...}` with a 200. If we only check the
+      status, that error turns into wrong data deep in our code. So we parse every reply at
+      the edge and get a typed parcel or a clear error. And a status we've never seen becomes
+      "unknown" instead of crashing the sync.
+
+recap:
+  - Read the body before you trust the status, because vendors send errors with 200 and validation failures with 500.
+  - Parse each reply with a schema where it enters, so a changed shape fails at the edge.
+  - Read only the fields you need, and map unknown enum values to a fallback.
+
+recall:
+  - id: card-status-lies
+    concept: integrations.spec-breaking-vendors
+    front: Name two ways a vendor reply can look fine by status and still be an error.
+    back: >-
+      A 200 with an error body such as `{"error": "rate limited"}`, and a 200 HTML page from a
+      proxy or maintenance mode.
+  - id: card-cast-vs-parse
+    concept: integrations.runtime-schema-validation
+    front: Why doesn't `as Booking[]` protect you from a changed vendor reply?
+    back: >-
+      A cast only changes what the compiler believes. Nothing checks the data at runtime, so a
+      wrong shape travels on until something breaks far away.
+  - id: card-tolerant-reader
+    concept: integrations.tolerant-reader
+    front: What does a tolerant reader do with a field or enum value it doesn't know?
+    back: >-
+      It ignores unknown fields and maps an unknown enum value to a fallback such as
+      `"unknown"`, so the vendor can grow without breaking the client.
+  - id: card-retry-by-code
+    concept: integrations.spec-breaking-vendors
+    front: The vendor sends a 500 for a bad postcode. How should your client decide whether to retry?
+    back: >-
+      By the error code in the body, not the status. An invalid input fails the same way every
+      time, so it isn't retried.
+
+references:
+  - kind: rfc
+    title: 'RFC 9110: HTTP Semantics'
+    authors: R. Fielding, M. Nottingham, J. Reschke
+    year: 2022
+    venue: IETF
+    url: https://www.rfc-editor.org/rfc/rfc9110
+    note: What each status code is meant to say, which is the contract vendors bend.
+    primary: true
+    verified: false
+  - kind: docs
+    title: Defining schemas
+    authors: Zod
+    venue: zod.dev
+    url: https://zod.dev/api
+    note: '`safeParse`, `z.object` dropping unknown keys, and `.catch()` for a fallback value.'
+    primary: true
+    verified: false
+  - kind: essay
+    title: Tolerant Reader
+    authors: Martin Fowler
+    year: 2011
+    venue: martinfowler.com
+    url: https://martinfowler.com/bliki/TolerantReader.html
+    note: Read only what you need, and survive everything else.
+    verified: false
+  - kind: rfc
+    title: 'RFC 9413: Maintaining Robust Protocols'
+    authors: M. Thomson, D. Schinazi
+    year: 2023
+    venue: IETF
+    url: https://www.rfc-editor.org/rfc/rfc9413
+    note: Why being liberal in what you accept lets broken senders become the norm, and when tolerance helps.
+    verified: false
+
+deepDive: >-
+  Why do vendors send a 200 with an error? Often the API sits behind a gateway that answers
+  for it, or a framework wraps every handler and always returns 200. Batch endpoints do it on
+  purpose: the request as a whole worked, and each item carries its own error.
+
+
+  Content type is a weak signal too. Some APIs send JSON as `text/plain`, and some proxies
+  send HTML as `application/json`. That's why the parse itself is the real test, and the
+  header is only a first hint.
+
+
+  Tolerance has a cost. A reader that accepts anything lets a broken sender become normal.
+  RFC 9413 argues for tolerance only where it's designed in. So be tolerant of additions,
+  which a vendor is allowed to make, and strict about the fields you depend on. Log and count
+  each fallback, such as an unknown status, so a vendor change shows up on a dashboard, not in
+  a customer's complaint.
+
+
+  With zod, `z.object` drops unknown keys by default, and `.catch(value)` replaces any value
+  that fails, while `.default(value)` only fills in a missing one. A new status string isn't
+  missing, so `.default` would still fail the parse.

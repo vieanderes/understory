@@ -1,0 +1,214 @@
+summary: >-
+  Most back-office AI work starts with a document nobody typed for a machine: a delivery
+  note exported from someone's stock software, an enrolment form fed through a scanner, a
+  photo of a signed sheet, a 9-page PDF of a whole morning's post. Before a model can
+  extract anything, your code has to decide how each page will be read.
+
+
+  There are three reading paths. A born-digital PDF has a **text layer**, so its characters
+  can be read exactly and for free, though tables and columns come out in storage order. A
+  scan or photo is pixels, so it needs OCR or a multimodal model that sees the page image,
+  which also keeps the layout. And an e-invoice carries its fields as XML, so you parse it
+  and read nothing at all.
+
+
+  Mixed batches add a step before extraction: split the file into its documents and
+  classify each one, trusting labels by the confidence bands of lesson 4. Only then does a
+  model fill a typed schema for each document, leaving fields empty when the page doesn't
+  show them. The next lesson checks what comes out.
+remember:
+  - Pick a reading path per page, in code, before any model call, and log which path each page took.
+  - A text layer is exact and free to read, but plain extraction scrambles tables and columns because a PDF stores positioned text, not rows.
+  - A blank or garbled text layer is common on scans, so test for readable text, not for any text.
+  - Split a multi-document scan and classify each part before extracting, or fields from different documents blend into one record.
+  - Make every field the page might not show optional with an empty default, and tell the model to leave it empty rather than guess.
+  - Keep amounts and dates as printed strings in the extraction, and let code parse and calculate.
+  - An e-invoice's XML is the data. Parse and validate it instead of reading the visible page.
+sections:
+  - title: A reading-path router you can test
+    body: |-
+      The router is a pure function of what you can learn about a page cheaply: whether it
+      has an attached XML, and whether its text layer is real. "Real" needs more than a
+      truthiness check. Scanners often write a blank layer, and some write their own OCR
+      text, full of junk characters.
+
+      ```python
+      import string
+      from dataclasses import dataclass
+
+      READABLE = set(string.ascii_letters + string.digits + string.whitespace + ".,:;-/()€£$%")
+
+
+      @dataclass
+      class Page:
+          text: str
+          embedded_xml: bool = False
+
+
+      def looks_readable(text, min_chars=200, min_share=0.9):
+          stripped = text.strip()
+          if len(stripped) < min_chars:
+              return False
+          share = sum(ch in READABLE for ch in stripped) / len(stripped)
+          return share >= min_share
+
+
+      def choose_path(page):
+          if page.embedded_xml:
+              return "parse-xml"
+          if looks_readable(page.text):
+              return "text"
+          return "vision"
+
+
+      print(choose_path(Page("\n\n")))                       # vision
+      print(choose_path(Page("Lavender 2 L 6.50\n" * 20)))   # text
+      print(choose_path(Page("L@v#nd^r ~2 ¦ 6,5¤\n" * 20)))  # vision
+      ```
+
+      The numbers are starting points, not truths. Tune `min_chars` and `min_share` on a
+      sample of your own pages, and record the path in the trace so a bad record can be
+      traced to the path that produced it. Add a layout signal when you have one: a page
+      that is mostly a table reads better as an image even when its text layer is perfect.
+      When you send a PDF to a model API that reads both the text and the page image, the
+      "text" path still costs image tokens, so the router also decides what you pay.
+  - title: Finding the boundaries in a mixed scan
+    body: |-
+      A classifier that labels each page with a type or `continuation` does most of the
+      splitting, but it isn't the only signal, and it's cheaper to combine signals than to
+      perfect one.
+
+      - **Page markers.** "Page 2 of 3" printed on the page, or a footer that repeats the
+        document number, settles a boundary without any model.
+      - **Repeated identifiers.** Two consecutive pages that show the same note number belong
+        together. A new number starts a new document.
+      - **Separator sheets.** Many mailrooms put a barcode sheet between documents before
+        scanning. If you control the scanning, this is the most reliable split there is.
+      - **Pair questions.** Instead of "what is this page?", ask "does page 5 continue page
+        4?", showing both. It catches a second page that has no header of its own.
+
+      After splitting, check each document against its type: a delivery note needs a note
+      number on its first page, an enrolment form needs a pupil's name. A document that
+      fails goes to review with its pages, so a person fixes the split as well as the fields.
+      Errors here are expensive later: one wrong boundary corrupts two records, and both
+      can pass every field check on their own.
+  - title: A schema that doesn't invite guessing
+    body: |-
+      A model filling a schema wants to fill every field. If `delivery_date` is required, a
+      page without a date still gets one, and it looks like a real date. So the schema
+      itself must say what may be absent.
+
+      ```python
+      from typing import Literal
+
+      from pydantic import BaseModel
+
+
+      class Line(BaseModel):
+          plant: str
+          quantity: int
+          unit_price: str | None = None   # as printed, "6.50"; code parses it later
+
+
+      class DeliveryNote(BaseModel):
+          doc_type: Literal["delivery_note"]
+          note_number: str
+          delivery_date: str | None = None
+          signed: bool | None = None      # None: the page has no signature box
+          lines: list[Line]
+
+
+      print(DeliveryNote.model_json_schema()["required"])
+      # ['doc_type', 'note_number', 'lines']
+      ```
+
+      Four habits follow. Require only what every document of this type truly carries.
+      Use `None` for "not on the page", distinct from `False` or an empty list. Keep amounts
+      and dates as printed strings, because "1.234,50" and "03/04" mean different things in
+      different places and code should decide. And use one schema per document type, chosen
+      by the split, so a returns form is never squeezed into a delivery note. Say all of it
+      in the prompt too: "If a field is not shown, leave it empty."
+  - title: Parsing e-invoices instead of reading them
+    body: |-
+      An e-invoice under the EU standard EN 16931 comes in one of two XML syntaxes, UBL or
+      CII. It arrives as a plain XML file, or inside a hybrid PDF such as Factur-X, where the
+      XML is an attachment of a PDF/A-3 file and the visible pages are a rendering for
+      people. Either way, the fields are typed and named: the invoice number, the issue
+      date, every line, the tax breakdown and the amount payable.
+
+      Detect it first. An `.xml` attachment on the email, or an embedded file in the PDF,
+      sends the document down the parse path before any model or OCR sees it. Then validate,
+      because well-formed isn't the same as correct. EN 16931 comes with business rules,
+      such as totals that must agree, and checking them is part of receiving. The next
+      lesson's checks still apply: a supplier's software can produce a valid file with the
+      wrong amount in it.
+
+      If you also read the visible page, compare it with the XML and send any difference to
+      a person rather than picking a winner in code. Which version counts legally depends on
+      the format and the country, so check the rules that apply to you. The cost argument is
+      simple: parsing is exact, takes milliseconds, and costs nothing per page.
+pitfalls:
+  - '**Treating any text layer as real text.** Scanners write blank or junk layers, and the page then skips the image path and comes back empty. Check for enough readable characters.'
+  - '**Extracting tables from plain text extraction.** Columns come out one after another, and amounts attach to the wrong rows. Send table-heavy pages as images, or use a layout-aware extractor.'
+  - '**Extracting a whole batch at once.** Fields from different documents blend into one record that looks complete. Split and classify first, then extract per document.'
+  - '**Required fields the page may not show.** The model invents a plausible value to satisfy the schema. Make them optional and say so in the prompt.'
+  - '**Sending e-invoices through OCR or a model.** It pays to reintroduce errors into data that was already exact. Detect the XML and parse it.'
+  - '**Forgetting that scans hold personal data.** Enrolment and membership forms carry names, birth dates and health notes. They follow the same redaction and provider rules as any other input.'
+verify:
+  - lens: breaks
+    check: Feed the router a scan with a blank text layer and one with a junk OCR layer, and confirm both take the vision path.
+  - lens: scales
+    check: Estimate tokens per page for each path on real samples, because sending every page as text and image multiplies the cost of a large batch.
+  - lens: tests
+    check: Keep a golden set of real pages, including scans, photos, two-column forms and multi-page documents, and check splits and fields after every prompt or model change.
+  - lens: leaks
+    check: Confirm scanned forms with names, birth dates or health notes go only to a model whose data terms allow that data.
+  - lens: confuses
+    check: Record the reading path and the split for every document, so a reviewer can see why a record came out wrong.
+interview:
+  - question: Design a pipeline that takes a mixed batch of scanned and digital documents and produces structured records.
+    answer: >-
+      I'd build it as a workflow with a decision per page, then per document. First,
+      intake: detect e-invoice XML and parse it directly. For other pages, check whether
+      there's a readable text layer, and choose text extraction or sending the page image to
+      a multimodal model; tables and handwriting go to the image path. Second, split: a
+      cheap classifier labels each page with a type or "continuation", combined with page
+      markers and repeated document numbers, and low-confidence pages go to review. Third,
+      extract each document into a schema for its type, with optional fields left empty
+      rather than guessed. Fourth, validate in code: business rules, values checked against
+      the source text, and review for anything that fails. The trade-off is more moving
+      parts than one big model call, but each stage is testable and cheap where it can be.
+  - question: Why not send every page to a multimodal model and skip text extraction?
+    answer: >-
+      Because it pays the most for the least certain path. A born-digital PDF already has
+      exact characters; a model reading the image can misread a digit that was never
+      ambiguous in the text layer. Images also cost more tokens per page than text, and a
+      batch of thousands of pages makes that real money. That said, the image path wins
+      where layout carries meaning, like tables, columns, ticked boxes and handwriting, and
+      for scans with no usable text. Some APIs give the model both the text and an image of
+      each page, which helps accuracy but still costs image tokens. So I route per page:
+      text where it's reliable, image where it isn't, and XML parsing where the data already
+      exists. I'd confirm the split on a labelled sample rather than assume it.
+  - question: How do you stop a model from inventing fields during extraction?
+    answer: >-
+      Design for absence and then verify. In the schema, only fields every document of that
+      type carries are required; everything else is optional with a null default, and the
+      prompt says to leave missing fields empty. I keep amounts and dates as printed strings
+      so the model copies rather than interprets. Structured output then guarantees the
+      shape, but not the truth, so code checks the values: does the invoice number appear
+      in the source text as a whole word, do the line amounts add up, is the date plausible.
+      Anything that fails goes to review. I'd also track invented-value rates per field on a
+      labelled set, because a prompt change can quietly make the model more eager to fill
+      gaps. The trade-off is more empty fields for people to fill, which is cheaper than
+      confident wrong ones.
+  - question: A supplier sends invoices as PDFs with embedded XML. How do you handle them?
+    answer: >-
+      I parse the XML and don't read the page. Formats such as Factur-X attach EN 16931 XML
+      to a PDF/A-3 file, so a PDF library can list the attachment, and the fields come out
+      typed and exact: invoice number, dates, lines, tax and the payable amount. That's
+      faster, free per page and has no OCR errors. I still validate it: schema validation,
+      the standard's business rules, and my own checks, such as whether the supplier and
+      bank details match what we hold. If we also render or read the visible page, I compare
+      it with the XML and send differences to a person, since which one counts legally
+      depends on the format and jurisdiction. The one trade-off is maintaining parsers for
+      two syntaxes, UBL and CII, which libraries largely cover.

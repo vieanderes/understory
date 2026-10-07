@@ -1,0 +1,352 @@
+id: testing.breaking-it-on-purpose
+title: Breaking it on purpose
+objective: Tell stress, soak and spike tests from load tests, inject faults such as a slow vendor or a timeout, and run a small chaos experiment.
+level: advanced
+minutes: 10
+concepts: [testing.stress-soak-spike, testing.fault-injection, testing.chaos-experiments]
+prerequisites: [testing.load-testing, backend.calling-other-apis]
+opening:
+  text: >-
+    You'll break your own service on purpose: too much traffic, a slow vendor, a dropped
+    connection. Better you find the weak spot on a Tuesday afternoon than your users on a Friday night.
+
+steps:
+  - type: prose
+    id: same-script-new-shapes
+    body: |-
+      Last lesson's ramp checked a normal busy day. Change only the `stages`, and the same
+      script asks a new question:
+
+      ```js
+      const stress = [{ duration: "5m", target: 200 }, { duration: "10m", target: 200 }];
+      const spike = [{ duration: "10s", target: 400 }, { duration: "1m", target: 400 }];
+      const soak = [{ duration: "5m", target: 60 }, { duration: "8h", target: 60 }];
+      ```
+
+      A **stress test** goes well past normal, to see how it degrades. A **spike test**
+      jumps in seconds. A **soak test** holds normal load for hours.
+
+  - type: multiple-choice
+    id: pick-soak
+    concept: testing.stress-soak-spike
+    difficulty: 1
+    question: Cinema bookings slow down after six hours of uptime, and a restart fixes it. Which test reproduces it?
+    choices:
+      - text: A soak test
+        correct: true
+        feedback: >-
+          Yes. Something builds up with time, such as a leak, and only hours show it.
+      - text: A spike test
+        feedback: >-
+          A spike is over in minutes. This needs six hours of ordinary traffic to appear.
+      - text: A stress test
+        feedback: >-
+          Stress raises the load. Here the load is normal, and it's the time that hurts.
+
+  - type: predict-output
+    id: predict-spike
+    concept: testing.stress-soak-spike
+    difficulty: 2
+    language: js
+    code: |
+      // Run A passed: p95 stayed under 300 ms throughout.
+      const runA = [{ duration: "30m", target: 400 }, { duration: "10m", target: 400 }];
+
+      // Run B: ticket sales open at 10:00 sharp.
+      const runB = [{ duration: "10s", target: 400 }, { duration: "10m", target: 400 }];
+    question: Both peak at 400 VUs. Servers get added when CPU runs hot. What happens early in run B?
+    choices:
+      - text: Latency and errors jump, then settle
+        correct: true
+        feedback: >-
+          Right. New servers, cold caches and growing pools take minutes, not seconds.
+      - text: The same as run A at 400 VUs
+        feedback: >-
+          Most people expect that. Same peak, different path: run A gave capacity half an hour to grow.
+      - text: Nothing until memory runs out hours later
+        feedback: >-
+          Trouble that builds over hours is a soak finding. A spike hurts in the first minute.
+
+  - type: prose
+    id: what-fault-injection-is
+    body: >-
+      Your server leans on other services, and they fail in four ways. They get slow, answer
+      `500`, never answer, or drop the connection.
+
+
+      **Fault injection** makes those happen on purpose, so you watch your timeouts and
+      fallbacks really work. In a unit test, you wrap the fake. Across the network, a proxy
+      such as **Toxiproxy** sits between your app and the vendor, adding delay or resetting
+      connections.
+
+  - type: ai-review
+    id: review-polite-fault-only
+    concept: testing.fault-injection
+    difficulty: 3
+    language: js
+    request: Test that the recipe page falls back to cached nutrition when the vendor fails.
+    flawClass: edge-case
+    code: |
+      test("shows cached nutrition when the vendor fails", async () => {
+        const vendor = fakeVendor({ status: 500 });
+        const page = await renderRecipe(42, { vendor });
+        expect(page.status).toBe(200);
+        expect(page.nutrition.source).toBe("cache");
+      });
+    prompt: >-
+      An assistant wrote this test, and it's green. Then the nutrition vendor hung for a
+      minute, and every recipe page hung with it. Tap the line at fault.
+    lines: [2]
+    reasons:
+      - text: It only injects a quick 500, never a hang
+        correct: true
+        feedback: >-
+          Yes. A 500 is the polite failure. Only a hang tests the timeout.
+      - text: The page should answer 503, not 200
+        feedback: >-
+          Serving cached nutrition with a 200 is a fine fallback. The gap is which fault was tried.
+      - text: '`renderRecipe` should be mocked too'
+        feedback: >-
+          Then the test would check the mock. The real page is what must survive the vendor.
+    fix: |
+      test("falls back when the vendor never answers", async () => {
+        const vendor = fakeVendor({ neverAnswers: true });
+        const page = await renderRecipe(42, { vendor, timeoutMs: 2000 });
+        expect(page.nutrition.source).toBe("cache");
+      });
+    verify:
+      question: Which test would have caught the hang before production?
+      choices:
+        - text: A vendor that never answers, expecting the cache
+          correct: true
+          feedback: >-
+            Right. It fails until the call has a timeout and a fallback behind it.
+        - text: A vendor that answers 503 instead
+          feedback: >-
+            Another quick error takes the same path as the 500. The hang stays untested.
+        - text: The same test run a hundred times
+          feedback: >-
+            Repeating a passing test proves the 500 path again. It can't see a missing timeout.
+        - text: A vendor that answers after 100 ms
+          feedback: >-
+            That's faster than any sensible timeout, so the fallback never runs.
+
+  - type: fill-blank
+    id: fill-model-stub
+    concept: testing.fault-injection
+    difficulty: 3
+    language: js
+    prompt: >-
+      Your recipe assistant calls a model API that limits requests and tokens per minute. A
+      load test against the real API mostly measures that limit, and costs money. Finish
+      this stub for capacity runs: it answers in the model's usual time, and refuses past
+      its limit the way the provider does.
+    template: |
+      let used = 0;
+      setInterval(() => { used = 0; }, 60_000);
+
+      export async function fakeModel(request) {
+        used += 1;
+        if (used > LIMIT_PER_MINUTE) {
+          return { status: {{1}}, headers: { "{{2}}": "20" } };
+        }
+        await sleep({{3}});
+        return { status: 200, body: CANNED_REPLY };
+      }
+    blanks:
+      - key: '1'
+        answer: '429'
+      - key: '2'
+        answer: retry-after
+      - key: '3'
+        answer: TYPICAL_LATENCY_MS
+    bank: ['429', '503', retry-after, x-retry-in, TYPICAL_LATENCY_MS, '0']
+
+  - type: code-challenge
+    id: write-inject-faults
+    concept: testing.fault-injection
+    difficulty: 4
+    language: ts
+    prompt: >-
+      Write `injectFaults(call, schedule, sleep, slowMs)`. It returns a function that acts
+      like `call`. But each call takes the next fault from `schedule`, starting again at the
+      end:
+
+
+      - `ok`: call through.
+
+      - `slow`: `await sleep(slowMs)`, then call through.
+
+      - `error500`: return `{ status: 500, body: 'Injected fault' }`.
+
+      - `timeout`: throw an `Error` whose `name` is `'TimeoutError'`.
+
+      - `drop`: throw an `Error` whose `code` is `'ECONNRESET'`.
+
+
+      Only `ok` and `slow` reach `call`. So `['ok', 'error500']` gives 200, 500, 200, 500.
+      Tests pass a fake `sleep`, so a slow fault takes no real time.
+    hints:
+      - Keep a counter outside the returned function, so it survives from one call to the next.
+      - '`index % schedule.length` wraps back to the start. Advance it on every call, faulty or not.'
+      - "A dropped connection can be built as `Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' })`."
+
+  - type: prose
+    id: what-a-chaos-experiment-is
+    body: >-
+      A fault in a unit test checks one function. A **chaos experiment** checks the running
+      system.
+
+
+      Write down the **steady state** you expect, such as p95 under 400 ms. Predict it holds
+      while one thing breaks. Keep the **blast radius**, the users who could be hurt, small.
+      Set an abort condition that stops the run early. Run it in staging first, then on a
+      small slice of production.
+
+  - type: bug-hunt
+    id: hunt-blast-radius
+    concept: testing.chaos-experiments
+    difficulty: 4
+    language: yaml
+    code: |
+      name: nutrition vendor slows down
+      steady_state:
+        search_p95_ms: 400
+        search_error_rate: 0.01
+      hypothesis: Search stays in steady state with a 3 s vendor delay
+      fault:
+        target: nutrition-vendor
+        type: latency
+        latency_ms: 3000
+      scope:
+        environment: production
+        traffic_share: 1.0
+      abort_when:
+        search_error_rate: 0.05
+      duration: 15m
+    prompt: >-
+      The team's first chaos run in production. The same plan passed in staging last week.
+      Tap the line that makes it dangerous.
+    lines: [12]
+    reasons:
+      - text: It sends every user through the fault
+        correct: true
+        feedback: >-
+          Yes. Start with a sliver, say 1%, and widen it while the hypothesis holds.
+      - text: Aborting at 5% errors is far too late
+        feedback: >-
+          A short burst of 5% is a common abort line. Who is exposed matters more.
+      - text: A 3-second vendor delay is unrealistic
+        feedback: >-
+          Vendors really do stall for seconds. A realistic fault is the whole point.
+      - text: Chaos never belongs in production
+        feedback: >-
+          Staging lacks real traffic and data. A small, guarded slice of production is the goal.
+    fix: |
+      scope:
+        environment: production
+        traffic_share: 0.01
+
+  - type: explain-back
+    id: explain-why-production
+    concept: testing.chaos-experiments
+    difficulty: 4
+    audience: interviewer
+    kind: decide
+    prompt: >-
+      An interviewer asks: staging survived the vendor slowdown, so why run it in production
+      at all? Defend the experiment, and say how you'd keep it safe.
+    rubric:
+      - Staging differs from production in traffic, data, caches and config, so it can't settle the hypothesis.
+      - A tiny blast radius and an abort condition cap the harm to a few users for a few minutes.
+      - The written steady state makes it a measurement, and a failure finds the weakness before an outage does.
+    modelAnswer: >-
+      Staging has a fraction of the traffic, small data and warm caches, so passing there
+      proves little. I'd write the steady state first: search p95 under 400 ms. Then I'd
+      delay the vendor for 1% of production traffic, with an automatic abort at 5% errors.
+      If the hypothesis holds, I widen it. If it breaks, a few users saw a slow page for a
+      minute. We found the weakness before a real outage did.
+
+recap:
+  - Reshape a load test into stress, spike or soak to answer a different question.
+  - Inject slow, failing, hanging and dropped calls to prove timeouts and fallbacks work.
+  - Run chaos experiments with a steady state, one fault, a small blast radius and an abort.
+
+recall:
+  - id: card-soak-finds
+    concept: testing.stress-soak-spike
+    front: What kind of problem does a soak test find that a stress test misses?
+    back: >-
+      Problems that build with time at normal load: memory or connection leaks, growing
+      queues, a disk filling with logs.
+  - id: card-spike-vs-ramp
+    concept: testing.stress-soak-spike
+    front: Why can a spike to 400 users fail when a slow ramp to 400 passed?
+    back: >-
+      New servers, caches and connection pools take minutes to grow. A spike arrives before
+      they have.
+  - id: card-four-faults
+    concept: testing.fault-injection
+    front: Which four dependency failures should fault injection cover?
+    back: >-
+      Slow replies, error replies such as `500`, no reply at all so you time out, and a
+      dropped connection.
+  - id: card-chaos-parts
+    concept: testing.chaos-experiments
+    front: What does a chaos experiment write down before it starts?
+    back: >-
+      The steady state, the hypothesis that it holds, the one fault and its blast radius, and
+      the condition that aborts the run.
+
+references:
+  - kind: docs
+    title: Load test types
+    authors: Grafana Labs
+    venue: Grafana k6 documentation
+    url: https://grafana.com/docs/k6/latest/testing-guides/test-types/
+    note: Smoke, average-load, stress, soak, spike and breakpoint tests, and what each answers.
+    primary: true
+    verified: false
+  - kind: essay
+    title: Principles of Chaos Engineering
+    venue: principlesofchaos.org
+    url: https://principlesofchaos.org/
+    note: Steady state, a hypothesis, real-world faults, production and a minimal blast radius.
+    primary: true
+    verified: false
+  - kind: source
+    title: Toxiproxy
+    authors: Shopify
+    venue: GitHub
+    url: https://github.com/Shopify/toxiproxy
+    note: A TCP proxy for fault injection, with latency, timeout, reset_peer and bandwidth toxics.
+    verified: false
+  - kind: docs
+    title: Rate limits
+    authors: Anthropic
+    venue: Claude API documentation
+    url: https://platform.claude.com/docs/en/api/rate-limits
+    note: One provider's limits on requests and tokens per minute, the 429 and its retry-after header.
+    verified: false
+
+deepDive: >-
+  k6 can stop a stress or chaos run by itself. A threshold in the long form takes
+  `abortOnFail: true`, and `delayAbortEval: '30s'` gives the run time to warm up first. That
+  is the abort condition, written in the script rather than kept in someone's head.
+
+
+  Toxiproxy's toxics include `latency` (with `jitter`), `timeout`, `reset_peer`,
+  `bandwidth` and `slow_close`. Each toxic also takes a `toxicity`, the chance it applies to
+  a connection, so `0.1` hurts one connection in ten. Taking a service fully down isn't a
+  toxic: you disable the proxy.
+
+
+  Model APIs often limit input and output tokens separately from requests. One provider
+  counts only uncached input tokens toward its input limit, so prompt caching raises the
+  load you can carry. Its limits refill continuously, like the token bucket from Rate
+  limits, so a burst can hit a 429 even when the minute's total looks fine.
+
+
+  A spike test needs an arrival-rate executor, such as `ramping-arrival-rate`. A ramp of
+  VUs slows its own sending once the server slows, which softens the very spike you meant
+  to send.

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   assistantSystemPrompt,
+  PLAN_OFFER,
   PLANNER_RULES,
   plannerPrompt,
   type AssistantContext,
@@ -94,5 +95,17 @@ describe('assistant system prompts', () => {
     const { stable, learner } = plannerPrompt({ ...base, mode: 'planner' });
     expect(stable).toContain('Do not draft a path without it.');
     expect(learner).toContain('(nothing known yet)');
+  });
+
+  it('offers the planner as a button in guide and tutor modes, never inside it or a test', () => {
+    const guide = assistantSystemPrompt({ ...base, mode: 'guide' });
+    const tutor = assistantSystemPrompt({ ...base, mode: 'tutor', app: 'Learn /paths' });
+    expect(guide).toContain(PLAN_OFFER);
+    expect(tutor).toContain(PLAN_OFFER);
+    expect(PLAN_OFFER).toContain('```scout-plan');
+    expect(assistantSystemPrompt({ ...base, mode: 'planner' }, '# The course')).not.toContain(
+      '```scout-plan',
+    );
+    expect(assistantSystemPrompt(base)).not.toContain('scout-plan');
   });
 });

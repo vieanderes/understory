@@ -1,0 +1,173 @@
+summary: >-
+  When your product shows data that lives in a vendor's system, you either ask the vendor on
+  every request (pass-through) or keep a copy (stored sync). Pass-through is always fresh but
+  inherits the vendor's latency, rate limits and outages, and you can't search, join or sort
+  across it. A stored copy is fast and queryable, and the price is keeping it right.
+
+
+  A full sync reads everything every time. It's simple, it heals any drift, and it's the only
+  way to notice deletions, but it costs a read per record per run. A delta sync reads only
+  what changed since a watermark, which makes frequent runs cheap, but it depends on the
+  vendor's change timestamps and can't see what disappeared. Most real integrations run a
+  frequent delta with an occasional full sync behind it.
+
+
+  Two details decide whether a delta loses data. The watermark is the time the run started,
+  saved only when it succeeds, so edits made during the run are picked up next time. And
+  each run reaches back an overlap window before the watermark, for clock differences and
+  late commits. Re-reading means seeing records twice, so a hash of each normalised record,
+  with stable key order, lets you skip the ones that didn't change.
+remember:
+  - Save the time the run started as the next watermark, and only after the run reaches the end.
+  - Ask from a few minutes before the watermark, because clocks differ and rows can commit after their timestamp.
+  - Overlap means re-reading, so writes must be idempotent upserts keyed by the vendor's id.
+  - A delta sync can't see deletions or edits it missed, so pair it with an occasional full sync.
+  - Hash only the normalised fields you store, never the raw reply, which may carry per-request values.
+  - Sort object keys at every level before hashing, and keep array order, because array order carries meaning.
+  - Skipping unchanged records saves writes and stops your own change events firing for nothing.
+sections:
+  - title: A delta sync, start to finish
+    body: |-
+      Here are the pieces together, with every dependency injected so a test can drive time
+      and the vendor.
+
+      ```ts
+      import { createHash } from 'node:crypto';
+
+      type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
+      type Plant = { id: string; name: string; pricePence: number; stock: number };
+
+      const canonical = (v: Json): string =>
+        Array.isArray(v) ? `[${v.map(canonical).join(',')}]`
+        : v !== null && typeof v === 'object'
+          ? `{${Object.keys(v).sort().map((k) => `${JSON.stringify(k)}:${canonical(v[k]!)}`).join(',')}}`
+          : JSON.stringify(v);
+      const sha256 = (text: string) => createHash('sha256').update(text).digest('hex');
+
+      interface Deps {
+        now: () => Date;
+        loadWatermark: () => Promise<Date>;
+        saveWatermark: (at: Date) => Promise<void>;
+        changedSince: (since: Date) => AsyncIterable<Plant>;
+        storedHash: (id: string) => Promise<string | undefined>;
+        upsert: (plant: Plant, hash: string) => Promise<void>;
+      }
+
+      const OVERLAP_MS = 5 * 60_000;
+
+      export async function deltaSync(deps: Deps): Promise<{ read: number; written: number }> {
+        const startedAt = deps.now();
+        const since = new Date((await deps.loadWatermark()).getTime() - OVERLAP_MS);
+        let read = 0;
+        let written = 0;
+        for await (const plant of deps.changedSince(since)) {
+          read += 1;
+          const hash = sha256(canonical(plant));
+          if ((await deps.storedHash(plant.id)) === hash) continue;
+          await deps.upsert(plant, hash);
+          written += 1;
+        }
+        // Only a run that reached the end may move the watermark.
+        await deps.saveWatermark(startedAt);
+        return { read, written };
+      }
+      ```
+
+      Run against an in-memory vendor of two plants, the first run returns
+      `{ read: 2, written: 2 }` and saves the start time. Change one plant's price, with its
+      keys in a different order, and the second run returns `{ read: 2, written: 1 }`. The
+      reordered but unchanged plant is skipped.
+
+      If anything throws mid-loop, the watermark stays where it was. The next run reads the
+      same window again, and the hashes make the repeat cheap.
+  - title: Whose clock the watermark uses
+    body: |-
+      The vendor compares your `since` with its own `updated_at` values, written by its own
+      clock. Your server's clock may be seconds or minutes away from it. The overlap window
+      absorbs small differences, but you can also avoid mixing clocks at all.
+
+      Two options use the vendor's time. One is the largest `updated_at` the run read, which
+      by definition is on the vendor's clock. Save it, minus the overlap, as the next
+      watermark. The catch is a run that reads nothing: keep the old watermark rather than
+      jumping to now. The other is the `Date` header on the vendor's first response of the
+      run, which RFC 9110 defines as the time the message was originated. It's precise only to
+      the second, which the overlap covers.
+
+      Late commits are the other reason for overlap. In PostgreSQL, `now()` returns the time
+      the transaction began. A long transaction that starts at 01:59:58 and commits at
+      02:00:03 stamps its rows 01:59:58. A run reading at 02:00:00 couldn't see them, and the
+      next run starts at 02:00:00. Five minutes of overlap is a common default. Size it from
+      the longest write transactions the vendor is likely to run, if their docs say.
+  - title: Hashing in the database, and what to hash
+    body: |-
+      Keep the hash in a column beside the record. Then the upsert can skip unchanged rows by
+      itself, in one statement:
+
+      ```sql
+      INSERT INTO plants (id, name, price_pence, stock, hash)
+      VALUES ($1, $2, $3, $4, $5)
+      ON CONFLICT (id) DO UPDATE
+      SET name = EXCLUDED.name, price_pence = EXCLUDED.price_pence,
+          stock = EXCLUDED.stock, hash = EXCLUDED.hash
+      WHERE plants.hash IS DISTINCT FROM EXCLUDED.hash;
+      ```
+
+      An unchanged row reports zero rows affected, a changed one reports one, which tells you
+      when to publish a "plant changed" event. `IS DISTINCT FROM` treats null as a value, so a
+      row with no hash yet is always updated.
+
+      What goes into the hash decides what counts as a change. Hash the normalised record,
+      the shape you store, not the vendor's reply. Leave out anything that changes on every
+      request, such as a `served_at` or an `etag` that isn't tied to content. And put in
+      everything you store, or an edit to a left-out field will never be written. If you
+      change the normalisation, every hash changes once, and the next run rewrites everything.
+      Plan that run for a quiet hour.
+pitfalls:
+  - '**Saving the end time as the watermark.** Edits made during the run, on pages already read, are older than the end and newer than the start, so the next run skips them for good. Save the start.'
+  - '**Moving the watermark after a failed run.** The records after the failure were never read, and the next run starts past them. Save the watermark only once the run completes.'
+  - '**No overlap window.** Clock differences and late commits put records shortly before the watermark, where no run looks. Reach back a few minutes and dedupe by upsert.'
+  - '**Hashing the raw reply.** Per-request fields make every record look changed every night. Hash the normalised record you store.'
+  - '**Hashing `JSON.stringify` output.** Key order follows insertion, so the same data from a different code path hashes differently. Sort keys before hashing.'
+  - '**Trusting the delta forever.** It can''t see deletions and it misses any edit the vendor forgot to timestamp. Run a full sync now and then to reconcile.'
+verify:
+  - lens: breaks
+    check: Edit a record on a page the sync has already passed, mid-run, and confirm the next run picks the edit up.
+  - lens: breaks
+    check: Make the sync fail halfway, and confirm the watermark did not move and the rerun reads the same window.
+  - lens: scales
+    check: Run the sync twice with no vendor changes, and confirm the second run writes zero rows and sends zero change events.
+  - lens: tests
+    check: Feed the same record with its keys in a new order, and assert it is not reported as changed.
+  - lens: confuses
+    check: Name the stored watermark after what it means, such as `delta_started_at`, so nobody mistakes it for the last success time.
+interview:
+  - question: Design a sync that keeps a local copy of a vendor's catalogue up to date.
+    answer: >-
+      I'd store a copy, keyed by the vendor's id per connection, and run two jobs. A delta
+      every hour asks for records updated since the watermark minus a few minutes of overlap,
+      upserts them, and saves the time the run started once it finishes. A full sync weekly
+      reads everything, catches edits the delta missed and finds deletions with mark and sweep.
+      Each record carries a hash of its normalised fields with sorted keys, so unchanged records
+      cost a read but no write and fire no events. Pages use a tie-broken keyset cursor, tokens
+      refresh in a single flight, and the sweep has a safety valve. The trade-off against
+      pass-through is staleness of up to an hour, in exchange for fast queries and independence
+      from the vendor's uptime.
+  - question: Why should a delta sync's watermark be the start time and not the end time?
+    answer: >-
+      Because the read takes time, and records change while it runs. If a record is edited at
+      02:05 on a page the run already passed at 02:01, it wasn't in this run. If the run then
+      saves 02:20, its finish time, the next run asks for changes after 02:20, and the 02:05
+      edit falls into the gap for good. Saving 02:00, the start, means the next run asks from
+      02:00 and catches it. The cost is that the next run re-reads records changed during this
+      one, which is harmless with upserts and cheap with change hashes. I'd also subtract an
+      overlap window for clock skew and late commits.
+  - question: How do you tell whether a synced record really changed?
+    answer: >-
+      Hash a canonical form of the fields I store and compare it with the hash saved last
+      time. Canonical means the same data always gives the same text: object keys sorted at
+      every level, arrays in their original order, and values written the same way, which RFC
+      8785 specifies fully if two languages must agree. I hash the normalised record, not the
+      raw reply, because replies often carry per-request values such as a generation time. The
+      hash sits in a column, so the upsert can skip unchanged rows in the same statement. It's
+      cheaper than comparing field by field, and it gives a reliable signal for publishing
+      change events downstream.

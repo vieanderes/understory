@@ -1,4 +1,4 @@
-import { z } from 'zod';
+import * as z from '@/core/zod';
 import { EXPLAIN_BACK_AUDIENCES, EXPLAIN_BACK_KINDS } from './explain-back';
 import { FIGURE_IDS } from './figures';
 import { idSchema, localIdSchema, moduleIdSchema } from './ids';

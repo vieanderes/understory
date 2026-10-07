@@ -1,0 +1,369 @@
+id: scale.fair-queues
+title: Fair and prioritised queues
+objective: Stop one noisy tenant from starving the rest with per-tenant round robin, priorities and bulkheads.
+level: advanced
+minutes: 10
+concepts: [scale.noisy-neighbour, scale.round-robin-fairness, scale.priority-queues, scale.bulkheads]
+prerequisites: [scale.queues-and-workers, scale.backpressure]
+opening:
+  text: >-
+    You'll stop one huge customer from making every other customer wait on a shared queue.
+    The fix is a scheduler of about twenty lines, and you'll write it.
+
+steps:
+  - type: prose
+    id: the-noisy-neighbour
+    body: |-
+      A newsletter platform sends every email through one queue and 100 workers. Each
+      newsletter is a **tenant**: a customer account that shares the system with the others.
+
+      ```text
+      09:00  big-garden-weekly   enqueues 50,000 sends
+      09:01  tiny-chess-club     enqueues 1 sign-up confirmation
+      ```
+
+      The queue is first in, first out. The workers are busy and healthy. Yet the chess club's new member hears nothing for a long while.
+
+  - type: multiple-choice
+    id: pick-why-it-waits
+    concept: scale.noisy-neighbour
+    difficulty: 1
+    question: The workers never stopped. Why did the confirmation wait so long?
+    choices:
+      - text: It's queued behind all 50,000 garden sends
+        correct: true
+        feedback: >-
+          Right. Arrival order lets one tenant's backlog decide everyone's wait.
+      - text: There aren't enough workers in total
+        feedback: >-
+          More workers only shorten the line. The confirmation still joins the back of it.
+      - text: Small newsletters get slower workers
+        feedback: >-
+          Every worker treats every job alike. The trouble is where the job sits in line.
+      - text: The confirmation job failed and was retried
+        feedback: >-
+          Nothing failed here. It waited its turn, and its turn came after 50,000 others.
+
+  - type: prose
+    id: round-robin
+    body: |-
+      That's the **noisy neighbour**: one tenant's flood makes everyone else wait. The fix is
+      a queue per tenant, served in turn. Take one job from each tenant, then go round again.
+      That's **round robin**.
+
+      ```js
+      // queues: { big: ["b1", "b2", "b3"], tiny: ["t1"], small: ["s1"] }
+      // first in, first out:  b1 b2 b3 t1 s1
+      // round robin:          b1 t1 s1 b2 b3
+      ```
+
+      The big tenant still gets every idle worker. It can't push in front, that's all.
+
+  - type: parsons
+    id: arrange-next-tenant
+    concept: scale.round-robin-fairness
+    difficulty: 2
+    language: js
+    prompt: >-
+      Arrange `nextTenant`. Start at `cursor`, skip tenants with empty queues, and return
+      the tenant with the cursor moved one past it.
+    blocks:
+      - id: sig
+        code: 'function nextTenant(tenants, queues, cursor) {'
+        subgoal: Try each tenant once
+      - id: loop
+        code: 'for (let i = 0; i < tenants.length; i++) {'
+        indent: 1
+      - id: index
+        code: 'const index = (cursor + i) % tenants.length;'
+        indent: 2
+        subgoal: Wrap round from the cursor
+      - id: tenant
+        code: 'const tenant = tenants[index];'
+        indent: 2
+      - id: check
+        code: 'if (queues[tenant].length > 0) {'
+        indent: 2
+        subgoal: Serve the first tenant with work
+      - id: ret
+        code: 'return { tenant, cursor: (index + 1) % tenants.length };'
+        indent: 3
+      - id: close-if
+        code: '}'
+        indent: 2
+      - id: close-loop
+        code: '}'
+        indent: 1
+      - id: none
+        code: 'return null;'
+        indent: 1
+        subgoal: Nobody has work
+      - id: close-fn
+        code: '}'
+    distractors:
+      - id: start-at-zero
+        code: 'const index = i;'
+        feedback: >-
+          Starting at the first tenant every time serves it again and again. The cursor is
+          what makes it a turn.
+      - id: cursor-plus-one
+        code: 'return { tenant, cursor: cursor + 1 };'
+        feedback: >-
+          After skipping empty tenants, `cursor + 1` lands on a tenant you've passed. Move
+          past the one you served.
+
+  - type: prose
+    id: priorities
+    body: >-
+      Not all jobs are equal. A sign-up confirmation has a person waiting for it. A scheduled
+      issue can go out a few minutes late and nobody notices.
+
+
+      So give jobs a **priority**: user-triggered work is high, background sends are low.
+      Workers take high jobs first. The catch is what happens to low jobs when the high ones
+      never run out.
+
+  - type: ai-review
+    id: review-strict-priority
+    concept: scale.priority-queues
+    difficulty: 3
+    language: js
+    request: Send user-triggered emails before scheduled issues.
+    flawClass: regression
+    code: |
+      const high = []; // sign-up confirmations, "send test" clicks
+      const low = []; // scheduled issues
+
+      function enqueue(job) {
+        (job.byUser ? high : low).push(job);
+      }
+
+      function pickNext() {
+        if (high.length > 0) return high.shift();
+        return low.shift();
+      }
+    prompt: >-
+      An assistant wrote this. The test queued one issue and one confirmation, and the
+      confirmation went first. Then a launch brought sign-ups all day, and the scheduled
+      issues went out hours late. Tap the line at fault.
+    lines: [9]
+    reasons:
+      - text: Low jobs run only once the high queue is empty
+        correct: true
+        feedback: >-
+          Yes. A steady stream of high jobs starves the low ones completely.
+      - text: '`shift` takes the newest job, not the oldest'
+        feedback: >-
+          `shift` removes the first item, which is the oldest. The order inside each queue is fine.
+      - text: Sign-ups belong in the low queue
+        feedback: >-
+          Someone is waiting for that email, so high is right. The rule for low jobs is the gap.
+      - text: In-memory arrays lose jobs on a restart
+        feedback: >-
+          True of any in-memory queue, but nothing restarted. The issues waited. They weren't lost.
+    verify:
+      question: Which test would have caught this before the launch?
+      choices:
+        - text: A stream of high jobs while one low job waits
+          correct: true
+          feedback: >-
+            That's the launch-day shape. The low job never comes out.
+        - text: One high and one low job, high first
+          feedback: >-
+            That's the test it already passed. Two jobs can't show starvation.
+        - text: Only low jobs, and an empty high queue
+          feedback: >-
+            With no high work, low jobs run at once. The flaw stays hidden.
+        - text: Many low jobs from many tenants
+          feedback: >-
+            Still no high jobs, so nothing competes. You need high work that keeps coming.
+    fix: |
+      function pickNext(now) {
+        // Ageing: a low job that has waited too long counts as high.
+        const aged = low.length > 0 && now - low[0].enqueuedAt >= MAX_WAIT_MS;
+        if (aged || high.length === 0) return low.shift();
+        return high.shift();
+      }
+
+  - type: prose
+    id: bulkheads
+    body: >-
+      One more way to sink everyone: a slow dependency. Say one mail provider starts taking
+      30 seconds per send. Workers pile up waiting on it, and soon all 100 are stuck there.
+
+
+      A **bulkhead** caps how many workers one tenant or one provider may hold at once, say
+      20 of 100. Like the walls in a ship's hull, it keeps one flood in one compartment.
+
+  - type: bug-hunt
+    id: hunt-cap-never-released
+    concept: scale.bulkheads
+    difficulty: 3
+    language: js
+    code: |
+      async function runJob(job) {
+        const tenant = job.tenant;
+        if ((running[tenant] ?? 0) >= TENANT_CAP) return requeue(job);
+        running[tenant] = (running[tenant] ?? 0) + 1;
+        await sendEmail(job);
+        running[tenant] -= 1;
+      }
+    prompt: >-
+      A newsletter's mail server was down for an hour. It's back now, but none of that
+      newsletter's sends run again, though its queue is full. Tap the line to fix.
+    lines: [6]
+    reasons:
+      - text: A throw from `sendEmail` skips the decrement
+        correct: true
+        feedback: >-
+          Right. Each failure leaks a slot, until the tenant is capped for good.
+      - text: The cap check should use `>` not `>=`
+        feedback: >-
+          That only moves the cap by one. Here the count climbs and never comes down.
+      - text: '`requeue` drops the job instead of retrying'
+        feedback: >-
+          The jobs are still there, the queue is full. They're refused before they start.
+      - text: Two workers can both pass the cap check
+        feedback: >-
+          There's no `await` between the check and the increment, so they can't interleave.
+    fix: |
+      async function runJob(job) {
+        const tenant = job.tenant;
+        if ((running[tenant] ?? 0) >= TENANT_CAP) return requeue(job);
+        running[tenant] = (running[tenant] ?? 0) + 1;
+        try {
+          await sendEmail(job);
+        } finally {
+          running[tenant] -= 1; // freed on success and on failure
+        }
+      }
+
+  - type: code-challenge
+    id: write-pick-next
+    concept: scale.round-robin-fairness
+    difficulty: 4
+    language: ts
+    editable: '19-24'
+    prompt: >-
+      Write `pickNext(s, now)`. It removes and returns the next job, or `undefined`. A job
+      is urgent if it's `'high'`, or if it has waited `maxWaitMs` or more.
+
+
+      Go round `s.tenants` from `s.cursor`, skipping tenants at `maxRunningPerTenant`. First
+      look for any urgent job, taking a tenant's oldest urgent one. If none, take the oldest
+      job of the first tenant with any. Then add one to that tenant's `running`, and move
+      `cursor` one past it.
+    hints:
+      - The same round-robin walk from `nextTenant` does the work. You run it twice, first for urgent jobs only.
+      - An urgent job can sit behind a low one in a tenant's queue, so find it with `findIndex` and remove it with `splice`.
+      - "Loop `for (const onlyUrgent of [true, false])` around the walk, and `continue` past tenants at their cap."
+
+  - type: explain-back
+    id: explain-fix-risks
+    concept: scale.noisy-neighbour
+    difficulty: 4
+    audience: incident
+    kind: risk
+    prompt: >-
+      Post in the incident channel. One newsletter's 50,000 sends delayed everyone's
+      confirmations. What still could go wrong after the fix, and how will you check?
+    rubric:
+      - Names the cause, one tenant's backlog ahead of everyone in a single queue, and the fix of per-tenant turns and priority.
+      - Names a remaining risk, such as low jobs starving or a slow provider filling every worker.
+      - Says how to check, such as the age of the oldest job per tenant and per priority.
+    modelAnswer: >-
+      Cause: one queue in arrival order, so one newsletter's 50,000 sends sat ahead of
+      everyone. Fix: a queue per tenant served in turn, with confirmations first. Risks:
+      scheduled issues could starve behind a stream of confirmations, and one slow mail
+      provider could still hold every worker. We're adding ageing and a per-provider cap.
+      We'll watch the oldest waiting job per tenant and per priority, and alert past ten
+      minutes.
+
+recap:
+  - Serve tenants in turn from per-tenant queues, so one backlog can't block the rest.
+  - Run user-triggered work first, and age low jobs so they can't starve.
+  - Cap the workers any one tenant or provider can hold, and free the slot on failure.
+
+recall:
+  - id: card-noisy-neighbour
+    concept: scale.noisy-neighbour
+    front: Why can a healthy, busy worker pool still leave small tenants waiting for hours?
+    back: >-
+      In one first-in, first-out queue, a big tenant's backlog sits ahead of them. Capacity
+      is fine; the order is unfair.
+  - id: card-round-robin
+    concept: scale.round-robin-fairness
+    front: How does per-tenant round robin pick the next job?
+    back: >-
+      It keeps a queue per tenant and takes one job from each tenant with work in turn,
+      remembering where it stopped.
+  - id: card-starvation
+    concept: scale.priority-queues
+    front: What goes wrong with strict priority, and what are two fixes?
+    back: >-
+      Low jobs starve while high work keeps arriving. Age them into high after a wait, or
+      reserve a share of picks for low.
+  - id: card-bulkhead
+    concept: scale.bulkheads
+    front: What does a bulkhead do in a worker pool?
+    back: >-
+      It caps how many workers one tenant or dependency may hold, so one flood or slowdown
+      can't take every worker.
+
+references:
+  - kind: essay
+    title: Avoiding insurmountable queue backlogs
+    authors: David Yanacek
+    venue: Amazon Builders' Library
+    url: https://aws.amazon.com/builders-library/avoiding-insurmountable-queue-backlogs/
+    note: Noisy neighbours in shared queues, per-customer fairness, and separating work so one backlog can't sink the rest.
+    primary: true
+    verified: false
+  - kind: paper
+    title: Efficient Fair Queuing Using Deficit Round Robin
+    authors: M. Shreedhar and George Varghese
+    year: 1995
+    venue: ACM SIGCOMM '95
+    note: Weighted round robin that stays fair when items differ in size, with constant work per pick.
+    primary: true
+    verified: false
+  - kind: essay
+    title: Workload isolation using shuffle-sharding
+    authors: Colm MacCárthaigh
+    venue: Amazon Builders' Library
+    url: https://aws.amazon.com/builders-library/workload-isolation-using-shuffle-sharding/
+    note: Giving each customer a small random set of workers, so one noisy customer affects few others.
+    verified: false
+  - kind: book
+    title: 'Release It! Design and Deploy Production-Ready Software'
+    authors: Michael T. Nygard
+    year: 2018
+    venue: Pragmatic Bookshelf, 2nd edition
+    note: The bulkhead pattern and its siblings, with stories of the outages they prevent.
+    verified: false
+
+deepDive: >-
+  Plain round robin gives every tenant the same number of picks. If paid plans should get
+  more, give each tenant a weight and let it take that many jobs per turn. When jobs differ
+  in cost, such as one email against a 10,000-row export, count cost instead of jobs.
+  Deficit round robin does this: each turn adds a tenant's weight to a running credit, and
+  the tenant runs jobs while its credit covers their cost. Unused credit carries to the next
+  turn.
+
+
+  Ageing and a reserved share are the two usual cures for starvation. Ageing promotes a job
+  once it has waited too long. A reserved share gives low work every fifth pick, say, so it
+  always moves. A reserved share is simpler to reason about under load, and ageing reacts
+  better when high work is rare.
+
+
+  Many managed queues, Amazon SQS among them, have no priority field. The usual shape is
+  one queue per priority, with workers that poll the urgent queue more often or have a
+  pool of their own. That's also a bulkhead: background syncs can never take the workers
+  kept for interactive work.
+
+
+  In a Postgres queue claimed with `SKIP LOCKED`, fairness needs care. A plain `ORDER BY
+  created_at` hands out jobs in arrival order, noisy neighbour included. Claiming the oldest
+  job per tenant, or keeping a per-tenant `running` count that the claim checks, brings the
+  turns back.

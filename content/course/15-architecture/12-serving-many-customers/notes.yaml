@@ -1,0 +1,236 @@
+summary: >-
+  Multi-tenancy means one deployment serves many customer organisations, the tenants, from
+  shared code and usually shared infrastructure. It's how almost all business software is
+  sold, because running one copy is far cheaper than running a thousand. Its defining risk
+  is a leak: one tenant seeing another's data, usually through one query that forgot its
+  tenant filter.
+
+
+  The defence is layered. The tenant id comes from the authenticated session on the server,
+  never from the request. It's applied once, through a store or repository scoped to that
+  tenant, so handlers can't forget it. And the database enforces it again with row-level
+  security, so even a query that bypasses the store returns nothing it shouldn't.
+
+
+  Isolation also has levels. A shared table with a `tenant_id` column is cheapest. A schema
+  per tenant or a database per tenant isolate more and cost more to run and migrate. Real
+  systems often mix them: small customers share, large or regulated ones get their own.
+  And tenancy reaches beyond the database, into caches, file storage, queues, logs and rate
+  limits.
+remember:
+  - The tenant id comes from the authenticated session on the server, never from a URL, body or header the client controls.
+  - Apply the tenant filter once, in a scoped store, so no handler can read another tenant's rows by forgetting a `WHERE`.
+  - Row-level security with a policy on `tenant_id` is the database's own check, and it catches the query that skipped the store.
+  - Set the tenant per transaction with `set_config(..., true)`, so a pooled connection can't carry one tenant's id into the next request.
+  - Table owners bypass row-level security unless the table has `FORCE ROW LEVEL SECURITY`, and superusers always bypass it.
+  - Include `tenant_id` in composite keys and foreign keys, so a row can't reference another tenant's row.
+  - Every cache key, file path, job payload and log line carries the tenant id, because there is no session in a queue.
+  - Shared tables, a schema per tenant and a database per tenant trade running cost for isolation.
+sections:
+  - title: Row-level security that fails closed
+    body: |-
+      The lesson mentioned row-level security as the net. Here is a complete setup, with
+      the details that decide whether the net holds.
+
+      ```sql
+      CREATE TABLE appointments (
+        tenant_id  integer NOT NULL,
+        id         integer GENERATED ALWAYS AS IDENTITY,
+        patient_id integer NOT NULL,
+        day        date NOT NULL,
+        PRIMARY KEY (tenant_id, id),
+        FOREIGN KEY (tenant_id, patient_id) REFERENCES patients (tenant_id, id)
+      );
+
+      ALTER TABLE appointments ENABLE ROW LEVEL SECURITY;
+      ALTER TABLE appointments FORCE ROW LEVEL SECURITY;
+      CREATE POLICY tenant_isolation ON appointments
+        USING (tenant_id = nullif(current_setting('app.tenant_id', true), '')::integer)
+        WITH CHECK (tenant_id = nullif(current_setting('app.tenant_id', true), '')::integer);
+      ```
+
+      `USING` filters the rows a query can see, update or delete. `WITH CHECK` stops a
+      write that would create a row outside the tenant. On PostgreSQL, with tenant 1 set,
+      inserting a row for tenant 2 failed with "new row violates row-level security policy".
+
+      The `nullif` matters. `current_setting(name, true)` returns null if the setting was
+      never defined, but an empty string once it has been defined in the session and then
+      reset. Casting an empty string to `integer` throws. With `nullif`, no tenant means
+      the comparison is null and the query returns zero rows. Either way it fails closed,
+      and zero rows is kinder to background tools than an error.
+
+      `FORCE` makes the policy apply to the table's owner as well. Without it, if your app
+      connects as the role that ran the migrations, row-level security does nothing. Run
+      the app as a separate role without `BYPASSRLS`, and never as a superuser.
+
+      The composite foreign key is a second, quieter guard. Because it includes
+      `tenant_id`, an appointment for tenant 1 can't point at a patient of tenant 2.
+      Inserting one failed with a foreign key violation.
+  - title: Setting the tenant on a pooled connection
+    body: |-
+      Row-level security reads the tenant from a setting on the database session. Web apps
+      share a pool of connections between requests, so a setting made with plain `SET`
+      stays on the connection and leaks into whichever request borrows it next. Scope it to
+      a transaction instead.
+
+      ```ts
+      type Client = { query(sql: string, params?: unknown[]): Promise<{ rows: any[] }> };
+
+      async function withTenant<T>(
+        client: Client,
+        tenantId: number,
+        work: (tx: Client) => Promise<T>,
+      ): Promise<T> {
+        await client.query('BEGIN');
+        try {
+          await client.query("SELECT set_config('app.tenant_id', $1, true)", [String(tenantId)]);
+          const result = await work(client);
+          await client.query('COMMIT');
+          return result;
+        } catch (error) {
+          await client.query('ROLLBACK');
+          throw error;
+        }
+      }
+      ```
+
+      The third argument of `set_config`, `true`, makes the setting local to the
+      transaction, the same as `SET LOCAL`. It disappears at `COMMIT` or `ROLLBACK`, so the
+      next borrower starts with no tenant. The function form also takes a bind parameter,
+      which `SET LOCAL` can't, so the tenant id is never glued into SQL text.
+
+      Run against PostgreSQL as the app role, with one appointment for each of two
+      tenants, `withTenant(db, 1, ...)` returned only tenant 1's row, and a query outside
+      any `withTenant` returned zero rows. In a real app, the client comes from
+      `pool.connect()` and is released in a `finally`.
+
+      Transaction-mode connection poolers, such as PgBouncer in that mode, hand a
+      connection to a client only for one transaction, so session-level `SET` is unsafe
+      there too. Transaction-local settings work in every pooling mode.
+  - title: Tenancy beyond the database
+    body: |-
+      Every place data is stored or processed needs the tenant, and each has its own way
+      to leak. In Node, `AsyncLocalStorage` carries a value through every `await` in a
+      request without passing it as an argument, which suits a tenant context.
+
+      ```ts
+      import { AsyncLocalStorage } from 'node:async_hooks';
+
+      const tenantContext = new AsyncLocalStorage<{ tenantId: number }>();
+
+      function currentTenant(): number {
+        const context = tenantContext.getStore();
+        if (!context) throw new Error('no tenant in context'); // fail closed
+        return context.tenantId;
+      }
+
+      const cacheKey = (name: string) => `t:${currentTenant()}:${name}`;
+
+      type Job = { name: 'send-reminders'; tenantId: number };
+
+      // Worker side: no session here, so restore the context from the job itself.
+      async function work(job: Job) {
+        await tenantContext.run({ tenantId: job.tenantId }, async () => {
+          await sendReminders(); // anything inside reads currentTenant()
+        });
+      }
+      ```
+
+      On Node 24, a request run inside `tenantContext.run({ tenantId: 1 }, ...)` built the
+      key `t:1:day-view:2026-10-01`, the worker still read tenant 1 after an `await`, and
+      calling `cacheKey` outside any context threw.
+
+      The same rule applies everywhere. Cache keys start with the tenant. Object storage
+      paths start with the tenant, and signed URLs are issued only after an ownership
+      check. Queue jobs carry the tenant id in their payload, and the worker sets the
+      context before doing anything. Search indexes filter by tenant on every query. Logs
+      and traces record the tenant id, so you can answer "what did this customer see?"
+      during an incident. Rate limits and quotas are per tenant, so one customer's import
+      can't exhaust capacity for the rest.
+  - title: Choosing an isolation model
+    body: |-
+      The three models are points on a line between cost and isolation, and the choice is
+      often made per customer tier.
+
+      A **shared schema** with a `tenant_id` column is the default. One migration updates
+      everyone, one connection pool serves everyone, and a new tenant is a row in a table.
+      Its risks are leaks, guarded by the layers above, and the **noisy neighbour**: one
+      tenant's heavy report slows everyone on the same database. Per-tenant rate limits,
+      statement timeouts and indexes that lead with `tenant_id` keep it manageable.
+
+      A **schema per tenant** gives each tenant its own tables in one database. Leaks need
+      the wrong `search_path` rather than a missing `WHERE`, and one tenant's data can be
+      exported or deleted by dropping its schema. Migrations now run once per tenant, and
+      thousands of schemas strain tooling and the catalogue.
+
+      A **database per tenant** isolates best. A tenant can be restored alone, placed in a
+      specific region for data-residency law, sized to its load, and given its own
+      encryption key. The costs are one connection pool, one backup and one migration run
+      per tenant, and cross-tenant reporting needs a separate pipeline.
+
+      A common production answer is hybrid: small tenants share, while enterprise tenants
+      who pay for it, or must meet regulation, get a dedicated database. The code stays
+      the same because a routing layer picks the connection from the tenant id. Design
+      that routing seam early, even if every tenant shares at first.
+pitfalls:
+  - "**Taking the tenant from the request.** A `?clinic=2` or an `X-Tenant-Id` header says whatever the client types. Read it from the server-side session, and treat a request tenant only as a hint that must match."
+  - "**Running the app as the table owner.** Row-level security is silently skipped for owners unless the table has `FORCE ROW LEVEL SECURITY`. Connect as a separate role with no `BYPASSRLS`."
+  - "**Session-level `SET` on a pooled connection.** The next request borrows the connection with the last tenant's id still set. Use `set_config(..., true)` inside a transaction."
+  - "**Caching without the tenant in the key.** Two clinics request `day-view:2026-10-01` and one gets the other's page. Put the tenant first in every cache key."
+  - "**Background jobs with no tenant.** A queue has no session, so a job without `tenantId` in its payload runs unscoped. Carry the tenant in the job and restore the context before any work."
+  - "**Foreign keys without `tenant_id`.** A row can then point at another tenant's record, and joins cross the wall. Make keys and references composite, `(tenant_id, id)`."
+verify:
+  - lens: leaks
+    check: The tenant always comes from the server-side session, never from a query string, header or request body.
+  - lens: leaks
+    check: Every cache key and every queued job carries the tenant, so no cached page or background job runs unscoped.
+  - lens: breaks
+    check: The app connects as a role without `BYPASSRLS`, and each tenant table has `FORCE ROW LEVEL SECURITY`, so policies apply to every query.
+  - lens: tests
+    check: Tests seed at least two tenants and assert that each endpoint, export and job returns only the caller's rows.
+interview:
+  - question: How would you design tenant isolation for a B2B SaaS on PostgreSQL?
+    answer: >-
+      Shared tables with a `tenant_id` on every row, enforced in three layers. The tenant
+      comes from the authenticated session, never the request. The application reads
+      through a repository scoped to that tenant, so the filter is written once. And
+      PostgreSQL enforces it again with row-level security: a policy comparing `tenant_id`
+      to a transaction-local setting, `FORCE ROW LEVEL SECURITY` on each table, and an app
+      role without `BYPASSRLS`. Keys and foreign keys include `tenant_id` so rows can't
+      cross-reference. I'd add tenant ids to cache keys, storage paths, job payloads and
+      logs, and a test that runs every endpoint as tenant A against tenant B's ids. For
+      enterprise customers who need it, a routing layer can move a tenant to its own
+      database without code changes.
+  - question: Why add row-level security if every query already filters by tenant?
+    answer: >-
+      Because the application filter protects only code that uses it, and a cross-tenant
+      leak is the most damaging bug a SaaS can ship. Sooner or later someone writes a
+      report script, an admin endpoint or a migration that queries directly, and an AI
+      assistant will happily omit the filter. Row-level security runs inside the database
+      on every query, whoever wrote it. The two checks are independent, so one mistake
+      doesn't become an incident. The costs are small but real: the tenant must be set per
+      transaction, which needs care with connection pools, and policies add a condition
+      the planner must handle, so indexes should lead with `tenant_id`. I'd also make sure
+      the app never connects as the table owner.
+  - question: Shared schema, schema per tenant, or database per tenant. How do you choose?
+    answer: >-
+      By the isolation customers need against the cost of running it, often per tier.
+      Shared schema is cheapest: one migration, one pool, onboarding is an insert. It
+      needs strong leak prevention and protection from noisy neighbours. Schema per tenant
+      isolates better and makes per-tenant export and deletion simple, but migrations run
+      per tenant and thousands of schemas strain tooling. Database per tenant gives
+      per-tenant restore, region placement for data residency and independent scaling,
+      at the cost of a pool, backup and migration per tenant, and harder cross-tenant
+      analytics. I'd start shared with a routing seam keyed by tenant, and move large or
+      regulated customers to dedicated databases when a contract requires it.
+  - question: What is a noisy neighbour, and how do you deal with it?
+    answer: >-
+      It's one tenant consuming enough shared capacity to degrade everyone else, such as a
+      huge export or an import that saturates the database. First, make it visible:
+      record the tenant id on every request, query and job, so you can see who is using
+      what. Then limit it: per-tenant rate limits and concurrency caps at the API,
+      separate queues or weighted fair scheduling for background jobs, and statement
+      timeouts so one query can't run for minutes. Heavy reports can move to a read
+      replica. If one tenant is consistently large, move it to dedicated resources, which
+      a routing layer makes possible without code changes. The trade-off is utilisation:
+      strict limits leave capacity idle, so tiers usually get different ceilings.

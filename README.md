@@ -108,14 +108,17 @@ which measure what you know without help.
 Away from a lesson it is a guide. It knows every page in the app and where you are on your
 paths, so you can ask where to start, what to practise or where yesterday's news went, and
 it answers with a link that takes you there. On a wide screen it docks beside the page
-instead of covering it, so the lesson and the answer stay side by side; on a phone it opens
-as a sheet. In the coding simulator the same assistant plays the one employers switch on,
+instead of covering it, so the lesson and the answer stay side by side; on a phone it fills
+the screen, so typing and scrolling stay in Scout and the page behind holds still. Ask it what
+to learn or which path to take, and it offers to plan one with you: a button takes you to the
+planner. In the coding simulator the same assistant plays the one employers switch on,
 and every prompt goes into your report.
 
 ### Plan a path with Scout
 
-Not sure which path fits, or none fits quite? Switch Scout to **Plan** (or choose "Plan a
-path with Scout" on Learn) and talk it through. Scout starts with what brings you here,
+Not sure which path fits, or none fits quite? Build your own, by hand or with Scout: in the
+builder ("Build your own path" on Learn), press **Plan with Scout** and talk it through, with
+Scout beside the builder. Scout starts with what brings you here,
 whatever it is: interviews coming up, a new career, your current work, a project of your own,
 school, a coding test, or plain curiosity. Then it asks only what changes the plan: what you
 already know, how much time you have and by when, which kinds of interviews or what you want
@@ -123,15 +126,17 @@ to build. Each question comes with answers to tap, and you can always type your 
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/scout-planner-dark.png">
-  <img alt="Scout in plan mode beside Learn. The learner tapped two reasons and a weekly time, and Scout drafted a named path of two stages, with its size, how many weeks it takes at that pace, a missing lesson it builds on marked in the accent, and Save path." src="docs/assets/readme/scout-planner-light.png" width="100%">
+  <img alt="Scout planning a path beside the builder. The learner tapped two reasons and a weekly time, and Scout drafted a named path of two stages, with its size, how many weeks it takes at that pace, a missing lesson it builds on marked in the accent, and Save path." src="docs/assets/readme/scout-planner-light.png" width="100%">
 </picture>
 
 After a few questions Scout drafts the path: whole chapters where a chapter fits, single
 lessons where only part of one does, in stages with a reason each, sized to your weeks, and
 with a name of its own and two others to pick from. Open the draft to rename it, take out a
-lesson or a stage, or add the lessons it builds on that you have not done yet. Ask for
-changes ("shorter", "more practice", "add system design") and Scout redrafts from the version
-you are looking at. Save puts it on Learn as one of your paths, beside any others. Lesson ids,
+lesson or a stage, or add the lessons it builds on that you have not done yet. The builder
+ticks what Scout drafts, and your ticks go back to Scout, so you can switch between ticking by
+hand and asking at any point. Ask for changes ("shorter", "more practice", "add system
+design") and Scout redrafts from the version you are looking at. Save puts it on Learn as one
+of your paths, beside any others. Lesson ids,
 minutes and gaps are checked against the course, never taken from the model on trust.
 
 ### It runs on your own Claude
@@ -311,7 +316,7 @@ Every screen is designed from 390 px up and checked at 390, 768, 1024 and 1440 p
 and dark. Writing code on a phone gets its own editor: a suggestion row above the keyboard,
 snippet gaps you tap to fill, trackpad-style cursor keys and a full-screen mode. See
 [`MOBILE-EDITING.md`](docs/MOBILE-EDITING.md). On a phone the four places sit in a tab bar,
-and Scout opens as a sheet over the lesson.
+and Scout fills the screen over the lesson.
 
 <p align="center">
   <picture>

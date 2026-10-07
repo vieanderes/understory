@@ -1,0 +1,357 @@
+id: arch.sagas-and-workflows
+title: Steps that span systems
+objective: Run a process across systems as a saga with compensations, tell when a durable workflow engine helps, and reconcile what drifted.
+level: advanced
+minutes: 10
+concepts: [arch.saga-pattern, arch.compensation, arch.durable-workflows, arch.deterministic-replay]
+prerequisites: [arch.monolith-and-services, arch.event-driven, scale.idempotency]
+opening:
+  text: >-
+    You'll run a process across several systems and undo it cleanly when one step fails.
+    That's how an order survives a card provider, a courier and a crash halfway through.
+
+steps:
+  - type: multiple-choice
+    id: pick-what-rollback-leaves
+    concept: arch.saga-pattern
+    difficulty: 1
+    language: js
+    code: |
+      async function placeCakeOrder(order) {
+        await db.query('BEGIN');
+        try {
+          await db.query('INSERT INTO oven_slots (order_id) VALUES ($1)', [order.id]);
+          await cards.hold(order.cardId, order.pence);   // the card provider
+          await couriers.book(order.address);            // throws: no drivers free
+          await db.query('COMMIT');
+        } catch (error) {
+          await db.query('ROLLBACK');
+          throw error;
+        }
+      }
+    question: The courier booking throws, and the `ROLLBACK` runs. What's still in place?
+    choices:
+      - text: Nothing, the whole order rolled back
+        feedback: >-
+          Tempting, but `ROLLBACK` only reaches our own database. The card provider never
+          heard about it.
+      - text: A hold on the customer's card
+        correct: true
+        feedback: >-
+          Right. The hold lives at the card provider, outside our transaction.
+      - text: The oven slot row
+        feedback: >-
+          That insert was inside the transaction, so the rollback removed it. The hold
+          wasn't.
+
+  - type: prose
+    id: name-saga-and-compensation
+    body: >-
+      So you undo it yourself. A **saga** runs a process as steps, each committed on its
+      own. Most steps get a **compensation**: an action that cancels it, like releasing a
+      card hold. When a step fails, the finished steps are compensated, newest first.
+
+
+      A compensation isn't a rollback. The customer may see the hold appear, then vanish.
+      And a sent email has no undo, so it goes last.
+
+  - type: fill-blank
+    id: fill-reverse-compensation
+    concept: arch.compensation
+    difficulty: 2
+    language: ts
+    prompt: >-
+      Finish the saga runner. Remember each finished step, and on a failure undo them
+      newest first.
+    template: |
+      const done: Step[] = [];
+      for (const step of steps) {
+        try {
+          await step.run();
+          done.{{1}}(step);
+        } catch (error) {
+          for (const finished of done.{{2}}()) await finished.{{3}}();
+          throw error;
+        }
+      }
+    blanks:
+      - key: '1'
+        answer: push
+      - key: '2'
+        answer: reverse
+      - key: '3'
+        answer: undo
+    bank: [push, reverse, undo, run, sort, concat]
+
+  - type: ai-review
+    id: review-email-moved-up
+    concept: arch.saga-pattern
+    difficulty: 3
+    language: js
+    request: Customers want their confirmation sooner. Send the email earlier in the cake order saga.
+    flawClass: regression
+    code: |
+      // Each step: what it does, and how to cancel it.
+      const cakeOrder = [
+        { name: 'reserve-oven', run: ovens.reserve, undo: ovens.free },
+        { name: 'hold-card', run: cards.hold, undo: cards.release },
+        { name: 'send-confirmation', run: mail.sendConfirmation },
+        { name: 'book-courier', run: couriers.book, undo: couriers.cancel },
+      ];
+    prompt: >-
+      An assistant made this change, and the happy-path test still sent one email. Then
+      the couriers had a bad Saturday. Forty customers got confirmations for cancelled
+      cakes. Tap the line at fault.
+    lines: [5]
+    reasons:
+      - text: Nothing undoes the email, and later steps can fail
+        correct: true
+        feedback: >-
+          Yes. Anything with no undo goes after every step that might fail.
+      - text: The confirmation step needs an `undo` function
+        feedback: >-
+          A sent email can't be unsent. A second "sorry, cancelled" email is damage control,
+          not an undo.
+      - text: The card should be held before the oven slot
+        feedback: >-
+          Both can be cancelled cleanly, so their order barely matters. The trouble is
+          what comes after the email.
+    verify:
+      question: Which test would have caught this before Saturday?
+      choices:
+        - text: Courier fails, and no email was sent
+          correct: true
+          feedback: >-
+            That's the failure the move broke. It fails at once on this code.
+        - text: Every step works, and one email was sent
+          feedback: >-
+            That's the test that passed. The happy path never reaches a compensation.
+        - text: Card declined, and the oven slot was freed
+          feedback: >-
+            The card step comes before the email, so this still passes. It misses the gap.
+    fix: |
+      const cakeOrder = [
+        { name: 'reserve-oven', run: ovens.reserve, undo: ovens.free },
+        { name: 'hold-card', run: cards.hold, undo: cards.release },
+        { name: 'book-courier', run: couriers.book, undo: couriers.cancel },
+        { name: 'send-confirmation', run: mail.sendConfirmation },   // nothing can fail after it
+      ];
+
+  - type: prose
+    id: name-saga-state
+    body: >-
+      The process running a saga can crash between steps. So store how far each order got,
+      in a status column: `oven_reserved`, `card_held`, `courier_booked`, `confirmed`. After
+      each step, its new status is saved, and a restart carries on from there.
+
+
+      An order that sits in one status for too long is stuck. A **reconciliation** job
+      finds those, and checks them against the card provider and the courier.
+
+  - type: multiple-choice
+    id: pick-crash-protection
+    concept: arch.durable-workflows
+    difficulty: 3
+    question: The server dies after booking the courier, before saving `courier_booked`. The step reruns. What stops a second van?
+    choices:
+      - text: An idempotency key made from the order id
+        correct: true
+        feedback: >-
+          Right. The courier sees the same key and returns the first booking.
+      - text: Saving the status before booking
+        feedback: >-
+          Then a crash after the save skips the booking. No van comes, and the status says
+          one will.
+      - text: Wrapping the booking in a transaction
+        feedback: >-
+          The courier's system isn't in your transaction. A rollback can't cancel its
+          booking.
+      - text: A longer timeout on the courier call
+        feedback: >-
+          The call already worked. The crash came after it, and no timeout changes that.
+
+  - type: prose
+    id: name-durable-engine
+    body: >-
+      A **durable workflow engine**, such as Temporal, keeps that state. A call
+      to another system is an **activity**, retried and recorded in a history. After a
+      crash, the engine reruns your workflow from the top. Recorded activities return
+      their saved results.
+
+
+      That's **deterministic replay**: a crash at step 4 resumes at 4. It needs the same
+      path every run, so workflow code never reads the clock or network directly.
+
+  - type: bug-hunt
+    id: hunt-fetch-in-workflow
+    concept: arch.deterministic-replay
+    difficulty: 4
+    language: ts
+    code: |
+      // Workflow code: the engine replays this function after a restart.
+      export async function cakeOrder(order: Order) {
+        await activities.reserveOven(order.id);
+        await activities.holdCard(order.id, order.pence);
+        const quote = await fetch(`${COURIER_URL}/quote?postcode=${order.postcode}`);
+        const { pence } = await quote.json();
+        if (pence > 1500) {
+          await activities.bookCargoBike(order.id);
+        } else {
+          await activities.bookVan(order.id);
+        }
+        await activities.sendConfirmation(order.id);
+      }
+    prompt: >-
+      A worker restarted mid-order. On replay, the engine stopped the workflow with a
+      non-determinism error: the history said `bookVan`, the code asked for
+      `bookCargoBike`. Tap the line at fault.
+    lines: [5]
+    reasons:
+      - text: The quote is fetched in workflow code, not an activity
+        correct: true
+        feedback: >-
+          Yes. The replay fetched a new price and took the other branch.
+      - text: Workflow code can't contain an `if`
+        feedback: >-
+          Branching is fine when its input is recorded. This one read a live price instead.
+      - text: The two bookings should run in parallel
+        feedback: >-
+          Only one courier is wanted. Running both would book two, and the replay problem
+          stays.
+    fix: |
+      const pence = await activities.getCourierQuote(order.postcode);   // recorded in the history
+      if (pence > 1500) {
+
+  - type: code-challenge
+    id: write-run-saga
+    concept: arch.compensation
+    difficulty: 4
+    language: ts
+    prompt: >-
+      Write `runSaga(steps)`. Run each step in order and log `ran <name>`. If a step throws,
+      log `failed <name>`, run no more steps, and undo the finished ones newest first.
+
+
+      Log `undid <name>` for each undo. Skip steps with no `undo`. If an undo throws, log
+      `undo failed <name>`, add the name to `stuck`, and keep going. Return `{ ok, log,
+      stuck }`.
+
+
+      So oven, card, then a failed courier logs `ran reserve-oven`, `ran hold-card`, `failed
+      book-courier`, `undid hold-card`, `undid reserve-oven`.
+    hints:
+      - Keep a list of the steps that finished. Only those get undone.
+      - Each run and each undo needs its own `try`, or one failed undo stops the rest.
+      - 'In the `catch` around `run`, loop over `[...done].reverse()` and skip a step when `!step.undo`.'
+
+  - type: explain-back
+    id: explain-hold-vanished
+    concept: arch.compensation
+    difficulty: 4
+    audience: non-technical
+    kind: explain
+    prompt: >-
+      A customer's banking app showed a £60 hold that vanished an hour later, with no cake.
+      The bakery owner asks why. Explain what happened.
+    rubric:
+      - The order runs as separate steps in different companies' systems, so one step can fail after others finished.
+      - When the courier couldn't be booked, the system undid the earlier steps itself, newest first.
+      - Releasing a hold is a new, visible action, not a charge, which is why the customer saw it come and go.
+    modelAnswer: >-
+      An order touches three companies: our oven booking, the card company and the
+      courier. Each does its part separately, so we can't cancel them all at once. This
+      time the courier had no drivers. So our system went back through the steps it had
+      done and cancelled each one, last first. It released the hold on the card and freed
+      the oven slot. The customer saw that release happen, but they were never charged.
+
+recap:
+  - Run a cross-system process as a saga, with a compensation for each step and the ones without one last.
+  - Store each order's progress, make every step idempotent, and reconcile what gets stuck.
+  - Let a durable workflow engine record activities, and keep workflow code deterministic so replay works.
+
+recall:
+  - id: card-why-saga
+    concept: arch.saga-pattern
+    front: Why can't one database transaction cover a card hold and a courier booking?
+    back: >-
+      Both live in other companies' systems. A transaction only commits or rolls back writes
+      in its own database.
+  - id: card-compensation-order
+    concept: arch.compensation
+    front: In what order does a saga run its compensations, and which steps get none?
+    back: >-
+      Newest first, for the steps that finished. The failed step and steps with no undo,
+      like a sent email, get none.
+  - id: card-durable-engine
+    concept: arch.durable-workflows
+    front: What does a durable workflow engine record, and what does that buy you?
+    back: >-
+      Each activity's result, in a history. After a crash it replays the workflow and resumes
+      at the first unfinished step.
+  - id: card-replay-rule
+    concept: arch.deterministic-replay
+    front: Why must workflow code not read the clock or call the network directly?
+    back: >-
+      Replay reruns the code and expects the same path. A fresh value can send it down a
+      branch the history doesn't match.
+
+references:
+  - kind: paper
+    title: Sagas
+    authors: Hector Garcia-Molina and Kenneth Salem
+    year: 1987
+    venue: ACM SIGMOD International Conference on Management of Data
+    url: https://doi.org/10.1145/38713.38742
+    note: The original paper. A long transaction split into steps, each with a compensating transaction.
+    primary: true
+    verified: false
+  - kind: docs
+    title: Workflow Definition, deterministic constraints
+    authors: Temporal
+    venue: Temporal documentation
+    url: https://docs.temporal.io/workflow-definition#deterministic-constraints
+    note: Why workflow code must be deterministic for replay, and why external calls belong in activities.
+    primary: true
+    verified: false
+  - kind: docs
+    title: Durable orchestrator code constraints
+    authors: Microsoft
+    venue: Microsoft Learn, Azure Durable Functions
+    url: https://learn.microsoft.com/en-us/azure/azure-functions/durable/durable-functions-code-constraints
+    note: A second replay engine's rules, listed one by one, for clocks, ids, random numbers and network calls.
+    verified: false
+  - kind: docs
+    title: 'Pattern: Saga'
+    authors: Chris Richardson
+    venue: microservices.io
+    url: https://microservices.io/patterns/data/saga.html
+    note: Sagas as a sequence of local transactions, with orchestration and choreography compared.
+    verified: false
+
+deepDive: >-
+  The original sagas paper, from 1987, wasn't about services. It split one long database
+  transaction into steps, so it wouldn't hold locks for hours. Each step had a
+  compensating transaction. The idea moved to services because the problem is the same:
+  no single commit covers the whole job.
+
+
+  Sagas give up isolation. Between steps, other code can see a half-done order: an oven
+  slot taken by a cake that may be cancelled. Design for it. Show statuses like "pending",
+  and don't let other work rely on a step until the saga finishes.
+
+
+  Some steps can't be undone, and some must never fail. A common way to order a saga:
+  steps you can compensate first, then one **pivot** step that commits the business to
+  the outcome, then steps that are retried until they succeed. Taking the money is often
+  the pivot. Sending the confirmation is a retried step after it.
+
+
+  Durable engines replay by comparing what your code asks for with what the history
+  recorded. Changing workflow code while orders are running can break that, because old
+  histories no longer match new code. Engines offer versioning for this. Temporal's
+  documentation calls it out, and so does Azure Durable Functions.
+
+
+  Reconciliation is the net under all of it. A nightly job lists card holds older than a
+  day with no confirmed order, and courier bookings with no matching order. It releases or
+  flags each one. Sagas make drift rare; reconciliation makes it visible.

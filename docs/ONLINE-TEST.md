@@ -275,9 +275,14 @@ of the allowed connection, and New code ends it all.
 
 ### Planning a path
 
-Scout's panel has two modes, **Ask** (tutor in a lesson, guide elsewhere) and **Plan**. In
-plan mode (`mode: 'planner'`) Scout talks a learning path through with the learner, drafts it,
-and the learner saves it as one of their own paths. The code is in `src/core/planner/`
+Scout plans in one place: the path builder (`/learn/build`), where "Plan with Scout" opens it
+in plan mode (`mode: 'planner'`) beside the ticks. There is no switch: everywhere else Scout is
+the tutor or the guide, and plan mode ends when Scout closes or the learner leaves the builder.
+Ticking by hand and planning with Scout edit one draft: the builder ticks what Scout drafts,
+and a tick is a change Scout sees with the next question. Away from the builder, when asked
+what to learn, Scout ends its reply with a `scout-plan` block (`PLAN_OFFER`), drawn as a
+"Plan it with Scout" button that opens the builder on a new plan with the learner's words in
+the question box. The code is in `src/core/planner/`
 (rules, test first) and `src/features/tutor/planner/` (the panel); the rules Scout follows are
 `PLANNER_RULES` in `src/core/ports/assistant.ts`.
 
@@ -306,8 +311,8 @@ and the learner saves it as one of their own paths. The code is in `src/core/pla
   starts from their version.
 - **Saving** records `custom_path_set` v2 (`pathId`, `name`, `lessonIds`, `stages`, `summary`,
   `pace`, `origin: 'scout'`) and puts the path first on Learn. Saving again from the same
-  conversation updates the same path; "Plan again with Scout" on an own path's page opens a
-  fresh conversation seeded with it.
+  conversation updates the same path; "Plan again with Scout" on an own path's page opens the
+  builder on that path (`?plan=1`) with a fresh conversation seeded with it.
 
 ## 6a. Guided mode
 

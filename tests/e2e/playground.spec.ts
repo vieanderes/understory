@@ -114,9 +114,10 @@ test.describe('playground', () => {
     const frame = await page.locator('iframe[title="Your page"]').boundingBox();
     expect(editor && frame).toBeTruthy();
     if (!editor || !frame) return;
-    // Stacked, the page next, with only its label between them.
+    // Stacked, the page next, with only the phone's symbol row (56 px) and the page's label
+    // row (40 px, lined up with the editor's) between them, and the gaps around them.
     expect(frame.y).toBeGreaterThan(editor.y + editor.height);
-    expect(frame.y - (editor.y + editor.height)).toBeLessThan(120);
+    expect(frame.y - (editor.y + editor.height)).toBeLessThan(144);
     expect(frame.width).toBeGreaterThan(300);
   });
 });

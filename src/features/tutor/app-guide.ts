@@ -103,7 +103,7 @@ export function buildAppGuide({
     'Setup (/plan): five questions: goal, interests, starting point, time a day, news on Home.',
     `GitHub (${REPO_URL}): the branch icon beside Settings, at the foot of the rail on desktop and in the top bar on a phone, opens Understory's code, issues and how to contribute, in a new tab.`,
     'Lessons, sessions and tests open full screen with one way back. Scout AI opens with its button or Command or Ctrl and J, and is off in timed tests, checkpoints and test-outs.',
-    'Plan mode: the Plan switch at the top of this Scout panel (also "Plan a path with Scout" on Learn and in the builder). Scout asks what the learner is learning for and how much time they have, drafts a path of chapters or single lessons with its own name, and the learner changes it and saves it to Learn. A learner keeps several own paths, each with its own name.',
+    'Own paths (/learn/build, "Build your own path" on Learn): the learner ticks parts, chapters or single lessons, or presses "Plan with Scout" there and Scout plans the path with them beside the builder: it asks what they are learning for and how much time they have, drafts a path with its own name, and ticks the lessons. A learner keeps several own paths, each with its own name.',
     '',
     `The learner is on ${pathname}.`,
     ...(situation ? describeSituation(situation) : []),

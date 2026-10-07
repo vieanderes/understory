@@ -1,0 +1,378 @@
+id: testing.testing-other-services
+title: Testing code that calls other services
+objective: Test code that calls other services with HTTP mocks, sanitised recorded fixtures checked against a schema, and real dependencies in containers.
+level: advanced
+minutes: 10
+concepts: [testing.http-mocking, testing.recorded-fixtures, testing.testcontainers]
+prerequisites: [testing.doubles-and-integration, testing.contract-tests, backend.calling-other-apis]
+opening:
+  text: >-
+    You'll test code that calls a courier's API without ever calling it, and without
+    committing a customer's email by accident. Then you'll give your tests a real database
+    that vanishes when they finish.
+
+steps:
+  - type: prose
+    id: mock-the-network
+    body: |-
+      In lesson 5 you passed a stub in as an argument. But often the call sits deep inside,
+      a plain `fetch` to a courier. **HTTP mocking** answers it at the network layer instead.
+      MSW, Mock Service Worker, does this with **request handlers**:
+
+      ```ts
+      import { http, HttpResponse } from 'msw';
+      import { setupServer } from 'msw/node';
+
+      const server = setupServer(
+        http.get('https://api.courier.example/parcels/:id', ({ params }) =>
+          HttpResponse.json({ id: params.id, status: 'in_transit' }),
+        ),
+      );
+
+      beforeAll(() => server.listen());
+      afterAll(() => server.close());
+      ```
+
+      Tell it to fail any request that has no handler. Then nothing slips out to the real courier.
+
+  - type: predict-output
+    id: predict-where-answer-comes-from
+    concept: testing.http-mocking
+    difficulty: 1
+    language: ts
+    code: |
+      // src/track.ts, not changed for the test
+      export async function trackParcel(id: string) {
+        const res = await fetch(`https://api.courier.example/parcels/${id}`);
+        return (await res.json()).status;
+      }
+
+      // track.test.ts, with the server above listening
+      test('shows the status', async () => {
+        expect(await trackParcel('P-17')).toBe('in_transit');
+      });
+    question: The test passes. Where did `in_transit` come from?
+    choices:
+      - text: MSW's handler, inside the test process
+        correct: true
+        feedback: >-
+          Right. The real `fetch` ran, and MSW answered before anything left the machine.
+      - text: The courier's real API
+        feedback: >-
+          Nothing reached the courier. The handler matched the URL and replied first.
+      - text: A stub passed into `trackParcel`
+        feedback: >-
+          Look at the signature: it only takes an id. That's the point, the code needs no changes.
+
+  - type: fill-blank
+    id: fill-per-test-override
+    concept: testing.http-mocking
+    difficulty: 2
+    language: ts
+    prompt: >-
+      `trackParcel` returns `'unknown'` when the courier fails. Make one test see the courier
+      down, while every other test keeps the normal handler. Fill the gaps.
+    template: |
+      afterEach(() => server.{{1}}());
+
+      test('says unknown when the courier is down', async () => {
+        server.{{2}}(
+          http.get('https://api.courier.example/parcels/:id', () =>
+            new HttpResponse(null, { status: {{3}} }),
+          ),
+        );
+        expect(await trackParcel('P-17')).toBe('unknown');
+      });
+    blanks:
+      - key: '1'
+        answer: resetHandlers
+      - key: '2'
+        answer: use
+      - key: '3'
+        answer: '503'
+    bank: [resetHandlers, close, use, listen, '503', '200']
+
+  - type: prose
+    id: record-a-fixture
+    body: >-
+      A handler you type by hand is a guess at what the courier sends. A **recorded
+      fixture** is better: one real response, saved to a JSON file, served by the handler.
+
+
+      Record it from the courier's sandbox, and two problems come with it. It can hold real
+      names, phone numbers and tokens. And it freezes the API on the day you recorded it.
+
+  - type: ai-review
+    id: review-recorder-leak
+    concept: testing.recorded-fixtures
+    difficulty: 3
+    language: ts
+    request: Record the courier's parcel response as a fixture, with personal data removed.
+    flawClass: data-exposure
+    code: |
+      // scripts/record-parcel.ts
+      const SECRET = ['name', 'phone'];
+      const headers = { authorization: `Bearer ${process.env.COURIER_TOKEN}` };
+      const res = await fetch(`${SANDBOX}/parcels/P-17`, { headers });
+      const body = await res.json();
+      for (const key of SECRET) {
+        if (key in body.recipient) body.recipient[key] = `${key}-1`;
+      }
+      const fixture = { request: { url: res.url, headers }, status: res.status, body };
+      await writeFile('fixtures/parcel-P-17.json', JSON.stringify(fixture, null, 2));
+    prompt: >-
+      The replay tests read only `body`, and they all pass. A week after the merge, the
+      secret scanner flags the repo. Tap the line at fault.
+    lines: [9]
+    reasons:
+      - text: It saves the request headers, token and all
+        correct: true
+        feedback: >-
+          Yes. The token now lives in git history. Leave headers out, and rotate it.
+      - text: Placeholders like `name-1` break the replay
+        feedback: >-
+          A placeholder is still a string, so the replay reads it happily. The leak sits elsewhere.
+      - text: Reading `process.env` exposes the token
+        feedback: >-
+          The script needs the token to call the sandbox. Trouble starts where the token ends up.
+    fix: |
+      const fixture = { request: { url: res.url }, status: res.status, body };
+      await writeFile('fixtures/parcel-P-17.json', JSON.stringify(fixture, null, 2));
+    verify:
+      question: Which check would have caught this before the merge?
+      choices:
+        - text: A CI test scanning fixtures for tokens and emails
+          correct: true
+          feedback: It reads every byte of every fixture, headers included.
+        - text: The replay tests, run once more
+          feedback: >-
+            They read only `body`. A token in the headers never touches them, so they stay green.
+        - text: A schema check on the response body
+          feedback: >-
+            The body was clean. A schema of the body never looks at the request part.
+
+  - type: bug-hunt
+    id: hunt-loose-schema
+    concept: testing.recorded-fixtures
+    difficulty: 3
+    language: ts
+    code: |
+      const Parcel = z.object({
+        id: z.string(),
+        status: z.string(),
+        recipient: z.object({ name: z.string(), phone: z.string().nullable() }),
+      });
+
+      // nightly CI: record from the courier's sandbox, scrub, then check
+      for (const file of await recordAll(SANDBOX)) {
+        Parcel.parse(await readJson(file));
+      }
+    prompt: >-
+      The courier added a new status, `held_at_depot`. The nightly check stayed green, and
+      the app showed a blank label. Tap the line that let it through.
+    lines: [3]
+    reasons:
+      - text: '`z.string()` accepts any status at all'
+        correct: true
+        feedback: >-
+          Yes. List the known values with `z.enum`, and a new one fails the run.
+      - text: The job should replay the old fixtures instead
+        feedback: >-
+          Old fixtures were recorded before `held_at_depot` existed. Only a fresh recording can show it.
+      - text: A Pact contract would catch this instead
+        feedback: >-
+          Contracts run in the provider's build. A third-party courier won't run yours.
+    fix: |
+      const Parcel = z.object({
+        id: z.string(),
+        status: z.enum(['in_transit', 'out_for_delivery', 'delivered']),
+        recipient: z.object({ name: z.string(), phone: z.string().nullable() }),
+      });
+      // Invalid option: expected one of "in_transit"|"out_for_delivery"|"delivered"
+
+  - type: code-challenge
+    id: write-scrub-fixture
+    concept: testing.recorded-fixtures
+    difficulty: 4
+    language: ts
+    prompt: |-
+      Write `scrubFixture(fixture, sensitiveKeys)`. It returns a scrubbed copy of a recorded
+      JSON fixture, walking every object and array.
+
+      - A string under a sensitive key becomes `<key>-1`, `<key>-2` and so on, with the key in lower case. Keys match whatever their case.
+      - If that string contains `@`, it becomes `user-1@example.com`, `user-2@example.com` instead, so email checks still pass.
+      - Each key, and emails, count from 1. The same original string always gets the same placeholder.
+      - Any string starting with `Bearer ` becomes `Bearer REDACTED`, under any key.
+
+      Leave numbers, booleans, `null` and the input itself unchanged. So `{ name: 'Ada', id: 7 }`
+      gives `{ name: 'name-1', id: 7 }`.
+    hints:
+      - Write a recursive `walk(value, key)` that passes each child's own key down. Handle arrays and objects first.
+      - Keep one `Map` from original string to placeholder for the whole fixture, plus a count per key.
+      - In `walk`, test `value.startsWith('Bearer ')` before the sensitive-key check, so a token goes under any key.
+
+  - type: prose
+    id: real-dependencies
+    body: >-
+      Lesson 5 ran database tests on a real PostgreSQL. Where does it come from?
+      **Testcontainers** starts one for the test run and throws it away afterwards.
+
+
+      It uses Docker, which runs a program in an isolated box called a container. Each run
+      gets a fresh database on a random port, in seconds. Redis and brokers work the same
+      way. The catch: every machine running the tests, CI included, needs Docker.
+
+  - type: parsons
+    id: arrange-postgres-container
+    concept: testing.testcontainers
+    difficulty: 3
+    language: ts
+    prompt: >-
+      Give the test file a fresh PostgreSQL for the run, and remove it afterwards.
+      `PostgreSqlContainer` and `pg` are already imported.
+    blocks:
+      - id: declare
+        code: |-
+          let container: StartedPostgreSqlContainer;
+          let db: pg.Client;
+        subgoal: Declare what the tests share
+      - id: before-open
+        code: 'beforeAll(async () => {'
+        subgoal: Start a fresh database
+      - id: start
+        code: "container = await new PostgreSqlContainer('postgres:17-alpine').start();"
+        indent: 1
+      - id: client
+        code: 'db = new pg.Client({ connectionString: container.getConnectionUri() });'
+        indent: 1
+      - id: connect
+        code: await db.connect();
+        indent: 1
+      - id: before-close
+        code: '});'
+      - id: after-open
+        code: 'afterAll(async () => {'
+        subgoal: Clean up
+      - id: end
+        code: await db.end();
+        indent: 1
+      - id: stop
+        code: await container.stop();
+        indent: 1
+      - id: after-close
+        code: '});'
+    distractors:
+      - id: fixed-port
+        code: "db = new pg.Client({ connectionString: 'postgres://localhost:5432/test' });"
+        feedback: >-
+          The container's port is random, so a fixed `5432` misses it. Ask the container.
+      - id: msw-for-sql
+        code: "server.use(http.post('/query', () => HttpResponse.json([])));"
+        feedback: >-
+          MSW fakes HTTP. Postgres speaks its own protocol, and a fake reply hides real SQL errors.
+
+  - type: explain-back
+    id: explain-review-fixture
+    concept: testing.recorded-fixtures
+    difficulty: 4
+    audience: reviewer
+    kind: risk
+    prompt: >-
+      A pull request adds a recorded courier fixture for an MSW handler. What would you
+      check before approving?
+    rubric:
+      - It may hold real personal data or tokens, so it needs scrubbing and a scan in CI.
+      - It freezes the API, so fresh recordings must pass a strict schema check to catch drift.
+      - Unhandled requests must fail the test, so nothing quietly reaches the real courier.
+    modelAnswer: >-
+      First, what's in it. A recording can carry a customer's name, phone or a bearer token.
+      I'd want it scrubbed, plus a CI scan over every fixture. Second, how it stays true.
+      It shows the API on one day. So a nightly job should re-record it and check a strict
+      schema. Third, MSW should fail any request without a handler, so no test quietly calls
+      the real courier.
+
+recap:
+  - Answer outgoing HTTP with MSW handlers, and override one per test with `server.use`.
+  - Record real responses, scrub names and tokens, and re-check fresh recordings against a strict schema.
+  - Run your own database or broker for real in a throwaway container with Testcontainers.
+
+recall:
+  - id: card-msw
+    concept: testing.http-mocking
+    front: How does MSW answer a `fetch` without changing the code under test?
+    back: >-
+      It intercepts outgoing requests inside the test process and answers them from the
+      request handlers you registered.
+  - id: card-override
+    concept: testing.http-mocking
+    front: How do you make one test see a vendor fail without affecting the others?
+    back: >-
+      Add a failing handler with `server.use` in that test, and call `server.resetHandlers()`
+      in `afterEach`.
+  - id: card-fixture
+    concept: testing.recorded-fixtures
+    front: What must happen to a recorded fixture before it's committed, and after?
+    back: >-
+      Before, scrub personal data and secrets out of it. After, keep re-recording on a
+      schedule and checking fresh recordings against a strict schema.
+  - id: card-testcontainers
+    concept: testing.testcontainers
+    front: What does Testcontainers give a test run, and what does it need?
+    back: >-
+      A real database or broker in a throwaway container on a random port. Every machine
+      running the tests needs Docker.
+
+references:
+  - kind: docs
+    title: Mock Service Worker documentation
+    authors: MSW contributors
+    venue: mswjs.io
+    url: https://mswjs.io/docs
+    note: Request handlers, `setupServer` for Node, and per-test overrides with `server.use`.
+    primary: true
+    verified: false
+  - kind: docs
+    title: setupServer
+    authors: MSW contributors
+    venue: mswjs.io
+    url: https://mswjs.io/docs/api/setup-server
+    note: '`listen`, `use`, `resetHandlers` and `close`, and what happens to unhandled requests.'
+    verified: false
+  - kind: docs
+    title: Testcontainers for NodeJS
+    authors: Testcontainers contributors
+    venue: node.testcontainers.org
+    url: https://node.testcontainers.org/
+    note: Throwaway containers for tests, with modules for PostgreSQL, Redis, Kafka and more.
+    primary: true
+    verified: false
+  - kind: docs
+    title: Zod documentation
+    venue: zod.dev
+    url: https://zod.dev
+    note: Schemas that parse a fixture and name the exact field that drifted.
+    verified: false
+
+deepDive: >-
+  The snippets here ran against MSW 3.0.2 and Testcontainers 12.2.0 on Node 24. MSW 3 renamed
+  the unhandled-request option: `server.listen({ onUnhandledFrame: 'error' })` makes a request
+  with no handler fail with `Cannot bypass a request when using the "error" strategy`. In MSW
+  2 the same option is `onUnhandledRequest`. The default in both only warns, and lets the
+  request carry on to the real network.
+
+
+  A strict schema belongs on the fixture check, where a new value should make noise. Your
+  production code should be the opposite: tolerant of a status it doesn't know, with a
+  fallback label, because the vendor won't wait for your release.
+
+
+  Contract tests from the last lesson suit two teams who can both run them. A third-party
+  vendor won't verify your pact, so a scheduled re-recording against their sandbox plays
+  that role. It runs on a timer rather than in their build, so it finds drift a day later,
+  not before they ship.
+
+
+  A Testcontainers PostgreSQL run printed `duplicate key value violates unique constraint
+  "loans_book_id_key"` for a repeated insert, the error a fake array never raises. Start one
+  container per test file or per run, not per test, and isolate tests with rolled-back
+  transactions as in lesson 5. Starting a container per test turns seconds into minutes.

@@ -1,0 +1,305 @@
+id: integrations.deletions
+title: Noticing what disappeared
+objective: Find records deleted at the source with mark and sweep, and stop a sweep that would delete too much with a safety valve.
+level: advanced
+minutes: 10
+concepts: [integrations.mark-and-sweep, integrations.deletion-safety-valve, integrations.remote-ids]
+prerequisites: [integrations.full-and-delta-sync, integrations.tokens-that-expire, db.constraints]
+opening:
+  text: >-
+    You'll find the records a vendor deleted, and refuse to delete when the vendor only looks
+    empty. One night that refusal will save your whole customer list.
+
+steps:
+  - type: prose
+    id: absence-is-silent
+    body: >-
+      A delta sync asks "what changed?". A deleted record isn't in any answer, so the delta
+      never hears about it. Absence makes no noise.
+
+
+      A full sync sees everyone, so it can notice who's missing. That's **mark and sweep**:
+      stamp each row the run sees with the run's number, `last_seen_run`. Once the pass
+      finishes, every row without this run's stamp is gone at the source.
+
+  - type: multiple-choice
+    id: pick-who-left
+    concept: integrations.mark-and-sweep
+    difficulty: 1
+    language: text
+    code: |
+      remote_id  name   last_seen_run
+      s-101      Ana    42
+      s-102      Ben    41
+      s-103      Chen   42
+    question: Run 42 has finished a complete pass. Who left?
+    choices:
+      - text: Ben
+        correct: true
+        feedback: >-
+          Right. Run 42 didn't stamp him, so the HR system no longer has him.
+      - text: Ana and Chen
+        feedback: >-
+          They carry this run's stamp, so the run saw them. The unstamped row is the one gone.
+      - text: Nobody, a full sync can't tell
+        feedback: >-
+          A plain copy can't. The stamp is what lets it: no stamp, not seen.
+
+  - type: prose
+    id: two-ids-and-soft-delete
+    body: >-
+      Two habits make a sweep safe. Keep the vendor's id as `remote_id` beside your own `id`,
+      with `UNIQUE (connection_id, remote_id)`. A **connection** is one customer's link to the
+      vendor, and two customers' ids can clash.
+
+
+      And sweep with a **soft delete**: set `deleted_at` instead of removing the row. History
+      and foreign keys survive, and a mistake can be undone.
+
+  - type: sql
+    id: write-the-sweep
+    concept: integrations.mark-and-sweep
+    difficulty: 2
+    prompt: >-
+      Run 42 of connection 1 finished a complete pass. Soft-delete every active person in
+      connection 1 that it didn't see. Leave everyone else alone.
+    setup: |
+      CREATE TABLE staff (
+        id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        connection_id integer NOT NULL,
+        remote_id text NOT NULL,
+        name text NOT NULL,
+        last_seen_run integer NOT NULL,
+        deleted_at timestamptz,
+        UNIQUE (connection_id, remote_id)
+      );
+      INSERT INTO staff (connection_id, remote_id, name, last_seen_run, deleted_at) VALUES
+        (1, 's-101', 'Ana', 42, NULL),
+        (1, 's-102', 'Ben', 41, NULL),
+        (1, 's-103', 'Chen', 42, NULL),
+        (1, 's-104', 'Dara', 30, '2026-05-02 02:00:00+00'),
+        (2, 's-101', 'Eli', 17, NULL);
+    starter: |
+      UPDATE staff SET deleted_at = now()
+      WHERE last_seen_run < 42;
+    solution: |
+      UPDATE staff SET deleted_at = now()
+      WHERE connection_id = 1
+        AND last_seen_run < 42
+        AND deleted_at IS NULL;
+    checks:
+      query: >-
+        SELECT connection_id, remote_id, deleted_at IS NOT NULL AS deleted,
+        deleted_at = '2026-05-02 02:00:00+00' AS kept_old_date
+        FROM staff ORDER BY connection_id, remote_id
+    showSchema: true
+    hints:
+      - Eli belongs to another customer, whose runs have their own numbers.
+      - Dara left in May. Sweeping her again would overwrite the day she left.
+      - The `WHERE` needs three conditions, joined with `AND`.
+
+  - type: multiple-choice
+    id: pick-zero-staff-cause
+    concept: integrations.deletion-safety-valve
+    difficulty: 2
+    language: text
+    code: |
+      02:00:00 sync.start   connection=7 mode=full
+      02:04:12 sync.fetched connection=7 staff=0 status=200
+      02:04:12 store.active connection=7 staff=3000
+    question: What most likely happened at the customer's company?
+    choices:
+      - text: The API user lost its permission to read staff
+        correct: true
+        feedback: >-
+          Almost always. A role change makes a 200 return nobody, as with scopes.
+      - text: All 3,000 people left overnight
+        feedback: >-
+          Possible on paper, but no company empties in one night. Bet on a fault first.
+      - text: The vendor is down for maintenance
+        feedback: >-
+          Maintenance usually looks like errors or an HTML page. This was a clean, empty 200.
+
+  - type: prose
+    id: the-safety-valve
+    body: >-
+      So the sweep gets a **safety valve**. Before deleting, count what it would delete. If
+      that's more than a set share of the active rows, say 10%, stop and alert a person.
+
+
+      Stop too if the pass didn't finish. A sync that died on page 7 never saw pages 8 to
+      30, and everyone on them looks deleted.
+
+  - type: ai-review
+    id: review-global-remote-id
+    concept: integrations.remote-ids
+    difficulty: 3
+    language: sql
+    request: Upsert each person from the HR sync and stamp them as seen.
+    flawClass: data-exposure
+    code: |
+      CREATE TABLE staff (
+        id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        connection_id integer NOT NULL,
+        remote_id text NOT NULL UNIQUE,
+        name text NOT NULL,
+        last_seen_run integer NOT NULL
+      );
+
+      INSERT INTO staff (connection_id, remote_id, name, last_seen_run)
+      VALUES ($1, $2, $3, $4)
+      ON CONFLICT (remote_id) DO UPDATE
+      SET name = EXCLUDED.name, last_seen_run = EXCLUDED.last_seen_run;
+    prompt: >-
+      It passed every test, all with one customer. Then a second company connected the same HR
+      system. The first company's admin saw a stranger in their staff list. Tap the line at fault.
+    lines: [4, 11]
+    reasons:
+      - text: Two customers can share a vendor id
+        correct: true
+        feedback: >-
+          Yes. Each company's HR system counts from 1. Make it `UNIQUE (connection_id, remote_id)`.
+      - text: The upsert should use `DO NOTHING`
+        feedback: >-
+          Then a renamed person never updates. The clash comes from the key, not the action.
+      - text: '`name` should be encrypted at rest'
+        feedback: >-
+          Encryption at rest protects a stolen disk. This app showed the row to the wrong company.
+    fix: |
+      remote_id text NOT NULL,
+      UNIQUE (connection_id, remote_id)
+      -- and ON CONFLICT (connection_id, remote_id)
+    verify:
+      question: Which test would have caught this?
+      choices:
+        - text: Two connections that share a remote id
+          correct: true
+          feedback: >-
+            That's the production case. The second sync writes into the first company's row.
+        - text: One person synced twice
+          feedback: >-
+            One connection upserts the same row cleanly. The clash needs two customers.
+        - text: A person whose name changed
+          feedback: >-
+            The upsert updates the name either way. The key never gets tested.
+
+  - type: code-challenge
+    id: write-plan-sweep
+    concept: integrations.deletion-safety-valve
+    difficulty: 4
+    language: ts
+    editable: '12-14'
+    prompt: >-
+      Write `planSweep(rows, runId, passComplete, maxShare)`. Only active rows count, those
+      with `deletedAt: null`. The unseen ones have `lastSeenRun` below `runId`.
+
+
+      If the pass didn't complete, return `{ action: "abort", reason: "incomplete-pass",
+      wouldDelete }`. If the unseen rows are more than `maxShare` of the active ones, abort with
+      `"too-many"`. Otherwise return `{ action: "sweep", remoteIds }`. For example, 3,000
+      active staff with none seen aborts with `wouldDelete: 3000`.
+    hints:
+      - Filter twice. First the active rows, then the unseen ones among them. Both counts matter.
+      - The pass check comes first. A half-finished pass proves nothing, whatever the numbers say.
+      - "Start with `const active = rows.filter((row) => row.deletedAt === null);`"
+
+  - type: explain-back
+    id: explain-valve-to-hr
+    concept: integrations.deletion-safety-valve
+    difficulty: 4
+    audience: non-technical
+    kind: explain
+    prompt: >-
+      The HR lead asks why your directory still lists 3,000 staff, when last night the HR
+      system showed none. Explain why the sync didn't remove them.
+    rubric:
+      - An empty answer is far more often a broken link or lost permission than real departures.
+      - The sync noticed it would remove far more than usual, so it stopped and asked a person.
+      - Nothing was lost, and once access is fixed the next sync carries on as normal.
+    modelAnswer: >-
+      Last night the HR system answered "no staff". That almost never means everyone left. It
+      usually means our access was changed, so the system showed us nothing. Our sync has a
+      rule: if it's about to remove more than a few people, it stops and asks us first. So it
+      kept the list as it was and alerted the team. Once your admin restores our access, the
+      next sync carries on as usual.
+
+recap:
+  - Stamp every row a full pass sees, then sweep the unstamped ones with a soft delete.
+  - Key copied rows by `(connection_id, remote_id)`, never by the vendor's id alone.
+  - Abort a sweep when the pass didn't finish or it would delete too much.
+
+recall:
+  - id: card-delta-blind
+    concept: integrations.mark-and-sweep
+    front: Why can't a delta sync notice deletions?
+    back: >-
+      It only receives records that changed. A deleted record never appears in an answer, so
+      only a full pass can notice it's missing.
+  - id: card-mark-sweep
+    concept: integrations.mark-and-sweep
+    front: How does mark and sweep find deleted records?
+    back: >-
+      Each row the full pass sees gets this run's number. Rows still carrying an older number
+      after a complete pass are gone at the source.
+  - id: card-safety-valve
+    concept: integrations.deletion-safety-valve
+    front: When should a sweep refuse to delete?
+    back: >-
+      When the pass didn't complete, or when it would delete more than a set share of active
+      rows. Both usually mean a fault, not real deletions.
+  - id: card-remote-id
+    concept: integrations.remote-ids
+    front: Why is a copied row unique on `(connection_id, remote_id)` rather than `remote_id`?
+    back: >-
+      Different customers' vendor accounts can reuse the same ids. A global key lets one
+      customer's sync overwrite, and expose, another's row.
+
+references:
+  - kind: docs
+    title: INSERT
+    authors: PostgreSQL Global Development Group
+    venue: PostgreSQL documentation
+    url: https://www.postgresql.org/docs/current/sql-insert.html
+    note: '`ON CONFLICT` with a conflict target over several columns, as the upsert here needs.'
+    primary: true
+    verified: false
+  - kind: rfc
+    title: 'RFC 7644: System for Cross-domain Identity Management: Protocol'
+    authors: P. Hunt, K. Grizzle, M. Ansari, E. Wahlstroem, C. Mortimore
+    year: 2015
+    venue: IETF
+    url: https://www.rfc-editor.org/rfc/rfc7644
+    note: A standard for syncing users between systems, with explicit deletes instead of guessing from absence.
+    primary: true
+    verified: false
+  - kind: paper
+    title: Recursive Functions of Symbolic Expressions and Their Computation by Machine, Part I
+    authors: John McCarthy
+    year: 1960
+    venue: Communications of the ACM, 3(4)
+    note: The garbage collector whose mark and sweep phases gave the pattern its name.
+    verified: false
+
+deepDive: >-
+  The name comes from garbage collection. A collector marks every object it can reach, then
+  sweeps the unmarked ones. A sync does the same, with the vendor's list as the set of what's
+  reachable.
+
+
+  A share alone misjudges small tables. One person leaving a team of five is 20%, and that's
+  normal. Real valves often combine a share with a floor, such as "more than 10% and more
+  than 20 rows". Some also compare with the last run: a list that shrinks by half since
+  yesterday is suspicious, whatever the threshold.
+
+
+  Prefer explicit deletes when the vendor has them. Some APIs offer a deleted-records
+  endpoint, tombstones in the delta (`"deleted": true`), or deletion webhooks. Identity
+  standards such as SCIM send a real `DELETE` or set `active` to false. Then mark and sweep
+  becomes the slow safety net, run weekly, rather than the only way to learn about a
+  deletion.
+
+
+  Soft-deleted rows still need a plan. Hide them in every query, or with a view or row-level
+  policy. Purge them after a retention period, because privacy law may require that personal
+  data of people who left is erased. And when a deleted person reappears in a later pass,
+  the upsert should clear `deleted_at`, so a vendor glitch heals itself.

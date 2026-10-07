@@ -1,4 +1,4 @@
-import { z } from 'zod';
+import * as z from '@/core/zod';
 
 /*
  * The one message the preview frame sends to the page. The frame runs learner code, so

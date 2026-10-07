@@ -1,4 +1,4 @@
-import * as z from 'zod';
+import * as z from '@/core/zod';
 import { LIMITS } from './limits';
 import { PYTHON_PACKAGES } from './python-packages';
 

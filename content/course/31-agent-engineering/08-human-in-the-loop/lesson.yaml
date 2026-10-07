@@ -1,0 +1,336 @@
+id: agents.human-in-the-loop
+title: Designing the human's part
+objective: "Design the human side of an agent: risk-ranked review queues, diffs with sources, interrupt and resume, and guards against automation bias."
+level: advanced
+minutes: 10
+concepts: [agents.review-queues, agents.interrupt-and-resume, agents.automation-bias, agents.corrections-as-labels]
+prerequisites: [aisys.guardrails, aisys.thresholds-and-calibration, agents.what-an-agent-may-touch]
+opening:
+  text: >-
+    You'll design the reviewer's side of an agent: what they see, in what order, and what
+    their answers teach it. A person who approves everything is no safeguard at all.
+
+steps:
+  - type: prose
+    id: place-the-checkpoints
+    body: |-
+      Guardrails and human approval put a person in front of risky actions. Now design
+      that person's job.
+
+      Place **checkpoints** by risk, not at every step: costly, irreversible or unusual
+      actions only. Show each one as *suggest, edit, accept*: the proposed change as a diff,
+      the sources it rests on, and an edit box. Reviewers fix more when fixing is one click.
+
+  - type: multiple-choice
+    id: pick-checkpoints
+    concept: agents.review-queues
+    difficulty: 1
+    question: A bakery's order agent proposes 300 actions a day. Which should wait for a person?
+    choices:
+      - text: The costly or unusual ones, ranked by risk
+        correct: true
+        feedback: >-
+          Yes. Attention is scarce, so spend it where a mistake hurts.
+      - text: All 300, to be safe
+        feedback: >-
+          Three hundred approvals a day trains people to click yes. Safety drops, not rises.
+      - text: None, with an audit at month end
+        feedback: >-
+          An audit finds a wrong £400 wedding cake order weeks too late.
+      - text: A random 10%, for fairness
+        feedback: >-
+          Random sampling measures quality. It doesn't stop the risky order that wasn't sampled.
+
+  - type: prose
+    id: name-interrupt-and-resume
+    body: |-
+      Waiting for a person can take minutes or days. So the run doesn't wait in memory.
+
+      At a checkpoint it saves its state, records "awaiting approval" and ends. When the
+      decision arrives, a new process loads the state and carries on. That's **interrupt and
+      resume**. A **clarifying question** works the same way: the agent asks instead of
+      guessing, and the run resumes on the answer.
+
+  - type: ai-review
+    id: review-polling-approval
+    concept: agents.interrupt-and-resume
+    difficulty: 3
+    language: python
+    request: Make the bakery agent wait for the baker before confirming custom cakes.
+    flawClass: performance
+    code: |
+      def run_order_agent(order):
+          state = start(order)
+          while (call := next_call(state)) is not None:
+              if needs_approval(call):
+                  ticket = approvals.submit(call, state)
+                  while ticket.status() == "pending":   # wait for the baker
+                      time.sleep(5)
+                  if ticket.status() != "approved":
+                      return stop(state, "rejected")
+              state.add(call, execute(call))
+          return finish(state)
+    prompt: >-
+      An assistant wrote this. In tests the baker approved within seconds. One Friday evening,
+      40 cake orders waited for approval, and no new order was answered until Monday. Tap the
+      lines at fault.
+    lines: [6, 7]
+    reasons:
+      - text: Each pending approval holds a worker asleep
+        correct: true
+        feedback: >-
+          Yes. Forty sleeping runs filled every worker. Save state and end the run instead.
+      - text: Five seconds is too slow a poll
+        feedback: >-
+          Polling faster burns more and still holds the worker. Waiting in memory is the problem.
+      - text: A rejection should retry with a new call
+        feedback: >-
+          Stopping on rejection is right. A person said no.
+      - text: Approvals should be submitted after executing
+        feedback: >-
+          Then the cake is confirmed before the baker sees it. That defeats the approval.
+    fix: |
+      if needs_approval(call):
+          approvals.submit(call, run_id=state.run_id)
+          save(state, status="awaiting_approval")
+          return                                  # free the worker; resume on the decision
+
+      # called when the baker decides, minutes or days later
+      def on_decision(run_id, verdict):
+          state = load(run_id)
+          resume(state, verdict)
+    verify:
+      question: Which test would have caught this?
+      choices:
+        - text: More pending approvals than workers, then a new order
+          correct: true
+          feedback: >-
+            Right. It checks new work still runs while approvals wait.
+        - text: One approval answered within a second
+          feedback: >-
+            That's the test that passed. A quick answer never holds a worker for long.
+        - text: A rejected approval stops the run
+          feedback: >-
+            That works already. It says nothing about how many runs can wait at once.
+
+  - type: bug-hunt
+    id: hunt-pre-ticked
+    concept: agents.automation-bias
+    difficulty: 3
+    language: python
+    code: |
+      def review_card(proposal):
+          return {
+              "title": proposal["summary"],
+              "diff": diff(proposal["before"], proposal["after"]),
+              "sources": proposal["sources"],
+              "requested_by": proposal["requester"],
+              "approve": {"checked": True},
+              "actions": ["Approve", "Edit", "Reject"],
+          }
+    prompt: >-
+      Timetable reviewers approve 99.6% of the agent's changes in a median of three seconds.
+      An audit finds one approved change in twelve was wrong. Tap the line to fix.
+    lines: [7]
+    reasons:
+      - text: Approval is ticked before anyone reads
+        correct: true
+        feedback: >-
+          Yes. A pre-ticked box makes approval the default, so reading becomes optional.
+      - text: The diff makes the change look settled
+        feedback: >-
+          The diff is what lets a reviewer see the change. It helps them catch errors.
+      - text: Sources add reading time
+        feedback: >-
+          They do, and they're what a reviewer checks claims against. Keep them.
+      - text: Offering Edit invites needless changes
+        feedback: >-
+          Edits are the most useful signal you get. Each one is a labelled correction.
+    fix: |
+      "approve": {"checked": False},   # a decision is always an action, never a default
+
+  - type: prose
+    id: name-corrections-and-accountability
+    body: |-
+      Every decision a reviewer makes is data. An edit says "this, not that". A rejection
+      with a reason says why. Store each one as a labelled example: the request, what the
+      agent proposed, what the person chose. These **corrections** become eval cases.
+
+      Store who decided, too. **Accountability** means any action traces to the agent's run
+      and the person who approved it.
+
+  - type: fill-blank
+    id: fill-correction-label
+    concept: agents.corrections-as-labels
+    difficulty: 2
+    language: python
+    prompt: >-
+      Store each review decision as a labelled example. Keep what the person finally chose,
+      who chose it, and which harness made the proposal. Fill the gaps.
+    template: |
+      def record_decision(proposal, decision):
+          LABELS.append({
+              "input": proposal["request"],
+              "proposed": proposal["after"],
+              "final": {{1}},
+              "verdict": decision["verdict"],   # approved, edited or rejected
+              "reason": decision.get("reason"),
+              "reviewer": {{2}},
+              "harness": proposal[{{3}}],
+          })
+    blanks:
+      - key: '1'
+        answer: decision["after"]
+      - key: '2'
+        answer: decision["reviewer"]
+      - key: '3'
+        answer: '"harness_version"'
+    bank: ['decision["after"]', 'proposal["after"]', 'decision["reviewer"]', 'proposal["agent"]', '"harness_version"', '"confidence"']
+
+  - type: multiple-choice
+    id: pick-bias-check
+    concept: agents.automation-bias
+    difficulty: 3
+    question: Approvals sit at 99.6%. Which check shows whether reviewers really read the changes?
+    choices:
+      - text: A second reviewer re-checks a random sample
+        correct: true
+        feedback: >-
+          Right. Their disagreements measure what the first reviewers missed.
+      - text: A tick box saying "I have read this"
+        feedback: >-
+          It's one more click to rubber-stamp. It measures nothing about reading.
+      - text: The approval rate, tracked weekly
+        feedback: >-
+          A high rate fits a great agent and a sleepy reviewer equally. It can't tell them apart.
+      - text: A higher confidence threshold for the agent
+        feedback: >-
+          Fewer items reach people, which helps workload. It still doesn't show whether they read.
+
+  - type: code-challenge
+    id: write-rank-queue
+    concept: agents.review-queues
+    difficulty: 4
+    language: python
+    starter: queue.starter.py
+    solution: queue.solution.py
+    tests: queue.tests.py
+    prompt: >-
+      Write `rank_queue(items, now, sla)`. Each item is `{"id", "risk": 1-5, "confidence":
+      0-1, "created": hours}`. `sla` maps each risk to the hours a reviewer may take. Return
+      the ids in the order a reviewer should see them.
+
+
+      Items whose age (`now - created`) has reached their SLA come first, most overdue
+      first. The rest follow by `risk * (1 - confidence)`, highest first, then oldest first,
+      then by id. Raise `ValueError` for a risk with no SLA.
+
+
+      So risk 2 at confidence 0.2 (score 1.6) comes before risk 5 at confidence 0.9 (score
+      0.5).
+    hints:
+      - Split the queue into two lists first, overdue and waiting. Each has its own order.
+      - Sort keys that are tuples order by each part in turn. Negate a number to sort it high first.
+      - 'For a waiting item, the key `(-score, -age, id)` gives all three tie-breaks at once.'
+
+  - type: explain-back
+    id: explain-queue-to-newcomer
+    concept: agents.review-queues
+    difficulty: 4
+    audience: newcomer
+    kind: explain
+    prompt: >-
+      A new reviewer on the timetable team asks why the queue isn't first come, first
+      served. Explain why it's ranked the way it is.
+    rubric:
+      - A wrong approval of a risky, unsure change does the most harm, so it comes first.
+      - Confident, low-risk changes can wait, because a mistake there costs little.
+      - Every item has a deadline by risk, and an overdue item jumps the queue so nothing waits forever.
+    modelAnswer: >-
+      Your attention is the scarce part. A risky change the agent is unsure about is where a
+      mistake hurts most, so it comes first. A confident change to a
+      single club slot can wait. Each risk level also has a deadline. If an item reaches
+      it, it jumps to the top, so low-risk items still get seen.
+
+recap:
+  - Put checkpoints on risky actions only, shown as a diff with sources and an edit box.
+  - Pause a run by saving its state, and resume it when the person answers.
+  - Never pre-tick approval, audit a sample, and store every decision as a labelled example.
+
+recall:
+  - id: card-checkpoint-placement
+    concept: agents.review-queues
+    front: Where should an agent's approval checkpoints go, and why not everywhere?
+    back: >-
+      On costly, irreversible or unusual actions. Approving everything trains people to click
+      yes without reading.
+  - id: card-interrupt-resume
+    concept: agents.interrupt-and-resume
+    front: How does a run wait days for an approval without holding a worker?
+    back: >-
+      It saves its state with the status "awaiting approval" and ends. The decision event
+      loads the state and resumes the run.
+  - id: card-automation-bias
+    concept: agents.automation-bias
+    front: Name two countermeasures against rubber-stamping in a review screen.
+    back: >-
+      Never pre-tick approval, and show the evidence. Then audit a random sample with a second
+      reviewer to measure what slips through.
+  - id: card-corrections
+    concept: agents.corrections-as-labels
+    front: What should be stored when a reviewer edits an agent's proposal?
+    back: >-
+      The request, the proposal, the final version, the verdict and reason, the reviewer and
+      the harness version. It becomes an eval case.
+
+references:
+  - kind: paper
+    title: "Complacency and bias in human use of automation: an attentional integration"
+    authors: Raja Parasuraman and Dietrich H. Manzey
+    year: 2010
+    venue: Human Factors 52(3)
+    note: The review of automation bias and complacency, and why monitoring a reliable system is hard.
+    primary: true
+    verified: false
+  - kind: essay
+    title: Building effective agents
+    authors: Erik Schluntz and Barry Zhang
+    year: 2024
+    venue: Anthropic Engineering
+    url: https://www.anthropic.com/engineering/building-effective-agents
+    note: Checkpoints where agents pause for human feedback, and stopping conditions.
+    verified: false
+  - kind: paper
+    title: "Ironies of automation"
+    authors: Lisanne Bainbridge
+    year: 1983
+    venue: Automatica 19(6)
+    note: Why automating the routine part leaves people worse placed to catch the rare failure.
+    primary: true
+    verified: false
+
+deepDive: >-
+  The queue ranking ran in Python 3.13 on made-up items. No model was called.
+
+
+  **Why the score multiplies.** `risk * (1 - confidence)` is a rough expected harm: how bad
+  a wrong approval would be, times how likely the proposal is wrong. It only works if
+  confidence is calibrated, as Confidence thresholds and calibration showed. An overconfident
+  agent pushes its riskiest mistakes to the bottom of the queue.
+
+
+  **Seeded checks.** Some teams slip known-bad proposals into the queue now and then, and
+  count how many get approved. It measures reading directly. Tell reviewers it happens, and
+  never count it against them; the point is the design, not blame.
+
+
+  **Workload is a safety number.** Track items per reviewer per hour and the time spent on
+  each. A median of three seconds on a timetable change means nobody can be reading the diff.
+  When the queue outgrows the people, raise the bar for what reaches them, rather than
+  asking them to go faster.
+
+
+  **Interrupts in managed platforms.** Some agent platforms pause a session at a tool call
+  that needs approval and wait for a confirmation event that names the call. The shape is
+  the one in the fix: the decision arrives later, as an event, and the run resumes from
+  saved state.

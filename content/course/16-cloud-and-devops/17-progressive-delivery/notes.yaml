@@ -15,12 +15,13 @@ summary: >-
   commit takes to reach production, how often a deploy needs an urgent fix, and how fast
   you recover. The research behind them finds that fast teams are also the stable ones.
   These notes cover flag types and their lifecycle, hashing done properly, how to judge a
-  canary with statistics, how flags interact with database changes, and how to compute
-  the metrics.
+  canary with statistics, dark launches and shadow traffic, how flags interact with
+  database changes, and how to compute the metrics.
 remember:
   - A feature flag separates deploying code from releasing a feature, so a bad feature turns off in seconds without a deploy.
   - Percentage rollouts hash the flag name and user id into a bucket, so each user always gets the same answer and raising the percentage only adds users.
   - A canary compares the new version's error rate and latency with the old one's on live traffic, and waits for enough requests before deciding.
+  - A dark launch runs new code in production unseen, and shadow mode mirrors real requests to it and compares answers, with no side effects and no delay to users.
   - Trunk-based development merges small changes to main at least daily, and flags keep unfinished work switched off.
   - Every flag has an owner and a removal date, because each one is a branch in the code that someone must test.
   - Flags don't cover schema changes, so database migrations stay backward compatible with the version still running.
@@ -126,6 +127,49 @@ sections:
       say 1%, 5%, 25%, 50%, 100%, with a minimum time at each so slow problems such as memory
       leaks have time to show. Tools such as Argo Rollouts and Flagger automate these steps
       on Kubernetes.
+  - title: Dark launches and shadow traffic
+    body: |-
+      Two older tricks test a change on real traffic before any user sees its result. Both
+      are common for AI features, where a new model or prompt answers quietly before it
+      replaces the old one, but neither is about AI.
+
+      A **dark launch** deploys new code and runs it in production while users see nothing
+      of it. A new search index is queried on every page load, say, but the page still
+      shows the old results. You learn whether the new code holds real load, and what it
+      costs, before anyone depends on it. A flag that is on for the code path and off for
+      the screen is often all it takes.
+
+      **Shadow mode**, also called traffic mirroring, sends each real request to the new
+      version as well as the old one. Users get the old version's answer. The new
+      version's answer is only compared and logged. It suits a rewrite where "the same
+      input gives the same answer" is the test: a pricing engine, a tax calculation, a
+      search service moved to a new database.
+
+      ```ts
+      async function price(cart: Cart): Promise<number> {
+        const current = await oldPricing(cart);
+        // The shadow runs beside the answer: it never delays or changes what the user gets.
+        void newPricing(cart)
+          .then((shadow) => {
+            if (shadow !== current) log.warn({ event: 'pricing.mismatch', current, shadow });
+          })
+          .catch((error) => log.warn({ event: 'pricing.shadow-failed', error: String(error) }));
+        return current;
+      }
+      ```
+
+      Run with a cart where the two engines disagree, it returned the old price, 10, and
+      logged `{"event":"pricing.mismatch","current":10,"shadow":11}`.
+
+      Two rules keep shadowing safe. The shadow has **no side effects**: it doesn't charge
+      cards, send emails or write to the real database, or every mirrored request happens
+      twice. And it **never slows or breaks the real path**: it runs beside the answer, its
+      errors are only logged, and it gets its own timeout. Proxies can mirror for you, with
+      `mirror` in nginx or a request mirror policy in Envoy. Mirroring doubles the load on
+      whatever the new version calls, so start with a sample of requests.
+
+      Shadowing proves the new version agrees with the old. A canary then proves users are
+      fine with it. Many rewrites use both, in that order.
   - title: Flags, canaries and the database
     body: |-
       Flags and canaries mean two versions of the code run at once: old and new instances
@@ -197,6 +241,17 @@ pitfalls:
   - '**Promoting a canary on a handful of requests.** Small samples look clean by luck. Set a minimum request count and time per step, and compare against a fresh baseline.'
   - '**Schema changes that assume one version.** A canary or flag runs old and new code together. Expand first, contract later, and keep every step reversible.'
   - '**Turning DORA metrics into individual targets.** People optimise the number, not the outcome. Use them per team to find where work waits.'
+verify:
+  - lens: breaks
+    check: 'Every flag read has a timeout and a safe default, so a flag service outage can''t become a product outage.'
+  - lens: breaks
+    check: 'A canary or a shadow copy waits for a minimum number of requests before anything is promoted.'
+  - lens: confuses
+    check: 'Every flag has an owner and a removal date, and is deleted once it has been at 100% for a while.'
+  - lens: leaks
+    check: 'A shadow version never charges, emails or writes to the real database, so mirrored requests don''t happen twice.'
+  - lens: tests
+    check: 'Tests cover both sides of every flag, and the schema works for old and new code at every step of a rollout.'
 interview:
   - question: What is the difference between deploying and releasing, and why does it matter?
     answer: >-

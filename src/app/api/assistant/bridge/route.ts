@@ -1,4 +1,4 @@
-import { z } from 'zod';
+import * as z from '@/core/zod';
 import { clientOf, limited, recordFailure } from '@/adapters/assistant/server/rate-limit';
 import { getBridgeStore, sharedStoreMissing } from '@/adapters/assistant/server/bridge-store';
 import {

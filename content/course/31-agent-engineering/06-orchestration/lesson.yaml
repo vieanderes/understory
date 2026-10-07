@@ -1,0 +1,339 @@
+id: agents.orchestration
+title: One agent or many
+objective: Choose between chaining, routing, parallel sections and an orchestrator with workers, and cap a fan-out by count and budget.
+level: advanced
+minutes: 10
+concepts: [agents.chaining-and-routing, agents.orchestrator-workers, agents.multi-agent-cost]
+prerequisites: [aisys.agent-harness, agents.long-running-loops]
+opening:
+  text: >-
+    You'll pick the right shape for a job too big for one call, and cap a fan-out's bill. Most "multi-agent" systems need less than they use.
+
+steps:
+  - type: prose
+    id: name-chain-and-router
+    body: |-
+      Controlling the agent loop named the fixed workflow shapes. Here they are as tools you
+      choose between.
+
+      **Prompt chaining** runs calls in a fixed order, with a check in code between them:
+      draft, check, then polish. **Routing** classifies the input first, then sends it to
+      one specialist prompt, model or person. Both keep the path in code, so they're cheap
+      and testable.
+
+  - type: multiple-choice
+    id: pick-routing
+    concept: agents.chaining-and-routing
+    difficulty: 1
+    question: 'Bakery messages are orders, allergy questions or complaints. Each needs its own prompt. What fits?'
+    choices:
+      - text: A router that classifies, then picks one prompt
+        correct: true
+        feedback: >-
+          Yes. One cheap classification, then a focused prompt for each kind.
+      - text: One agent with every instruction in its prompt
+        feedback: >-
+          It works until the instructions crowd each other. Allergy rules end up diluted by order rules.
+      - text: An orchestrator that spawns three workers
+        feedback: >-
+          Each message is one kind, so only one worker would ever matter. You'd pay for the other two.
+      - text: Three agents that vote on each reply
+        feedback: >-
+          Voting helps when one answer may be wrong. Here the problem is picking the right prompt.
+
+  - type: fill-blank
+    id: fill-router
+    concept: agents.chaining-and-routing
+    difficulty: 2
+    language: python
+    prompt: >-
+      Route each bakery message. Allergy questions always go to a person, whatever the
+      classifier says about confidence. Unknown labels go to a person too. Fill the gaps.
+    template: |
+      ROUTES = {"order": take_order, "complaint": draft_apology}
+
+      def route(message):
+          label, confidence = classify(message)
+          if label == "allergy" or confidence < 0.7:
+              return {{1}}(message)
+          handler = ROUTES.{{2}}(label, {{3}})
+          return handler(message)
+    blanks:
+      - key: '1'
+        answer: to_person
+      - key: '2'
+        answer: get
+      - key: '3'
+        answer: to_person
+    bank: [to_person, take_order, get, pop, None, draft_apology]
+
+  - type: prose
+    id: name-parallel-and-workers
+    body: |-
+      **Parallelisation** runs calls at once. *Sectioning* splits a job into independent
+      parts. *Voting* runs the same task several times and takes the majority.
+
+      An **orchestrator** goes further: a model decides the parts at run time and hands each
+      to a **worker** with its own fresh context. Each handoff carries a brief: the goal,
+      the constraints, and the shape of the answer it wants back.
+
+  - type: multiple-choice
+    id: pick-cost-driver
+    concept: agents.multi-agent-cost
+    difficulty: 2
+    language: python
+    code: |
+      def start_worker(year):
+          return Agent(
+              model="claude-sonnet-5-5",
+              system=SCHOOL_RULES,          # 9,000 tokens
+              documents=ALL_TIMETABLES,     # 30,000 tokens
+              task=f"Find clashes in {year}'s timetable.",
+          )
+
+      workers = [start_worker(y) for y in ["Year 7", "Year 8", "Year 9", "Year 10", "Year 11"]]
+    question: One timetable agent became five workers. The bill rose sixfold, not onefold. What drove it?
+    choices:
+      - text: Every worker re-reads every timetable, every turn
+        correct: true
+        feedback: >-
+          Right. Five fresh contexts each carry the full 39,000 tokens, turn after turn.
+      - text: Running workers in parallel costs extra
+        feedback: >-
+          Tokens cost the same at once or in turn. Parallel runs save time, not money.
+      - text: The provider charges a fee per agent
+        feedback: >-
+          Most people suspect a hidden fee. The cost is tokens, and five contexts read far more of them.
+      - text: The orchestrator uses a bigger model
+        feedback: >-
+          It might, but the snippet shows the workers' inputs. Each one carries everything.
+
+  - type: ai-review
+    id: review-uncapped-gather
+    concept: agents.orchestrator-workers
+    difficulty: 3
+    language: python
+    request: Let the timetable orchestrator check every class at once.
+    flawClass: performance
+    code: |
+      async def check_school(plan):
+          briefs = [
+              {"goal": f"Find clashes for {c}", "rules": RULES, "reply": CLASH_SCHEMA}
+              for c in plan["classes"]
+          ]
+          replies = await asyncio.gather(*(run_worker(b) for b in briefs))
+          clashes = [clash for reply in replies for clash in reply["clashes"]]
+          return sorted(clashes, key=lambda c: (c["day"], c["period"]))
+    prompt: >-
+      An assistant wrote this. The test school had six classes, and it ran fine. A real
+      school's plan listed 140 classes. Most workers hit rate limits and the run cost £60.
+      Tap the line at fault.
+    lines: [6]
+    reasons:
+      - text: Nothing caps how many workers start, or what they spend
+        correct: true
+        feedback: >-
+          Yes. The model's plan sets the fan-out, so the code must cap it.
+      - text: Sorting by day and period loses clashes
+        feedback: >-
+          Sorting only orders them. Every clash is still in the list.
+      - text: Each brief should carry the whole conversation
+        feedback: >-
+          The opposite. A short brief keeps each worker small. The count is the problem.
+      - text: '`gather` returns replies in finishing order'
+        feedback: >-
+          `gather` keeps the order the tasks were given. That part is safe.
+    fix: |
+      gate = asyncio.Semaphore(8)            # at most 8 workers at once
+      briefs = briefs[:MAX_WORKERS]          # and a ceiling on how many exist
+
+      async def capped(brief):
+          async with gate:
+              return await run_worker(brief, max_tokens=PER_WORKER_BUDGET)
+
+      replies = await asyncio.gather(*(capped(b) for b in briefs))
+    verify:
+      question: Which test would have caught this before release?
+      choices:
+        - text: A plan with 140 classes and a counting fake worker
+          correct: true
+          feedback: >-
+            Right. It measures the peak and the total, which is where the fault lives.
+        - text: The six-class school, run again
+          feedback: >-
+            It passed already. Six workers never reach a rate limit or a big bill.
+        - text: A check that the clashes come back sorted
+          feedback: >-
+            Sorting was never wrong. That test stays green with or without a cap.
+
+  - type: bug-hunt
+    id: hunt-thin-handoff
+    concept: agents.orchestrator-workers
+    difficulty: 3
+    language: python
+    code: |
+      def hand_off(history, part):
+          brief = {
+              "goal": part["goal"],
+              "context": history[-1]["content"],
+              "reply": part["schema"],
+          }
+          return run_worker(brief)
+    prompt: >-
+      The head teacher wrote "No PE straight after lunch" in her first message. Five turns
+      later, the workers' new timetable puts PE straight after lunch twice. Tap the line to fix.
+    lines: [4]
+    reasons:
+      - text: Only the last message reaches the worker
+        correct: true
+        feedback: >-
+          Yes. The constraint was in message one, so no worker ever saw it.
+      - text: The worker needs the full history instead
+        feedback: >-
+          That works and costs a fortune at scale. Pass the constraints, not the whole transcript.
+      - text: The reply schema should come first
+        feedback: >-
+          Key order in a dict changes nothing here. The missing rule does.
+      - text: Workers should share one context
+        feedback: >-
+          Then they'd lose the clean, small context that makes workers worth having.
+    fix: |
+      def hand_off(state, part):
+          brief = {
+              "goal": part["goal"],
+              "constraints": state["constraints"],   # every rule the user set, kept by the harness
+              "reply": part["schema"],
+          }
+          return run_worker(brief)
+
+  - type: code-challenge
+    id: write-fan-out
+    concept: agents.multi-agent-cost
+    difficulty: 4
+    language: python
+    starter: fanout.starter.py
+    solution: fanout.solution.py
+    tests: fanout.tests.py
+    prompt: >-
+      Write `async fan_out(tasks, worker, max_workers, budget)`. Each task is
+      `{"id": ..., "estimate": tokens}`. `await worker(task)` returns
+      `{"tokens": n, "result": ...}` or raises.
+
+
+      Admit tasks in order while the sum of admitted estimates stays within `budget`. Skip
+      any task that would break it, but keep trying later ones. Never start a skipped task.
+      Run at most `max_workers` at once.
+
+
+      Return `{"results": [{"id", "result"}, ...], "failed": [ids], "skipped": [ids],
+      "tokens": n}`, every list in task order. `tokens` adds up the successful workers.
+      A failing worker goes in `failed`; the rest still return. Raise `ValueError` if
+      `max_workers` is below 1.
+    hints:
+      - Decide admission first, in a plain loop over the estimates. Then run only the admitted tasks.
+      - '`asyncio.Semaphore(max_workers)` caps how many run at once, and `gather` keeps input order.'
+      - Wrap each worker call in `try`, and return the task with its reply or its error.
+
+  - type: explain-back
+    id: defend-one-agent
+    concept: agents.multi-agent-cost
+    difficulty: 4
+    audience: interviewer
+    kind: decide
+    prompt: >-
+      An interviewer asks you to design the bakery's order assistant. A candidate before you
+      proposed five cooperating agents. Defend a router with one agent per route instead.
+    rubric:
+      - Each message is one kind, so routing to one focused prompt fits the task.
+      - Every extra agent re-reads its own context, so tokens and failure points multiply.
+      - Reach for an orchestrator only when the parts can't be known ahead and really run apart.
+    modelAnswer: >-
+      Each message is an order, an allergy question or a complaint. A cheap classifier can
+      route it to one focused prompt, with allergies going to a person. Five agents would
+      each carry their own context and turns, so tokens multiply, and every handoff can
+      drop a detail. I'd add an orchestrator only when the parts appear at run time. They
+      must also run apart, like checking a hundred orders overnight.
+
+recap:
+  - Choose a chain or a router first, and an orchestrator only when the parts appear at run time.
+  - Hand each worker a brief with the goal, the constraints and the reply shape.
+  - Cap a fan-out by worker count and token budget, and merge results in task order.
+
+recall:
+  - id: card-chain-vs-route
+    concept: agents.chaining-and-routing
+    front: What's the difference between prompt chaining and routing?
+    back: >-
+      A chain runs calls in a fixed order with checks between them. A router classifies the
+      input, then sends it down one branch.
+  - id: card-sectioning-voting
+    concept: agents.chaining-and-routing
+    front: When would you use voting rather than sectioning?
+    back: >-
+      Voting runs the same task several times to catch a wrong answer. Sectioning splits a job
+      into independent parts to finish sooner.
+  - id: card-handoff-brief
+    concept: agents.orchestrator-workers
+    front: What belongs in the brief an orchestrator hands to a worker?
+    back: >-
+      The goal, every constraint the user set, and the shape of the reply. Not the whole
+      transcript, and never only the last message.
+  - id: card-fan-out-cost
+    concept: agents.multi-agent-cost
+    front: Why does splitting one agent into five workers often multiply the cost?
+    back: >-
+      Each worker carries its own copy of the instructions and documents through its own
+      turns. The orchestrator then reads all their replies too.
+
+references:
+  - kind: essay
+    title: Building effective agents
+    authors: Erik Schluntz and Barry Zhang
+    year: 2024
+    venue: Anthropic Engineering
+    url: https://www.anthropic.com/engineering/building-effective-agents
+    note: Chaining, routing, sectioning and voting, orchestrator and workers, and evaluator and optimiser, with when to use each.
+    primary: true
+    verified: false
+  - kind: essay
+    title: How we built our multi-agent research system
+    authors: Anthropic
+    year: 2025
+    venue: Anthropic Engineering
+    url: https://www.anthropic.com/engineering/multi-agent-research-system
+    note: An orchestrator with parallel workers, what the briefs need, and how far tokens multiply.
+    primary: true
+    verified: false
+  - kind: docs
+    title: Coroutines and tasks
+    authors: Python Software Foundation
+    venue: Python 3 documentation
+    url: https://docs.python.org/3/library/asyncio-task.html
+    note: '`gather`, which returns results in the order the awaitables were passed.'
+    verified: false
+
+deepDive: >-
+  The fan-out and its tests ran in Python 3.13 against a fake worker that sleeps and
+  counts. No model was called.
+
+
+  **How far tokens multiply.** One provider reported that its agents used about four times
+  the tokens of a chat, and its multi-agent research system about fifteen times. The
+  multi-agent version won on broad research questions with many independent threads. It
+  fits poorly where the parts depend on each other, as in most coding tasks.
+
+
+  **Evaluator and optimiser.** The generator and evaluator loop from Loops that run for
+  hours is the fifth named shape. It belongs here too: one call proposes, another checks
+  against criteria, and code decides when to stop.
+
+
+  **Estimates and actuals.** The challenge admits work by estimate, so the decision never
+  depends on timing. A real harness also counts what each worker really spent, and stops
+  starting new workers once the running total passes the budget.
+
+
+  **Handoffs that transfer control.** Some frameworks offer a handoff where one agent passes
+  the whole conversation to another, as a support bot passes to a billing bot. The same
+  rule applies: decide what state crosses the line. A summary with the constraints is
+  usually better than every message so far.

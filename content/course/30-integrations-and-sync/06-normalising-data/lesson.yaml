@@ -1,0 +1,353 @@
+id: integrations.normalising-data
+title: Making messy data consistent
+objective: "Map a vendor record to a common shape: pure dates kept apart from timestamps, enums with a fallback, empty values and CSV quirks."
+level: advanced
+minutes: 10
+concepts: [integrations.pure-dates, integrations.enum-fallback, integrations.csv-quirks]
+prerequisites: [integrations.systems-you-dont-control, integrations.full-and-delta-sync]
+opening:
+  text: >-
+    You'll turn a vendor's messy record into one clean shape, without a single birthday
+    slipping a day. Every import you'll ever write meets these same few traps.
+
+steps:
+  - type: prose
+    id: instant-or-day
+    body: >-
+      A school's scheduling vendor sends you its pupils every night. Your job is to map each
+      record to your own shape.
+
+
+      Two kinds of time hide in it. A **timestamp** is an instant, the same moment everywhere:
+      `2026-09-01T08:45:00Z`. A **pure date** is a day on the calendar, with no clock and no
+      zone. A birthday is one: `2014-03-09`.
+
+  - type: multiple-choice
+    id: pick-the-pure-date
+    concept: integrations.pure-dates
+    difficulty: 1
+    question: Which of these vendor fields is a pure date?
+    choices:
+      - text: '`date_of_birth`'
+        correct: true
+        feedback: >-
+          Right. A birthday is the same calendar day wherever you are.
+      - text: '`registered_at`'
+        feedback: >-
+          That's the moment a record was made. A moment is an instant, so it's a timestamp.
+      - text: '`lesson_starts_at`'
+        feedback: >-
+          A lesson starts at one instant. A parent abroad sees it at their own local time.
+      - text: '`updated_at`'
+        feedback: >-
+          The vendor's change time is an instant. Delta syncs compare it as one.
+
+  - type: predict-output
+    id: predict-birthday-shift
+    concept: integrations.pure-dates
+    difficulty: 2
+    language: bash
+    code: |
+      $ TZ=America/New_York node -e '
+        const born = new Date("2014-03-09");
+        console.log(born.getDate());
+      '
+    question: The pupil was born on the 9th. What does a server in New York log?
+    choices:
+      - text: '`9`'
+        feedback: >-
+          Most people pick this. But `new Date` made an instant, midnight UTC, and New York is
+          behind UTC.
+      - text: '`8`'
+        correct: true
+        feedback: >-
+          Yes. A date-only string means midnight UTC. In New York, that's still the 8th.
+      - text: '`NaN`, it can''t parse that'
+        feedback: >-
+          `YYYY-MM-DD` is the one format every engine must parse. It parsed fine, as an
+          instant.
+
+  - type: prose
+    id: keep-the-day
+    body: >-
+      So never send a pure date through `new Date`. Keep it as the text `2014-03-09` all the
+      way through, and store it in a `date` column.
+
+
+      Vendors write dates their own way, too. Is `05/06/2026` the 5th of June or the 6th of
+      May? The data can't tell you. Set the order per connection, and convert to
+      `YYYY-MM-DD` once, at the edge.
+
+  - type: ai-review
+    id: review-unknown-becomes-present
+    concept: integrations.enum-fallback
+    difficulty: 3
+    language: ts
+    request: Map the vendor's attendance codes to ours, and don't crash on new ones.
+    flawClass: logic
+    code: |
+      type Attendance = "present" | "absent" | "late";
+
+      const CODES: Record<string, Attendance> = {
+        P: "present",
+        A: "absent",
+        L: "late",
+      };
+
+      function toAttendance(code: string): Attendance {
+        return CODES[code.trim()] ?? "present";
+      }
+    prompt: >-
+      A school's register sync. Its tests cover every code in the vendor's docs, and all
+      pass. Then the vendor added `S` for sick. Sick pupils showed as present for a month.
+      Tap the line at fault.
+    lines: [10]
+    reasons:
+      - text: An unknown code becomes a real value, silently
+        correct: true
+        feedback: >-
+          Yes. A fallback must be told apart from real data, like `null`, and counted.
+      - text: It should throw on an unknown code
+        feedback: >-
+          Throwing stops the whole night's sync at one pupil. Keep going, but don't invent a
+          value.
+      - text: '`trim()` can change a valid code'
+        feedback: >-
+          Trimming only drops stray spaces. `S` stays `S`, and it's still missing from the map.
+      - text: A `Record` can't hold one-letter keys
+        feedback: >-
+          One-letter keys work fine. `P`, `A` and `L` all map, as the tests showed.
+    fix: |
+      function toAttendance(code: string): Attendance | null {
+        const mapped = CODES[code.trim()];
+        if (mapped === undefined) unmapped.add(code); // counted after the run
+        return mapped ?? null;
+      }
+    verify:
+      question: Which check would have caught this within a day?
+      choices:
+        - text: A test for every documented code
+          feedback: >-
+            That's the suite that passed. `S` wasn't in the docs it was written from.
+        - text: A count of unmapped codes after each sync
+          correct: true
+          feedback: >-
+            That count jumps the night `S` appears, long before a parent asks.
+        - text: Type-checking the mapper
+          feedback: >-
+            `Record<string, Attendance>` lets any string in. The compiler sees nothing wrong.
+        - text: Snapshot tests of mapped pupils
+          feedback: >-
+            Snapshots are recorded from known codes, so they pass as well.
+
+  - type: prose
+    id: csv-has-no-label
+    body: |-
+      Some vendors send a CSV file instead. A file is only bytes, and nothing in it says how
+      to read them. Three things vary:
+
+      - the **encoding**: UTF-8, or Windows-1252 (often called Latin-1) from older spreadsheets
+      - a **byte order mark**: three invisible bytes, `EF BB BF`, before the first header
+      - the **delimiter**: a semicolon, in countries that write three and a half as `3,5`
+
+  - type: bug-hunt
+    id: hunt-missing-id
+    concept: integrations.csv-quirks
+    difficulty: 3
+    language: js
+    code: |
+      import { readFileSync } from "node:fs";
+
+      const text = readFileSync("pupils.csv", "utf8");
+      const [header, ...lines] = text.split("\r\n");
+      const columns = header.split(",");
+      console.log(columns); // [ 'id', 'name', 'dob' ]
+
+      const pupils = lines.map((line) => {
+        const values = line.split(",");
+        return Object.fromEntries(columns.map((c, i) => [c, values[i]]));
+      });
+      console.log(pupils[0].id, pupils[0].name); // undefined Renée
+    prompt: >-
+      The import runs without an error. Every pupil's `id` is `undefined`, yet `name` is
+      fine. Tap the line at fault.
+    lines: [3]
+    reasons:
+      - text: '`utf8` keeps the byte order mark on the first header'
+        correct: true
+        feedback: >-
+          Yes. The first column is really `﻿id`, and the log hides the mark.
+      - text: The file uses semicolons, not commas
+        feedback: >-
+          Then `name` would be missing too. Only the first column is broken.
+      - text: '`Renée` isn''t valid UTF-8'
+        feedback: >-
+          The name decoded fine in the log. The trouble sits before the first header.
+      - text: Windows line endings broke the split
+        feedback: >-
+          It splits on `\r\n`, so those are handled. Stray `\r` would spoil the last column
+          anyway, not the first.
+    fix: |
+      // TextDecoder drops a leading byte order mark by default.
+      const text = new TextDecoder("utf-8").decode(readFileSync("pupils.csv"));
+
+  - type: fill-blank
+    id: fill-decode-settings
+    concept: integrations.csv-quirks
+    difficulty: 3
+    language: ts
+    prompt: >-
+      Each connection stores how its files are written. Decode and split with those settings,
+      never with a guess. Fill the gaps.
+    template: |
+      interface CsvSettings {
+        encoding: "utf-8" | "windows-1252";
+        delimiter: "," | ";";
+      }
+
+      // Quoted fields need a real CSV parser. This shows the settings.
+      function readRows(bytes: Uint8Array, settings: CsvSettings): string[][] {
+        const text = new {{1}}(settings.{{2}}).decode(bytes);
+        return text
+          .split(/\r?\n/)
+          .filter((line) => line !== "")
+          .map((line) => line.split(settings.{{3}}));
+      }
+    blanks:
+      - key: '1'
+        answer: TextDecoder
+      - key: '2'
+        answer: encoding
+      - key: '3'
+        answer: delimiter
+    bank: [TextDecoder, TextEncoder, encoding, delimiter, charset]
+
+  - type: code-challenge
+    id: write-to-pupil
+    concept: integrations.enum-fallback
+    difficulty: 4
+    language: ts
+    editable: '26-34'
+    prompt: >-
+      Write `toPupil(raw, settings, warn)`. It maps one vendor row, where every value is text
+      or missing, to your `Pupil`.
+
+
+      Trim every value first. `""`, `"N/A"` and `"-"`, in any case, and a missing value all
+      mean `null`. `DOB` is written in `settings.dateOrder`, `DMY` or `MDY`. Return it as
+      `YYYY-MM-DD` text, with no `Date`. `Status` maps through `STATUSES`, `FreeMeals`
+      through `YES` and `NO`, and `Country` becomes upper case.
+
+
+      An unknown status or flag becomes `null` and calls `warn` once, such as
+      `warn("Status", "SUSP")`. For example, `DOB: "09/03/2014"` with `DMY` gives
+      `born: "2014-03-09"`.
+    hints:
+      - Write a small `clean(value)` first. Every field goes through it before any other rule.
+      - '`null` from `clean` is not unknown. Only a value that survives `clean` and still fails the map gets a warning.'
+      - "For the date, `text.split('/')` gives three parts. Pick day and month by `settings.dateOrder`, then pad each to two digits."
+
+  - type: explain-back
+    id: explain-importer-risks
+    concept: integrations.csv-quirks
+    difficulty: 4
+    audience: teammate
+    kind: risk
+    prompt: >-
+      A teammate's CSV importer passes with the vendor's sample file. They want to switch it
+      on for every school. What could go wrong, and how would you check?
+    rubric:
+      - Other schools' files may differ in encoding, byte order mark or delimiter.
+      - The failures are quiet, such as garbled names, a missing first column or one giant column.
+      - Store encoding and delimiter per connection, and test with a file for each quirk.
+    modelAnswer: >-
+      The sample is one file from one spreadsheet. Another school might export Windows-1252,
+      so `Renée` arrives garbled. A byte order mark glues itself to the first header, and
+      every id goes missing. A semicolon delimiter turns each row into one column. None of
+      that throws: it imports wrong data quietly. I'd store encoding and delimiter per
+      connection, strip the mark, and add a test file for each quirk. I'd also alert on rows
+      with no id.
+
+recap:
+  - Keep pure dates as `YYYY-MM-DD` text, and read vendor formats with an order set per connection.
+  - Map vendor codes to yours, and send unknown ones to `null` with a warning, never to a real value.
+  - Read CSV with the connection's encoding and delimiter, and drop the byte order mark.
+
+recall:
+  - id: card-date-shift
+    concept: integrations.pure-dates
+    front: Why does `new Date("2014-03-09")` show the 8th on a server in New York?
+    back: >-
+      A date-only string is parsed as midnight UTC, an instant. In New York that instant is
+      still the evening of the 8th.
+  - id: card-store-birthday
+    concept: integrations.pure-dates
+    front: How should you keep a date of birth that comes from a vendor?
+    back: >-
+      As a calendar date: `YYYY-MM-DD` text in code and a `date` column in the database, never
+      a timestamp.
+  - id: card-unknown-code
+    concept: integrations.enum-fallback
+    front: What should an unknown vendor code map to, and what else should happen?
+    back: >-
+      A value nobody can mistake for real data, such as `null`, plus a warning or a counter so
+      someone sees it.
+  - id: card-csv-unknowns
+    concept: integrations.csv-quirks
+    front: Name three things a CSV file doesn't tell you about itself.
+    back: >-
+      Its encoding, whether it starts with a byte order mark, and its delimiter.
+
+references:
+  - kind: spec
+    title: 'ECMAScript Language Specification: Date Time String Format'
+    authors: Ecma TC39
+    venue: ECMA-262
+    url: https://tc39.es/ecma262/#sec-date-time-string-format
+    note: Why a date-only string is read as UTC and a date-time without an offset as local time.
+    primary: true
+    verified: false
+  - kind: rfc
+    title: 'RFC 4180: Common Format and MIME Type for Comma-Separated Values (CSV) Files'
+    authors: Y. Shafranovich
+    year: 2005
+    venue: IETF
+    url: https://www.rfc-editor.org/rfc/rfc4180
+    note: The closest thing CSV has to a standard, including quoting rules.
+    primary: true
+    verified: false
+  - kind: spec
+    title: Encoding Standard
+    authors: WHATWG
+    venue: encoding.spec.whatwg.org
+    url: https://encoding.spec.whatwg.org/
+    note: How `TextDecoder` handles a byte order mark, and why the label `latin1` means windows-1252.
+    verified: false
+  - kind: docs
+    title: Date/Time Types
+    authors: PostgreSQL Global Development Group
+    venue: PostgreSQL documentation
+    url: https://www.postgresql.org/docs/current/datatype-datetime.html
+    note: The `date` type for calendar dates, next to `timestamptz` for instants.
+    verified: false
+
+deepDive: >-
+  JavaScript's parser has two rules that look alike. `new Date("2014-03-09")`, a date-only
+  string, is read as UTC. `new Date("2014-03-09T00:00")`, a date and time with no offset, is
+  read as local time. On a server in Tokyo the second one is `2014-03-08T15:00:00.000Z`. The
+  Temporal proposal adds `Temporal.PlainDate` for exactly this, but Node 24 doesn't ship it,
+  so plain `YYYY-MM-DD` text is the portable choice.
+
+
+  Other values have standard forms worth converting to at the edge. Phone numbers become
+  E.164: a plus sign, the country code and the number, at most 15 digits, such as
+  `+447700900123`. Parsing a local number needs the country and real numbering-plan data, so
+  use a library rather than a regular expression. Countries become ISO 3166-1 alpha-2 codes.
+  The United Kingdom's code is `GB`, not `UK`, which surprises people. Currencies become ISO
+  4217 codes such as `GBP`, and each one has its own number of minor units: two for pounds,
+  none for yen.
+
+
+  CSV also has quoting. A field holding a comma or a line break is wrapped in double quotes,
+  and a quote inside is doubled: `"Okafor, Ada"`. That's why `line.split(",")` breaks on real
+  files, and why a real importer uses a CSV parser with the connection's delimiter.

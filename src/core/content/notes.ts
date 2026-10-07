@@ -1,4 +1,4 @@
-import { z } from 'zod';
+import * as z from '@/core/zod';
 import { VERIFY_LENSES } from './lenses';
 
 /*

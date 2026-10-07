@@ -1,0 +1,324 @@
+id: agents.evals-for-agents
+title: Evaluating an agent
+objective: Evaluate an agent by outcome and by trajectory, compute pass@k and pass^k over repeated trials, and check tool-call accuracy.
+level: advanced
+minutes: 10
+concepts: [agents.outcome-vs-trajectory, agents.pass-at-k, agents.pass-hat-k, agents.repeated-trials]
+prerequisites: [ai.evals, aisys.evals-in-depth, agents.human-in-the-loop]
+opening:
+  text: >-
+    You'll grade an agent the way its users experience it: on what it changed, how it got
+    there, and whether it does that every time. One lucky run proves very little.
+
+steps:
+  - type: prose
+    id: name-outcome-and-trajectory
+    body: |-
+      Evals graded single answers. An agent changes the world, so give each task an
+      **environment**: a sandbox bike-share with fake riders, bikes and docks.
+
+      An **outcome** grade checks the end state: is bike 812 flagged for repair, and the ride
+      closed? A **trajectory** grade checks the path: the right tools, with the right
+      arguments, in the right order, and nothing forbidden on the way.
+
+  - type: multiple-choice
+    id: pick-trajectory-grader
+    concept: agents.outcome-vs-trajectory
+    difficulty: 1
+    question: The ride ended correctly, but the agent cancelled the rider's membership and then restored it. Which grade fails?
+    choices:
+      - text: The trajectory grade, for a forbidden call
+        correct: true
+        feedback: >-
+          Yes. The end state looks fine. Only the path shows the scare.
+      - text: The outcome grade, for a wrong end state
+        feedback: >-
+          The membership was restored, so the end state matches. That's why the path needs grading too.
+      - text: Neither, since it fixed its own mistake
+        feedback: >-
+          The rider got a cancellation email in between. A forbidden call is a failure.
+      - text: Both, since any extra call fails
+        feedback: >-
+          Extra harmless lookups are fine. Grade required and forbidden calls, not every step.
+
+  - type: prose
+    id: name-pass-at-k-and-hat-k
+    body: |-
+      Agents vary from run to run, so run each task several times. These are **repeated
+      trials**.
+
+      Then two numbers answer two questions. **pass@k** is the chance that at least one of
+      k tries succeeds: right when a person picks the best attempt. **pass^k** is the chance
+      that all k succeed: right when riders rely on it every single time.
+
+  - type: multiple-choice
+    id: pick-k-trend
+    concept: agents.pass-hat-k
+    difficulty: 2
+    question: You raise k from 1 to 8 for the same agent. What happens to the two scores?
+    choices:
+      - text: pass@k rises and pass^k falls
+        correct: true
+        feedback: >-
+          Right. More tries make one success likelier and an unbroken streak rarer.
+      - text: Both rise with more trials
+        feedback: >-
+          More tries help "at least one". They make "every one" harder, so pass^k falls.
+      - text: Both fall with more trials
+        feedback: >-
+          Most people expect stricter for both. But one success in eight is easier than in one.
+      - text: Both stay near the single-run score
+        feedback: >-
+          They only match at k of 1. After that they pull apart, and the gap shows inconsistency.
+
+  - type: ai-review
+    id: review-grade-the-reply
+    concept: agents.outcome-vs-trajectory
+    difficulty: 3
+    language: python
+    request: Write the eval runner for the bike-share support agent's repair tasks.
+    flawClass: logic
+    code: |
+      async def run_task(task, agent):
+          env = BikeShareSandbox(seed=task["seed"])
+          run = await agent.run(task["message"], tools=env.tools)
+          passed = "flagged for repair" in run.final_reply.lower()
+          return {"task": task["id"], "passed": passed, "calls": run.calls}
+    prompt: >-
+      An assistant wrote this. The eval scored 94% for weeks. Meanwhile riders kept finding
+      broken bikes back in service, after the agent had told them it flagged them. Tap the
+      line at fault.
+    lines: [4]
+    reasons:
+      - text: It grades what the agent says, not the sandbox
+        correct: true
+        feedback: >-
+          Yes. The agent can claim a repair flag it never set. Check the bike's state.
+      - text: A fixed seed makes every run identical
+        feedback: >-
+          The seed fixes the sandbox's data, which keeps tasks fair. The model still varies.
+      - text: The calls should be graded instead
+        feedback: >-
+          A call to `flag_repair` can still fail. Grade the end state, and the path alongside.
+      - text: Lower-casing the reply hides errors
+        feedback: >-
+          Lower-casing only makes the match forgiving. The match itself checks the wrong thing.
+    fix: |
+      bike = env.bike(task["bike_id"])
+      ride = env.ride(task["ride_id"])
+      passed = bike.status == "needs_repair" and ride.status == "closed"
+    verify:
+      question: Which test would have caught this?
+      choices:
+        - text: A fake agent that only says "flagged for repair"
+          correct: true
+          feedback: >-
+            Right. It passes the old grader and fails a real one. That's the gap.
+        - text: A fake agent that does everything right
+          feedback: >-
+            Both graders pass it. It can't tell a claim from a change.
+        - text: Running the eval twice with the same seed
+          feedback: >-
+            That checks repeatability. The grader would be wrong both times.
+
+  - type: bug-hunt
+    id: hunt-set-trajectory
+    concept: agents.outcome-vs-trajectory
+    difficulty: 3
+    language: python
+    code: |
+      def trajectory_ok(calls):
+          required = {"verify_rider", "update_card"}
+          return required <= set(calls) and "cancel_membership" not in calls
+    prompt: >-
+      A trace shows the agent changed a rider's card first and checked their identity after.
+      The trajectory check passed it. Tap the line to fix.
+    lines: [3]
+    reasons:
+      - text: Comparing sets ignores the order of calls
+        correct: true
+        feedback: >-
+          Yes. Both calls happened, so the set test passes. Order needs a sequence check.
+      - text: The forbidden check should use a set too
+        feedback: >-
+          `not in` on a list works fine. The required calls are what lose their order.
+      - text: '`<=` should be `<` for a strict subset'
+        feedback: >-
+          A strict subset would fail correct runs too. It still ignores order.
+      - text: Identity checks don't belong in evals
+        feedback: >-
+          Verifying the rider before changing their card is exactly the rule worth testing.
+    fix: |
+      def trajectory_ok(calls):
+          remaining = iter(calls)
+          in_order = all(step in remaining for step in ["verify_rider", "update_card"])
+          return in_order and "cancel_membership" not in calls
+
+  - type: fill-blank
+    id: fill-pass-estimators
+    concept: agents.pass-at-k
+    difficulty: 3
+    language: python
+    prompt: >-
+      A task ran `n` times and passed `c` times. Estimate both scores for k tries by counting
+      ways to pick k of the n trials. Fill the gaps.
+    template: |
+      from math import comb
+
+      def pass_at_k(n, c, k):    # 1 minus the chance that all k picks failed
+          return 1 - comb({{1}}, k) / comb(n, k)
+
+      def pass_hat_k(n, c, k):   # the chance that all k picks passed
+          return comb({{2}}, k) / comb({{3}}, k)
+    blanks:
+      - key: '1'
+        answer: n - c
+      - key: '2'
+        answer: c
+      - key: '3'
+        answer: n
+    bank: [n - c, c, n, k, n - k]
+
+  - type: multiple-choice
+    id: pick-rerun
+    concept: agents.repeated-trials
+    difficulty: 3
+    question: Prompt v2 passed 41 of 50 tasks, one run each. v1 passed 38. What next?
+    choices:
+      - text: Run every task several times on both
+        correct: true
+        feedback: >-
+          Right. Three tasks of difference is within one run's noise for an agent.
+      - text: Ship v2, since it scored higher
+        feedback: >-
+          Three tasks can flip on a rerun. One trial each can't separate them.
+      - text: Keep v1, since change is risky
+        feedback: >-
+          That's a guess too. Repeated trials tell you which is really better.
+      - text: Add more tasks, still one run each
+        feedback: >-
+          More tasks help, but per-task variance stays hidden. You'd miss flaky tasks.
+
+  - type: code-challenge
+    id: write-evaluate
+    concept: agents.pass-hat-k
+    difficulty: 4
+    language: python
+    starter: passk.starter.py
+    solution: passk.solution.py
+    tests: passk.tests.py
+    prompt: >-
+      Write two functions. `trajectory_ok(calls, required, forbidden)` is `True` when the
+      `required` tool names appear in `calls` in order and no `forbidden` name appears.
+      Other calls may sit between them.
+
+
+      `evaluate(trials, k, required, forbidden)` takes trials like `{"id", "task", "outcome":
+      bool, "calls": [...]}`. A trial passes only if its outcome is true and its trajectory
+      is ok. For each task with n trials and c passes, pass@k is `1 - comb(n-c, k) /
+      comb(n, k)` and pass^k is `comb(c, k) / comb(n, k)`.
+
+
+      Return `{"pass_at_k", "pass_hat_k", "bad_trajectories"}`. The first two are averages
+      over tasks, rounded to 3 places. The last lists trials with a bad path, in input order. Raise
+      `ValueError` if a task has fewer than k trials.
+    hints:
+      - Write `trajectory_ok` first, then group the trials by task and count passes.
+      - '`step in iterator` consumes the iterator up to the match, so later steps must come later.'
+      - '`by_task.setdefault(trial["task"], []).append(passed)` collects each task''s results.'
+
+  - type: explain-back
+    id: defend-pass-hat-k
+    concept: agents.pass-hat-k
+    difficulty: 4
+    audience: teammate
+    kind: decide
+    prompt: >-
+      Your teammate wants the launch report for the bike-share agent to say "pass@5: 96%".
+      Defend reporting pass^k instead, and say what it costs.
+    rubric:
+      - pass@5 counts a task as solved if one of five tries works, which riders never get.
+      - Riders get one try each time, and need it to work every time, which pass^k measures.
+      - It costs more trials per task and a lower, less flattering number.
+    modelAnswer: >-
+      pass@5 says one of five tries worked. A rider gets one try, every time they write in,
+      and they need it to work each time. pass^k measures that consistency, so it's the
+      honest launch number. A task that passes three times in five looks solved under
+      pass@5 and shaky under pass^5. It costs us more trials per task, and a lower score
+      in the report.
+
+recap:
+  - Grade the end state in a sandbox, and grade the path for required and forbidden calls.
+  - Run each task several times, and compare versions on repeated trials, not single runs.
+  - Report pass^k for agents people rely on, and pass@k when a person picks the best try.
+
+recall:
+  - id: card-outcome-trajectory
+    concept: agents.outcome-vs-trajectory
+    front: What can a trajectory grade catch that an outcome grade misses?
+    back: >-
+      A forbidden or out-of-order call that left the end state looking right, such as a
+      cancelled and restored membership.
+  - id: card-pass-at-k
+    concept: agents.pass-at-k
+    front: When is pass@k the right number to report?
+    back: >-
+      When a person or a checker picks the best of k attempts, so one success is enough.
+  - id: card-pass-hat-k
+    concept: agents.pass-hat-k
+    front: Why does pass^k fall as k grows?
+    back: >-
+      It needs every one of k tries to pass, and each extra try is another chance to fail.
+  - id: card-repeated-trials
+    concept: agents.repeated-trials
+    front: Why run each eval task several times for an agent?
+    back: >-
+      One run hides how much results vary. Repeated trials show flaky tasks and whether a
+      version difference is real.
+
+references:
+  - kind: paper
+    title: "τ-bench: A benchmark for tool-agent-user interaction in real-world domains"
+    authors: Shunyu Yao, Noah Shinn, Pedram Razavi and Karthik Narasimhan
+    year: 2024
+    venue: arXiv
+    url: https://arxiv.org/abs/2406.12045
+    note: Grades agents by the end state of a database, and introduces pass^k for consistency.
+    primary: true
+    verified: false
+  - kind: paper
+    title: Evaluating large language models trained on code
+    authors: Mark Chen and others
+    year: 2021
+    venue: arXiv
+    url: https://arxiv.org/abs/2107.03374
+    note: The unbiased pass@k estimator from n samples with c correct.
+    primary: true
+    verified: false
+
+deepDive: >-
+  The estimators and the challenge ran in Python 3.13 on made-up trials. No model was called.
+
+
+  **Why the combinatorial estimator.** With per-trial pass rate p, pass@k is 1 - (1 - p)^k
+  and pass^k is p^k. Plugging in c / n is biased for small n. Counting ways to choose k of
+  the n trials gives unbiased estimates, and needs n at least k. Run more trials than the
+  k you report, say n = 10 for k = 5.
+
+
+  **Sandboxes worth building.** A good environment resets to a known seed. It exposes the
+  same tools as production with fake data behind them, and lets the grader read the
+  final state directly. Grade with code where you can: a row exists, a status changed, no
+  email went to anyone else. Use a model judge only for what code can't check, such as the
+  tone of the reply.
+
+
+  **Red teaming.** Add adversarial tasks: a rider who claims to be someone else, a ticket
+  with an injected instruction, a request slightly outside policy. Grade them by forbidden
+  calls and end state. Keep them in the suite, so every harness change is tested against
+  yesterday's attacks.
+
+
+  **Tool-call accuracy.** Beyond order, check arguments: the right ride id, the right
+  dock. Compare parsed arguments, not strings, because the same call can be written with
+  different spacing or key order.

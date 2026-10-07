@@ -1,0 +1,158 @@
+summary: >-
+  "Will it hold at 10x?" is a question about shape, not speed. Most lines of code cost the
+  same whether you have a hundred users or a million. A few lines grow with the data or the
+  traffic, and those are the ones that fall over: a query with no `LIMIT`, a table loaded
+  into memory, a query or a network call per item in a loop.
+
+
+  Growth doesn't need more users. A loan history, an order log or a table of plays grows
+  every day with flat traffic, so a page that was fast at launch slows down on its own. And
+  not every line deserves the same care. A **hot path**, the code that runs on every
+  request, multiplies any cost by all your traffic, so it is where to look first.
+
+
+  A **quick estimate** ties it together. Users, requests per user, a peak factor and queries
+  per request give the load on your database at ten times today, in two minutes, before any
+  code is written. It tells you which line to fix now and which can wait a year.
+remember:
+  - Look for work that grows with the data, because most code doesn't and the few lines that do are what breaks at 10x.
+  - A query with no `LIMIT`, a whole table in memory and a query per item in a loop are the three usual shapes of unbounded work.
+  - Data grows with flat traffic, so an unbounded query gets slower every year on its own.
+  - A hot path runs on every request, so its cost is multiplied by all your traffic and it gets reviewed first.
+  - Postgres keeps no stored row count, so `count(*)` on a big table reads every row each time.
+  - Peak requests per second is daily users times requests each, divided by 86,400, times a peak factor of a few.
+  - An estimate gives the shape of the problem; measuring the real hot path tells you its size.
+sections:
+  - title: Reading a diff for unbounded work
+    body: |-
+      Scan a diff for four shapes, each with a standard fix.
+
+      - **A query with no `LIMIT`** on a table that grows: a history, a log, a feed. Add a `LIMIT` and cursor pagination, so a page always costs the same.
+      - **A query or API call inside a loop**: the N+1. Fetch everything in one query with a join or `WHERE id = ANY($1)`, or one batch call.
+      - **A whole table loaded to filter or count in code**: `rows.filter(...)` or `rows.length` after a `SELECT *`. Push the work into SQL with `WHERE`, `GROUP BY` and `count`.
+      - **A loop inside a loop over the same data**: a duplicate check or a match between two lists. Build a `Map` or `Set` once, then look up in constant time.
+
+      The last one is in memory, so it slips past review: no query appears anywhere.
+
+      ```js
+      // Quadratic: each order searches the whole customer list.
+      const slow = orders.map((o) => customers.find((c) => c.id === o.customerId));
+
+      // Linear: build the lookup once.
+      const byId = new Map(customers.map((c) => [c.id, c]));
+      const fast = orders.map((o) => byId.get(o.customerId));
+      ```
+
+      Both return the same customers. With 50,000 orders and 50,000 customers, the first
+      makes up to two and a half billion comparisons and the second about 100,000 steps.
+
+      When a list must be unbounded, such as an export of every row, stream it in pages and
+      write each page out, so memory stays flat however big the table gets.
+  - title: Finding the hot path
+    body: |-
+      You can often guess a hot path from the code: middleware, the layout, the home page, the
+      sign-in check. But the real ranking comes from production numbers, and it is total time
+      that matters, not the slowest request.
+
+      ```js
+      const routes = [
+        { route: "GET /", requestsPerDay: 900_000, averageMs: 40 },
+        { route: "GET /recipes/:id", requestsPerDay: 400_000, averageMs: 60 },
+        { route: "GET /admin/report", requestsPerDay: 20, averageMs: 9_000 },
+      ];
+
+      const ranked = routes
+        .map((r) => ({ ...r, hoursPerDay: (r.requestsPerDay * r.averageMs) / 3_600_000 }))
+        .toSorted((a, b) => b.hoursPerDay - a.hoursPerDay);
+
+      for (const r of ranked) console.log(r.route, r.hoursPerDay.toFixed(2));
+      // GET / 10.00
+      // GET /recipes/:id 6.67
+      // GET /admin/report 0.05
+      ```
+
+      The admin report is the slowest request by far and the least important to optimise.
+      The home page, at 40 ms, costs ten hours of server time a day. Shaving 10 ms off it
+      saves two and a half hours; shaving five seconds off the report saves under two
+      minutes.
+
+      Your monitoring tool usually has this view already: routes sorted by total time, or by
+      request count times p95 latency. Start reviews and optimisation there. A per-request
+      cost added to the top of that list, such as the footer's `count(*)`, is the change
+      to question hardest.
+  - title: A worked estimate
+    body: |-
+      A recipe site has 40,000 daily users. Will the database cope at ten times that? Write
+      the numbers down, round generously, and multiply.
+
+      ```js
+      const dailyUsers = 40_000 * 10;
+      const requestsPerUser = 30;  // pages and API calls in a day
+      const peakFactor = 4;        // busiest hour against the daily average
+      const queriesPerRequest = 6;
+
+      const averagePerSecond = (dailyUsers * requestsPerUser) / 86_400;
+      const peakPerSecond = averagePerSecond * peakFactor;
+      const queriesPerSecond = peakPerSecond * queriesPerRequest;
+
+      console.log(Math.round(averagePerSecond), Math.round(peakPerSecond), Math.round(queriesPerSecond));
+      // 139 556 3333
+      ```
+
+      About 3,300 queries a second at the peak. Whether that is fine depends on what each
+      query costs, which is where the estimate meets measurement. If the six queries are
+      primary-key lookups taking a fraction of a millisecond, one database handles it. If one
+      of them is the footer's full-table `count(*)`, the same arithmetic says the database
+      spends its whole day counting recipes.
+
+      Two habits keep estimates honest. Write the assumptions as named numbers, as above, so a
+      reviewer can challenge one without redoing the rest. And estimate the thing that runs
+      out first: connections in the pool, rows scanned per second, or the provider's rate
+      limit, not just requests.
+pitfalls:
+  - '**Testing scale with a laptop-sized database.** A query that reads every row is instant on 200 rows. Keep a production-sized copy, or generated data at the expected size, for anything on a hot path.'
+  - '**Assuming flat traffic means flat cost.** Tables grow every day. Any query without a `LIMIT` on a growing table gets slower on its own.'
+  - '**Optimising the slowest request instead of the costliest.** A nine-second report run twenty times a day matters less than 10 ms on the home page. Rank by total time.'
+  - '**Adding work to a hot path without counting it.** A count, a remote call or a log of the whole request in middleware is paid on every request. Cache it, move it off the path, or batch it.'
+  - '**Estimating once and never checking.** An estimate is a hypothesis. Compare it with production numbers after launch and update the assumptions.'
+verify:
+  - lens: scales
+    check: Every query on a table that grows has a `LIMIT` or returns one row, and pages use a cursor rather than a deep `OFFSET`.
+  - lens: scales
+    check: No query or network call runs once per item inside a loop, where one query or one batch would do.
+  - lens: scales
+    check: Code added to middleware, the layout or another hot path has its per-request cost estimated against daily traffic.
+  - lens: tests
+    check: Changes to hot-path queries are load-tested against a production-sized copy, not only unit-tested on a handful of rows.
+  - lens: confuses
+    check: A cached or estimated value, such as a count refreshed each minute, says so in its name or a comment.
+interview:
+  - question: How would you check whether a design will hold at ten times the load?
+    answer: >-
+      I'd estimate first, then look for the parts that grow with the data. The estimate is
+      daily users times requests each, over 86,400 seconds, times a peak factor, then times
+      queries per request. That gives a load I can compare with what our database and our
+      providers' rate limits can take. Then I'd look for unbounded work: queries without a
+      limit on growing tables, a query per item in a loop, whole tables loaded into memory,
+      and anything added to a hot path. Those are what break first, usually well before raw
+      request volume does. Finally I'd confirm with a load test on production-sized data,
+      because an estimate gives the shape of the problem, not its exact size.
+  - question: What is an N+1 query, and how do you find them in a large codebase?
+    answer: >-
+      It's one query for a list, then one more per item, so a page of fifty items makes
+      fifty-one round trips. It's slow because each trip waits on the network, not because
+      each query is expensive. In review I look for a query inside a loop, and for ORM
+      relations read in a loop, since lazy loading hides the query behind a field access. At
+      scale I'd rather measure: log the number of queries per request and alert when a
+      route goes above a threshold, or assert the count in an integration test, such as at
+      most three queries for the dashboard. The fix is a join, a `WHERE id = ANY($1)` batch,
+      or the ORM's eager loading.
+  - question: A page got slow but traffic hasn't changed. Where do you look?
+    answer: >-
+      At the data, because it grows even when traffic doesn't. I'd find the slow route in
+      monitoring, then run `EXPLAIN ANALYZE` on its queries against production-sized data. The
+      usual causes are a query without a `LIMIT` on a table that keeps growing, such as a
+      history or a log, deep `OFFSET` pagination, or a missing index that only hurts once the
+      table is large. I'd also check whether something was added to a hot path, like a count
+      or a remote call in middleware. The fixes follow the cause: a limit with cursor
+      pagination, an index, or moving the work off the path with a cache.

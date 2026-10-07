@@ -1,0 +1,334 @@
+id: aisys.reading-documents
+title: Reading documents
+objective: Feed PDFs and scans to a model, split and classify a mixed scan, extract fields into a schema, and parse e-invoices without OCR.
+level: advanced
+minutes: 10
+concepts: [aisys.document-input, aisys.document-splitting, aisys.schema-extraction, aisys.structured-e-invoices]
+prerequisites: [ai.structured-output-and-tools, aisys.thresholds-and-calibration]
+opening:
+  text: >-
+    You'll turn PDFs, scans and phone photos into clean records, reading each page the
+    right way. It's the first job of almost every back-office AI feature.
+
+steps:
+  - type: prose
+    id: what-comes-in
+    body: |-
+      A PDF exported from software carries a **text layer**: the characters themselves. A
+      scan or a phone photo is only pixels. Reading it needs **OCR**, optical character
+      recognition, or a model that reads images.
+
+      Model APIs take both kinds as content blocks:
+
+      ```python
+      {"type": "document", "source": {"type": "base64",
+          "media_type": "application/pdf", "data": pdf_b64}}
+      {"type": "image", "source": {"type": "base64",
+          "media_type": "image/jpeg", "data": photo_b64}}
+      ```
+
+  - type: multiple-choice
+    id: pick-text-layer
+    concept: aisys.document-input
+    difficulty: 1
+    question: A supplier's PDF came from their stock software. Text copies out cleanly. What's inside?
+    choices:
+      - text: A text layer you can read without OCR
+        correct: true
+        feedback: >-
+          Right. The characters are already there, exact and free to read.
+      - text: An image that needs OCR first
+        feedback: >-
+          An image-only page copies out nothing. Clean text means real characters.
+      - text: XML data behind the page
+        feedback: >-
+          Some PDFs carry XML, but copyable text only proves a text layer.
+
+  - type: multiple-choice
+    id: why-columns-scramble
+    concept: aisys.document-input
+    difficulty: 2
+    language: text
+    code: |
+      # The plant nursery's price list, as printed:
+      Plant         Pot    Price
+      Lavender      2 L    6.50
+      Olive tree    30 L   89.00
+
+      # What plain text extraction returned:
+      Plant Lavender Olive tree Pot 2 L 30 L Price 6.50 89.00
+    question: Why did the extractor return the table one column after another?
+    choices:
+      - text: It reads text in the order the file stores it
+        correct: true
+        feedback: >-
+          Yes. A PDF stores positioned text, not rows. Tables and columns come out scrambled.
+      - text: The PDF has no text layer
+        feedback: >-
+          Then extraction would return nothing at all. Here every word came back.
+      - text: The font isn't embedded in the file
+        feedback: >-
+          A missing font garbles the characters themselves. These are fine, only their order isn't.
+
+  - type: ai-review
+    id: review-empty-text-layer
+    concept: aisys.document-input
+    difficulty: 3
+    language: python
+    request: Pick a reading path for each page of an incoming PDF.
+    flawClass: edge-case
+    code: |
+      def choose_path(page):
+          if page.embedded_xml:
+              return "parse-xml"
+          if page.text:            # it has a text layer, so skip the image
+              return "text"
+          return "vision"          # send the page image to the model
+    prompt: >-
+      An assistant wrote this. Tests used exported PDFs and phone photos, and passed. Then
+      a school's new scanner sent in enrolment forms, and every record came back empty. Tap
+      the line at fault.
+    lines: [4]
+    reasons:
+      - text: A text layer of only whitespace still counts as text
+        correct: true
+        feedback: >-
+          Yes. Scanners add blank layers, and `"\n\n"` is truthy. Pixels never reach the model.
+      - text: The XML check should run last
+        feedback: >-
+          First is right. When the data is there, nothing else needs to read the page.
+      - text: Every page should go to the model as an image
+        feedback: >-
+          That works, but it pays for vision on pages whose text is already exact.
+    fix: |
+      def choose_path(page):
+          if page.embedded_xml:
+              return "parse-xml"
+          if len(page.text.strip()) >= 200:   # a real text layer, not a blank one
+              return "text"
+          return "vision"
+    verify:
+      question: Which test would have caught this before the scanner did?
+      choices:
+        - text: A scanned page whose text layer is whitespace
+          correct: true
+          feedback: >-
+            That's the exact page the scanner produced, and it goes down the wrong path.
+        - text: An exported PDF with a full text layer
+          feedback: >-
+            That page takes the text path in both versions, so it can't tell them apart.
+        - text: A phone photo with no text layer
+          feedback: >-
+            An empty string is falsy, so the photo already reached the model. The test passes.
+
+  - type: prose
+    id: e-invoices-are-data
+    body: |-
+      Some documents arrive as data. An **e-invoice** follows a standard, such as the EU's
+      EN 16931. It comes as pure XML, or as a PDF with the XML attached inside.
+
+      The visible page is for people. The XML holds every field, typed and exact. So you
+      parse it. No OCR, no model, no guessing, and it costs nothing per page.
+
+  - type: fill-blank
+    id: fill-parse-ubl
+    concept: aisys.structured-e-invoices
+    difficulty: 2
+    language: python
+    prompt: >-
+      A museum shop's supplier sends UBL e-invoices. Read the invoice number and the amount
+      due straight from the XML.
+    template: |
+      import xml.etree.ElementTree as ET
+      from decimal import Decimal
+
+      NS = {"cbc": "urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2",
+            "cac": "urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2"}
+
+      root = ET.fromstring(xml_bytes)
+      number = root.{{1}}("cbc:ID", NS).text
+      due = Decimal(root.findtext("cac:LegalMonetaryTotal/cbc:{{2}}", namespaces=NS))
+      # number == "GN-2026-0815", due == Decimal("182.40")
+    blanks:
+      - key: '1'
+        answer: find
+      - key: '2'
+        answer: PayableAmount
+    bank: [find, findall, PayableAmount, TaxAmount, ocr]
+
+  - type: prose
+    id: split-then-extract
+    body: |-
+      A nursery's morning post is scanned as one 9-page PDF: three delivery notes, a returns
+      form, and a note that runs over two pages.
+
+      Extract from the whole file, and fields from different notes blur into one record. So
+      **split** first. A classifier labels each page with a document type, or as a
+      continuation of the page before. Lesson 4's bands decide which labels to trust.
+
+  - type: fill-blank
+    id: fill-extract-schema
+    concept: aisys.schema-extraction
+    difficulty: 2
+    language: python
+    prompt: >-
+      Extract one delivery note into a schema. A field the page doesn't show must stay empty,
+      never guessed.
+    template: |
+      class Line(BaseModel):
+          plant: str
+          quantity: int
+
+      class DeliveryNote(BaseModel):
+          note_number: str
+          delivery_date: {{1}} = None    # empty when the page doesn't show it
+          lines: list[Line]
+
+      reply = client.messages.parse(
+          model="claude-haiku-4-5", max_tokens=2048, {{2}}=DeliveryNote,
+          messages=[{"role": "user", "content": [*note_pages,
+              {"type": "text", "text": "Extract the note. Leave missing fields empty."}]}])
+      note = reply.{{3}}
+    blanks:
+      - key: '1'
+        answer: str | None
+        accept: ['Optional[str]']
+      - key: '2'
+        answer: output_format
+      - key: '3'
+        answer: parsed_output
+    bank: [str | None, str, output_format, response_format, parsed_output, content]
+
+  - type: code-challenge
+    id: write-split-batch
+    concept: aisys.document-splitting
+    difficulty: 4
+    language: python
+    starter: split.starter.py
+    solution: split.solution.py
+    tests: split.tests.py
+    prompt: >-
+      Write `split_batch(pages, auto=0.9, review=0.6)`. Each page is a dict of label to
+      probability, such as `{"delivery_note": 0.96, "continuation": 0.03, ...}`. Return the
+      documents in order, each as `{"type": label, "pages": [1, 2], "route": route}`.
+
+
+      Page numbers start at 1. A page whose top score is below `review` becomes its own
+      `"unknown"` document. A `"continuation"` page joins the document before it, or starts
+      an `"unknown"` one if there's none. Any other label starts a new document. A document
+      goes to `"extract"` only if every page's top score reaches `auto`, otherwise to
+      `"review"`. Unknown documents always go to `"review"`. Raise `ValueError` if `review`
+      is above `auto`.
+    hints:
+      - Walk the pages once, keeping the list of documents. The last one is where a continuation goes.
+      - Find each page's top label and score first. The score decides the route before the label decides the grouping.
+      - '`label = max(scores, key=scores.get)` gives the top label. Check `scores[label] < review` before anything else.'
+
+  - type: explain-back
+    id: explain-path-per-page
+    concept: aisys.document-input
+    difficulty: 3
+    audience: newcomer
+    kind: explain
+    prompt: >-
+      A new teammate asks why the pipeline picks a reading path per page. Why not run OCR on
+      everything?
+    rubric:
+      - A real text layer is exact and free, so OCR would only add errors and cost.
+      - Scans, photos and pages with tables or columns need the image read, by OCR or a model.
+      - An e-invoice's XML is parsed as data, so nothing needs to read the page at all.
+    modelAnswer: >-
+      Pages come in three kinds. An exported PDF already has its characters. Reading them is
+      exact and free. OCR would only add mistakes. A scan or photo is pixels. It needs OCR
+      or a model that sees the page, and so do tables. An e-invoice carries
+      its fields as XML, so we parse that and skip reading altogether.
+
+recap:
+  - Tell a text layer from pixels, and pick text, vision or XML for each page.
+  - Split a mixed scan into documents before extracting, with bands deciding what to trust.
+  - Extract into a schema that leaves missing fields empty, and parse e-invoices as data.
+
+recall:
+  - id: card-text-layer
+    concept: aisys.document-input
+    front: Why does plain text extraction scramble a table in a PDF?
+    back: >-
+      A PDF stores positioned text, not rows and columns, so extraction returns it in storage
+      order. A model that sees the page image keeps the layout.
+  - id: card-split-first
+    concept: aisys.document-splitting
+    front: Why split a multi-document scan before extracting fields?
+    back: >-
+      Otherwise fields from different documents mix into one record. Each part is classified
+      and extracted on its own.
+  - id: card-missing-empty
+    concept: aisys.schema-extraction
+    front: How should an extraction schema handle a field the document doesn't show?
+    back: >-
+      Make it optional with an empty default, and tell the model to leave it empty. A guessed
+      value looks like a real one.
+  - id: card-e-invoice
+    concept: aisys.structured-e-invoices
+    front: What do you do with a PDF that carries e-invoice XML inside?
+    back: >-
+      Parse the XML. It holds every field exactly, so OCR or a model would only add cost and
+      errors.
+
+references:
+  - kind: docs
+    title: PDF support
+    authors: Anthropic
+    venue: Claude Platform Docs
+    url: https://platform.claude.com/docs/en/build-with-claude/pdf-support
+    note: Document blocks, page and size limits, and how each page is read as text and image.
+    primary: true
+    verified: false
+  - kind: docs
+    title: Structured outputs
+    authors: Anthropic
+    venue: Claude Platform Docs
+    url: https://platform.claude.com/docs/en/build-with-claude/structured-outputs
+    note: Extracting into a schema with `messages.parse` and a Pydantic model.
+    verified: false
+  - kind: spec
+    title: 'EN 16931-1: Electronic invoicing, semantic data model of the core elements of an electronic invoice'
+    authors: European Committee for Standardization (CEN)
+    year: 2017
+    note: The EU e-invoice data model behind UBL and CII invoices.
+    primary: true
+    verified: false
+  - kind: docs
+    title: xml.etree.ElementTree, The ElementTree XML API
+    authors: Python Software Foundation
+    url: https://docs.python.org/3/library/xml.etree.elementtree.html
+    note: Parsing XML with namespaces, including `find` and `findtext`.
+    verified: false
+
+deepDive: >-
+  No model was called. The UBL snippet and the splitter ran in Python on made-up
+  pages.
+
+
+  **How a model reads a PDF.** For each page, the API extracts the text layer and renders an
+  image. The model gets both. So a scan with an empty text layer
+  still gets read, and a page's layout survives. The price is tokens: every page costs text
+  tokens plus image tokens. A request takes up to 32 MB and 600 pages, or 100 pages on
+  models with a 200k context window. For big jobs, upload once through a Files API and refer
+  to the file by id.
+
+
+  **Citations and schemas don't mix in one call.** Citations point an answer at the page it
+  came from. But they can't be combined with structured output in the same request.
+  Extract into the schema in one call, and check the values against the text in code, as
+  the next lesson does.
+
+
+  **E-invoice formats.** EN 16931 fixes what an invoice must say. UBL and UN/CEFACT CII are
+  two XML syntaxes for it. Hybrid formats such as Factur-X embed the CII XML in a PDF/A-3
+  file as an attachment, so a PDF library lists it like any attached file. Validate the XML
+  against its schema and rules before booking, as you would any input.
+
+
+  **Handwriting** is the hardest input. Modern vision models read neat handwriting well,
+  but ticked boxes, crossed-out digits and signatures still fail often. Give handwritten
+  forms a higher bar for automation, and measure on your own forms.

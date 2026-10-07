@@ -61,6 +61,23 @@ const eslintConfig = [
       '.claude/**',
     ],
   },
+  {
+    // zod only through src/core/zod.ts: zod's own `z` namespace carries every locale, and
+    // Turbopack cannot shake it, so a direct import puts them on every page.
+    files: ['src/**/*.{ts,tsx}'],
+    ignores: ['src/core/zod.ts'],
+    rules: {
+      '@typescript-eslint/no-restricted-imports': [
+        'error',
+        {
+          paths: [{ name: 'zod', message: "Import zod as `import * as z from '@/core/zod'`." }],
+          patterns: [
+            { group: ['zod/*'], message: "Import zod as `import * as z from '@/core/zod'`." },
+          ],
+        },
+      ],
+    },
+  },
 ];
 
 export default eslintConfig;

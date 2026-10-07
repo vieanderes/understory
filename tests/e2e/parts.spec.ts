@@ -135,10 +135,11 @@ test.describe('the Learn page in parts', () => {
     await expect(first.getByTestId('chapter-time').first()).toHaveText(
       /0\/\d+ done · about .+ · .+ left/i,
     );
-    // The chapter with the next lesson is open, and every lesson row carries its time.
-    const times = first.getByTestId('lesson-time');
-    expect(await times.count()).toBeGreaterThanOrEqual(5);
-    for (const text of await times.allTextContents()) expect(text).toMatch(/^\d+ min$/);
+    // The chapter with the next lesson is open, and every lesson row carries its time, or
+    // says it is in preparation when the outline lists a lesson not written yet.
+    const times = await first.getByTestId('lesson-time').allTextContents();
+    expect(times.filter((text) => /^\d+ min$/.test(text)).length).toBeGreaterThanOrEqual(5);
+    for (const text of times) expect(text).toMatch(/^(\d+ min|In preparation)$/);
   });
 
   test('a row shows its time, Next and Advanced together', async ({ page }) => {

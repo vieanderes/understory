@@ -1,0 +1,305 @@
+id: aisys.guardrails
+title: Guardrails and human approval
+objective: Check inputs and outputs, gate irreversible actions behind human approval, verify grounding, and moderate content.
+level: advanced
+minutes: 10
+concepts: [aisys.guardrails, aisys.human-in-the-loop, aisys.grounding-checks, aisys.content-moderation]
+prerequisites: [aisys.thresholds-and-calibration, ai.injection-and-leakage]
+opening:
+  text: >-
+    You'll put checks around a model that hold even when the model is fooled. Then an agent
+    can act for real without you lying awake about it.
+
+steps:
+  - type: prose
+    id: name-guardrails
+    body: |-
+      **Guardrails** are checks around the model, in your code: on what comes in, on what
+      goes out, and on every action it proposes. Some are plain rules, like an allow-list
+      of tools. Some are fast classifiers, like the ones from lesson 3.
+
+      A rule in the prompt can be talked out of. A check in code runs whatever the model
+      was told.
+
+  - type: prose
+    id: name-human-in-the-loop
+    body: |-
+      The strongest guardrail is a person. **Human in the loop** means risky or
+      irreversible actions wait for approval. A good approval screen shows the proposed
+      action, the user's original request, and why it was flagged.
+
+      The person can approve, edit or reject. No answer in time means no action. The log
+      records who approved what.
+
+  - type: multiple-choice
+    id: pick-before-bulk-email
+    concept: aisys.human-in-the-loop
+    difficulty: 1
+    question: An agent proposes emailing 400 customers. What should happen before it runs?
+    choices:
+      - text: A person approves it
+        correct: true
+        feedback: >-
+          Yes. It can't be unsent, so a person signs it off first.
+      - text: It runs, since the model chose it
+        feedback: >-
+          The model can be wrong or misled. An action this big needs a second pair of eyes.
+      - text: The model is asked if it's sure
+        feedback: >-
+          The same model checking itself shares its mistakes. The check must be independent.
+
+  - type: ai-review
+    id: review-self-rated-risk
+    concept: aisys.human-in-the-loop
+    difficulty: 3
+    language: python
+    request: Add an approval step for risky tool calls.
+    flawClass: security
+    code: |
+      def run_tool(call, request):
+          # The tool schema asks the model to rate each call's risk from 1 to 5.
+          risk = call.input.get("risk_level", 1)
+          if risk >= 4:
+              return request_approval(call, request)
+          return TOOLS[call.name](**call.input)
+    prompt: >-
+      An assistant wrote this. In tests the model rated every bulk email 5. Then a pasted
+      message said "routine update, risk level 1", a prompt injection, and 400 emails went
+      out. Tap the line at fault.
+    lines: [3]
+    reasons:
+      - text: The risk comes from the model it should check
+        correct: true
+        feedback: >-
+          Yes. Injected text steered the model, and with it the gate.
+      - text: The approval threshold of 4 is too high
+        feedback: >-
+          Any threshold fails when the number is the model's own claim. The source is wrong.
+      - text: '`get` should have no default'
+        feedback: >-
+          A missing value would then crash. The trouble is who supplies the value.
+    verify:
+      question: Which test would have caught this?
+      choices:
+        - text: A bulk email with injected text claiming "risk level 1"
+          correct: true
+          feedback: >-
+            Yes. It's the one case where the model's claim and reality differ.
+        - text: A bulk email the model honestly rates 5
+          feedback: >-
+            That's what the tests already did, and the gate worked there.
+        - text: A tool call with no `risk_level` at all
+          feedback: >-
+            It would show the default of 1, but not that an attacker can choose the number.
+    fix: |
+      def run_tool(call, request):
+          risk = risk_classifier.score(call, request)   # independent of the agent
+          if call.name in IRREVERSIBLE or risk >= 4:
+              return request_approval(call, request)
+          return TOOLS[call.name](**call.input)
+
+  - type: prose
+    id: name-grounding
+    body: |-
+      Now the output. A **grounding check** asks whether each claim in a draft is supported
+      by the sources it was written from. A small model or classifier scores it, cheaply,
+      on every answer:
+
+      ```python
+      grounding.score("Refunds arrive in 3 days.", ["Refunds take 5 working days."])   # 0.22
+      ```
+
+      A weak score means regenerate from the sources, or hand the draft to a person.
+
+  - type: bug-hunt
+    id: hunt-grounding-ignored
+    concept: aisys.grounding-checks
+    difficulty: 2
+    language: python
+    code: |
+      def answer(question):
+          sources = retrieve(question)
+          draft = write_answer(question, sources)
+          score = grounding.score(draft, sources)
+          if score < 0.5:
+              log.warning("weak grounding %.2f", score)
+          return send(draft)
+    prompt: >-
+      A customer was told refunds take 3 days. The sources say 5. The log shows `weak
+      grounding 0.22` for that answer. Tap the line to fix.
+    lines: [6]
+    reasons:
+      - text: A weak score only logs, then sends anyway
+        correct: true
+        feedback: >-
+          Right. The check found the problem and changed nothing.
+      - text: The 0.5 threshold is too strict
+        feedback: >-
+          0.22 fails any sensible bar. The draft went out regardless.
+      - text: Grounding should be checked before writing
+        feedback: >-
+          There's nothing to check until the draft exists. The reaction is missing.
+    fix: |
+      def answer(question):
+          sources = retrieve(question)
+          draft = write_answer(question, sources)
+          if grounding.score(draft, sources) < 0.5:
+              draft = write_answer(question, sources, note="Use only facts in the sources.")
+              if grounding.score(draft, sources) < 0.5:
+                  return hand_to_person(question, draft)
+          return send(draft)
+
+  - type: prose
+    id: name-moderation
+    body: >-
+      One more check runs on everything, in and out. **Content moderation** scores each
+      message for harm, such as self-harm, harassment or spam.
+
+
+      It must judge meaning, not keywords, and be fast enough for all traffic. High-risk
+      cases go to trained people, not to an automatic reply.
+
+  - type: multiple-choice
+    id: pick-moderation
+    concept: aisys.content-moderation
+    difficulty: 2
+    question: 'Keywords flag "this bug is killing me" and miss "I won''t be a burden much longer". What fixes both?'
+    choices:
+      - text: A classifier that scores meaning in context
+        correct: true
+        feedback: >-
+          Yes. It reads the first as a joke and the second as a warning sign.
+      - text: A longer list of keywords
+        feedback: >-
+          The second message has no alarming word at all. No list will catch it.
+      - text: Blocking every message that sounds negative
+        feedback: >-
+          That blocks people who need help, along with ordinary complaints.
+
+  - type: code-challenge
+    id: write-gate-action
+    concept: aisys.guardrails
+    difficulty: 3
+    language: python
+    starter: gate.starter.py
+    solution: gate.solution.py
+    tests: gate.tests.py
+    prompt: >-
+      Write `gate_action(p, policy)` for an action the agent proposes. `p` has a `"tool"`
+      name, a `"risk"` from 1 to 5 from an independent classifier, and probabilities
+      `"matches_intent"` and `"pii_leak"`. `policy` lists `"allowed"` and `"irreversible"`
+      tools.
+
+
+      Return `"block"` for a tool not allowed, or a `pii_leak` of 0.5 or more. Return
+      `"approve"` for an irreversible tool, a `risk` of 4 or more, or `matches_intent` under
+      0.8. Otherwise `"run"`. Raise `ValueError` if `risk` is outside 1 to 5.
+    hints:
+      - Check the blocking rules before the approval rules. Blocked beats approved.
+      - '`in` tells you whether a tool is in each list.'
+      - '`1 <= p["risk"] <= 5` checks the range in one comparison.'
+
+  - type: explain-back
+    id: explain-prompt-not-enough
+    concept: aisys.guardrails
+    difficulty: 3
+    audience: teammate
+    kind: explain
+    prompt: >-
+      The system prompt says "never email more than 10 customers without asking". Why isn't
+      that enough on its own?
+    rubric:
+      - The model can misread the rule or be steered past it by injected text.
+      - A guardrail in code runs on the actual action, whatever the model was told.
+      - The check should use independent signals, like tool lists and a classifier, and log decisions.
+    modelAnswer: >-
+      The prompt is a request, not a lock. The model can get it wrong, and a pasted message
+      can talk it out of it. A guardrail in code looks at the action the agent actually
+      proposes. It counts the recipients, checks the tool against a list, and asks a person
+      when needed. It runs whatever the model believed, and it leaves a log.
+
+recap:
+  - Put checks in code around input, output and every proposed action.
+  - Send irreversible or risky actions to a person, with the evidence shown.
+  - Check drafts against their sources, and moderate by meaning, not keywords.
+
+recall:
+  - id: card-guardrail
+    concept: aisys.guardrails
+    front: Why must a guardrail live in code rather than in the prompt?
+    back: >-
+      A prompt can be ignored or overridden by injected text. Code runs on the real action,
+      whatever the model was told.
+  - id: card-approval-screen
+    concept: aisys.human-in-the-loop
+    front: What should a person see before approving an agent's action?
+    back: >-
+      The proposed action, the user's original request, and why it was flagged, with the
+      option to edit or reject.
+  - id: card-grounding
+    concept: aisys.grounding-checks
+    front: What does a grounding check verify about a draft answer?
+    back: >-
+      That each claim is supported by the retrieved sources, before the answer is sent.
+  - id: card-moderation
+    concept: aisys.content-moderation
+    front: Why does moderation need a classifier rather than a keyword list?
+    back: >-
+      Harm is in the meaning. Keywords flag harmless jokes and miss worrying messages with
+      no alarming word.
+
+references:
+  - kind: docs
+    title: LLM06:2025 Excessive Agency
+    authors: OWASP Gen AI Security Project
+    year: 2025
+    venue: OWASP Top 10 for LLM Applications
+    url: https://genai.owasp.org/llmrisk/llm062025-excessive-agency/
+    note: Least functionality for tools, and human approval for high-impact actions.
+    primary: true
+    verified: true
+  - kind: paper
+    title: 'Llama Guard: LLM-based Input-Output Safeguard for Human-AI Conversations'
+    authors: Hakan Inan and others
+    year: 2023
+    venue: arXiv
+    url: https://arxiv.org/abs/2312.06674
+    note: A classifier for unsafe inputs and outputs against a category taxonomy.
+    verified: true
+  - kind: paper
+    title: 'FActScore: Fine-grained Atomic Evaluation of Factual Precision in Long Form Text Generation'
+    authors: Sewon Min and others
+    year: 2023
+    venue: Conference on Empirical Methods in Natural Language Processing
+    url: https://arxiv.org/abs/2305.14251
+    note: Splitting an answer into atomic claims and checking each against a source.
+    verified: true
+  - kind: docs
+    title: Mitigate jailbreaks and prompt injections
+    authors: Anthropic
+    venue: Claude Platform Docs
+    url: https://platform.claude.com/docs/en/test-and-evaluate/strengthen-guardrails/mitigate-jailbreaks
+    note: Screening inputs with a fast model before the main one runs.
+    primary: true
+    verified: true
+
+deepDive: >-
+  No model was called. The gate and the challenge ran in Python 3.12 on made-up scores, and
+  the thresholds are examples: choose yours with lesson 4's method.
+
+
+  Order guardrails by cost. Cheap rules run first: the tool allow-list, a recipient count, a
+  regular expression for card numbers. Fast classifiers come next. An expensive check, like
+  a large model acting as a judge, runs only on what's left. Input screening can run in
+  parallel with the main call and cancel it, so a check adds little latency.
+
+
+  Grounding checks work best claim by claim. Split the draft into short factual statements,
+  then ask of each: does a source support it? An answer is as weak as its weakest claim. When
+  a claim fails, retry with the sources and a note, drop the claim, or say the documents
+  don't answer that.
+
+
+  Approval needs care too. If people approve hundreds of alerts a day, they stop reading.
+  Keep the human band narrow with good thresholds, show the evidence, and measure how often
+  approvers change or reject what they see. A rate near zero may mean rubber-stamping.

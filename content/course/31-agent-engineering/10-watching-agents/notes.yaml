@@ -1,0 +1,180 @@
+summary: >-
+  An agent in production fails quietly. A looping run returns no errors, a hallucinated
+  booking ends with a polite reply, and one school's runaway night hides behind a normal
+  median. Watching agents means recording each run so it can be read, costed, classified
+  and replayed.
+
+
+  The record is a **trace**: one span for the run, a child span for every model call and
+  every tool call, each tagged with the prompt, model and harness versions. **Cost** is
+  counted on every call, not from sampled traces, and rolled up per run and per tenant, so
+  the tail shows. Failures are sorted into an **error taxonomy**: hallucination, tool
+  misuse, loops, refusals and truncation, each with a signal you can compute from the
+  trace.
+
+
+  Stored inputs and tool results let you **replay** a run against a new version and see
+  whether a fix works before the next bad night. Over weeks, the same signals show
+  **drift**: task success, handovers and cost per task sliding as traffic and models change.
+  Alerts go on what users feel, not on CPU.
+remember:
+  - Trace each run as a tree, one run span with a child per model call and per tool call, tagged with prompt, model and harness versions.
+  - Count cost on every call as a metric, because sampled traces miss most runs and the rare runaway matters most.
+  - Roll cost up per run and per tenant, and alert on the costliest runs, since a median hides the tail.
+  - Sort failures into hallucination, tool misuse, loops, refusals and truncation, each with a signal computed from the trace.
+  - A normal ending is not success, so check the reply's claims against the tool results before calling a run ok.
+  - Replay a stored run by feeding the recorded tool results to the new version, never by calling live tools.
+  - Keep message text off spans by default and store redacted transcripts separately with access control.
+  - Alert on what users feel, such as failed tasks, handovers and slow runs, and watch them for drift.
+sections:
+  - title: A trace you can read
+    body: |-
+      A good agent trace answers four questions without opening a transcript: what ran,
+      for whom, with which versions, and where the time and tokens went.
+
+      - **The run span** carries the run id, the tenant, the user from the session, the
+        agent name, the prompt version, the model and the harness version, and the final
+        status: `done`, `step_cap`, `budget`, `loop` or `awaiting_approval`.
+      - **Model call spans** carry tokens in and out, cached tokens, stop reason, latency
+        and cost.
+      - **Tool call spans** carry the tool name, the tool-call id that links them to the
+        model's request, latency, and whether the tool returned an error. Arguments go in
+        only if they're free of personal data, or as a hash.
+
+      The OpenTelemetry generative AI conventions name these spans by operation, such as
+      `chat` for a model call and `execute_tool` for a tool. They're still in development,
+      so map your field names through one function.
+
+      Versions are what make a trace useful a month later. When success drops on Tuesday,
+      grouping runs by harness version shows whether Monday's deploy did it, without
+      guessing. A trace without versions tells you what happened, never why.
+  - title: Counting cost where it can't be sampled away
+    body: |-
+      Traces are expensive to store, so most systems sample them. That's fine for reading
+      runs and fatal for adding up money.
+
+      ```python
+      import random
+
+      random.seed(7)
+      runs = [0.04] * 2000 + [410.0]            # one runaway among 2,001 runs
+      kept = [cost for cost in runs if random.random() < 0.01]
+      print(round(sum(runs), 2), round(sum(kept), 2), len(kept))
+      # 490.0 0.96 24
+      ```
+
+      The 1% sample missed the runaway entirely. Count cost as a metric on every model
+      call, before any sampling: a counter tagged with tenant, agent and harness version.
+      Totals from counters match the bill; check them against the provider's usage data
+      every day.
+
+      Then look at the shape, not the middle. Chart the costliest runs of the day, cost per
+      tenant, and the 99th percentile of cost per run. Alert when one run passes a limit
+      you set from the eval suite's normal range, well before the hard spend cap from What
+      an agent may touch stops it.
+
+      For traces, prefer **tail sampling**: decide at the end of a run, and keep every
+      failed, slow or costly one plus a small share of the rest.
+  - title: An error taxonomy with signals
+    body: |-
+      A taxonomy turns "the agent is worse" into named, countable problems. Each kind needs
+      a signal you can compute, or it stays a label people argue about.
+
+      - **Hallucination.** The reply claims an action or fact no tool result supports:
+        "I've booked the hall" with no booking call. Signal: extract claimed actions from
+        the reply and match them against successful tool calls in the trace.
+      - **Tool misuse.** The wrong tool, bad arguments or a schema error. Signal: tool
+        spans with errors, or validation failures before the call.
+      - **Loops.** The same call, or the same result, repeating. Signal: repeated calls
+        with equal arguments, or repeated result hashes, as Loops that run for hours used.
+      - **Refusals.** The model declines. Signal: the refusal stop reason, or a refusal
+        classifier on the reply.
+      - **Truncation.** The reply was cut off at the output limit, or context ran out.
+        Signal: the `max_tokens` stop reason.
+
+      Order the checks by what explains the run best. A loop that ends at `max_tokens` is a
+      loop: the truncation is a symptom. And never let a normal ending short-circuit the
+      rest, because hallucinations end normally.
+
+      Count each kind per day and per harness version. A new version that halves loops and
+      doubles hallucinations is not an improvement.
+  - title: Replay and drift
+    body: |-
+      **Replay** answers "would the new version have done better on that run?" Store each
+      run's user input, the system prompt version and every tool result. Then feed the new
+      version the same input, and when it asks for a tool, return the recorded result
+      instead of calling the live tool.
+
+      This works until the new version asks for something different. At that point the
+      recording has no answer. Stop and record the divergence, which is often the fix
+      working, or move the case into the eval sandbox, where tools run against fake data.
+      Never replay against live tools: they book rooms and send emails.
+
+      Replay turns production incidents into tests. Tuesday's looping run becomes a case;
+      the fix must end it within the step budget, and the suite keeps it forever.
+
+      **Drift** is slower. Traffic changes, schools start term, a provider updates a model,
+      and success slides a point a week. Watch the signals users feel: task success from
+      online evals, handovers to people, retries, edits and cost per completed task. Chart
+      them per tenant and per version, and alert on a change against last month's band,
+      not only on a hard threshold.
+pitfalls:
+  - '**Adding up cost from sampled traces.** The runaway run is the one most likely to be dropped. Count cost on every call as a metric.'
+  - '**Watching the median.** One looping run doesn''t move it. Chart the costliest runs and the high percentiles.'
+  - '**Calling a normal ending a success.** Hallucinated actions end with a polite reply. Check claims against tool results.'
+  - '**Traces without versions.** You see what broke but not which change broke it. Tag prompt, model and harness versions on every run.'
+  - '**Replaying against live tools.** It repeats real side effects. Feed recorded tool results instead.'
+  - '**Putting message text on spans.** Prompts and results carry personal data into every tracing tool. Keep ids and counts on spans and redacted transcripts elsewhere.'
+verify:
+  - lens: breaks
+    check: A daily check compares cost counted per tenant with the provider's usage report, and alerts on a gap.
+  - lens: scales
+    check: Tail sampling keeps every failed, slow or costly run even when overall trace volume grows tenfold.
+  - lens: leaks
+    check: Spans carry ids, versions and token counts but no message text, and transcripts are stored redacted with access control.
+  - lens: tests
+    check: A replay of a stored looping run against the fixed version ends within the step budget, using recorded tool results only.
+  - lens: confuses
+    check: Each failure kind on the dashboard has a written signal, so two people classify the same run the same way.
+interview:
+  - question: What would you put in a trace for an agent run?
+    answer: >-
+      A tree: one span for the run and a child for each model call and each tool call. The
+      run span carries the run id, tenant, agent, prompt version, model, harness version and
+      final status. Model spans carry tokens in and out, cached tokens, stop reason, latency
+      and cost. Tool spans carry the tool name, the tool-call id, latency and whether it
+      errored. I'd follow the OpenTelemetry generative AI conventions for names, mapped
+      through one function because they're still in development. Message text stays off
+      spans by default, since it carries personal data, and redacted transcripts go to a
+      separate store for replay. The versions are the part people forget, and they're what
+      lets you tie a regression to a deploy.
+  - question: How do you keep agent costs visible per customer?
+    answer: >-
+      Count cost as a metric on every model call, tagged with tenant, agent and harness
+      version, before any trace sampling. Sampled traces are fine for reading runs but
+      wrong for money: a 1% sample usually misses the one runaway run that matters. I'd
+      reconcile those counters with the provider's usage daily. Then I'd chart the tail,
+      not the median: the costliest runs of the day, the 99th percentile per run, and cost
+      per tenant per day, with an alert when one run passes a threshold set from the eval
+      suite's normal range. A hard per-run and per-tenant cap sits behind that in the
+      harness, so the alert is for understanding and the cap is for safety.
+  - question: How would you classify agent failures in production?
+    answer: >-
+      With a small taxonomy where every kind has a computable signal. Hallucination: the
+      reply claims an action or fact no tool result supports. Tool misuse: tool errors or
+      invalid arguments. Loops: repeated calls with equal arguments or repeated result
+      hashes. Refusals: the refusal stop reason. Truncation: the output-limit stop reason.
+      I'd order the checks so the root cause wins, a loop that hits the limit is a loop,
+      and never treat a normal ending as success, since hallucinations end normally. Then I
+      count each kind per day and per harness version, so a change that trades loops for
+      hallucinations shows up. A sample of each kind gets read by a person to keep the
+      signals honest.
+  - question: A prompt change is meant to fix a failure seen in production. How do you check it before shipping?
+    answer: >-
+      Replay the failing runs. I store each run's input, versions and tool results, so I can
+      feed the same input to the new version and answer its tool calls from the recording
+      instead of live tools. If the run now ends correctly within budget, the fix works on
+      that case. If the new version asks for a different call, the recording can't answer,
+      so I note the divergence and move the case into the eval sandbox. Then I run the full
+      eval suite with repeated trials, because a fix for one run can break others. Replay
+      never touches live tools, since that would book or send things again.

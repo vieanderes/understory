@@ -8,27 +8,28 @@ import type {
 import { bugHuntStepSchema, multipleChoiceStepSchema, predictStepSchema } from './schema';
 
 /*
- * Placement (docs/LEARNING-SCIENCE.md B1). The course is measured area by area, because
- * one staircase over the whole course can only measure one skill, and the course holds
- * several that do not move together: someone strong in React can be new to Python.
+ * Placement (docs/LEARNING-SCIENCE.md B1). The course is measured module by module: a part
+ * holds lessons with very different focuses, and someone can know half of a part and not
+ * the other half. Every learner meets the same fixed questions, so two results mean the
+ * same thing.
  *
- * Each area covers a few modules and has three levels, Foundations, Working and
- * Advanced. A level holds alternative items, so a second attempt, or the longer check of
- * one area, meets different snippets at the same height.
+ * Each module has two core questions and two deep ones, each from a different lesson. The
+ * first core question is asked in every mode, the second only in the thorough one. A deep
+ * question follows a shown core answer; the second deep one confirms the first unless it
+ * was answered with certainty, so "strong" never rests on one lucky pick.
  *
- * What a pass lets the course assume is not written by hand: it is the concepts of the
- * lessons the level's items come from (`assumedByLevel`). A hand-written list drifts
- * towards claiming whole chapters from one answer; this one claims what was tested.
+ * What a right answer lets the course assume is not written by hand: it is the concepts of
+ * the lessons that teach what the question tests (`assumedByItem`).
  *
  * An item is an ordinary lesson step, so the player, the graders and the compiler are the
  * ones lessons already use. Only the three formats that read in under 45 seconds are
  * allowed: predict-output, multiple-choice and bug-hunt.
  */
 
-export const PLACEMENT_SCHEMA = 2;
-export const PLACEMENT_LEVELS = 3;
-/** The one-area check asks up to two items per level, and a retake starts elsewhere. */
-export const MIN_ITEMS_PER_LEVEL = 3;
+export const PLACEMENT_SCHEMA = 3;
+export const CORE_ITEMS = 2;
+export const DEEP_ITEMS = 2;
+export const QUICK_MODULES = 2;
 
 /** Matches `moduleSchema.id` in schema.ts: one lowercase word, for example "js". */
 const placementModuleId = z
@@ -40,29 +41,44 @@ const placementAreaId = z
   .string()
   .regex(/^[a-z][a-z0-9]*$/, 'An area id is one lowercase word, for example "servers".');
 
+/** A question that needs two ideas at once names the second in `also`. */
+const also = {
+  also: z
+    .array(z.string().min(1))
+    .min(1)
+    .optional()
+    .describe('Further concepts a right answer shows, from modules of the same part.'),
+};
+
 export const placementItemSchema = z.discriminatedUnion('type', [
-  predictStepSchema,
-  multipleChoiceStepSchema,
+  predictStepSchema.extend(also),
+  multipleChoiceStepSchema.extend(also),
   // A placement item is answered in one tap of a line and one reason: no verify follow-up.
-  bugHuntStepSchema.omit({ verify: true }),
+  bugHuntStepSchema.omit({ verify: true }).extend(also),
 ]);
 
-export const placementLevelSchema = z.strictObject({
-  level: z.int().min(1).max(PLACEMENT_LEVELS).describe('1 Foundations, 2 Working, 3 Advanced.'),
-  items: z
+export const placementModuleSchema = z.strictObject({
+  id: placementModuleId,
+  core: z
     .array(placementItemSchema)
-    .min(MIN_ITEMS_PER_LEVEL, `A level holds at least ${MIN_ITEMS_PER_LEVEL} alternative items.`),
+    .length(CORE_ITEMS, `A module has exactly ${CORE_ITEMS} core questions.`)
+    .describe('What anyone who has worked through the module gets right.'),
+  deep: z
+    .array(placementItemSchema)
+    .length(DEEP_ITEMS, `A module has exactly ${DEEP_ITEMS} deep questions.`)
+    .describe('Harder follow-ups, asked after a right core answer.'),
 });
 
 export const placementAreaSchema = z.strictObject({
   id: placementAreaId,
   title: z.string().min(1).describe('As the results screen names it, for example "Servers and data".'),
-  /** The course part this area mirrors, so an advanced result can offer its test-out. */
+  /** The course part this area mirrors, so a strong result can offer its test-out. */
   part: placementAreaId.optional(),
-  modules: z.array(placementModuleId).min(1).describe('The modules this area speaks for.'),
-  levels: z
-    .array(placementLevelSchema)
-    .length(PLACEMENT_LEVELS, `An area has exactly ${PLACEMENT_LEVELS} levels.`),
+  quick: z
+    .array(placementModuleId)
+    .length(QUICK_MODULES, `The quick check asks ${QUICK_MODULES} modules of each area.`)
+    .describe('The modules that best stand for the area, asked in the quick check.'),
+  modules: z.array(placementModuleSchema).min(1).describe('In course order.'),
 });
 
 /**
@@ -72,7 +88,7 @@ export const placementAreaSchema = z.strictObject({
  */
 export const placementPathRuleSchema = z.strictObject({
   area: placementAreaId,
-  below: z.int().min(1).max(PLACEMENT_LEVELS),
+  below: z.int().min(1).max(3),
   path: z.string().regex(/^[a-z0-9-]+$/, 'A path id, as in content/tracks/<id>.yaml.'),
 });
 
@@ -83,7 +99,7 @@ export const placementFileSchema = z.strictObject({
 });
 
 export type PlacementItem = z.infer<typeof placementItemSchema>;
-export type PlacementLevel = z.infer<typeof placementLevelSchema>;
+export type PlacementModule = z.infer<typeof placementModuleSchema>;
 export type PlacementArea = z.infer<typeof placementAreaSchema>;
 export type PlacementPathRule = z.infer<typeof placementPathRuleSchema>;
 export type PlacementFile = z.infer<typeof placementFileSchema>;
@@ -92,24 +108,26 @@ export type PlacementFile = z.infer<typeof placementFileSchema>;
 // The compiled shapes, in the bundle at `placement.json`
 // ---------------------------------------------------------------------------
 
-export type CompiledPlacementItem =
+export type CompiledPlacementItem = (
   | CompiledPredictStep
   | CompiledMultipleChoiceStep
-  | Omit<CompiledBugHuntStep, 'verify'>;
+  | Omit<CompiledBugHuntStep, 'verify'>
+) & { also?: string[] };
 
-export interface CompiledPlacementLevel {
-  level: number;
-  /** Derived at build time by `assumedByLevel`: what a pass lets the course assume. */
-  concepts: string[];
-  items: CompiledPlacementItem[];
+export interface CompiledPlacementModule {
+  id: string;
+  core: CompiledPlacementItem[];
+  deep: CompiledPlacementItem[];
+  /** Derived at build time by `assumedByItem`: what a right answer to each item assumes. */
+  assumes: Record<string, string[]>;
 }
 
 export interface CompiledPlacementArea {
   id: string;
   title: string;
   part?: string;
-  modules: string[];
-  levels: CompiledPlacementLevel[];
+  quick: string[];
+  modules: CompiledPlacementModule[];
 }
 
 export interface CompiledPlacementFile {
@@ -137,30 +155,30 @@ export interface PlacementWorld {
   readonly paths: readonly string[];
 }
 
+/** The concepts an item tests: its own, and any it names in `also`. */
+export function testedConcepts(item: {
+  readonly concept: string;
+  readonly also?: readonly string[] | undefined;
+}): string[] {
+  return [item.concept, ...(item.also ?? [])];
+}
+
 /**
- * What passing each level lets the course assume: the concepts of every lesson, in the
- * area, that teaches a concept one of the level's items tests. A concept assumed on a
- * lower level is not repeated. Passing a level marks its lessons known, and no more.
+ * What a right answer to an item lets the course assume: the concepts of every lesson in
+ * the area that teaches one of the concepts the item tests, kept to the area's modules.
+ * One answer marks the lessons it tested known, and no more.
  */
-export function assumedByLevel(
-  area: {
-    readonly modules: readonly string[];
-    readonly levels: readonly { readonly items: readonly { readonly concept: string }[] }[];
-  },
+export function assumedByItem(
+  item: { readonly concept: string; readonly also?: readonly string[] | undefined },
+  areaModules: readonly string[],
   lessons: readonly PlacementLessonRef[],
-): string[][] {
-  const inArea = lessons.filter((l) => area.modules.includes(l.moduleId));
-  const seen = new Set<string>();
-  return area.levels.map((level) => {
-    const tested = new Set(level.items.map((i) => i.concept));
-    const concepts = inArea
-      .filter((l) => l.concepts.some((c) => tested.has(c)))
-      .flatMap((l) => l.concepts)
-      .filter((c) => area.modules.includes(moduleOfConcept(c)) && !seen.has(c));
-    const unique = [...new Set(concepts)];
-    unique.forEach((c) => seen.add(c));
-    return unique;
-  });
+): string[] {
+  const tested = new Set(testedConcepts(item));
+  const concepts = lessons
+    .filter((l) => areaModules.includes(l.moduleId) && l.concepts.some((c) => tested.has(c)))
+    .flatMap((l) => l.concepts)
+    .filter((c) => areaModules.includes(moduleOfConcept(c)));
+  return [...new Set(concepts)];
 }
 
 /** The choices an item is graded on: reasons for a bug-hunt, choices for the rest. */
@@ -198,6 +216,7 @@ export function checkPlacement(file: PlacementFile, world: PlacementWorld, path:
 
   for (const area of file.areas) {
     const where = `area ${area.id}`;
+    const areaModules = area.modules.map((m) => m.id);
     if (seenAreas.has(area.id)) {
       issues.push(issue(path, where, 'placement-area-reused', `Two areas are called "${area.id}".`));
     }
@@ -207,13 +226,32 @@ export function checkPlacement(file: PlacementFile, world: PlacementWorld, path:
         issue(path, where, 'placement-part-unknown', `No course part is called "${area.part}".`),
       );
     }
-
-    for (const moduleId of area.modules) {
-      if (!knownModules.has(moduleId)) {
+    for (const quick of area.quick) {
+      if (!areaModules.includes(quick)) {
         issues.push(
           issue(
             path,
             where,
+            'placement-quick-unknown',
+            `The quick check names "${quick}", which is not a module of this area.`,
+          ),
+        );
+      }
+    }
+    if (new Set(area.quick).size !== area.quick.length) {
+      issues.push(
+        issue(path, where, 'placement-quick-twice', 'The quick check names a module twice.'),
+      );
+    }
+
+    for (const courseModule of area.modules) {
+      const moduleId = courseModule.id;
+      const at = `${where}, module ${moduleId}`;
+      if (!knownModules.has(moduleId)) {
+        issues.push(
+          issue(
+            path,
+            at,
             'placement-module-unknown',
             `No module is called "${moduleId}". Use an id from content/course/*/module.yaml.`,
           ),
@@ -224,23 +262,15 @@ export function checkPlacement(file: PlacementFile, world: PlacementWorld, path:
         issues.push(
           issue(
             path,
-            where,
+            at,
             'placement-module-twice',
             `"${moduleId}" is in both "${other}" and "${area.id}". A module belongs to one area.`,
           ),
         );
       }
       areaOfModule.set(moduleId, area.id);
-    }
 
-    for (const [index, level] of area.levels.entries()) {
-      const at = `${where}, level ${level.level}`;
-      if (level.level !== index + 1) {
-        issues.push(
-          issue(path, at, 'placement-level-order', 'Levels are listed in order, 1 to 3, once each.'),
-        );
-      }
-      for (const item of level.items) {
+      for (const item of [...courseModule.core, ...courseModule.deep]) {
         const itemAt = `${at}, item ${item.id}`;
         if (seenItems.has(item.id)) {
           issues.push(
@@ -261,33 +291,45 @@ export function checkPlacement(file: PlacementFile, world: PlacementWorld, path:
           );
         }
 
-        if (!knownConcepts.has(item.concept)) {
-          issues.push(
-            issue(
-              path,
-              itemAt,
-              'placement-concept-unknown',
-              `No concept is called "${item.concept}". Use an id from the module it belongs to.`,
-            ),
-          );
-        } else if (!area.modules.includes(moduleOfConcept(item.concept))) {
-          issues.push(
-            issue(
-              path,
-              itemAt,
-              'placement-concept-off-area',
-              `"${item.concept}" belongs to a module outside this area.`,
-            ),
-          );
-        } else if (!taught.has(item.concept)) {
-          issues.push(
-            issue(
-              path,
-              itemAt,
-              'placement-concept-untaught',
-              `No lesson teaches "${item.concept}", so a pass could not mark any lesson known.`,
-            ),
-          );
+        for (const concept of testedConcepts(item)) {
+          const isOwn = concept === item.concept;
+          if (!knownConcepts.has(concept)) {
+            issues.push(
+              issue(
+                path,
+                itemAt,
+                'placement-concept-unknown',
+                `No concept is called "${concept}". Use an id from the module it belongs to.`,
+              ),
+            );
+          } else if (isOwn && moduleOfConcept(concept) !== moduleId) {
+            issues.push(
+              issue(
+                path,
+                itemAt,
+                'placement-concept-off-module',
+                `"${concept}" belongs to another module than "${moduleId}".`,
+              ),
+            );
+          } else if (!isOwn && !areaModules.includes(moduleOfConcept(concept))) {
+            issues.push(
+              issue(
+                path,
+                itemAt,
+                'placement-concept-off-area',
+                `"${concept}" belongs to a module outside this area.`,
+              ),
+            );
+          } else if (!taught.has(concept)) {
+            issues.push(
+              issue(
+                path,
+                itemAt,
+                'placement-concept-untaught',
+                `No lesson teaches "${concept}", so a right answer could not mark any lesson known.`,
+              ),
+            );
+          }
         }
 
         if (item.type === 'bug-hunt') {
@@ -335,7 +377,7 @@ export function checkPlacement(file: PlacementFile, world: PlacementWorld, path:
         path,
         where: 'areas',
         rule: 'placement-module-unplaced',
-        message: `No area speaks for "${courseModule.id}", so it starts at the default rating.`,
+        message: `No area asks about "${courseModule.id}", so placement never measures it.`,
       });
     }
   }

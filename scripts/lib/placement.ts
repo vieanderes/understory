@@ -9,7 +9,7 @@ import type {
   PlacementWorld,
 } from '../../src/core/content/placement-schema';
 import {
-  assumedByLevel,
+  assumedByItem,
   checkPlacement,
   placementFileSchema,
 } from '../../src/core/content/placement-schema';
@@ -129,16 +129,22 @@ export function compilePlacement(
   lessons: PlacementWorld['lessons'],
 ): CompiledPlacementFile {
   const areas: CompiledPlacementArea[] = file.areas.map((area) => {
-    const assumed = assumedByLevel(area, lessons);
+    const areaModules = area.modules.map((m) => m.id);
     return {
       id: area.id,
       title: area.title,
       ...(area.part === undefined ? {} : { part: area.part }),
-      modules: [...area.modules],
-      levels: area.levels.map((level, index) => ({
-        level: level.level,
-        concepts: assumed[index] ?? [],
-        items: level.items.map((item) => compileItem(item, render)),
+      quick: [...area.quick],
+      modules: area.modules.map((courseModule) => ({
+        id: courseModule.id,
+        core: courseModule.core.map((item) => compileItem(item, render)),
+        deep: courseModule.deep.map((item) => compileItem(item, render)),
+        assumes: Object.fromEntries(
+          [...courseModule.core, ...courseModule.deep].map((item) => [
+            item.id,
+            assumedByItem(item, areaModules, lessons),
+          ]),
+        ),
       })),
     };
   });
@@ -148,7 +154,7 @@ export function compilePlacement(
 /** Every language placement's own renderer has to load. */
 export function placementLanguages(file: PlacementFile): Language[] {
   const found = new Set<Language>();
-  for (const item of file.areas.flatMap((a) => a.levels.flatMap((l) => l.items))) {
+  for (const item of file.areas.flatMap((a) => a.modules.flatMap((m) => [...m.core, ...m.deep]))) {
     if (item.type === 'multiple-choice') {
       if (item.language) found.add(item.language);
     } else found.add(item.language);

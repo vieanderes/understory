@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
-  assumedByLevel,
+  assumedByItem,
   checkPlacement,
   placementFileSchema,
   type PlacementFile,
@@ -15,48 +15,54 @@ const lessons = [
   { moduleId: 'other', concepts: ['other.a', 'web.a'] },
 ];
 
-const item = (id: string, concept: string, correct = true) => ({
+const item = (id: string, concept: string, extra: Record<string, unknown> = {}) => ({
   type: 'multiple-choice' as const,
   id,
   concept,
   difficulty: 2,
   question: 'Which one?',
   choices: [
-    { text: 'This', correct, feedback: 'Yes.' },
+    { text: 'This', correct: true, feedback: 'Yes.' },
     { text: 'That', feedback: 'No.' },
   ],
+  ...extra,
 });
 
-const area = (levels: string[][]) => ({
-  id: 'site',
-  title: 'The site',
-  modules: ['web', 'api'],
-  levels: levels.map((concepts, i) => ({
-    level: i + 1,
-    items: concepts.map((c, j) => item(`site-${i + 1}-${j}`, c)),
-  })),
+/** A module whose four items test the given concepts, core first. */
+const mod = (id: string, concepts: [string, string, string, string]) => ({
+  id,
+  core: concepts.slice(0, 2).map((c, i) => item(`${id}-core-${i}`, c)),
+  deep: concepts.slice(2).map((c, i) => item(`${id}-deep-${i}`, c)),
 });
 
-describe('assumedByLevel', () => {
-  it('assumes the lessons the items come from, and nothing else', () => {
-    expect(assumedByLevel(area([['web.a'], ['web.d'], ['api.a']]), lessons)).toEqual([
-      ['web.a', 'web.b'],
-      ['web.d', 'web.e'],
-      ['api.a', 'web.c'],
+describe('assumedByItem', () => {
+  it('assumes the lessons that teach what the item tests, and nothing else', () => {
+    expect(assumedByItem({ concept: 'web.d' }, ['web', 'api'], lessons)).toEqual([
+      'web.d',
+      'web.e',
     ]);
   });
 
-  it('never repeats a concept a lower level assumed', () => {
-    expect(assumedByLevel(area([['web.c'], ['api.a'], ['web.b']]), lessons)).toEqual([
-      ['web.c', 'api.a'],
-      [],
-      ['web.a', 'web.b'],
-    ]);
+  it('adds the lessons of the concepts named in also', () => {
+    expect(
+      assumedByItem({ concept: 'web.a', also: ['web.c'] }, ['web', 'api'], lessons),
+    ).toEqual(['web.a', 'web.b', 'web.c', 'api.a']);
   });
 
   it('leaves out lessons and concepts outside the area', () => {
-    const [first] = assumedByLevel(area([['web.a'], [], []]), lessons);
-    expect(first).not.toContain('other.a');
+    expect(assumedByItem({ concept: 'web.a' }, ['web'], lessons)).not.toContain('other.a');
+  });
+});
+
+describe('placementFileSchema', () => {
+  it('needs exactly two core and two deep questions in a module', () => {
+    const short = { ...mod('web', ['web.a', 'web.b', 'web.c', 'web.d']), deep: [] };
+    const parsed = placementFileSchema.safeParse({
+      schema: 3,
+      areas: [{ id: 'site', title: 'The site', quick: ['web', 'api'], modules: [short] }],
+      paths: [],
+    });
+    expect(parsed.success).toBe(false);
   });
 });
 
@@ -71,47 +77,71 @@ describe('checkPlacement', () => {
     parts: ['site'],
     paths: ['web-basics'],
   };
-  const file = (levels: string[][], extra: Partial<PlacementFile> = {}): PlacementFile =>
+  const file = (extra: Partial<PlacementFile> = {}): PlacementFile =>
     placementFileSchema.parse({
-      schema: 2,
-      areas: [area(levels)],
+      schema: 3,
+      areas: [
+        {
+          id: 'site',
+          title: 'The site',
+          part: 'site',
+          quick: ['web', 'api'],
+          modules: [
+            mod('web', ['web.a', 'web.c', 'web.d', 'web.b']),
+            mod('api', ['api.a', 'api.a', 'api.a', 'api.a']),
+          ],
+        },
+      ],
       paths: [{ area: 'site', below: 2, path: 'web-basics' }],
       ...extra,
     });
-  const three = ['web.a', 'web.b', 'web.c'];
   const rules = (f: PlacementFile) => checkPlacement(f, world, 'p.yaml').map((i) => i.rule);
 
-  it('accepts a sound file, and warns about modules no area speaks for', () => {
-    const sound = file([three, ['web.d', 'web.e', 'api.a'], ['web.a', 'web.c', 'web.d']]);
-    expect(rules(sound)).toEqual(['placement-module-unplaced']);
+  it('accepts a sound file, and warns about modules no area asks about', () => {
+    expect(rules(file())).toEqual(['placement-module-unplaced']);
   });
 
   it('rejects two items with one id', () => {
-    const f = file([three, ['web.d', 'web.e', 'api.a'], ['web.a', 'web.c', 'web.d']]);
-    const level = f.areas[0]!.levels[1]!;
-    level.items[1] = { ...level.items[1]!, id: level.items[0]!.id };
+    const f = file();
+    const web = f.areas[0]!.modules[0]!;
+    web.deep[0] = { ...web.deep[0]!, id: web.core[0]!.id };
     expect(rules(f)).toContain('placement-item-id-reused');
   });
 
-  it('rejects an item concept that is unknown, off the area or taught by no lesson', () => {
-    const f = file([
-      ['web.zz', 'other.a', 'web.f'],
-      ['web.d', 'web.e', 'api.a'],
-      ['web.a', 'web.c', 'web.d'],
-    ]);
+  it('rejects a concept that is unknown, in another module, off the area or untaught', () => {
+    const f = file();
+    const web = f.areas[0]!.modules[0]!;
+    web.core[0] = { ...web.core[0]!, concept: 'web.zz' };
+    web.core[1] = { ...web.core[1]!, concept: 'api.a' };
+    web.deep[0] = { ...web.deep[0]!, also: ['other.a'] };
+    web.deep[1] = { ...web.deep[1]!, concept: 'web.f' };
     expect(rules(f)).toEqual(
       expect.arrayContaining([
         'placement-concept-unknown',
+        'placement-concept-off-module',
         'placement-concept-off-area',
         'placement-concept-untaught',
       ]),
     );
   });
 
+  it('accepts also from another module of the same area', () => {
+    const f = file();
+    const web = f.areas[0]!.modules[0]!;
+    web.core[0] = { ...web.core[0]!, also: ['api.a'] };
+    expect(rules(f)).toEqual(['placement-module-unplaced']);
+  });
+
+  it('rejects a quick check that names a module outside the area, or one twice', () => {
+    const f = file();
+    f.areas[0]!.quick = ['web', 'nowhere'];
+    expect(rules(f)).toContain('placement-quick-unknown');
+    f.areas[0]!.quick = ['web', 'web'];
+    expect(rules(f)).toContain('placement-quick-twice');
+  });
+
   it('rejects unknown paths, parts and rule areas', () => {
-    const f = file([three, ['web.d', 'web.e', 'api.a'], ['web.a', 'web.c', 'web.d']], {
-      paths: [{ area: 'nowhere', below: 2, path: 'missing' }],
-    });
+    const f = file({ paths: [{ area: 'nowhere', below: 2, path: 'missing' }] });
     const bad = { ...f, areas: f.areas.map((a) => ({ ...a, part: 'nopart' })) };
     expect(rules(bad)).toEqual(
       expect.arrayContaining([

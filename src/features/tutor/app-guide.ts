@@ -29,7 +29,7 @@ export const LIBRARY_SHELVES: readonly (readonly [label: string, href: string])[
   ['the news archive', '/signal/archive'],
   ['decision records', '/decisions'],
   [
-    'find your level, a placement check of each area of the course, with a level per area, an overall level and a recommended path; /start?area=<id> checks one area in depth',
+    'find your level: pick parts and Quick, Balanced or Thorough; the same fixed questions per module for everyone, a harder follow-up after a right answer; a verdict per part, each module strong, basics or gap, and a path; /start?area=<id> checks one part',
     '/start',
   ],
   ['every learning path', '/paths'],

@@ -75,48 +75,68 @@ actions, the illusion of competence from rereading, split attention, seductive d
 
 ## B. Core loop
 
-### B1. First session: find your level (no quiz)
+### B1. First session: find your level
 
-The course holds several skills that do not move together: someone strong in React can be
-new to Python. One staircase over the whole course can only measure one of them, so
-placement measures **area by area** (`content/placement.yaml`). The eight areas follow the
-course parts: First code, JavaScript and TypeScript, Interfaces, Servers and data,
-Production, Python and AI, Senior engineer, and Craft and judgement.
+A part of the course holds lessons with very different focuses, and someone can know half
+of a part and not the other half. So placement measures **module by module** (34 modules in
+8 parts, `content/placement.yaml`), and every learner meets **the same fixed questions**, so
+two results mean the same thing.
 
-1. **One question, then a rating per area.** "New to code / I build with AI / Experienced"
-   fills in a rating for each area: New, Some or Confident. Someone new checks First code
-   only, someone who builds with AI the first three areas, someone experienced all of them,
-   the first two as Confident. The learner can change any rating. New skips the area: asking
-   about what someone has never done costs time and tells us nothing.
-2. **A short search in each area.** An area has three levels, 1 Foundations, 2 Working,
-   3 Advanced, each holding alternative items: short, realistic snippets that ask "what does
-   this print", "which line is wrong" or "what happens when two requests arrive at once".
-   - The search starts at level 1, or level 2 for Confident. A shown answer passes the level
-     and climbs; a miss fails it and drops. It stops when a passed level sits right under a
-     failed one, so it asks at most one item per level.
-   - **A right answer marked as a guess does not count.** It is recorded as right for
-     calibration, but a lucky pick is evidence of nothing.
-   - Confidence is captured on every item. Nothing is shown between items.
-3. **One area in depth.** `/start?area=<id>` checks one area and needs two shown answers per
-   level, up to six items, so a lucky pick counts for less. It updates that area only.
+1. **Pick what to check and how long.** The learner picks the parts that matter to them; a
+   part they have never touched, or do not care about, is left out rather than asked. Then
+   a mode, each saying up front about how many questions it takes for the parts picked:
+   - **Quick**, a rough picture: the two modules of each part that best stand for it.
+   - **Balanced**: every module once.
+   - **Thorough**: every module, the core answer confirmed by a second one.
+     `/start?area=<id>`, linked from a result, runs the thorough check of one part.
+2. **Per module, fixed questions from different lessons.** Two core questions, what anyone
+   who has worked through the module gets right, and two deep ones, harder. Each of the
+   four tests a different lesson, and a question that truly needs two ideas names the
+   second in `also`, so a module is covered broadly, not in one corner.
+   - The first core question is asked in every mode, the second only in the thorough one.
+     A miss, or a right answer marked as a guess, makes the module a **gap**.
+   - A shown core answer earns a **follow-up**, the first deep question, and the screen
+     says so: a harder question is a small reward. A miss leaves the module **known**.
+   - A deep answer that was not marked Certain is confirmed by the second deep question,
+     and the thorough check always asks both, so **strong** never rests on one lucky pick.
+   - The modules of the picked parts take turns, so the topics mix, in an order fixed by
+     the pick. No question says which part it is from; a follow-up says it is a follow-up.
+   - **Saying how sure checks the answer**, then the item shows right or wrong and why.
+     Confidence is still given before the answer is seen (Butterfield and Metcalfe 2001).
+     "Don't know" records a miss marked as a guess, so nobody has to pick at random.
+3. **Questions worth answering.** Core questions are everyday scenarios with an "aha" in the
+   feedback (a page that shows yesterday's prices, a teammate's install that differs), not
+   definitions. Placement is the first thing a learner does; it has to be enjoyable.
 4. **Output.**
-   - A **level per area**, 0 to 3, kept as the latest result per area.
-   - An **overall level**, the area levels added up out of 24, named Starting out, Building,
-     Working or Strong by quarter.
-   - A starting rating theta for each module of a checked area (decisions, below).
-   - Concepts of the levels passed are marked **assumed**, which the map shows as outlined
-     and not filled. A level assumes only the lessons its own items come from: about four
-     lessons, never a whole chapter. A later placement that does not show a concept takes the
-     assumption back.
+   - A **state per module**: gap, basics (known) or strong.
+   - A **level per part**, 0 to 3, built from its modules: Advanced when three in four hold
+     and half are strong, Working when half hold, Foundations when one does. Shown as a
+     verdict a learner can act on, **Solid**, **Mostly there** or **Go deeper**, with its
+     evidence and every module's state. Only the parts picked are placed; the rest keep an
+     earlier result. The level per part is kept as the latest result.
+   - **Sure, but wrong**: up to three misses the learner was certain of, the surest sign
+     of a misconception, with the right answer and why.
+   - An **overall level**, the part levels added up out of 24, named Starting out,
+     Building, Working or Strong by quarter.
+   - A starting rating theta for each module asked: a gap at the bottom, basics at
+     Working, strong at the top.
+   - The lessons of the questions answered right are marked **assumed**, which the map
+     shows as outlined and not filled: the lessons that teach what each question tested,
+     and no more. A later placement that asks a module and does not show a concept takes
+     the assumption back.
+   - The result calls itself an estimate, "a rough estimate" after a quick check.
 5. **Nothing is locked.** Assumed concepts are verified by probes mixed into the first two
    weeks of practice, so placement continues quietly. A wrong probe flips the concept to "gap".
-6. **Ending: a path and its first lesson.** The area to work on is the first in course order
-   below Working, among the first two areas and those not rated New. A rule in
-   `placement.yaml` names the written path for that area and level; an area with no rule gets
-   a path built from its own lessons. The result offers the first lesson on it that is not
-   done and not **placed out** (every concept assumed), a link to the path, and Refine with
-   Scout, which opens the builder with the path less the placed-out lessons. Paths pass over
-   placed-out lessons when they pick the next one, and show them as Known.
+6. **Ending: a path and its first lesson.** The part to work on is the first picked part
+   in course order below Working, else the weakest picked part not yet Advanced. A rule in
+   `placement.yaml` names the written path for that part and level; a part with no rule gets
+   a path built from its lessons, its gap modules first. The result offers the first lesson
+   on it that is not done and not **placed out** (every concept assumed), a link to the path,
+   and Refine with Scout, which opens the builder with the path less the placed-out lessons.
+   Paths pass over placed-out lessons when they pick the next one, and show them as Known.
+7. **Always within reach.** Home invites a first check (beside "Just start coding" on a first
+   visit, and as a line under the next step), then shows the standing it found with a way to
+   check again; the Paths page offers it to anyone not sure which path to pick.
 
 ### B2. Returning, 10 minutes, phone
 

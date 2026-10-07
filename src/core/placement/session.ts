@@ -1,160 +1,179 @@
 /*
- * One placement session (LEARNING-SCIENCE.md B1): the areas the learner chose to check,
- * in course order, each searched on its own with `area.ts`. The session holds only the
- * facts, the ratings and the answers; where each search stands is replayed from them, so
- * undo is dropping the last answer.
- *
- * Nothing is shown between items, so the session holds no feedback.
+ * One placement session (LEARNING-SCIENCE.md B1): the areas the learner picked, measured
+ * module by module with the same fixed questions for everyone. The modules of the picked
+ * areas take turns, so the topics mix. The session holds only the facts, the picks and
+ * the answers; where each module stands is replayed from them, so undo is dropping the
+ * last answer.
  */
 
-import { moduleOfConcept } from '@/core/content/placement-schema';
 import type { Confidence } from '@/core/progress/events';
-import { AREA_LEVELS, startAreaSearch, stepAreaSearch, type AreaSearch } from './area';
-
-export type StartedAs = 'new' | 'ai-builder' | 'experienced';
 
 /**
- * How the learner rates an area before the check. "new" skips it: asking someone about
- * what they say they have never done costs time and tells us nothing. "confident" starts a
- * level higher, so a strong learner is not walked through the basics.
+ * How long the learner wants to spend. Quick asks two modules an area, balanced every
+ * module, thorough every module with a second core question to confirm the first.
  */
-export type AreaRating = 'new' | 'some' | 'confident';
+export type PlacementMode = 'quick' | 'balanced' | 'thorough';
 
-const START_LEVEL: Readonly<Record<Exclude<AreaRating, 'new'>, number>> = {
-  some: 1,
-  confident: 2,
-};
+export type ItemRole = 'core' | 'deep';
 
 /**
- * The ratings the opening question fills in, by area position in course order. Someone
- * new checks only the first area; someone who builds with AI the first three, where gaps
- * hide under working code; someone experienced checks everything, the first two from the
- * middle. The learner can change any of them.
+ * Where a module stands. A gap: the core question was missed. Known: the core holds, the
+ * deep question did not. Strong: the deep question holds too.
  */
-export function defaultRatings(
-  startedAs: StartedAs,
-  areaIds: readonly string[],
-): Record<string, AreaRating> {
-  const rate = (index: number): AreaRating => {
-    if (startedAs === 'new') return index === 0 ? 'some' : 'new';
-    if (startedAs === 'ai-builder') return index < 3 ? 'some' : 'new';
-    return index < 2 ? 'confident' : 'some';
-  };
-  return Object.fromEntries(areaIds.map((id, index) => [id, rate(index)]));
+export type ModuleState = 'gap' | 'known' | 'strong';
+
+export interface PlacementItemRef {
+  readonly id: string;
+  readonly concept: string;
+  readonly also?: readonly string[] | undefined;
 }
 
 /** The part of a placement area the session needs. Compiled areas fit this shape. */
 export interface PlacementAreaSpec {
   readonly id: string;
-  readonly modules: readonly string[];
-  readonly levels: readonly {
-    readonly level: number;
-    readonly concepts: readonly string[];
-    readonly items: readonly { readonly id: string; readonly concept: string }[];
+  readonly quick: readonly string[];
+  readonly modules: readonly {
+    readonly id: string;
+    readonly core: readonly PlacementItemRef[];
+    readonly deep: readonly PlacementItemRef[];
+    /** What a right answer to each item lets the course assume, by item id. */
+    readonly assumes?: Readonly<Record<string, readonly string[]>>;
   }[];
 }
+
+type ModuleSpec = PlacementAreaSpec['modules'][number];
 
 export interface PlacementAnswer {
   readonly itemId: string;
   readonly areaId: string;
-  readonly level: number;
-  readonly concept: string;
   readonly moduleId: string;
+  readonly role: ItemRole;
   readonly correct: boolean;
   readonly confidence: Confidence;
 }
 
-/** "all" checks every area not rated new; an area id checks that one area in depth. */
+/** "all" for a check the learner composed; an area id for the check of that one area. */
 export type PlacementScope = 'all' | (string & {});
 
 export interface PlacementSession {
-  readonly startedAs?: StartedAs;
-  /** How many placements this learner finished before. It rotates the items. */
-  readonly attempt: number;
+  readonly mode: PlacementMode;
   readonly scope: PlacementScope;
-  /** Shown answers a level needs: 1 in the quick check, 2 in the check of one area. */
-  readonly itemsToPass: number;
-  readonly ratings: Readonly<Record<string, AreaRating>>;
+  /** The picked areas. Their order does not matter: the session follows the course. */
+  readonly areas: readonly string[];
   readonly answers: readonly PlacementAnswer[];
 }
 
 export interface CurrentPlacementItem {
   readonly id: string;
   readonly areaId: string;
-  readonly level: number;
-  readonly concept: string;
   readonly moduleId: string;
+  readonly role: ItemRole;
 }
 
 export function startPlacement(input: {
-  ratings: Readonly<Record<string, AreaRating>>;
-  startedAs?: StartedAs;
-  attempt?: number;
+  areas: readonly string[];
+  mode: PlacementMode;
   scope?: PlacementScope;
-  itemsToPass?: number;
 }): PlacementSession {
-  return {
-    ...(input.startedAs ? { startedAs: input.startedAs } : {}),
-    attempt: input.attempt ?? 0,
-    scope: input.scope ?? 'all',
-    itemsToPass: input.itemsToPass ?? 1,
-    ratings: input.ratings,
-    answers: [],
-  };
+  return { mode: input.mode, scope: input.scope ?? 'all', areas: input.areas, answers: [] };
 }
 
-/** The areas this session checks, in course order. */
+/** The picked areas, in course order. */
 export function checkedAreas<A extends PlacementAreaSpec>(
   session: PlacementSession,
   areas: readonly A[],
 ): A[] {
-  if (session.scope !== 'all') return areas.filter((a) => a.id === session.scope);
-  return areas.filter((a) => (session.ratings[a.id] ?? 'new') !== 'new');
+  return areas.filter((a) => session.areas.includes(a.id));
 }
 
-function startLevel(session: PlacementSession, areaId: string): number {
-  const rating = session.ratings[areaId] ?? 'some';
-  // Asking for one area is itself a rating of at least "some".
-  return START_LEVEL[rating === 'new' ? 'some' : rating];
-}
-
-/** Where the search of one area stands after the answers given in it. */
-export function areaSearchOf(session: PlacementSession, areaId: string): AreaSearch {
-  let search = startAreaSearch(startLevel(session, areaId), session.itemsToPass);
-  for (const a of session.answers) {
-    if (a.areaId !== areaId) continue;
-    search = stepAreaSearch(search, a.correct && a.confidence !== 'guess');
-  }
-  return search;
+export interface PlannedModule {
+  readonly areaId: string;
+  readonly moduleId: string;
 }
 
 /**
- * The item an area would ask next, or null when its search is over. Items at a level are
- * taken in turn from an offset that moves with each attempt. A level with no unseen item
- * left ends the area: showing an item twice would measure memory of it, not skill.
+ * Every module the session will ask, in the order it asks them: the first module of each
+ * picked area, then the second of each, and so on. Fixed for a given pick, so everyone who
+ * picks the same meets the same questions in the same order.
  */
-function nextItemIn(
+export function plannedModules(
   session: PlacementSession,
-  area: PlacementAreaSpec,
-): CurrentPlacementItem | null {
-  const search = areaSearchOf(session, area.id);
-  if (search.done) return null;
-  const level = area.levels.find((l) => l.level === search.level);
-  if (!level || level.items.length === 0) return null;
-  const visits = session.answers.filter(
-    (a) => a.areaId === area.id && a.level === level.level,
-  ).length;
-  if (visits >= level.items.length) return null;
-  const item = level.items[(session.attempt + visits) % level.items.length];
-  /* v8 ignore next -- the index is always in range after the length checks above */
-  if (!item) return null;
-  return {
-    id: item.id,
-    areaId: area.id,
-    level: level.level,
-    concept: item.concept,
-    moduleId: moduleOfConcept(item.concept),
-  };
+  areas: readonly PlacementAreaSpec[],
+): PlannedModule[] {
+  const lists = checkedAreas(session, areas).map((area) =>
+    (session.mode === 'quick'
+      ? area.modules.filter((m) => area.quick.includes(m.id))
+      : area.modules
+    ).map((m) => ({ areaId: area.id, moduleId: m.id })),
+  );
+  const longest = Math.max(0, ...lists.map((l) => l.length));
+  const planned: PlannedModule[] = [];
+  for (let i = 0; i < longest; i += 1) {
+    for (const list of lists) {
+      const entry = list[i];
+      if (entry) planned.push(entry);
+    }
+  }
+  return planned;
+}
+
+/** A right answer the learner did not mark as a guess: a lucky pick is evidence of nothing. */
+const shown = (a: PlacementAnswer) => a.correct && a.confidence !== 'guess';
+
+const coreNeeded = (mode: PlacementMode) => (mode === 'thorough' ? 2 : 1);
+
+interface ModuleStep {
+  readonly next: { readonly item: PlacementItemRef; readonly role: ItemRole } | null;
+  readonly state: ModuleState | undefined;
+}
+
+/**
+ * Replays one module's answers. Core questions first; a miss is a gap. Then the first deep
+ * question; a miss leaves the module known. A deep answer that was not certain is
+ * confirmed by the second deep question, and the thorough check always asks both, so
+ * "strong" never rests on one lucky pick.
+ */
+function stepModule(session: PlacementSession, spec: ModuleSpec): ModuleStep {
+  const answers = session.answers.filter((a) => a.moduleId === spec.id);
+  const need = coreNeeded(session.mode);
+  for (let i = 0; i < need; i += 1) {
+    const a = answers[i];
+    const item = spec.core[i];
+    if (!a) return item ? { next: { item, role: 'core' }, state: undefined } : end('known');
+    if (!shown(a)) return end('gap');
+  }
+  const first = answers[need];
+  const deep = spec.deep[0];
+  if (!first) return deep ? { next: { item: deep, role: 'deep' }, state: undefined } : end('known');
+  if (!shown(first)) return end('known');
+  if (session.mode !== 'thorough' && first.confidence === 'certain') return end('strong');
+  const second = answers[need + 1];
+  const confirm = spec.deep[1];
+  if (!second) {
+    return confirm ? { next: { item: confirm, role: 'deep' }, state: undefined } : end('strong');
+  }
+  return end(shown(second) ? 'strong' : 'known');
+}
+
+const end = (state: ModuleState): ModuleStep => ({ next: null, state });
+
+function findModule(areas: readonly PlacementAreaSpec[], moduleId: string) {
+  for (const area of areas) {
+    const spec = area.modules.find((m) => m.id === moduleId);
+    if (spec) return spec;
+  }
+  return undefined;
+}
+
+/** Where a module stands, or undefined while it is not settled. */
+export function moduleStateOf(
+  session: PlacementSession,
+  areas: readonly PlacementAreaSpec[],
+  moduleId: string,
+): ModuleState | undefined {
+  const spec = findModule(areas, moduleId);
+  if (!spec || !session.answers.some((a) => a.moduleId === moduleId)) return undefined;
+  return stepModule(session, spec).state;
 }
 
 /** The item to show now, or null when the session is over. */
@@ -162,9 +181,17 @@ export function currentPlacementItem(
   session: PlacementSession,
   areas: readonly PlacementAreaSpec[],
 ): CurrentPlacementItem | null {
-  for (const area of checkedAreas(session, areas)) {
-    const item = nextItemIn(session, area);
-    if (item) return item;
+  for (const planned of plannedModules(session, areas)) {
+    const spec = findModule(areas, planned.moduleId);
+    const next = spec ? stepModule(session, spec).next : null;
+    if (next) {
+      return {
+        id: next.item.id,
+        areaId: planned.areaId,
+        moduleId: planned.moduleId,
+        role: next.role,
+      };
+    }
   }
   return null;
 }
@@ -184,9 +211,8 @@ export function answerPlacement(
       {
         itemId: item.id,
         areaId: item.areaId,
-        level: item.level,
-        concept: item.concept,
         moduleId: item.moduleId,
+        role: item.role,
         correct: answer.correct,
         confidence: answer.confidence,
       },
@@ -203,12 +229,21 @@ export function undoPlacement(session: PlacementSession): PlacementSession {
   return { ...session, answers: session.answers.slice(0, -1) };
 }
 
+/** The most questions one module can ask: its core questions and both deep ones. */
+const moduleCeiling = (mode: PlacementMode) => coreNeeded(mode) + 2;
+
+/** How long a fresh session can run: one question a module at least. */
+export function placementLength(
+  session: PlacementSession,
+  areas: readonly PlacementAreaSpec[],
+): { readonly fewest: number; readonly most: number } {
+  const modules = plannedModules(session, areas).length;
+  return { fewest: modules, most: modules * moduleCeiling(session.mode) };
+}
+
 export interface PlacementProgress {
-  /** The area under way, 0-based; equal to `areaCount` once every area is settled. */
-  readonly areaIndex: number;
-  readonly areaCount: number;
   readonly asked: number;
-  /** The most items the session can still ask in total, for a "3 / 24" ceiling. */
+  /** The most items the session can ask in all. It falls as modules settle early. */
   readonly maxItems: number;
 }
 
@@ -216,13 +251,12 @@ export function placementProgress(
   session: PlacementSession,
   areas: readonly PlacementAreaSpec[],
 ): PlacementProgress {
-  const checked = checkedAreas(session, areas);
-  const current = currentPlacementItem(session, areas);
-  const index = current ? checked.findIndex((a) => a.id === current.areaId) : checked.length;
-  return {
-    areaIndex: index,
-    areaCount: checked.length,
-    asked: session.answers.length,
-    maxItems: checked.length * AREA_LEVELS * session.itemsToPass,
-  };
+  const asked = session.answers.length;
+  const left = plannedModules(session, areas).reduce((sum, planned) => {
+    const spec = findModule(areas, planned.moduleId);
+    if (!spec || stepModule(session, spec).next === null) return sum;
+    const inModule = session.answers.filter((a) => a.moduleId === planned.moduleId).length;
+    return sum + moduleCeiling(session.mode) - inModule;
+  }, 0);
+  return { asked, maxItems: asked + left };
 }

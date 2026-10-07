@@ -1,6 +1,28 @@
+import { writeFileSync } from 'node:fs';
 import type { NextConfig } from 'next';
+import * as ts from 'typescript';
 
 const isDev = process.env.NODE_ENV === 'development';
+
+// Parallel builds (several e2e runs at once) each need their own output directory.
+const distDir = process.env.NEXT_DIST_DIR || '.next';
+
+/**
+ * Next adds the types of every output directory to the tsconfig it builds with, so each
+ * parallel build used to rewrite tsconfig.json. Those builds get a generated, git-ignored
+ * tsconfig that extends the real one and already lists their directory.
+ */
+function tsconfigFor(dir: string): string {
+  if (dir === '.next') return 'tsconfig.json';
+  const { include = [] } = ts.readConfigFile('tsconfig.json', ts.sys.readFile).config as {
+    include?: string[];
+  };
+  const path = `tsconfig.${dir.replace(/^\.+/, '').replace(/[^\w-]/g, '-')}.json`;
+  const types = [`${dir}/types/**/*.ts`, `${dir}/dev/types/**/*.ts`];
+  const config = { extends: './tsconfig.json', include: [...include, ...types] };
+  writeFileSync(path, `${JSON.stringify(config, null, 2)}\n`);
+  return path;
+}
 
 /**
  * A static CSP, set here rather than per-request in proxy.ts. Nonces would force every
@@ -65,8 +87,8 @@ const securityHeaders = [
 ];
 
 const nextConfig: NextConfig = {
-  // Parallel builds (several e2e runs at once) each need their own output directory.
-  distDir: process.env.NEXT_DIST_DIR || '.next',
+  distDir,
+  typescript: { tsconfigPath: tsconfigFor(distDir) },
   // The Docker image for a VPS sets BUILD_STANDALONE=1 to get a self-contained server
   // bundle (docs/DEPLOYMENT.md). Vercel and `next start` use the default output.
   output: process.env.BUILD_STANDALONE === '1' ? 'standalone' : undefined,

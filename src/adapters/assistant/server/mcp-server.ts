@@ -91,13 +91,7 @@ function questionText(question: BridgeQuestion, context: AssistantContext): stri
 /** The app guide for the study modes, so an app connection can give directions as well. */
 function appGuide(context: AssistantContext): string[] {
   if (!context.app) return [];
-  return [
-    '',
-    NAVIGATION_RULES,
-    PLAN_OFFER,
-    '',
-    `The app:\n${untrusted('app-guide', context.app)}`,
-  ];
+  return ['', NAVIGATION_RULES, PLAN_OFFER, '', `The app:\n${untrusted('app-guide', context.app)}`];
 }
 
 /** What get_task says: the page or task, by mode. */

@@ -1,0 +1,183 @@
+summary: >-
+  An agent's context is its working memory: the system prompt, the tools, every message and
+  every tool result, resent on every turn. In Prompting and context engineering it was a
+  hard limit you had to fit under. In a long agent run, the softer limit arrives first. As
+  the context grows, the model attends to it less reliably, and a fact stated early sinks
+  into the middle, where models use information worst. The agent hasn't lost the fact. It
+  has stopped noticing it.
+
+
+  Three habits keep a context sharp. Compaction replaces old turns with a short note while
+  keeping the task, decisions, open questions and recent turns word for word. Just-in-time
+  retrieval keeps references, such as ids and paths, in context and loads content only when
+  a step needs it, with tool output trimmed and paged. Sub-agents read the bulky material
+  in their own contexts and hand back conclusions.
+
+
+  Behind all three is one measurement: count the real request's tokens before each call,
+  and act on the number, not on a guess. A context that stays small is also cheaper and
+  faster, because every token in it is paid for on every turn.
+remember:
+  - A fact that is still in the context can still be ignored; length and position decide how much attention it gets.
+  - Models use the start and end of a long input better than the middle, so old facts in long histories are the most fragile.
+  - Compaction keeps the task, decisions, open questions and recent turns verbatim, and summarises or drops everything else.
+  - Old tool results are the first thing to drop, because the agent can fetch them again.
+  - A tool result must never be kept without the call that asked for it, or the API rejects the request.
+  - Tools should return references and counts, not whole records, and say how to get more.
+  - A sub-agent's value is the context it keeps out of the parent, so it returns conclusions, not transcripts.
+  - Count tokens with the provider's counter on the real request, tools included, before deciding to compact.
+sections:
+  - title: Watching rot happen in your own agent
+    body: |-
+      Published long-context tests hide a needle in a haystack and ask for it. Your agent's
+      version of that test is more useful, because its haystack is its own history.
+
+      Take a real task where the user states a rule early: "no peanuts", "under £40",
+      "only use the staging database". Replay the run with more and more realistic filler
+      between that rule and the moment it matters: tool results, side questions, retries.
+      Record whether the agent still obeys the rule at each length. The length where it
+      starts to fail is your practical context limit for that task, and it's usually far
+      below the advertised window.
+
+      Two things move the curve. Position: a rule restated near the end, or kept in a pinned
+      block the harness re-sends at the top of each compacted context, survives much longer
+      than one left at turn 3. Noise: bulky, repetitive tool output hurts more than the same
+      number of tokens of conversation, because it pushes everything else apart without
+      adding meaning.
+
+      This turns "the agent gets worse over time" from a vague complaint into a number you
+      can track per harness version, like any other eval.
+  - title: Trimming and paging tool output
+    body: |-
+      Tool results are usually the largest and least valuable part of a long history. Trim
+      them at the source, and say what was cut and how to get it.
+
+      ```python
+      def trim(text, max_lines=40, head=30):
+          lines = text.splitlines()
+          if len(lines) <= max_lines:
+              return text
+          tail = max_lines - head
+          skipped = len(lines) - head - tail
+          return "\n".join([*lines[:head],
+                            f"[... {skipped} lines cut. Call read_log(start={head + 1}) for more ...]",
+                            *lines[-tail:]])
+
+      log = "\n".join(f"line {n}" for n in range(1, 501))
+      print(trim(log).splitlines()[30])
+      # [... 460 lines cut. Call read_log(start=31) for more ...]
+      ```
+
+      Keeping the head and tail suits logs, where the start shows the command and the end
+      shows the error. Search results suit a different shape: the top ten as one line each,
+      a total count, and a tool to open one item. Either way, the marker matters as much as
+      the cut. A silently truncated list leads the agent to state wrong totals with full
+      confidence; a marker tells it the list is partial and how to page.
+
+      Some APIs can also clear old tool results from the history for you, replacing each
+      with a short placeholder. That suits results the agent has already acted on.
+  - title: Compaction that doesn't lose the plot
+    body: |-
+      A compaction step has three parts: decide when, decide what stays exact, and write the
+      note.
+
+      **When.** Count the next request, and compact when it passes a threshold well under
+      the window, such as 70%. Compacting a little every turn rewrites the history each time
+      and defeats prompt caching, so compact rarely and decisively.
+
+      **What stays exact.** Pin the user's task as written, every decision with its reason,
+      open questions, and anything the user marked as a rule. Keep the last few turns whole,
+      and never split a tool call from its result. The challenge built this part.
+
+      **The note.** Ask for a structured summary, not a paragraph: what has been done, what
+      was found, what was tried and failed, and what's next. A list of failed attempts
+      matters more than it seems: without it, a fresh context happily retries them.
+
+      Server-side compaction exists on some APIs, in beta. It writes the summary when the
+      context passes a trigger and returns a compaction block that must be sent back on the
+      next request. If your code keeps only the reply's text, it silently loses that block.
+      Whoever writes the summary, pin the things that must not be paraphrased.
+  - title: Sub-agents as context isolation
+    body: |-
+      A sub-agent is a separate loop with its own context, started by the parent with a
+      focused question. Its job is to absorb reading the parent shouldn't have to hold:
+      thirty shop pages, a large codebase search, a long log.
+
+      Give it a contract like a function's:
+
+      - A specific question: "Which of these 30 shops stock tahini, and at what price?"
+      - A return shape: "At most five lines: shop, price, link. Say 'none' if none."
+      - Its own budget and a smaller toolset than the parent's.
+
+      The return shape is the point. A sub-agent that returns its whole transcript has moved
+      the problem back into the parent. Keep the transcript in your logs and traces, where a
+      person can audit it, but out of the parent's context.
+
+      Sub-agents cost tokens of their own, often more in total than one agent doing the work,
+      because each re-reads its instructions and tools. They pay off when the reading is
+      large and the conclusion small, and when several questions can run in parallel. The
+      orchestration lesson later in this chapter covers fan-out and its costs.
+pitfalls:
+  - '**Assuming a big window means full attention.** Facts in a long middle are used least reliably. Keep critical rules pinned and near the end of the context.'
+  - '**Summarising the task itself.** A paraphrase drops numbers and rules: "under £40, no peanuts" becomes "meal planning". Keep the task verbatim.'
+  - '**Cutting the history at a fixed index.** It can keep a tool result whose call was dropped, and the API rejects the request. Trim whole call-and-result pairs.'
+  - '**Truncating tool output silently.** The agent treats a partial list as complete and reports wrong totals. Always add a marker with the count and how to get more.'
+  - '**Keeping only the reply text with server-side compaction.** The compaction block is lost and the API can''t apply it. Append the full response content each turn.'
+  - '**Estimating tokens from characters.** Tokenisers differ by model, and tool schemas count too. Use the provider''s token counter on the real request.'
+verify:
+  - lens: breaks
+    check: Replay a task with a rule stated at turn 3 and 200 turns of filler, and confirm the agent still obeys the rule after compaction.
+  - lens: breaks
+    check: Compact a history whose cut falls between a tool call and its result, and confirm the request is still accepted.
+  - lens: scales
+    check: Log the token count of every request, because a run whose context only grows will slow down and cost more each turn.
+  - lens: confuses
+    check: Check that every trimmed tool result says how much was cut and which call fetches the rest.
+  - lens: tests
+    check: Feed compaction a history where the pinned items alone exceed the budget, and confirm it fails loudly instead of dropping the task.
+interview:
+  - question: Our agent follows instructions well early in a session and badly later. What's going on and what would you do?
+    answer: >-
+      Most likely context rot. As the history grows, the model attends to it less reliably,
+      and early instructions end up in the middle of a long input, where models use
+      information worst. The instruction is still there; it just isn't weighed. I'd confirm
+      it by replaying a task with increasing filler between the rule and the moment it
+      matters, to find the length where it breaks. Then I'd shrink and reorder the context:
+      trim tool results at the source, compact at a threshold while pinning the task,
+      decisions and rules verbatim, and keep pinned rules near the end. Bulky reading moves
+      to sub-agents that return short conclusions. The trade-off is that summaries can lose
+      detail, so I keep the full transcript in logs and let the agent re-fetch anything it
+      needs.
+  - question: How would you implement compaction for a long-running agent?
+    answer: >-
+      I'd count the real request before each call and compact when it passes about 70% of
+      the window, rarely and decisively, so prompt caching survives between compactions.
+      The compacted context has three parts. A pinned block with the user's task as
+      written, decisions with reasons, open questions and stated rules, never paraphrased.
+      A structured note: done, found, tried and failed, next. And the last few turns whole,
+      cut only at call-and-result boundaries so no tool result is orphaned. If the pinned
+      block alone doesn't fit, I fail loudly rather than drop the task. If the provider
+      offers server-side compaction I'd consider it, but I'd still pin critical rules, and
+      make sure the code passes back the full response content so the compaction state
+      isn't lost.
+  - question: When would you use a sub-agent instead of letting the main agent do the work?
+    answer: >-
+      When the work needs a lot of reading but produces a small answer. Searching thirty
+      pages for one fact, scanning a big codebase for call sites, or reading a long log for
+      the first error all fit. The sub-agent reads in its own context and returns a few
+      lines, so the main context grows by those lines instead of by everything read. I give
+      it a narrow question, a strict return shape, its own budget and fewer tools than the
+      parent. I avoid sub-agents for tightly coupled work where the pieces need each other's
+      details, because summaries lose those. The cost is more total tokens, since every
+      sub-agent re-reads its instructions, so it pays off only when the isolation or
+      parallelism is worth it.
+  - question: A tool returns 5,000 rows. How should it present them to an agent?
+    answer: >-
+      Not as 5,000 rows. The tool should return what the next decision needs: often the top
+      ten as one short line each with an id, plus a marker like "showing 10 of 5,000; filter
+      by date or call get_item(id)". The count is essential, because an agent shown a silent
+      partial list will report it as complete. If the agent really needs an aggregate, such
+      as a total or a breakdown, the tool should compute it and return the number rather
+      than make the model count rows in its head. For logs, I keep the head and tail and cut
+      the middle with a marker. The principle is that the model's context is the scarcest
+      resource in the system, so tools spend it deliberately.

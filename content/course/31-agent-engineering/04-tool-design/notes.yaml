@@ -1,0 +1,201 @@
+summary: >-
+  Tools are the agent's hands, and the model only knows them through what you write: a
+  name, a description, a schema, and whatever comes back when it calls. Tool use showed the
+  mechanics of one call. This lesson is about designing the set, because most agent
+  failures that look like the model being careless are really tools that were hard to use
+  well.
+
+
+  Four rules carry most of the weight. Shape tools around the tasks people bring, not
+  around your API's endpoints, so the model makes one call where it would have chained
+  four. Make every response cheap and honest: paged, trimmed, with a count and a way to get
+  more, and errors that say what was wrong and what to try. Take identity and tenant from
+  the authenticated session, never from arguments, because anything the model writes can be
+  steered by text it read. And keep reading tools apart from writing ones, labelled, so the
+  harness can run reads freely and gate writes.
+
+
+  Then measure. Tool-call accuracy, arguments that validate first time and calls per task
+  are numbers you can track per harness version, and they move every time you rename or
+  re-describe a tool.
+remember:
+  - Design tools around user tasks; thin wrappers over each endpoint force the model to chain calls it often gets wrong.
+  - A tool's name and description are how the model chooses it, so make them distinct and say when to call it.
+  - Every large result is paged and marked with a count and how to get more, or the agent will treat a partial list as complete.
+  - An actionable error says what was wrong and what to try next, so the model can recover in one turn.
+  - User and tenant identity come from the authenticated session, never from arguments the model fills in.
+  - A read-only tool must have no side effects, because the harness runs reads freely and as often as asked.
+  - Annotations such as readOnlyHint are hints from the tool's author; decide permission modes from your own list.
+  - Measure tool selection and argument accuracy with an eval set, and rerun it whenever tools change.
+sections:
+  - title: Consolidating without building a god tool
+    body: |-
+      Consolidation has two failure modes, one on each side.
+
+      Too granular: one tool per endpoint. The model must know that `get_parcel` needs an id
+      that only `list_parcels` returns, and that the carrier lives behind a third call. Each
+      extra hop is a chance to stop early, pass the wrong id or give up. Every schema also
+      sits in every request, costing context and making the choice blurrier.
+
+      Too broad: one tool that does everything, such as `call_api(method, path, body)` or
+      `parcel(action, ...)` with twelve actions. The model now has to learn your API from a
+      description, and the harness sees one opaque tool, so it can't gate cancellations
+      apart from lookups or log them separately.
+
+      The middle is one tool per task a person would name: track a parcel, find parcels,
+      reschedule a delivery, open a claim. Inside, the tool chains the endpoints itself, in
+      code, where the order is guaranteed. A useful test is the support script: if a human
+      agent's checklist says "look up the parcel, check the scans, check the carrier", that
+      checklist is one tool.
+
+      Descriptions should say when to call the tool, not only what it does: "Use when the
+      customer asks where a parcel is or when it will arrive. Needs a tracking number,
+      order reference or postcode." Two tools whose descriptions could swap are one tool
+      too many, or two descriptions that need rewriting.
+  - title: Errors the model can act on
+    body: |-
+      A tool error is a message to a reader who can't see your logs, can't ask a follow-up
+      question and will try again in a second. Write it for that reader.
+
+      ```python
+      def reschedule(session, tracking, date, slots):
+          if date not in slots:
+              nearest = ", ".join(sorted(slots)[:3])
+              return {"is_error": True,
+                      "content": f"No delivery slot on {date}. Free dates: {nearest}. "
+                                 "Ask the customer which they want."}
+          return {"is_error": False, "content": f"Moved {tracking} to {date}."}
+
+      print(reschedule({}, "PT00000003", "2026-10-12",
+                       {"2026-10-14", "2026-10-15", "2026-10-16", "2026-10-20"})["content"])
+      # No delivery slot on 2026-10-12. Free dates: 2026-10-14, 2026-10-15, 2026-10-16. Ask the customer which they want.
+      ```
+
+      Three ingredients: what was wrong, with the value that was wrong; what would be right,
+      as a format, an example or a short list of valid values; and the next move, when it
+      isn't obvious. Leave out stack traces and internal ids: they cost tokens and can leak
+      details about your systems.
+
+      Mark failures as errors, with `is_error` in a tool result or `isError` in MCP, rather
+      than returning them as ordinary text. The model treats them differently, and so can
+      your traces: a rising error rate on one tool is an early sign its description or
+      schema confuses the model.
+  - title: Identity, tenancy and the schema
+    body: |-
+      The safest argument is the one that isn't in the schema. If a tool's schema has a
+      `customer_id`, `shop_id` or `user_email` property, the model will fill it, and the
+      model fills arguments from everything it has read: the user's message, an email, a
+      web page, a tool result. Any of those can name someone else.
+
+      So identity flows around the model, not through it. The harness authenticates the
+      user, builds a session with the user and tenant, and passes that session to every
+      tool handler. The handler scopes every query by it.
+
+      ```python
+      def handle(call, session, tools):
+          handler = tools[call["name"]]
+          return handler(session, **call["input"])   # session from the login, input from the model
+      ```
+
+      Defence in depth still applies. Strict schemas with `additionalProperties: false`
+      reject an injected `customer` field before the handler runs. Row-level security in
+      the database, as in the tenancy lessons, means even a buggy handler can't read another
+      tenant's rows. And the ownership check from Tool use stays: when the model passes a
+      tracking number, confirm it belongs to the session's customer before answering.
+
+      Delegated access works the same way. If the agent acts for a user on another service,
+      the token comes from that user's session, scoped to the actions the tool needs, and
+      never appears in the context.
+  - title: Measuring whether tools work
+    body: |-
+      Tool design is quick to argue about, and it can be measured. Collect a few hundred real
+      requests, and for each write down the tool that should be called and the key
+      arguments. Then run the agent and score:
+
+      - **Selection accuracy**: was the right tool called first?
+      - **Argument validity**: did the arguments pass validation first time?
+      - **Calls per task**: how many calls did a solved task take?
+      - **Error recovery**: after an error, did the next call succeed?
+
+      ```python
+      def score(runs):
+          picked = sum(r["first_tool"] == r["expected_tool"] for r in runs)
+          valid = sum(r["first_args_valid"] for r in runs)
+          return {"selection": picked / len(runs), "valid_args": valid / len(runs)}
+
+      print(score([
+          {"first_tool": "track_parcel", "expected_tool": "track_parcel", "first_args_valid": True},
+          {"first_tool": "list_parcels", "expected_tool": "track_parcel", "first_args_valid": True},
+          {"first_tool": "track_parcel", "expected_tool": "track_parcel", "first_args_valid": False},
+          {"first_tool": "find_parcels", "expected_tool": "find_parcels", "first_args_valid": True},
+      ]))
+      # {'selection': 0.75, 'valid_args': 0.75}
+      ```
+
+      Run the same set before and after every change to names, descriptions, schemas or the
+      tool list. Read the failures, not only the scores: a model that keeps picking
+      `list_parcels` for "where's my parcel?" is telling you the two descriptions overlap.
+      With a large catalogue behind tool search, add one more number: how often the search
+      surfaced the right tool at all.
+pitfalls:
+  - '**One tool per endpoint.** The model has to chain calls in the right order and often stops short. Build one tool per user task and chain the endpoints in code.'
+  - '**Silent truncation.** Returning the first 20 rows with no count makes the agent report 20 as the total. Always say "showing 20 of 312" and how to get more.'
+  - '**Errors that only say "invalid input".** The model retries the same call. Say what was wrong and what to try.'
+  - '**Identity in the schema.** A `customer_id` argument will be filled from whatever the model read, including an attacker''s email. Take it from the session.'
+  - '**Side effects in read tools.** A lookup that also sends a message runs every time the model asks, without approval. Move the write into its own gated tool.'
+  - '**Trusting annotations from someone else''s server.** A read-only hint is a claim, not a guarantee. Set permission modes from your own list.'
+verify:
+  - lens: leaks
+    check: Search every tool schema for user, customer, shop or tenant ids, and remove each one in favour of the session.
+  - lens: leaks
+    check: Send a chat that names another customer's id, and confirm no tool returns that customer's data.
+  - lens: breaks
+    check: Call each read-only tool ten times in a row, and confirm nothing outside the system changed.
+  - lens: confuses
+    check: Read the tool descriptions side by side, and rewrite any two that could describe the same request.
+  - lens: tests
+    check: Rerun the tool-selection eval after every change to a name, description or schema, and compare per request.
+  - lens: scales
+    check: Measure the tokens of the largest result each tool can return, and page any tool that can exceed a few thousand.
+interview:
+  - question: How do you design tools for an LLM agent?
+    answer: >-
+      I start from the tasks users bring, not from the API. Each tool does one task a
+      person would name, like tracking a parcel or rescheduling a delivery, and chains the
+      underlying endpoints in code. Names and descriptions are distinct and say when to call
+      the tool. Responses are token-efficient: the fields the next step needs, paged with a
+      count and a way to get more. Errors say what was wrong and what to try. Identity comes
+      from the session, never from arguments. Reads and writes are separate tools so the
+      harness can gate writes. Then I measure selection accuracy and argument validity on a
+      set of real requests, and rerun it whenever a tool changes. The trade-off is that
+      task-shaped tools cover fewer odd requests, which I accept and route to a person.
+  - question: Why shouldn't a tool take the user id as an argument?
+    answer: >-
+      Because the model fills arguments from everything it has read, and some of that is
+      untrusted. A customer can type another customer's id, an email can claim to come from
+      another shop, and a web page can contain instructions. If the tool trusts an id in its
+      arguments, any of those becomes a data leak. So the harness authenticates the user,
+      puts the user and tenant in a session object, and passes it to every handler, which
+      scopes its queries by it. The schema doesn't even have the field, and strict schemas
+      reject one that's injected. Behind that, row-level security limits the damage of a
+      handler bug. The only cost is plumbing the session through, which is small.
+  - question: An agent keeps calling the same tool with the same wrong argument. How do you fix it?
+    answer: >-
+      I read the error it gets back, because that's usually the cause. If the tool returns
+      something like "400 Bad Request" or "invalid input", the model has no idea what to
+      change, so it tries the same thing or something random. I rewrite the error to name
+      the bad value, show the expected format or valid options, and suggest the next step.
+      I also check the schema and description: an enum instead of free text, an example in
+      the description, or a clearer parameter name often prevents the error entirely. Then I
+      add the case to the tool eval so it stays fixed. As a backstop, stall detection in the
+      harness stops a run that keeps getting the same result.
+  - question: How would you handle an agent that needs access to 300 tools?
+    answer: >-
+      First I'd question the number: 300 tools often means one tool per endpoint across many
+      services, and consolidating by task can cut that a lot. For what remains, loading
+      every schema in every request costs context and blurs selection, so I'd use deferred
+      loading with a tool search step: the model searches the catalogue and only matching
+      schemas join the context. I'd keep the handful of most-used tools always loaded, both
+      for speed and because an API may reject a request where everything is deferred. Names
+      get service prefixes so search and selection can tell them apart. Then I'd measure
+      two things: whether search surfaces the right tool, and whether the model picks it.

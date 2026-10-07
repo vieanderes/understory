@@ -1,0 +1,307 @@
+id: agents.context-at-scale
+title: Context that stays sharp
+objective: Keep an agent's context useful over a long run by compacting history, trimming tool output and retrieving just in time.
+level: advanced
+minutes: 10
+concepts: [agents.context-rot, agents.compaction, agents.just-in-time-retrieval]
+prerequisites: [agents.long-running-loops, ai.prompting-and-context]
+opening:
+  text: >-
+    You'll keep a long-running agent's context small and sharp, so it still follows turn 3
+    at turn 300. Most agents that "get worse over time" are drowning in their own history.
+
+steps:
+  - type: prose
+    id: name-context-rot
+    body: |-
+      Prompting and context engineering showed the window as a hard limit. There's a softer
+      one long before it. As the history grows, the model attends to it less reliably:
+      **context rot**.
+
+      Position matters too. Models use the start and the end of a long input better than the
+      middle. A fact from turn 3 of 140 sits right in that weak spot: **lost in the middle**.
+
+  - type: multiple-choice
+    id: pick-buried-fact
+    concept: agents.context-rot
+    difficulty: 1
+    question: >-
+      Turn 3: "no peanuts". Turn 140: the shopping agent adds peanut butter. Turn 3 is still in
+      the history. Why?
+    choices:
+      - text: It's buried in the middle of a long history
+        correct: true
+        feedback: >-
+          Yes. Present isn't the same as noticed. Long middles get the least attention.
+      - text: The window quietly dropped turn 3
+        feedback: >-
+          The question says it's still there. The model saw it and didn't weigh it.
+      - text: The model forgot it between calls
+        feedback: >-
+          A model keeps nothing between calls. Your app resends everything, every turn.
+      - text: The temperature was set too high
+        feedback: >-
+          Randomness might explain one odd item. Ignoring a stated rule at turn 140 is rot.
+
+  - type: prose
+    id: name-compaction
+    body: |-
+      **Compaction** swaps older turns for a short note, so the context starts small again.
+
+      Some things never go into the note. Keep them word for word: the task as the user wrote
+      it, decisions made, open questions, and the last few turns. Summarise the rest. Old tool
+      results go first, because the agent can fetch them again.
+
+  - type: fill-blank
+    id: fill-count-tokens
+    concept: agents.compaction
+    difficulty: 2
+    language: python
+    prompt: >-
+      Count the next request with the provider's token counter, and compact once it passes
+      70% of the limit. Fill the gaps.
+    template: |
+      LIMIT = 200_000
+
+      size = client.messages.{{1}}(
+          model=MODEL, system=SYSTEM, tools=TOOLS, messages=messages,
+      )
+      if size.{{2}} > 0.7 * LIMIT:
+          messages = compact(messages)
+    blanks:
+      - key: '1'
+        answer: count_tokens
+      - key: '2'
+        answer: input_tokens
+    bank: [count_tokens, create, tokenize, input_tokens, output_tokens, total_tokens]
+
+  - type: bug-hunt
+    id: hunt-paraphrased-task
+    concept: agents.compaction
+    difficulty: 3
+    language: python
+    code: |
+      def compact(messages, keep_recent=6):
+          old, recent = messages[:-keep_recent], messages[-keep_recent:]
+          note = summarise(old)   # one paragraph, written by a small model
+          return [{"role": "user", "content": f"Summary so far: {note}"}, *recent]
+    prompt: >-
+      After compaction, "five vegetarian dinners, under £40, no peanuts" became "planning
+      meals for a family". Tap the line at fault.
+    lines: [3]
+    reasons:
+      - text: The task and its rules get paraphrased away
+        correct: true
+        feedback: >-
+          Yes. Pin the task, decisions and open questions, and keep them word for word.
+      - text: Six recent turns is too few
+        feedback: >-
+          More recent turns only delay it. The task is old, so it lands in the summary anyway.
+      - text: The summary should be a system message
+        feedback: >-
+          Where the note sits matters little. What it lost matters a lot.
+      - text: A small model can't write summaries
+        feedback: >-
+          Small models summarise well. No summary is safe for rules that must stay exact.
+    fix: |
+      def compact(messages, keep_recent=6):
+          start = turn_start(messages, len(messages) - keep_recent)   # never split a call from its result
+          pinned = [m for m in messages[:start] if m.get("pin")]      # task, decisions, open questions
+          old = [m for m in messages[:start] if not m.get("pin")]
+          note = {"role": "user", "content": f"Summary so far: {summarise(old)}"}
+          return [*pinned, note, *messages[start:]]
+
+  - type: ai-review
+    id: review-whole-catalogue
+    concept: agents.just-in-time-retrieval
+    difficulty: 3
+    language: python
+    request: Write the find_recipes tool for the shopping agent.
+    flawClass: performance
+    code: |
+      def find_recipes(query: str) -> str:
+          """Find recipes that match the query. Exposed to the agent as a tool."""
+          rows = db.search_recipes(query)
+          return json.dumps([row.to_dict() for row in rows])   # steps, photos, reviews
+    prompt: >-
+      An assistant wrote this. Tests used a catalogue of 12 recipes. In production, one
+      search for "pasta" put 180,000 tokens into the context. Tap the line at fault.
+    lines: [4]
+    reasons:
+      - text: Every full recipe lands in the context at once
+        correct: true
+        feedback: >-
+          Yes. Return short references, and let the agent open the one it needs.
+      - text: '`json.dumps` fails on long lists'
+        feedback: >-
+          It handles long lists fine, which is the trouble. The size is the problem.
+      - text: The query should be sanitised first
+        feedback: >-
+          Worth doing for the database's sake. It wouldn't shrink the result.
+      - text: The search should run asynchronously
+        feedback: >-
+          Async changes when it returns, not how much it returns.
+    fix: |
+      rows = db.search_recipes(query, limit=10)
+      lines = [f"{r.id}: {r.title} ({r.minutes} min)" for r in rows]
+      return "\n".join(lines) + f"\nshowing {len(rows)} of {db.count(query)}; call get_recipe(id) for one"
+
+  - type: prose
+    id: name-just-in-time
+    body: |-
+      That fix is **retrieval on demand**: keep references, such as ids and file paths, in
+      the context, and load content only when a step needs it.
+
+      A **sub-agent** takes the idea further. It's a second loop with its own fresh context.
+      Ask it "which of these 30 shops stock tahini?", and it reads all 30 pages and returns
+      three lines. Ask it for conclusions, not dumps.
+
+  - type: multiple-choice
+    id: pick-sub-agent-return
+    concept: agents.just-in-time-retrieval
+    difficulty: 2
+    question: A sub-agent checked 30 shop pages for tahini. What should it hand back?
+    choices:
+      - text: The three shops that stock it, with prices
+        correct: true
+        feedback: >-
+          Right. The parent gets the answer, and its context grows by three lines.
+      - text: All 30 pages, so nothing is lost
+        feedback: >-
+          That moves the whole problem back into the parent's context. Isolation is the point.
+      - text: Its full transcript, for auditing
+        feedback: >-
+          Keep the transcript, but in your logs. The parent's context needs only the result.
+      - text: A summary of every page it read
+        feedback: >-
+          Thirty summaries is still a dump. The parent asked one question.
+
+  - type: code-challenge
+    id: write-compact
+    concept: agents.compaction
+    difficulty: 4
+    language: python
+    starter: compact.starter.py
+    solution: compact.solution.py
+    tests: compact.tests.py
+    prompt: >-
+      Write `compact(history, budget, count)`. Each message is a dict with `"role"` and
+      `"text"`, and maybe `"pin": True` for the task, decisions and open questions.
+      `count(message)` gives its tokens.
+
+
+      Return `(kept, dropped)`, both in the original order. Keep every pinned message. Then,
+      from the newest backwards, keep unpinned messages while they fit in what's left of
+      `budget`. Stop at the first one that doesn't fit: no gaps.
+
+
+      A message with role `"tool"` is a tool result. The kept turns must never start with one,
+      since its call was dropped. Raise `ValueError` if the pinned messages alone exceed
+      `budget`.
+    hints:
+      - Add up the pinned messages first. What's left of the budget is the room for recent turns.
+      - Walk from the end with a falling index, skip pinned messages, and stop at the first misfit.
+      - 'Then look at the oldest message you kept. While its role is `"tool"`, drop it too.'
+
+  - type: explain-back
+    id: explain-why-not-keep-everything
+    concept: agents.context-rot
+    difficulty: 3
+    audience: newcomer
+    kind: explain
+    prompt: >-
+      A newcomer asks: the model's window holds a million tokens, so why not keep the
+      agent's whole history? Explain why.
+    rubric:
+      - Accuracy drops as the context grows, and facts in the middle get the least attention.
+      - Every token is resent and paid for on every turn, and long requests are slower.
+      - Compaction and retrieval on demand keep the key facts exact and the context small.
+    modelAnswer: >-
+      A big window is room, not attention. As the history grows, the model weighs it less
+      reliably. Old facts in the middle get missed. That's why an agent can ignore "no
+      peanuts" from turn 3. Every token is also resent and paid for on every turn. So we
+      keep the task and decisions word for word and summarise the rest. Details are fetched
+      only when a step needs them.
+
+recap:
+  - Spot context rot when an agent ignores facts that are still in its history.
+  - Compact by pinning the task, decisions and open questions, and dropping old tool output.
+  - Keep references in context and fetch content on demand, or hand reading to a sub-agent.
+
+recall:
+  - id: card-lost-in-middle
+    concept: agents.context-rot
+    front: Why can a model ignore a fact that is still in its context?
+    back: >-
+      Attention weakens as the context grows, and facts in the middle of a long input are
+      used least reliably.
+  - id: card-keep-verbatim
+    concept: agents.compaction
+    front: Which parts of a history should compaction keep word for word?
+    back: >-
+      The task as written, decisions made, open questions and the most recent turns. The rest
+      can be summarised or dropped.
+  - id: card-orphan-result
+    concept: agents.compaction
+    front: Why must the kept turns after compaction never start with a tool result?
+    back: >-
+      A tool result must follow the call that asked for it. Without that call, the API
+      rejects the request.
+  - id: card-jit
+    concept: agents.just-in-time-retrieval
+    front: With retrieval on demand, what does a tool return instead of full content?
+    back: >-
+      Short references, such as ids, titles and paths, with a count, so the agent loads only
+      the item a step needs.
+
+references:
+  - kind: paper
+    title: "Lost in the Middle: How Language Models Use Long Contexts"
+    authors: Nelson F. Liu et al.
+    year: 2024
+    venue: Transactions of the Association for Computational Linguistics
+    note: Accuracy is highest when the relevant fact is at the start or end of the input, and lowest in the middle.
+    primary: true
+    verified: false
+  - kind: essay
+    title: Effective context engineering for AI agents
+    authors: Anthropic
+    year: 2025
+    venue: Anthropic Engineering
+    url: https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents
+    note: Compaction, note-taking, retrieval on demand and sub-agents as ways to keep context small.
+    primary: true
+    verified: false
+  - kind: docs
+    title: Context editing
+    authors: Anthropic
+    venue: Claude Platform Docs
+    url: https://platform.claude.com/docs/en/build-with-claude/context-editing
+    note: Clearing old tool results and thinking blocks from a long conversation.
+    verified: false
+
+deepDive: >-
+  The challenge ran in Python 3.12, with word counts standing in for tokens. The token
+  counter call follows the provider's Python SDK.
+
+
+  **Clearing is not compacting.** Some APIs can clear old tool results for you, in beta,
+  leaving a placeholder where each one was. That keeps the shape of the conversation and
+  drops the bulk. Server-side compaction, also in beta, writes the summary for you when the
+  context passes a threshold. Then pass back the whole response content each turn, or the
+  API loses the summary it wrote.
+
+
+  **Count, don't guess.** Word counts and characters divided by four are rough, and
+  tokenisers differ between model generations. Count the real request, tools included,
+  before deciding to compact.
+
+
+  **Notes the agent writes itself.** A long task can keep a progress file outside the
+  context: what's done, what's next, what was decided. After compaction or a fresh context,
+  the agent reads the file instead of trusting a summary of a summary.
+
+
+  **Caching and compaction pull in opposite directions.** A stable prefix is cheap to
+  resend, and compaction rewrites history. Compact rarely and decisively, not a little every
+  turn, so the cache survives between compactions.

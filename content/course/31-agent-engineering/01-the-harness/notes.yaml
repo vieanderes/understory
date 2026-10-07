@@ -1,0 +1,199 @@
+summary: >-
+  In Controlling the agent loop, the harness was the loop: it counted steps, saved state and
+  decided when to stop. This lesson widens the word to everything around the model. The
+  harness decides which tools exist, where they run, what they can reach on the network,
+  which calls need a person, what code runs before and after each call, and what the model
+  reads before it starts. The model proposes tool calls. The harness decides which of them
+  are even possible, and which run.
+
+
+  It matters because a model's behaviour is shaped as much by its surroundings as by its
+  weights. A rule in the system prompt is a request the model usually honours. A missing
+  tool, a closed network port or a blocking hook is a fact it can't argue with. When you
+  want a guarantee, put it in the harness. When you want a preference, the prompt is fine.
+
+
+  The same reach cuts the other way. Rename a tool, load a skill in full or reorder the
+  hooks, and the agent can get worse with no error anywhere and no change to the model.
+  So the harness gets a version, a diff and an eval run, like any other code that ships.
+remember:
+  - The harness, not the prompt, decides what an agent can do; a tool that isn't offered can't be called.
+  - The action space is the set of tools that exist at all; shrinking it is the strongest safety control you have.
+  - A sandbox limits files, time and egress, but only for tools that run inside it; provider-run tools need their own limits.
+  - Permission modes sort calls into always allow, always ask, and auto, where unsure calls escalate to a person.
+  - In a chain of pre-tool hooks, any block wins, no objection passes to the next hook, and later hooks see earlier rewrites.
+  - Keep the model's proposed call unchanged for the audit log, and log the rewritten call that actually ran.
+  - Instruction files stay short and skills load on demand, because everything the model reads competes for its attention.
+  - A harness change can regress an agent with the model untouched, so version the harness and run the eval on every change.
+sections:
+  - title: The parts of a harness, from the outside in
+    body: |-
+      It helps to list the layers in the order a tool call meets them.
+
+      1. **The action space.** The tools in the request. If `delete_account` isn't there,
+         no prompt injection can call it. Prefer several narrow tools over one shell tool
+         when you need to tell actions apart, because a hook can read typed arguments but
+         only sees an opaque string from `bash`.
+      2. **The permission mode** of each tool: always allow, always ask, or auto. Auto
+         usually means a cheap rule or classifier scores the call; low risk runs, high risk
+         is refused, and the middle waits for a person.
+      3. **Pre-tool hooks.** Your code, run with the tool name and arguments. They block,
+         rewrite or pass.
+      4. **The sandbox.** Where the tool runs: a container or VM with its own filesystem,
+         CPU and time limits, and an egress allow-list.
+      5. **Post-tool hooks.** They see the result: trim it, redact personal data, log it.
+
+      Around all of that sits what the model reads first. Instruction files such as
+      `AGENTS.md` hold the few rules every run needs. Skills hold the rest: a folder per
+      task, of which only a one-line description is loaded until a task needs the full
+      text. Sub-agents are the last layer: a second loop with its own context and a
+      smaller toolset, started by the harness.
+
+      Each layer can enforce something the layer above can only ask for. A rule that must
+      hold belongs as low in that list as it can go.
+  - title: A hook chain you can trust
+    body: |-
+      The challenge built the core of it. Here it is with logging of both calls, which is
+      what an audit needs: what the model asked for, and what actually ran.
+
+      ```python
+      def gate_and_log(call, modes, hooks, log):
+          verdict = gate(call, modes, hooks)
+          log.append({
+              "proposed": call,
+              "ran": {"name": call["name"], "input": verdict["input"]},
+              "decision": verdict["decision"],
+              "reason": verdict["reason"],
+          })
+          return verdict
+
+
+      log = []
+      gate_and_log({"name": "renew_loan", "input": {"loan": "L-9", "weeks": 8}},
+                   MODES, [cap_renewal], log)
+      print(log[0]["proposed"]["input"]["weeks"], log[0]["ran"]["input"]["weeks"])  # 8 3
+      ```
+
+      Three properties make a chain safe. Deny beats allow: one block stops the call, so
+      adding a permissive hook can never remove protection. Rewrites flow forward: the
+      next hook checks what will run, not what was asked. And hooks fail closed: if a hook
+      raises, treat it as a block with the exception as the reason, because a crashed
+      safety check that lets calls through is worse than no check.
+
+      Order hooks by cost, as with guardrails: cheap rules first, a classifier later, a
+      person last. Keep each hook small enough to test alone, then test the chain with a
+      blocking hook placed after a permissive one.
+  - title: Sandboxes and the egress hole
+    body: |-
+      A sandbox earns its keep when the agent runs code or shell commands. It confines the
+      filesystem to a project folder, caps time and memory, and denies network access by
+      default, opening only the hosts the job needs, such as one internal API and a package
+      registry.
+
+      Egress is the control people forget. An agent that can read private data and also
+      reach any host can be steered into sending that data out, a pattern chapter 20's
+      injection lesson warned about. A deny-by-default egress list removes the exit.
+
+      The hole is tools that never run inside the sandbox. A provider's server-side web
+      fetch or web search runs on the provider's machines, so the sandbox's allow-list
+      never sees the request. The same goes for an MCP server running elsewhere, or any tool
+      your own backend executes outside the container. For each tool, ask where it runs,
+      and limit it there: a domain allow-list on the web tool, scoped credentials on the
+      MCP server, or leave it out of the action space.
+
+      One more rule: secrets stay out of the sandbox. If the agent needs to call an API
+      with a key, let a tool outside the sandbox hold the key and make the call. A
+      command inside the sandbox can print any variable it can read.
+  - title: Catching harness regressions
+    body: |-
+      A harness regression is a drop in quality caused by the wrapper, not the model. The
+      usual causes are small and look harmless in review:
+
+      - A tool renamed or its description reworded, so the model picks it less often.
+      - A skill or instruction file loaded in full every run, crowding out the task.
+      - A new tool whose description overlaps an old one, so the model alternates.
+      - A hook that rewrites arguments in a way the model then fights.
+      - Tool results that grew, pushing earlier facts into the middle of the context.
+
+      Treat the harness as code with a version. Put the version in every trace, next to the
+      model id, so a dashboard can split success rate by harness version. Keep an eval set
+      of real tasks, run it on every harness change, and compare per task, not only the
+      average: a change can fix five tasks and break three. When success drops and the
+      model id is unchanged, diff the harness first.
+
+      ```python
+      def compare(old_scores, new_scores):
+          broke = [t for t in old_scores if old_scores[t] and not new_scores[t]]
+          fixed = [t for t in old_scores if not old_scores[t] and new_scores[t]]
+          return {"broke": broke, "fixed": fixed}
+
+
+      print(compare({"book-spin": True, "cancel-yoga": True, "move-pt": False},
+                    {"book-spin": False, "cancel-yoga": True, "move-pt": True}))
+      # {'broke': ['book-spin'], 'fixed': ['move-pt']}
+      ```
+
+      The evals lesson later in this chapter goes further: run each task several times,
+      because one run hides how much an agent's results vary.
+pitfalls:
+  - '**Putting a hard rule in the prompt.** "Never email more than 20 patrons" is a request. Make it a pre-tool hook that counts recipients and blocks, and keep the prompt line only to explain why.'
+  - '**Letting one hook''s allow end the chain.** A permissive hook added first then silently disables every blocker after it. No objection must pass to the next hook; only a block returns early.'
+  - '**Trusting the sandbox for every tool.** Provider-run tools and remote MCP servers never pass through it. Limit each tool where it runs.'
+  - '**Hooks that fail open.** A hook that raises and is skipped lets every call through. Catch the exception and treat it as a block.'
+  - '**Loading every skill in full.** It feels thorough, but it buries the task in instructions. Load one-line descriptions and the full skill only when a task needs it.'
+  - '**Shipping a harness change without an eval.** A renamed tool or a reworded description can drop success with no error. Version the harness and compare eval runs before merging.'
+verify:
+  - lens: breaks
+    check: Place a blocking hook after one that allows, and confirm the call is still blocked.
+  - lens: leaks
+    check: List every tool that runs outside the sandbox, and confirm each has its own network or credential limits.
+  - lens: leaks
+    check: Search the sandbox's environment for API keys, because any key a command can read is a key it can print.
+  - lens: tests
+    check: Run the agent eval on the old and new harness version for every change to tools, skills or instruction files.
+  - lens: confuses
+    check: Log the model's proposed call and the rewritten call side by side, so a reviewer sees what a hook changed.
+interview:
+  - question: What do you mean by an agent's harness, and why does it matter more than the prompt?
+    answer: >-
+      The harness is everything around the model: which tools exist, where they run, what
+      network they can reach, which calls need approval, the hooks that run before and after
+      each call, what the model reads at start-up, and the loop itself. It matters because
+      it turns preferences into guarantees. A prompt rule is something the model usually
+      follows, and an injected document can talk it out of. A tool that isn't offered, a
+      denied egress host or a blocking hook can't be argued with. So I put hard rules as low
+      in the stack as possible, and use the prompt to explain intent. The trade-off is
+      flexibility: a tight harness makes some legitimate tasks impossible, so I widen it
+      deliberately, one tool or host at a time, with an eval run each time.
+  - question: How would you design permissions for an agent that can read and change customer data?
+    answer: >-
+      I start from the action space: only the tools the job needs, split into reads and
+      writes. Reads such as search and lookup run freely. Writes get a mode by risk: small,
+      reversible ones like renewing a loan can be auto, scored by a cheap rule or classifier,
+      with unsure calls escalated to a person; irreversible or bulk actions are always ask.
+      Pre-tool hooks enforce the hard limits in code, such as a recipient cap or a ban on
+      card numbers in messages, and any block wins. Identity comes from the session, never
+      from arguments. Every proposed and executed call goes to an audit log. The cost is
+      reviewer time, so I watch how often people approve without changes; if it's nearly
+      always, that tool can probably move to auto.
+  - question: An agent's success rate dropped last week, and the model version didn't change. How do you investigate?
+    answer: >-
+      I look at the harness diff first, because the model sees more than its weights: tool
+      names and descriptions, the tool list, skills and instruction files, hook rewrites and
+      the size of tool results. Each trace should carry the harness version and model id, so
+      I can split success by version and confirm the drop starts at a release. Then I rerun
+      the eval set on the old and new harness and compare per task, not just the average, to
+      see which tasks broke. Reading a few failing traces usually shows the mechanism: the
+      model picking a renamed tool less often, or a long skill crowding out the task. The
+      lasting fix is process: no harness change merges without an eval comparison, the same
+      as a code change without tests.
+  - question: When would you give an agent a general shell tool, and when dedicated tools?
+    answer: >-
+      A shell tool gives breadth fast, which suits a coding agent in a sandbox where most
+      actions are reversible and the blast radius is a container. Its weakness is that the
+      harness sees one opaque string for every action, so it can't tell a harmless `grep`
+      from a `git push` or an outbound `curl`. I promote an action to a dedicated tool when
+      I need to gate it, audit it, render it for a person, or run it in parallel safely.
+      Sending email, spending money, deleting data and calling external APIs all get their
+      own typed tools with hooks and modes. So a common design is shell for exploration
+      inside the sandbox, plus dedicated tools for anything that leaves it.

@@ -1,0 +1,218 @@
+summary: >-
+  A short agent run fails in a few predictable ways, and Controlling the agent loop handled
+  them: a step cap, a money cap, loop detection on repeated calls and saved state. A run
+  that lasts hours meets new ones. It spends in three currencies at once, tokens, time and
+  money, and any of them can run out first. It gets stuck in ways a call check can't see,
+  varying its calls while learning nothing. And over hours, something will kill the
+  process: a deploy, a scaled-down machine, an out-of-memory kill.
+
+
+  This lesson gives the loop four habits. Budgets in all three currencies, checked before
+  every model call, with a reserve for a final summary. Stall detection on tool results,
+  answered first with a re-plan and then with a hand-over to a person. Write-ahead
+  checkpoints, where the model's reply is saved before any of its calls run, and the
+  tool-call id becomes the idempotency key, so a resumed run never repeats a side effect.
+  And, where quality matters, a generator and evaluator loop that keeps working until a
+  separate check passes.
+
+
+  You don't need all four for a chat assistant that answers in ten seconds. You need them
+  the moment an agent runs unattended, touches anything outside itself, or runs long enough
+  that a restart is likely.
+remember:
+  - A long run carries token, wall-time and cost budgets, all checked before every model call, with a named stop status for each.
+  - Keep a small reserve of each budget for one final call that summarises what's done and what's left.
+  - Matching hashes of recent tool results mean no new information is arriving, even when every call looks different.
+  - Answer the first stall with a re-plan and the second with an escalation to a person, never with silent retries.
+  - Save the model's reply before running its calls, and on resume replay those saved calls instead of asking again.
+  - The tool-call id is a ready-made idempotency key, but only if it survives the crash in a write-ahead record.
+  - In a generator and evaluator loop, the check is a separate call with explicit criteria, bounded by a try limit.
+  - Hash what the tool said, never when it was asked, or every result looks new.
+sections:
+  - title: Three budgets and a reserve
+    body: |-
+      Tokens, time and money run out at different rates. A run reading large files burns
+      tokens fast. A run waiting on a slow API burns time. A run on an expensive model burns
+      money even with small contexts. So check all three, and name which one stopped the
+      run: a dashboard of `budget_time` stops tells you something different from
+      `budget_cost` stops.
+
+      ```python
+      from dataclasses import dataclass
+
+      @dataclass
+      class Budget:
+          tokens: int = 2_000_000
+          seconds: float = 8 * 3600
+          dollars: float = 25.0
+          reserve: float = 0.05  # kept back for the final summary call
+
+      def over_budget(run, budget, now):
+          usable = 1 - budget.reserve
+          if run["tokens"] >= budget.tokens * usable:
+              return "budget_tokens"
+          if now - run["started"] >= budget.seconds * usable:
+              return "budget_time"
+          if run["dollars"] >= budget.dollars * usable:
+              return "budget_cost"
+          return None
+
+      run = {"tokens": 1_200_000, "started": 0.0, "dollars": 24.10}
+      print(over_budget(run, Budget(), now=3 * 3600))  # budget_cost
+      ```
+
+      The reserve pays for one last call with no tools: "summarise what you finished, what
+      is left and what you were about to try". That note is what a person, or tomorrow's
+      run, starts from. Pass `now` in rather than reading the clock inside, so a test can
+      move time forward without waiting eight hours.
+
+      Hard budgets live in the harness. Some APIs also accept an advisory budget the model
+      can see, so it paces itself. That helps it finish tidily, but it's never the only
+      limit.
+  - title: Stalls, self-correction and re-planning
+    body: |-
+      Not every repeat is a stall. An agent that gets an error, fixes its arguments and
+      tries again is **self-correcting**: the error messages differ, so the hashes differ,
+      and the run is learning. A stall is the same answer over and over. The response
+      escalates in steps, and each step clears the window so the new plan gets a fair
+      chance.
+
+      ```python
+      import hashlib
+
+      def on_result(run, result, window=3):
+          run["hashes"].append(hashlib.sha256(result.encode()).hexdigest())
+          tail = run["hashes"][-window:]
+          if len(tail) < window or len(set(tail)) > 1:
+              return "continue"
+          run["stalls"] += 1
+          run["hashes"].clear()  # give the new plan a clean slate
+          return "replan" if run["stalls"] == 1 else "escalate"
+
+      run = {"hashes": [], "stalls": 0}
+      same = "in transit, last scan Tue 09:14"
+      print([on_result(run, same) for _ in range(6)])
+      # ['continue', 'continue', 'replan', 'continue', 'continue', 'escalate']
+      ```
+
+      A re-plan is a message to the model, such as: "Your last three lookups returned the
+      same status. Don't look it up again. Decide what to do with what you know, or say
+      what you're missing." That breaks most stalls, because the model often doesn't notice
+      it's repeating itself. An escalation stops the run with a `stalled` status and hands
+      the history to a person.
+
+      Normalise before hashing when results carry noise: strip timestamps, request ids and
+      "fetched at" lines. Otherwise every result looks new and the detector never fires.
+  - title: Write-ahead checkpoints and the call id
+    body: |-
+      The order of three writes decides whether resume is safe.
+
+      1. The model replies with tool calls. **Save the reply**, calls and ids included.
+      2. Run each call, passing its id as the idempotency key.
+      3. Save the results.
+
+      A crash before step 1 loses only a model call: ask again. A crash during step 2
+      leaves the saved reply on disk, so resume replays exactly those calls with exactly
+      those ids, and any tool that already ran returns its stored result. A crash after
+      step 3 resumes cleanly at the next model call.
+
+      The tempting mistake is to treat a half-finished turn as garbage and ask the model
+      again. A model's reply isn't deterministic, and even an identical plan arrives with
+      new ids. New ids mean new keys, and new keys mean the email goes twice.
+
+      The call id only works as a key if the tool side honours it: a table with a unique
+      key, or an external API that accepts an `Idempotency-Key` header, as the idempotency
+      lesson in chapter 14 showed. For a tool that can't take a key, write a "sending"
+      record before the call and a "sent" record after. On resume, a "sending" record with
+      no "sent" is a gap for a person to check, not something to retry blindly.
+  - title: Generator and evaluator loops
+    body: |-
+      Some tasks have a quality bar you can check: show notes must mention every guest,
+      quote only what's in the transcript, and stay under 300 words. A generator and
+      evaluator loop writes a draft, checks it, feeds the critique back and tries again,
+      up to a limit.
+
+      Put the cheap, certain checks in code and the judgment calls in a model judge.
+
+      ```python
+      def evaluate(draft, transcript, guests):
+          notes = []
+          if len(draft.split()) > 300:
+              notes.append("Cut to 300 words.")
+          for guest in guests:
+              if guest not in draft:
+                  notes.append(f"Mention {guest}.")
+          for quote in quotes_in(draft):
+              if quote not in transcript:
+                  notes.append(f"'{quote}' isn't in the transcript. Remove or fix it.")
+          return {"pass": not notes, "notes": notes}
+      ```
+
+      Three rules keep the loop honest. The evaluator is a separate call or code path, with
+      its own criteria; a writer grading itself passes too easily. Critique is specific and
+      actionable, like a good tool error. And the loop is bounded: when it runs out of
+      tries, a person decides, because a draft that never passed isn't fit to publish.
+pitfalls:
+  - '**Checking budgets after the call.** By then the money is spent, and the run may have taken several more turns. Check before every model call.'
+  - '**Hashing noisy results.** A timestamp or request id in the hashed text makes every result unique, and the stall check never fires. Hash only what the tool said.'
+  - '**Retrying a stall forever.** Re-plan once with a clear note, then escalate to a person with the history. A stall that survives a re-plan won''t be fixed by a third.'
+  - '**Dropping the half-finished turn on resume.** Asking again produces new call ids, so idempotency keys don''t match and side effects repeat. Replay the saved calls.'
+  - '**Saving only after the tools run.** A crash between the call and the save leaves no record of what was attempted. Write the reply first, then run its calls.'
+  - '**Letting the generator grade itself.** The writer tends to approve its own draft. Use a separate evaluator with explicit criteria, and deterministic checks where you can.'
+verify:
+  - lens: breaks
+    check: Kill the process after a tool call runs but before results are saved, resume, and confirm the side effect happened once.
+  - lens: tests
+    check: Feed the stall detector the same output twice with time passing between, and confirm the hashes match.
+  - lens: scales
+    check: Chart stop statuses per night, because a rising share of budget_time or stalled stops means the task or tools need work.
+  - lens: confuses
+    check: Make every stopped run end with a summary of what's done and what's left, so the person picking it up doesn't start over.
+  - lens: tests
+    check: Give the evaluator a draft with an invented quote, and confirm it fails with a note naming that quote.
+interview:
+  - question: How would you design an agent that runs unattended for eight hours?
+    answer: >-
+      I'd give the harness four jobs. First, budgets in tokens, wall time and money,
+      checked before every model call, with a small reserve for a final summary, and a
+      named status for whichever runs out. Second, stall detection on tool results, not
+      just calls: if the last few result hashes match, nothing new is arriving, so I
+      re-plan once and then escalate to a person. Third, write-ahead checkpoints: save the
+      model's reply before running its calls and pass each call's id as an idempotency key,
+      so a restart replays rather than repeats. Fourth, observability: every stop status
+      and every side effect counted per run. The trade-off is engineering time and some
+      storage writes per step, which is small next to the cost of a duplicated action or a
+      run that burns money all night.
+  - question: Your agent crashed mid-turn. How do you make sure resuming doesn't repeat an action?
+    answer: >-
+      Order the writes so the plan is saved before anything happens. When the model replies
+      with tool calls, I persist that reply, including each tool-call id, before running a
+      single call. Each side-effecting tool takes the call id as its idempotency key and
+      stores its result under it. On resume, if the last saved message is an assistant turn
+      with calls but no results, I replay those exact calls with the same ids. Calls that
+      already ran return their stored results; calls that didn't run now run once. What I
+      must not do is ask the model again: it may choose differently, and even the same
+      choice comes with new ids, so every key misses. For tools that can't accept a key, I
+      record intent before the call and flag gaps for a person.
+  - question: How do you tell an agent that's stuck from one that's working through errors?
+    answer: >-
+      By whether new information arrives. An agent fixing its arguments after a validation
+      error gets a different error, then a success: the results change, so it's
+      self-correcting. A stuck agent gets the same result again and again, often while
+      rephrasing its calls, which is why a repeated-call check misses it. I hash each
+      normalised tool result and treat a run of identical hashes as a stall. The first
+      stall gets a re-plan message telling the model what it keeps getting and asking for a
+      different approach. A second stall stops the run and escalates with the history. I
+      also keep a step cap as a backstop, because no detector catches everything, and I
+      chart how often each signal fires to find tools that cause stalls.
+  - question: When is a generator and evaluator loop worth its cost?
+    answer: >-
+      When there is a quality bar you can state as criteria, and one pass often misses it.
+      Show notes that must mention every guest and quote only the transcript fit well:
+      code checks the facts, a model judge checks tone, and the critique tells the writer
+      exactly what to fix. Each round costs at least two calls, so I bound the loop to a
+      few tries and send failures to a person. It's not worth it when the first draft
+      usually passes, when no one can write down the criteria, or when the evaluator is as
+      likely to be wrong as the writer. I also watch for gaming: a generator can learn to
+      satisfy the checks without doing the task, so I sample passed outputs for human
+      review.

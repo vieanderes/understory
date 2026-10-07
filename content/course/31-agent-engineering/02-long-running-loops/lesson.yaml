@@ -1,0 +1,376 @@
+id: agents.long-running-loops
+title: Loops that run for hours
+objective: Keep a long agent run within budget, detect stalls by result hash, and checkpoint it so it resumes without repeating a tool call.
+level: advanced
+minutes: 10
+concepts: [agents.run-budgets, agents.stall-detection, agents.checkpoint-and-resume, agents.generator-evaluator]
+prerequisites: [agents.the-harness, aisys.agent-harness]
+opening:
+  text: >-
+    You'll build an agent loop that runs all night, stops cleanly and survives a crash
+    without doing anything twice. It's what lets you leave an agent working while you sleep.
+
+steps:
+  - type: prose
+    id: three-budgets
+    body: |-
+      Controlling the agent loop capped steps and money for a short run. A run that lasts
+      all night needs three budgets: **tokens**, **wall time** and **cost**.
+
+      Check each one before every model call. When one runs out, stop with a named status,
+      such as `budget_time`, and save the state. Keep a little budget back for one last call
+      that summarises what's done.
+
+  - type: multiple-choice
+    id: pick-budget-check
+    concept: agents.run-budgets
+    difficulty: 1
+    question: An overnight run has a token budget. When should the harness check it?
+    choices:
+      - text: Before every model call
+        correct: true
+        feedback: >-
+          Yes. The check runs before money is spent, never after.
+      - text: When the run finishes
+        feedback: >-
+          By then the money's gone. A budget only helps if it can stop the next call.
+      - text: Only after a tool fails
+        feedback: >-
+          Expensive runs often fail nothing at all. They keep succeeding at the wrong thing.
+      - text: Once every hundred turns
+        feedback: >-
+          Each turn resends the history, so a hundred late turns can cost more than the rest.
+
+  - type: predict-output
+    id: predict-hidden-stall
+    concept: agents.stall-detection
+    difficulty: 2
+    language: text
+    code: |
+      turn 1  track(id="P-77")              → in transit, last scan Tue 09:14
+      turn 2  track(id="P-77", fresh=True)  → in transit, last scan Tue 09:14
+      turn 3  carrier_lookup(ref="P-77")    → in transit, last scan Tue 09:14
+      turn 4  track(id="p-77 ")             → in transit, last scan Tue 09:14
+    question: Does the repeated-call check from Controlling the agent loop fire on this parcel agent?
+    choices:
+      - text: No, yet the agent is stuck
+        correct: true
+        feedback: >-
+          Right. Every call differs, so the call check stays quiet. The results never change.
+      - text: Yes, `track` appears three times
+        feedback: >-
+          Three `track` calls, but each with different arguments. The check compares whole calls.
+      - text: Yes, turns 1 and 4 match
+        feedback: >-
+          Close, but `"p-77 "` isn't `"P-77"`. The model changed the text, so the strings differ.
+      - text: No, the agent is making progress
+        feedback: >-
+          It's busy, not progressing. Four answers, one fact, nothing new learnt since turn 1.
+
+  - type: prose
+    id: name-stall-detection
+    body: |-
+      A run can stay busy and learn nothing. **Stall detection** hashes each tool result and
+      watches the last few hashes. If they match, no new information is arriving, whatever
+      the calls look like.
+
+      Respond in two steps. First **re-plan**: tell the model it's stuck and ask for a
+      different approach. If it stalls again, **escalate**: stop, and hand the run to a person
+      with its history.
+
+  - type: bug-hunt
+    id: hunt-unique-hashes
+    concept: agents.stall-detection
+    difficulty: 3
+    language: python
+    code: |
+      import hashlib, json, time
+
+      def fingerprint(result):
+          return hashlib.sha256(json.dumps(result).encode()).hexdigest()
+
+      def stalled(hashes, window=3):
+          return len(hashes) >= window and len(set(hashes[-window:])) == 1
+
+      # after each tool call:
+      result = {"output": out, "checked_at": time.time(), "is_error": failed}
+      run.hashes.append(fingerprint(result))
+      if stalled(run.hashes):
+          replan_or_escalate(run)
+    prompt: >-
+      The parcel agent above ran for six hours on that one parcel. The stall check never
+      fired. Tap the line at fault.
+    lines: [10]
+    reasons:
+      - text: The timestamp makes every hash different
+        correct: true
+        feedback: >-
+          Yes. Hash only what the tool said, never when you asked.
+      - text: SHA-256 is too slow to run every turn
+        feedback: >-
+          Hashing a short result takes microseconds. Speed isn't why it never fired.
+      - text: '`set()` loses the order of the hashes'
+        feedback: >-
+          Order doesn't matter here. The check only asks whether the last three are equal.
+      - text: A window of 3 is too small
+        feedback: >-
+          A bigger window would fire later, not sooner. These hashes never match at any size.
+    fix: |
+      run.hashes.append(fingerprint({"output": out, "is_error": failed}))
+    verify:
+      question: Which test would have caught this?
+      choices:
+        - text: The same output twice, a second apart, must match
+          correct: true
+          feedback: >-
+            Right. Time passing is exactly what broke it, so the test lets time pass.
+        - text: Ten different outputs never count as a stall
+          feedback: >-
+            That passes with or without the bug. Every hash already differed.
+        - text: A unit test of `stalled()` with equal hashes
+          feedback: >-
+            `stalled()` is correct. The bug is in what gets hashed, before it's called.
+
+  - type: prose
+    id: name-tool-call-id-key
+    body: |-
+      Controlling the agent loop keyed side effects by run and step. There's a sharper key
+      already in each reply: the **tool-call id**, such as `toolu_01A`.
+
+      Save the reply before you run its calls. After a crash, replay the saved calls instead
+      of asking the model again. Pass each id to the tool as its **idempotency key**. A call
+      that already ran returns its first result.
+
+  - type: ai-review
+    id: review-resume-reasks
+    concept: agents.checkpoint-and-resume
+    difficulty: 4
+    language: python
+    request: Make the show-notes agent resume after a crash.
+    flawClass: logic
+    code: |
+      def resume(run_id):
+          state = load(run_id)
+          messages = state["messages"]
+          if messages[-1]["role"] == "assistant":   # crashed while its tools ran
+              messages.pop()                         # drop the half-finished turn
+          while True:
+              reply = client.messages.create(**request, tools=TOOLS, messages=messages)
+              messages.append({"role": "assistant", "content": reply.content})
+              save(run_id, state)
+              if reply.stop_reason != "tool_use":
+                  return finish(reply)
+              calls = [b for b in reply.content if b.type == "tool_use"]
+              results = [run_tool(b, idempotency_key=b.id) for b in calls]
+              messages.append({"role": "user", "content": results})
+              save(run_id, state)
+    prompt: >-
+      An assistant wrote this. Tests killed the process between turns, and every resume
+      worked. Then a deploy killed it mid-turn, and 40 episodes' notes went out twice. Tap
+      the line at fault.
+    lines: [5]
+    reasons:
+      - text: Dropping the turn throws away its call ids
+        correct: true
+        feedback: >-
+          Yes. Asked again, the model makes new ids, so the keys never match.
+      - text: Save should come after the tools run
+        feedback: >-
+          Saving first is the point: it's what lets a resume see the calls.
+      - text: Keys should be random UUIDs instead
+        feedback: >-
+          A fresh UUID per attempt never matches the last one. That repeats every call.
+      - text: The loop has no step cap
+        feedback: >-
+          It should have one, but a cap wouldn't stop the double publish. The lost ids did.
+    fix: |
+      if messages[-1]["role"] == "assistant":   # crashed while its tools ran
+          calls = [b for b in messages[-1]["content"] if b.type == "tool_use"]
+          results = [run_tool(b, idempotency_key=b.id) for b in calls]   # replay, same ids
+          messages.append({"role": "user", "content": results})
+          save(run_id, state)
+
+  - type: parsons
+    id: arrange-generator-evaluator
+    concept: agents.generator-evaluator
+    difficulty: 3
+    language: python
+    prompt: >-
+      One call writes an episode's show notes. A second call checks them against
+      `CRITERIA`. Loop until the check passes, then publish. Out of tries, hand it to a
+      person. Two blocks don't belong.
+    checkIndent: true
+    blocks:
+      - id: start-empty
+        code: 'feedback = None'
+        subgoal: 'Start with no critique'
+      - id: bound-loop
+        code: 'for attempt in range(MAX_TRIES):'
+        subgoal: 'Bound the loop'
+      - id: write-draft
+        code: 'draft = generate(episode, feedback)'
+        indent: 1
+        subgoal: 'Write a draft'
+      - id: check-draft
+        code: 'verdict = evaluate(draft, CRITERIA)'
+        indent: 1
+        subgoal: 'Check it with a separate call'
+      - id: if-pass
+        code: 'if verdict["pass"]:'
+        indent: 1
+      - id: publish-pass
+        code: 'return publish(draft)'
+        indent: 2
+      - id: keep-critique
+        code: 'feedback = verdict["notes"]'
+        indent: 1
+        subgoal: 'Feed the critique back'
+      - id: hand-over
+        code: 'return escalate(episode, draft, feedback)'
+        subgoal: 'Out of tries, ask a person'
+    distractors:
+      - id: self-grade
+        code: 'verdict = generate(draft, CRITERIA)'
+        feedback: >-
+          The writer grading its own draft tends to pass it. The check needs its own call
+          and criteria.
+      - id: ship-anyway
+        code: 'publish(draft)  # ship the best we have'
+        feedback: >-
+          A draft that never passed isn't good enough to publish. Out of tries, a person
+          decides.
+
+  - type: code-challenge
+    id: write-resumable-loop
+    concept: agents.checkpoint-and-resume
+    difficulty: 5
+    language: python
+    starter: resume.starter.py
+    solution: resume.solution.py
+    tests: resume.tests.py
+    prompt: >-
+      Write `run_agent(model, tools, state, max_tokens, save)`. `state` holds `"history"`,
+      `"tokens"` and `"pending"`. `model(history)` returns `{"calls": [...], "tokens": n}`,
+      each call `{"id", "name", "input"}`. Run a tool with `tools[name](input, call_id)`.
+
+
+      Each turn: if `state["tokens"] >= max_tokens`, return `"budget"`. Otherwise ask the
+      model, add its tokens, and append `{"role": "assistant", "calls": calls}`. No calls
+      means return `"done"`. Otherwise store the calls in `"pending"` and `save(state)`
+      before running any.
+
+
+      Run pending calls first, even on the first turn of a resumed run. Append each result
+      as `{"role": "tool", "id": call_id, "result": text}`. A tool that raises gives
+      `"error: <message>"`. Then clear `"pending"` and save.
+    hints:
+      - The loop has two halves. First run whatever is pending, then think about asking the model.
+      - The id passed to the tool must be the id the model gave the call, saved before it ran.
+      - '`save(state)` goes right after you set `state["pending"]`, before the first tool call.'
+
+  - type: explain-back
+    id: warn-overnight-run
+    concept: agents.run-budgets
+    difficulty: 4
+    audience: incident
+    kind: risk
+    prompt: >-
+      The show-notes agent will run unattended overnight from Friday. Warn the incident
+      channel: what could go wrong, and what will you watch?
+    rubric:
+      - A runaway run burns tokens, time or money, so each has a budget and a named stop status.
+      - A stalled run repeats itself, so result hashes trigger a re-plan and then a hand-over to a person.
+      - A crash and resume could publish twice, so calls are saved first and keyed by their call id.
+    modelAnswer: >-
+      Three risks. It could run away with money or time, so it has three budgets and a
+      named stop status. It could stall, checking one thing for hours. We hash results,
+      re-plan once, then hand it to a person. A deploy could crash it mid-publish, so calls
+      are saved first and keyed by call id. I'll watch stop statuses and the count of notes
+      published.
+
+recap:
+  - Give a long run token, time and cost budgets, checked before every model call.
+  - Spot a stall when tool results stop changing, then re-plan or escalate.
+  - Save calls before running them and replay them on resume, keyed by their call id.
+
+recall:
+  - id: card-budgets
+    concept: agents.run-budgets
+    front: What three budgets does an overnight agent run need, and when are they checked?
+    back: >-
+      Tokens, wall time and cost. All three are checked before every model call, and a run
+      that hits one stops with a named status.
+  - id: card-result-hash
+    concept: agents.stall-detection
+    front: Why hash tool results when you already check for repeated calls?
+    back: >-
+      An agent can vary its calls and still get the same answer every time. Matching result
+      hashes show no new information is arriving.
+  - id: card-call-id-key
+    concept: agents.checkpoint-and-resume
+    front: Why must a resumed run replay saved calls instead of asking the model again?
+    back: >-
+      A new reply brings new call ids, so idempotency keys don't match and side effects
+      repeat. Replaying keeps the original ids.
+  - id: card-generator-evaluator
+    concept: agents.generator-evaluator
+    front: In a generator and evaluator loop, why is the check a separate call?
+    back: >-
+      A writer grading its own work tends to pass it. A separate call with explicit criteria
+      gives an honest verdict to loop on.
+
+references:
+  - kind: essay
+    title: Effective harnesses for long-running agents
+    authors: Justin Young
+    year: 2025
+    venue: Anthropic Engineering
+    url: https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents
+    note: Progress files, checkpoints and fresh context windows for agents that work across many sessions.
+    primary: true
+    verified: false
+  - kind: essay
+    title: Building effective agents
+    authors: Erik Schluntz and Barry Zhang
+    year: 2024
+    venue: Anthropic Engineering
+    url: https://www.anthropic.com/engineering/building-effective-agents
+    note: The evaluator-optimizer workflow, and stopping conditions for agent loops.
+    verified: false
+  - kind: paper
+    title: "Self-Refine: Iterative Refinement with Self-Feedback"
+    authors: Aman Madaan et al.
+    year: 2023
+    venue: NeurIPS
+    note: A model drafting, critiquing and revising in a loop, with measured gains and limits.
+    verified: false
+  - kind: docs
+    title: Stop reasons and fallback
+    authors: Anthropic
+    venue: Claude Platform Docs
+    url: https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons
+    note: Every way a turn can end, which a long-running harness must handle on resume too.
+    primary: true
+    verified: false
+
+deepDive: >-
+  The challenge's loop ran in Python 3.12 against a scripted model that invents fresh call
+  ids on every request, as a real model does. No model was called.
+
+
+  **Advisory budgets.** Your harness enforces hard limits. Some APIs also let the model see
+  a budget. One provider's task budget, in beta, gives the model a token figure for the
+  whole agentic loop, with a minimum of 20,000. The model paces itself and wraps up instead
+  of being cut off mid-step. It's advisory: keep your own hard cap behind it.
+
+
+  **A partly finished turn.** A reply can ask for three tools, and the crash can come after
+  the first. Replaying all three is safe only because each tool honours its key. Read-only
+  tools can repeat freely. Tools that can't take a key, like an old email API, need a
+  record of "sent" written before the send, and a person to check the gap.
+
+
+  **Evaluators that can be gamed.** A generator that learns what the evaluator checks can
+  satisfy the letter of the criteria and miss the point. Mix deterministic checks, such as
+  length, links that resolve and quotes found in the transcript, with a model judge. Sample
+  some passes for a person to read.

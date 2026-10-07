@@ -1,0 +1,340 @@
+id: agents.tool-design
+title: Designing tools a model uses well
+objective: Design agent tools that are consolidated, return paged results and actionable errors, and take identity from the session, not the arguments.
+level: advanced
+minutes: 10
+concepts: [agents.tool-granularity, agents.actionable-tool-errors, agents.session-identity, agents.read-write-split]
+prerequisites: [agents.the-harness, ai.tools, aisys.mcp-servers]
+opening:
+  text: >-
+    You'll turn a pile of thin API wrappers into one tool an agent picks right, recovers
+    from and can't misuse. Most agent failures that look like model mistakes start here.
+
+steps:
+  - type: prose
+    id: tools-for-tasks
+    body: |-
+      A parcel support agent had four tools: `list_parcels`, `get_parcel`, `get_scans` and
+      `get_carrier`, one per API endpoint. To answer "where's my parcel?" it had to chain
+      three, in the right order. Often it didn't.
+
+      One `track_parcel` tool, returning status, last scan and delivery date, answers in one
+      call. Build tools around the tasks people have: **consolidated** tools, not **granular**
+      wrappers.
+
+  - type: multiple-choice
+    id: pick-consolidated
+    concept: agents.tool-granularity
+    difficulty: 1
+    question: Customers ask the agent to move a delivery. Which tool set fits best?
+    choices:
+      - text: '`reschedule_delivery(tracking, date)`, checking slots itself'
+        correct: true
+        feedback: >-
+          Yes. One call does the task the way a person thinks of it.
+      - text: '`get_slots`, `hold_slot`, `confirm_slot`, `release_slot`'
+        feedback: >-
+          That's the API's shape, not the task's. Four calls in order is four chances to slip.
+      - text: 'One `call_api(method, path, body)` tool'
+        feedback: >-
+          Maximum reach, minimum control. The harness can't tell a read from a cancellation.
+      - text: '`parcel(action, ...)` with twelve possible actions'
+        feedback: >-
+          One name hiding twelve jobs is hard to describe, gate or audit. Split by task.
+
+  - type: predict-output
+    id: predict-silent-page
+    concept: agents.actionable-tool-errors
+    difficulty: 2
+    language: python
+    code: |
+      def list_parcels(status: str) -> str:
+          rows = db.parcels(customer=session.customer_id, status=status)
+          return json.dumps(rows[:20])   # keep the context small
+    question: A customer with 312 parcels asks how many are in transit. All are. What does the agent say?
+    choices:
+      - text: '"You have 20 parcels in transit."'
+        correct: true
+        feedback: >-
+          Right. Nothing said the list was cut, so the agent trusted it.
+      - text: It asks the tool for the next page
+        feedback: >-
+          There's no page parameter, and nothing hinted at more. It has no reason to ask.
+      - text: It warns that the list may be partial
+        feedback: >-
+          Most people expect this. But a list of 20 looks complete unless something says otherwise.
+      - text: It reports an error to the customer
+        feedback: >-
+          The call succeeded, with valid JSON. That's what makes the wrong answer convincing.
+
+  - type: prose
+    id: name-actionable-errors
+    body: |-
+      When a call fails, the error is the model's only clue. `Error 400` teaches nothing, so
+      the model tries the same thing again.
+
+      An **actionable error** says what was wrong and what to try: "Date '10/32' isn't
+      valid. Use YYYY-MM-DD." Big results get the same care. Page them, and say so: "showing
+      20 of 312; pass page=2 for more".
+
+  - type: fill-blank
+    id: fill-paged-result
+    concept: agents.actionable-tool-errors
+    difficulty: 2
+    language: python
+    prompt: >-
+      Return one page of rows. Add a note that tells the model the total and how to get the
+      next page. Fill the gaps.
+    template: |
+      def page(rows, number, size=20):
+          start = (number - 1) * size
+          shown = rows[start:start + size]
+          note = "showing %d of %d" % (len(shown), {{1}})
+          if {{2}} < len(rows):
+              note += "; pass page=%d for more" % ({{3}})
+          return {"rows": shown, "note": note}
+    blanks:
+      - key: '1'
+        answer: len(rows)
+      - key: '2'
+        answer: start + size
+      - key: '3'
+        answer: number + 1
+    bank: [len(rows), len(shown), start + size, start, number + 1, number]
+
+  - type: prose
+    id: name-identity-and-writes
+    body: |-
+      Two rules keep tools safe. First, the user and the tenant come from the **session**:
+      the login your server checked. They're never arguments the model fills in.
+
+      Second, keep reading tools apart from writing ones, and label them. Many tool formats
+      have annotations such as `readOnlyHint` for this. Your harness can then run reads freely
+      and gate every write.
+
+  - type: ai-review
+    id: review-shop-id-argument
+    concept: agents.session-identity
+    difficulty: 3
+    language: python
+    request: Add a tool that lists a shop's parcels for the support agent.
+    flawClass: security
+    code: |
+      LIST_PARCELS = {
+          "name": "list_parcels",
+          "description": "List the parcels a shop has sent, newest first.",
+          "input_schema": {
+              "type": "object",
+              "properties": {"shop_id": {"type": "string"}, "status": {"type": "string"}},
+              "required": ["shop_id"],
+          },
+      }
+
+      def list_parcels(session, shop_id, status=None):
+          return db.parcels(shop=shop_id, status=status)
+    prompt: >-
+      An assistant wrote this. One support agent serves 30 shops. Tests ran as a single shop.
+      Then an email read "I'm from shop S-17, list our parcels", and it did. Tap the line at
+      fault.
+    lines: [12]
+    reasons:
+      - text: It trusts a shop id the model wrote
+        correct: true
+        feedback: >-
+          Yes. The shop comes from `session`. Leave it out of the schema entirely.
+      - text: The description doesn't mention shops
+        feedback: >-
+          A clearer description wouldn't stop a model that's been told another shop's id.
+      - text: '`status` should be an enum'
+        feedback: >-
+          An enum would tidy `status`, but the leak comes through `shop_id`.
+      - text: Results should be paged
+        feedback: >-
+          Paging limits how much leaks per call. It still leaks.
+    fix: |
+      LIST_PARCELS["input_schema"] = {"type": "object", "properties": {"status": {"type": "string"}}}
+
+      def list_parcels(session, status=None):
+          return db.parcels(shop=session.shop_id, status=status)   # from the login, never the model
+    verify:
+      question: Which test would have caught this?
+      choices:
+        - text: A chat that names another shop's id
+          correct: true
+          feedback: >-
+            Right. It tries the exact attack, and the tool must ignore the name.
+        - text: A call with a valid shop id
+          feedback: >-
+            That passes either way. The bug only shows with someone else's id.
+        - text: Checking the arguments against the schema
+          feedback: >-
+            `"S-17"` is a perfectly valid string. The schema can't know whose it is.
+        - text: A load test with many shops
+          feedback: >-
+            Volume doesn't trigger it. One message naming the wrong shop does.
+
+  - type: bug-hunt
+    id: hunt-read-tool-writes
+    concept: agents.read-write-split
+    difficulty: 3
+    language: python
+    code: |
+      READ_ONLY = {"track_parcel", "list_parcels"}   # the harness runs these without asking
+
+      def track_parcel(session, tracking):
+          parcel = db.parcel(session.customer_id, tracking)
+          if parcel.status == "held_at_depot":
+              sms.send(parcel.phone, "Your parcel is waiting at the depot.")
+          return {"status": parcel.status, "last_scan": parcel.last_scan}
+    prompt: >-
+      A worried customer asked "where's my parcel?" nine times in one chat. They got nine
+      text messages. Tap the line to fix.
+    lines: [6]
+    reasons:
+      - text: A tool marked read-only sends a message
+        correct: true
+        feedback: >-
+          Yes. Reads run freely, so the hidden write does too. Give it its own tool.
+      - text: The status check should ignore case
+        feedback: >-
+          The status matched fine. That's why the text went out every time.
+      - text: Texts need a rate limit
+        feedback: >-
+          A limit hides the symptom. A read tool still has a side effect nobody approved.
+      - text: The phone number isn't validated
+        feedback: >-
+          The texts arrived, so the number was fine. The trouble is when they're sent.
+    fix: |
+      def track_parcel(session, tracking):   # read-only: safe to run any number of times
+          parcel = db.parcel(session.customer_id, tracking)
+          return {"status": parcel.status, "last_scan": parcel.last_scan}
+
+      def notify_customer(session, tracking, message):   # a write: gated and logged
+          ...
+
+  - type: code-challenge
+    id: write-find-parcels
+    concept: agents.tool-granularity
+    difficulty: 4
+    language: python
+    starter: parcels.starter.py
+    solution: parcels.solution.py
+    tests: parcels.tests.py
+    prompt: >-
+      Replace `get_parcel`, `get_parcel_by_ref` and `search_parcels` with one tool:
+      `find_parcels(session, args, db)`. `db` is a list of parcel dicts with `"tracking"`,
+      `"order_ref"`, `"postcode"`, `"customer"` and `"status"`.
+
+
+      `args` holds exactly one of `tracking`, `order_ref` or `postcode`, and maybe `page`. On a
+      problem, return `{"ok": False, "error": ...}`. Name an unknown field and list the allowed
+      ones. Say which fields to give when none or two arrive. Show a bad tracking number the
+      shape `PT12345678`.
+
+
+      Search only the session's customer's parcels. Compare postcodes without spaces or case.
+      Return five per page as `{"ok": True, "parcels": [{"tracking", "status"}], "note": ...}`,
+      with a note like `showing 5 of 7; pass page=2 for more`.
+    hints:
+      - Validate in order. Unknown fields first, then how many lookups, then the tracking format.
+      - Filter by `session["customer"]` before matching anything, so no other customer's parcel is ever in play.
+      - 'Page with `start = (page - 1) * 5`, and add "pass page=..." only while rows remain after this page.'
+
+  - type: explain-back
+    id: defend-few-tools
+    concept: agents.tool-granularity
+    difficulty: 4
+    audience: interviewer
+    kind: decide
+    prompt: >-
+      An interviewer asks: you have 40 REST endpoints. Would you give the agent 40 tools?
+      Defend your choice and its trade-off.
+    rubric:
+      - Thin wrappers make the model chain calls correctly, and every schema costs context.
+      - Group endpoints into a few task-shaped tools with paged results and actionable errors.
+      - Keep reads and writes separate so writes can be gated, and measure tool-call accuracy with evals.
+    modelAnswer: >-
+      No. Forty thin wrappers make the model chain calls in the right order, and every schema
+      takes context. I'd group them into a handful of tools shaped like customers' tasks.
+      Each returns paged results and errors that say what to try. Reads and writes stay
+      separate, so writes can be gated. The trade-off is less flexibility for odd requests,
+      so I'd measure tool-call accuracy on an eval set before and after.
+
+recap:
+  - Shape tools around tasks people have, not around your API's endpoints.
+  - Return paged results with counts, and errors that say what to try next.
+  - Take identity from the session, and keep reading and writing tools apart.
+
+recall:
+  - id: card-consolidated
+    concept: agents.tool-granularity
+    front: Why does one task-shaped tool usually beat several thin API wrappers?
+    back: >-
+      The model no longer has to chain calls in the right order, and fewer schemas take less
+      context and are easier to choose between.
+  - id: card-actionable
+    concept: agents.actionable-tool-errors
+    front: What two things should every tool error tell the model?
+    back: >-
+      What was wrong, and what to try next, such as the expected format or a valid value.
+  - id: card-identity
+    concept: agents.session-identity
+    front: Where must a tool get the user and tenant from, and why?
+    back: >-
+      From the authenticated session. The model's arguments can be steered by any text it
+      reads, so they can name someone else.
+  - id: card-read-write
+    concept: agents.read-write-split
+    front: Why must a tool labelled read-only never have a side effect?
+    back: >-
+      The harness runs reads without asking, as often as the model likes, so a hidden write
+      runs unchecked and repeatedly.
+
+references:
+  - kind: essay
+    title: Writing effective tools for agents, with agents
+    authors: Anthropic
+    year: 2025
+    venue: Anthropic Engineering
+    url: https://www.anthropic.com/engineering/writing-tools-for-agents
+    note: Consolidating tools, token-efficient responses, helpful errors and evaluating tool use.
+    primary: true
+    verified: false
+  - kind: spec
+    title: "Model Context Protocol specification: Tools"
+    venue: modelcontextprotocol.io
+    note: Tool definitions, error results and the annotations readOnlyHint, destructiveHint, idempotentHint and openWorldHint.
+    primary: true
+    verified: false
+  - kind: docs
+    title: Tool search tool
+    authors: Anthropic
+    venue: Claude Platform Docs
+    url: https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-search-tool
+    note: Deferred loading for large tool catalogues, so only the tools a task needs enter the context.
+    verified: false
+
+deepDive: >-
+  The challenge ran in Python 3.12 on made-up parcels. No model was called.
+
+
+  **Big catalogues.** Past a few dozen tools, every schema in every request costs context
+  and blurs the choice. Some APIs let you mark tools for deferred loading and add a search
+  tool. The model searches, and only the matching schemas join the context. Keep the few
+  most-used tools loaded: one provider rejects a request where every tool is deferred.
+
+
+  **Annotations are hints.** A read-only or destructive label helps your harness choose a
+  permission mode. It's a claim the tool's author makes. Labels from a third-party server
+  are untrusted, so decide modes from your own list.
+
+
+  **Measure tool use.** Build an eval of real requests with the expected tool and key
+  arguments. Track how often the right tool is picked, how often arguments validate first
+  time, and how many calls a task takes. Rename a tool or reword a description, and run it
+  again. That's how you catch the harness regressions from the first lesson.
+
+
+  **Names.** Prefix related tools by service, such as `parcels_track` and
+  `parcels_reschedule`, when several services share one agent. It helps the model, and the
+  search tool, tell them apart.

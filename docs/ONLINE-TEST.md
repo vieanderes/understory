@@ -31,7 +31,7 @@ Matches:
 - **Employer report.** Named test groups with a verdict per case, the detected time
   complexity, a code playback, integrity signals and the assistant transcript.
 - **Task types.** Algorithmic, coding (correctness only) and bug-fix (limited changed lines).
-- **Test shapes.** A 30-minute demo, 90 to 120-minute screens, and 120-minute training on one
+- **Test shapes.** A 30-minute demo, 70 to 120-minute screens, and 120-minute training on one
   task, as in the platforms' training lessons.
 
 Differs on purpose:
@@ -175,9 +175,11 @@ Generator kinds (`src/core/online-test/generate.ts`):
 
 - Tasks are original. Use the platform's syllabus families (`topic`), never its task text or
   names. The examples are generic (law 10). Beyond the algorithm families, `topic` takes
-  `api-integration`, `reliability`, `data-sync`, `ai-systems`, `agents` and `evals` for
-  coding and bug-fix tasks from the later chapters (`TOPICS` in
-  `src/core/online-test/schema.ts`).
+  the engineering families `api-integration` (paging, webhooks), `reliability` (rate limits,
+  retries, sagas), `data-sync` (snapshot diffs), `ai-systems` (redaction before a model),
+  `agents` (tool-call guards, agent loops) and `evals` (pass@k and pass^k) for tasks from
+  the later chapters (`TOPICS` in `src/core/online-test/schema.ts`). They are usually
+  `coding`; make one `algorithmic` only when a naive version really times out.
 - Titles are one CamelCase word.
 - `pnpm validate:content` runs the gates: expected values agree with the reference, Python
   agrees with TypeScript, the speed limits hold, the brute force behaves, and bug-fix limits
@@ -186,10 +188,43 @@ Generator kinds (`src/core/online-test/generate.ts`):
 Preset tests live in `content/online-tests/tests/<id>.yaml` (`presetFileSchema`):
 
 - `id`, `title`, `summary`
-- `mode` (`demo`, `screen` or `ai`)
-- `order`, `minutes`, `tasks`
+- `mode`, one of four:
+  - `demo`: one easy task with no assistant and no proctoring, to learn the screen;
+  - `screen`: a timed first round of two or three tasks, assistant off, proctored;
+  - `ai`: the same shape with the assistant on, so the report shows the conversation as a
+    reviewer reads it;
+  - `mock`: a full 90-minute mock of three tasks under real conditions;
+- `order`, `minutes`, `tasks` (at most four)
 - `languages` (optional; default is all three)
 - `assistant`, `proctoring`
+
+### The task bank
+
+40 tasks. 30 are algorithmic, coding and bug-fix tasks across the platform's syllabus
+families. Ten are practical engineering tasks, all `coding` except the two with a real
+performance trap, which are `algorithmic` and ship a `brute.ts`:
+
+| Task                | Topic             | Difficulty | Type        | Signature                                                   |
+| ------------------- | ----------------- | ---------- | ----------- | ----------------------------------------------------------- |
+| `token-bucket-gate` | `reliability`     | easy       | coding      | `(C: int, R: int, T: int[]) -> int[]`                       |
+| `retry-plan`        | `reliability`     | easy       | coding      | `(A: string[], B: int, C: int, M: int) -> string[]`         |
+| `stable-cursor`     | `api-integration` | medium     | coding      | `(R: int[][], C: int[], P: int) -> int[]`                   |
+| `delta-diff`        | `data-sync`       | medium     | algorithmic | `(P: int[][], F: int[][], Q: int, T: int) -> string[]`      |
+| `webhook-ledger`    | `api-integration` | medium     | algorithmic | `(E: int[], D: int[], V: int[], X: int[]) -> int[][]`       |
+| `saga-steps`        | `reliability`     | medium     | coding      | `(S: string[], R: int[], U: int[]) -> string[]`             |
+| `scripted-agent`    | `agents`          | medium     | coding      | `(T: string[], W: string[], A: string[], K: int) -> string` |
+| `tool-call-check`   | `agents`          | easy       | coding      | `(R: string[], C: string[]) -> string[]`                    |
+| `redact-records`    | `ai-systems`      | medium     | coding      | `(L: string[]) -> string[]`                                 |
+| `eval-scorer`       | `evals`           | medium     | coding      | `(B: string[], C: string[], D: int) -> string[]`            |
+
+The value types allow no objects, so a record is a row of an `int[][]`, parallel `int[]`
+arrays (when the generators must build it: they have no kind for wider rows), or a string of
+space-separated words; a structured result is a `string[]` of fixed-format lines. Every
+statement spells out that format and the order of the rules.
+
+Presets: `demo`; `screen-a` to `screen-d`; `practical-screen` (screen, 70 minutes:
+`token-bucket-gate`, `stable-cursor`, `saga-steps`); `ai-screen` and `agent-screen` (ai,
+90 minutes: `tool-call-check`, `scripted-agent`, `eval-scorer`); `mock-a` to `mock-c`.
 
 ## 6. The assistant
 

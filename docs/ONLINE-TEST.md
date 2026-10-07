@@ -195,7 +195,7 @@ Preset tests live in `content/online-tests/tests/<id>.yaml` (`presetFileSchema`)
 
 A panel like the platforms' built-in AI assistant, in the left rail of every test. The test's own setting,
 or the box on the intro page, only decides whether it opens by itself at the start. Every
-message goes into the transcript the report shows, as the reviewer would read it. Three
+message goes into the transcript the report shows, as the reviewer would read it. Four
 providers sit behind `src/core/ports/assistant.ts`:
 
 1. **Your Claude account, through MCP.** No API key. Connect Claude to the simulator's MCP
@@ -233,6 +233,13 @@ providers sit behind `src/core/ports/assistant.ts`:
 3. **Claude Code on this machine.** Only when the app runs on your machine (`pnpm dev`, or
    `ASSISTANT_LOCAL_CLI=1 pnpm start`): `/api/assistant/local` runs `claude -p` with the
    account logged in there.
+4. **OpenAI-compatible (Ollama, LM Studio, Mistral, Groq, OpenRouter, OpenAI).** Connects to any
+   service exposing standard `/v1/chat/completions`. Set the base URL (e.g. `http://localhost:11434`,
+   `http://localhost:1234/v1`, `https://api.openai.com/v1`), model name, and optional API key.
+   Local endpoints (`localhost`, `127.0.0.1`, `[::1]`) are called directly from the browser so
+   local models work seamlessly even when Understory is deployed to Vercel/cloud. Remote endpoints
+   stream through `/api/assistant/compatible` to avoid browser CORS restrictions, and keys are
+   never stored on the server.
 
 ### How it stays safe
 

@@ -50,11 +50,17 @@ import {
   refreshMcpStatus,
   rotatePairing,
   claudeClientStore,
+  openAiUrlStore,
+  openAiKeyStore,
+  openAiModelStore,
   useApiKey,
   useClaudeClient,
   useLocalCliAvailability,
   useMcpStatus,
   useModel,
+  useOpenAiKey,
+  useOpenAiModel,
+  useOpenAiUrl,
   useOrigin,
   usePairing,
   useProvider,
@@ -145,6 +151,9 @@ function defaultCreatePort(id: AssistantProviderId): AssistantPort {
     getKey: keyStore.get,
     pairing: readPairing(),
     model: readModel,
+    getOpenAiUrl: openAiUrlStore.get,
+    getOpenAiKey: openAiKeyStore.get,
+    getOpenAiModel: openAiModelStore.get,
   });
 }
 
@@ -235,7 +244,7 @@ function Step({ n, title, children }: { n: number; title: string; children: Reac
  * The ways to reach Claude, as the learner thinks of them: where they use Claude. The Claude
  * app and Claude Code share one connection (MCP) and differ only in how it is set up.
  */
-type Choice = ClaudeClient | 'claude-cli' | 'api-key';
+type Choice = ClaudeClient | 'claude-cli' | 'api-key' | 'openai-compatible';
 
 const CHOICES: Record<Choice, { label: string; hint: string }> = {
   app: { label: 'Claude app', hint: 'Web, desktop or phone. Connect once, then just ask here.' },
@@ -248,6 +257,10 @@ const CHOICES: Record<Choice, { label: string; hint: string }> = {
     hint: 'Already signed in on this computer. Nothing to set up.',
   },
   'api-key': { label: 'An API key', hint: 'No Claude plan? Pay per question with your own key.' },
+  'openai-compatible': {
+    label: 'OpenAI-compatible',
+    hint: 'Ollama, LM Studio, Mistral, Groq, OpenRouter, or OpenAI.',
+  },
 };
 
 function ProviderChoice({
@@ -264,8 +277,8 @@ function ProviderChoice({
   const name = useId();
   // Where nothing needs setting up, that comes first and is the one to pick.
   const options: Choice[] = cliAvailable
-    ? ['claude-cli', 'app', 'code', 'api-key']
-    : ['app', 'code', 'api-key'];
+    ? ['claude-cli', 'app', 'code', 'api-key', 'openai-compatible']
+    : ['app', 'code', 'api-key', 'openai-compatible'];
   const recommended = options[0];
   return (
     <fieldset disabled={disabled} className="flex min-w-0 flex-col gap-1">
@@ -358,13 +371,19 @@ function ProviderSetup({
 }) {
   const keyId = useId();
   const modelId = useId();
+  const urlId = useId();
+  const oaiModelId = useId();
+  const oaiKeyId = useId();
   const apiKey = useApiKey();
   const model = useModel();
+  const openAiUrl = useOpenAiUrl();
+  const openAiModel = useOpenAiModel();
+  const openAiKey = useOpenAiKey();
   const origin = useOrigin();
   const { code: pairing } = usePairing();
 
   const modelField =
-    provider === 'mcp' ? null : (
+    provider === 'mcp' || provider === 'openai-compatible' ? null : (
       <div>
         <label htmlFor={modelId} className="t-label">
           Model
@@ -383,6 +402,74 @@ function ProviderSetup({
         </select>
       </div>
     );
+
+  if (provider === 'openai-compatible') {
+    return (
+      <div className="flex flex-col gap-2">
+        <div>
+          <label htmlFor={urlId} className="t-label">
+            Base URL
+          </label>
+          <input
+            id={urlId}
+            type="text"
+            autoComplete="off"
+            spellCheck={false}
+            value={openAiUrl}
+            placeholder="http://localhost:11434/v1"
+            onChange={(event) => {
+              onEdit();
+              openAiUrlStore.set(event.target.value.trim());
+            }}
+            className={cn(FIELD, 'mt-0.5 h-5 font-mono')}
+          />
+          <p className="text-muted mt-0.5 text-sm text-pretty">
+            Ollama, LM Studio, Mistral, Groq, OpenRouter or OpenAI. Local models on localhost are
+            called directly.
+          </p>
+        </div>
+        <div>
+          <label htmlFor={oaiModelId} className="t-label">
+            Model
+          </label>
+          <input
+            id={oaiModelId}
+            type="text"
+            autoComplete="off"
+            spellCheck={false}
+            value={openAiModel}
+            placeholder="llama3.2, mistral, gpt-4o-mini..."
+            onChange={(event) => {
+              onEdit();
+              openAiModelStore.set(event.target.value.trim());
+            }}
+            className={cn(FIELD, 'mt-0.5 h-5 font-mono')}
+          />
+        </div>
+        <div>
+          <label htmlFor={oaiKeyId} className="t-label">
+            API key (optional)
+          </label>
+          <input
+            id={oaiKeyId}
+            type="password"
+            autoComplete="off"
+            spellCheck={false}
+            value={openAiKey}
+            placeholder="Optional for local Ollama"
+            onChange={(event) => {
+              onEdit();
+              openAiKeyStore.set(event.target.value.trim());
+            }}
+            className={cn(FIELD, 'mt-0.5 h-5 font-mono')}
+          />
+          <p className="text-muted mt-0.5 text-sm text-pretty">
+            Leave empty for local Ollama or LM Studio. Kept in this browser only.
+          </p>
+        </div>
+      </div>
+    );
+  }
 
   if (provider === 'api-key') {
     return (
@@ -559,6 +646,8 @@ export function AssistantPanel({
   const client = useClaudeClient();
   const cli = useLocalCliAvailability();
   const apiKey = useApiKey();
+  const openAiUrl = useOpenAiUrl();
+  const openAiModel = useOpenAiModel();
   const pairing = usePairing();
   // A remembered local provider falls back while it is unavailable (another machine).
   const provider: AssistantProviderId =
@@ -577,7 +666,11 @@ export function AssistantPanel({
 
   const mcpStatus = useMcpStatus(provider === 'mcp' && !createPort);
   const ready =
-    provider === 'api-key' ? apiKey.length > 0 : !(provider === 'mcp' && mcpStatus.unavailable);
+    provider === 'api-key'
+      ? apiKey.length > 0
+      : provider === 'openai-compatible'
+        ? openAiUrl.trim().length > 0 && openAiModel.trim().length > 0
+        : !(provider === 'mcp' && mcpStatus.unavailable);
   // Open by itself until the provider is ready; after that the candidate decides.
   const setupOpen = setupChoice ?? !ready;
   const busy = streaming !== null;
@@ -670,7 +763,9 @@ export function AssistantPanel({
         : CHOICES[client].label
       : provider === 'claude-cli'
         ? 'Claude on this machine'
-        : 'Your API key';
+        : provider === 'openai-compatible'
+          ? 'OpenAI-compatible'
+          : 'Your API key';
   // For a Claude app, green means it is listening: a question gets an answer by itself.
   const live = provider === 'mcp' ? mcpStatus.listening : ready;
 

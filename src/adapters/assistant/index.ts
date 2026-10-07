@@ -1,10 +1,24 @@
 import type { AssistantPort, AssistantProviderId } from '@/core/ports/assistant';
 import { createApiKeyPort, createLocalCliPort } from './http-ports';
 import { createMcpPort } from './mcp-port';
+import { createOpenAiCompatiblePort } from './openai-compatible';
 import type { Pairing } from './pairing';
 import type { AssistantModel } from './protocol';
 
 export { createApiKeyPort, createLocalCliPort, localCliAvailable } from './http-ports';
+export {
+  buildOpenAiChatRequest,
+  createOpenAiCompatiblePort,
+  DEFAULT_OLLAMA_URL,
+  DEFAULT_OPENAI_MODEL,
+  isLocalUrl,
+  mapOpenAiStatus,
+  readOpenAiStream,
+  resolveCompletionsUrl,
+  type OpenAiChatMessage,
+  type OpenAiChatRequest,
+  type OpenAiPortOptions,
+} from './openai-compatible';
 export {
   createMcpPort,
   decideMcpConnection,
@@ -23,6 +37,10 @@ export interface AssistantPortSettings {
   pairing: Pairing;
   model?: () => AssistantModel | undefined;
   fetcher?: typeof fetch;
+  getOpenAiUrl?: () => string;
+  getOpenAiKey?: () => string;
+  getOpenAiModel?: () => string;
+  course?: string;
 }
 
 /** The browser adapter for a provider. */
@@ -41,5 +59,13 @@ export function createAssistantPort(
       return createLocalCliPort({ model: settings.model, fetcher: settings.fetcher });
     case 'mcp':
       return createMcpPort({ pairing: settings.pairing, fetcher: settings.fetcher });
+    case 'openai-compatible':
+      return createOpenAiCompatiblePort({
+        getBaseUrl: settings.getOpenAiUrl ?? (() => ''),
+        getKey: settings.getOpenAiKey ?? (() => ''),
+        getModel: settings.getOpenAiModel ?? (() => ''),
+        fetcher: settings.fetcher,
+        course: settings.course,
+      });
   }
 }

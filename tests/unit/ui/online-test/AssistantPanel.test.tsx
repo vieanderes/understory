@@ -290,4 +290,38 @@ describe('AssistantPanel', () => {
       await screen.findByRole('radio', { name: /Claude Code on this machine/ }),
     ).toBeInTheDocument();
   });
+
+  it('allows selecting OpenAI-compatible, entering base URL, model, and optional key', async () => {
+    const user = userEvent.setup();
+    const ids: AssistantProviderId[] = [];
+    render(
+      <Harness
+        createPort={(id) => {
+          ids.push(id);
+          return controllablePort().port;
+        }}
+      />,
+    );
+    await user.click(screen.getByRole('button', { name: /Assistant settings/ }));
+    await user.click(screen.getByRole('radio', { name: /OpenAI-compatible/ }));
+    expect(window.localStorage.getItem('understory:assistant:provider')).toBe('openai-compatible');
+    expect(ids.at(-1)).toBe('openai-compatible');
+
+    const urlInput = screen.getByLabelText('Base URL');
+    const modelInput = screen.getByLabelText('Model');
+    const keyInput = screen.getByLabelText('API key (optional)');
+
+    await user.type(urlInput, 'http://localhost:11434');
+    await user.type(modelInput, 'llama3.2');
+    await user.type(keyInput, 'ollama-secret');
+
+    expect(window.localStorage.getItem('understory:assistant:openai:url')).toBe(
+      'http://localhost:11434',
+    );
+    expect(window.localStorage.getItem('understory:assistant:openai:model')).toBe('llama3.2');
+    expect(window.localStorage.getItem('understory:assistant:openai:key')).toBe('ollama-secret');
+
+    await user.type(screen.getByLabelText('Ask the assistant'), 'Hello local');
+    expect(screen.getByRole('button', { name: 'Send' })).toBeEnabled();
+  });
 });

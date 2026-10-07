@@ -153,7 +153,7 @@ describe('Python messages', () => {
     v: 1,
     type: 'python-assets',
     runId: 'r1',
-    version: '0.27.8',
+    version: '0.29.5',
     loader: bytes(4),
     runtime: bytes(4),
     wasm: bytes(4),
@@ -187,7 +187,7 @@ describe('Python messages', () => {
       v: 1,
       type: 'python-packages',
       runId: 'r1',
-      files: { 'numpy-2.0.2-cp312-cp312-pyodide_2024_0_wasm32.whl': bytes(4) },
+      files: { 'numpy-2.2.5-cp313-cp313-pyemscripten_2025_0_wasm32.whl': bytes(4) },
     };
     expect(parseParentMessage(wheels)?.type).toBe('python-packages');
     expect(

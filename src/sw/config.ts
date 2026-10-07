@@ -27,9 +27,9 @@ export const CACHES = {
    * Pyodide, about 13 MB, kept after the first Python run and never precached: most
    * learners never run Python. Its own cache, because the static cache is pruned to the
    * current build's files on every activate. The wheels of numpy, pandas and pydantic
-   * (11 MB for all three) join it on the first run that imports each.
+   * (10 MB for all three) join it on the first run that imports each.
    */
-  python: 'understory-python-v1',
+  python: 'understory-python-v2',
   /**
    * The TypeScript checker worker, about 1 MB compressed, kept after the first TypeScript
    * challenge and never precached, for the same reasons as Python.

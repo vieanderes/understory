@@ -234,7 +234,7 @@ export const codeChallengeStepSchema = z.strictObject({
   language: z
     .enum(['js', 'ts', 'tsx', 'python'])
     .describe(
-      'python runs through Pyodide (Python 3.12). tsx is a React component challenge. Name their .py or .tsx files below.',
+      'python runs through Pyodide (Python 3.13). tsx is a React component challenge. Name their .py or .tsx files below.',
     ),
   /**
    * Sibling files of lesson.yaml. TypeScript and JavaScript files are linted and

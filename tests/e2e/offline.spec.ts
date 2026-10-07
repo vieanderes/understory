@@ -262,7 +262,7 @@ test.describe('code offline', () => {
         Boolean(await (await caches.open(cache)).match(key));
       return {
         runtime: await has('understory-static-v1', '/sandbox/react-runtime.v1.js'),
-        pyodide: await has('understory-python-v1', '/pyodide/0.27.8/pyodide.asm.wasm'),
+        pyodide: await has('understory-python-v2', '/pyodide/0.29.5/pyodide.asm.wasm'),
       };
     });
     expect(cached).toEqual({ runtime: true, pyodide: true });

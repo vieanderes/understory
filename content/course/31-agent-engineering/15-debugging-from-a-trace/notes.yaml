@@ -1,0 +1,169 @@
+summary: >-
+  Sooner or later a user tells you the agent did something wrong: it booked the wrong date,
+  refunded the wrong order, quoted a policy that doesn't apply. The agent can't tell you why,
+  and running it again may not repeat the mistake. What you need is a record of what it
+  decided at each step and what it saw when it decided.
+
+
+  That record is a **decision log**: per step, the tool, its arguments, the documents
+  retrieved with their ids and scores, and the reason the model wrote before acting, with
+  personal data redacted on the way in. It extends the span tree from Watching agents in
+  production with the content of each decision, not only its timing and cost.
+
+
+  Debugging is then a loop you can repeat. Walk the trace from the top and find the first
+  step whose inputs were right and whose output was wrong. Form a hypothesis about the
+  cause, and check it against what was recorded: the prompt, a vague tool contract,
+  retrieval that missed the right document, or ordinary code. Fix the root cause, not the
+  symptom. Replay the failing run against the fix, several times, and add it to the eval
+  set as a regression case so it can't come back unnoticed.
+remember:
+  - A decision log records, for every step, the tool, its arguments, the retrieved document ids and scores, and the model's stated reason.
+  - Redact personal data before the record leaves the process, with stable keyed tokens so one user can still be followed across steps.
+  - The first step with good inputs and a bad output is where a run broke; everything after it is a consequence.
+  - Check each hypothesis against the recorded inputs, because the model usually did something reasonable with what it was given.
+  - The four usual root causes are the prompt, a vague tool contract, retrieval that missed the right document, and code.
+  - A vague contract makes the model fill the gap, so fix it in the schema with a format, enum, unit or sharper description, and enforce it in the tool.
+  - Adding "be careful" to the prompt makes a right guess likelier, never certain, and it hides the gap from the next person.
+  - A fix counts once the failing run replays to the right outcome repeatedly and sits in the eval set as a regression case.
+sections:
+  - title: What to log, and what to leave out
+    body: |-
+      A decision log answers one question for any step: what did the agent know, and what
+      did it do with it? That needs five fields per step, beside the run id, step number and
+      versions already on the span.
+
+      - **Tool and arguments**, exactly as the model wrote them, before your code converts
+        anything. If your code parses `"03/04/2026"` into a date object first, the log shows
+        the parsed value and the ambiguity disappears.
+      - **Retrieved documents**: ids, scores and rank, including a few just below the cut.
+        "kb-48 ranked fourth with k=3" is a finding; "three documents were used" is not.
+      - **The model's stated reason**: the text it wrote just before the call. It isn't proof
+        of what drove the choice, but it shows what the model believed it was doing.
+      - **The tool result**, trimmed, with any error.
+      - **What the user asked**, redacted, so you can tell a misread request from a misread
+        tool.
+
+      Personal data goes through a redactor before the record is written. A keyed hash keeps
+      one person traceable without storing who they are. Keep enough of the hash, here 12 hex
+      characters, that two guests don't share a token.
+
+      ```ts
+      import { createHmac } from 'node:crypto';
+
+      const KEY = 'from-a-secret-store';
+      const token = (kind: string, value: string) =>
+        `<${kind}:${createHmac('sha256', KEY).update(value).digest('hex').slice(0, 12)}>`;
+
+      function redact(args: Record<string, unknown>): Record<string, unknown> {
+        const out: Record<string, unknown> = {};
+        for (const [k, v] of Object.entries(args)) {
+          out[k] = typeof v === 'string' && v.includes('@') ? token('email', v) : v;
+        }
+        return out;
+      }
+
+      console.log(redact({ guest: 'sam@example.com', date: '03/04/2026' }));
+      // { guest: '<email:8c8743cc4e50>', date: '03/04/2026' }, the same token every time
+      ```
+
+      Real redactors detect more than emails: phone numbers, card numbers, names from your
+      own user table. Keep the full transcript, if at all, in a separate store with access
+      control and short retention.
+  - title: Reading a trace to a root cause
+    body: |-
+      Start at the symptom, then go back to the top and read forwards. For each step, ask
+      whether its inputs were right and whether its output was right. The first step with
+      good inputs and a bad output is the break. Every later step is a consequence, which is
+      why the step where the problem shows (a booking for 4 March) is rarely where it
+      started (a date string that reads two ways).
+
+      Then name a suspect and test it against the record, not against your expectations.
+
+      - **Prompt.** The instructions say one thing and the model did another, or the
+        instructions conflict. Check: does the system prompt actually say what you assumed?
+      - **Tool contract.** The arguments are plausible but wrong, and the schema allowed both
+        readings. Check: could a careful person, reading only the tool definition, have
+        written the same value? If yes, the contract is vague.
+      - **Retrieval.** The answer was faithful to the documents it got, and the right
+        document wasn't among them. Check: where did the right document rank?
+      - **Code.** The model asked for the right thing and your code did something else: a
+        parser, a timezone conversion, a missing ownership check. Check: compare the logged
+        arguments with what the downstream system received.
+
+      Often two causes stack. A vague `id` let the model pass a customer number, and a
+      missing ownership check let the refund go through. Fix both, and record both.
+  - title: Fix, replay, keep
+    body: |-
+      The fix goes where the cause lives. A rule about one argument belongs in that tool's
+      schema and description, which the model reads at the moment it writes the call, and
+      in the tool's own validation, which holds even when the model ignores it.
+
+      ```json
+      "date": {
+        "type": "string",
+        "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+        "description": "Check-in date as YYYY-MM-DD, in the hotel's local time."
+      }
+      ```
+
+      Then replay. Feed the fixed agent the same user message and the recorded tool results,
+      as in Watching agents in production. Replay more than once: a model is not
+      deterministic, and a prompt-only fix can pass one replay by luck. A replay can also
+      diverge: the new validation rejects `03/04/2026`, the model retries with a valid date,
+      and the recording has no answer for that call. Grade the end state in the eval sandbox
+      from Evaluating an agent, as Watching agents in production describes.
+
+      Last, keep the case. Add the redacted input, the expected end state (a booking for
+      3 April) and a tag for the cause to the eval set. From then on, every prompt, model or
+      tool change runs it before release. Eval sets grown from real failures, as in Evals in
+      depth, are the ones that catch real regressions.
+pitfalls:
+  - '**Fixing the symptom in the prompt.** "Be careful with dates" feels like a fix and passes one replay. The contract still allows two readings, so tighten the schema and validate in the tool.'
+  - '**Logging the parsed value instead of the raw argument.** Once your code has turned a string into a date, the ambiguity is gone from the log. Log what the model wrote, then what you did with it.'
+  - '**Logging only the documents that were used.** A retrieval miss is invisible without the ranks just below the cut. Log ids, scores and rank for a few beyond k.'
+  - '**Stopping at the step where the problem shows.** The wrong booking appears in the result, but the result was faithful to its input. Walk back to the first bad output.'
+  - '**Redacting in a nightly job.** By then the raw data has reached log storage, backups and maybe a vendor. Redact before the record leaves the process.'
+  - '**Calling one passing replay proof.** Models vary run to run. Replay several times, then keep the case in the eval set.'
+verify:
+  - lens: tests
+    check: The failing run replays to the right outcome at least ten times in a row before the fix is called done.
+  - lens: tests
+    check: Every fixed incident becomes a redacted eval case tagged with its root cause, and the eval suite runs before each release.
+  - lens: leaks
+    check: Emails, names and card numbers are replaced with keyed tokens before any decision log record is written or shipped.
+  - lens: confuses
+    check: Every date, amount and id parameter states its format, unit or kind in the schema, so neither the model nor a teammate has to guess.
+  - lens: breaks
+    check: Logs store the model's raw arguments before parsing, so a misread value is still visible when someone investigates.
+interview:
+  - question: A user says your agent refunded the wrong order. How do you debug it?
+    answer: >-
+      I find the run in the decision log and walk it from the top until I hit the first
+      step with good inputs and a bad output. Say the model passed `48213` to `refund(id)`,
+      and that's the customer number from the message. Then I test hypotheses against the
+      record: was the prompt wrong, was the contract vague, did retrieval miss something, or
+      did code mangle a correct call? Here the schema's `id` could mean either number, so
+      the contract is the root cause, and the missing ownership check is a second cause in
+      code. I rename the field to `order_id`, describe it, check ownership in the tool,
+      replay the run several times and add it to the eval set. What I avoid is a prompt
+      line saying "use the right id".
+  - question: What would you log for each step of an agent so failures can be explained later?
+    answer: >-
+      The tool, its raw arguments, the retrieved document ids with scores and ranks, the
+      model's stated reason, and the trimmed result, on top of the run id and versions. Raw
+      arguments matter because parsing hides ambiguity. Ranks just below the cut matter
+      because a retrieval miss is otherwise invisible. Personal data is redacted at write
+      time with keyed tokens, so one user stays traceable without being identifiable, and
+      full transcripts live in a separate, access-controlled store with short retention.
+      The trade-off is volume and cost, which I manage with tail sampling for traces but
+      never for the decisions of failed or flagged runs.
+  - question: How do you know a fix to an agent actually worked?
+    answer: >-
+      I replay the failing run against the fix, with the recorded user input and tool
+      results, and check the end state, not the wording of the reply. Once isn't enough:
+      the model isn't deterministic, and a weak fix can pass by luck, so I replay it
+      several times and want it to pass every time. Then the case goes into the eval set
+      with its root cause tagged, so every future prompt, model or tool change has to pass
+      it too. If the fixed agent takes a different path the recording can't answer, I grade
+      the outcome in the eval sandbox instead.

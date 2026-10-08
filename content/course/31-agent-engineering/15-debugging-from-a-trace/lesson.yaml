@@ -1,0 +1,378 @@
+id: agents.debugging-from-a-trace
+title: Debugging an agent from its trace
+objective: Log every decision with its tool, arguments, retrieved context and reason, trace a failure to its root cause, fix it and prove the fix by replaying the trace.
+level: advanced
+minutes: 10
+concepts: [agents.decision-logs, agents.trace-to-root-cause, agents.fix-and-replay]
+prerequisites: [agents.watching-agents, agents.evals-for-agents, agents.tool-design]
+opening:
+  text: >-
+    You'll take a report that your agent booked the wrong day, and find the step and the
+    cause. Then you'll fix it so it stays fixed.
+
+steps:
+  - type: prose
+    id: name-decision-log
+    body: |-
+      A guest asked your hotel agent for 3 April. It booked 4 March. Can you say why?
+
+      Only if every step left a **decision log**: the tool, its arguments, the documents
+      retrieved with their scores, and the reason the model wrote before acting. A run's
+      logs, in order, are its **trace**.
+
+      ```json
+      {"run": "r-88", "step": 3, "tool": "book_room",
+       "args": {"hotel": "h-204", "date": "03/04/2026", "nights": 2, "guest": "<email:7f3a>"},
+       "retrieved": [{"doc": "kb-31", "score": 0.88}],
+       "reason": "Booking 3 April as asked."}
+      ```
+
+      Personal data goes through `redact()` first. An email becomes a stable token, so you
+      can still follow one guest.
+
+  - type: multiple-choice
+    id: pick-logged-args
+    concept: agents.decision-logs
+    difficulty: 1
+    question: Which logged field shows what the agent actually sent to the booking system?
+    choices:
+      - text: The tool's arguments
+        correct: true
+        feedback: >-
+          Yes. `"date": "03/04/2026"` is the exact string the booking system received.
+      - text: The model's final reply
+        feedback: >-
+          The reply said 3 April. That's what it meant, not what it sent.
+      - text: The step's latency
+        feedback: >-
+          Latency says how long it took. It can't say which date went out.
+      - text: The retrieved documents
+        feedback: >-
+          Those are what the model read. The arguments are what it wrote.
+
+  - type: fill-blank
+    id: fill-decision-log
+    concept: agents.decision-logs
+    difficulty: 2
+    language: ts
+    prompt: >-
+      Log one step. `said` holds what the model wrote right before the call. Mask personal
+      data in the arguments, and keep each document's id and score, not its text.
+    template: |
+      log.write({
+        run: run.id,
+        step: n,
+        tool: call.name,
+        args: {{1}}(call.input),
+        retrieved: hits.map((hit) => ({ doc: hit.id, score: {{2}} })),
+        reason: {{3}},
+      });
+    blanks:
+      - key: '1'
+        answer: redact
+      - key: '2'
+        answer: hit.score
+      - key: '3'
+        answer: said
+    bank: [redact, JSON.stringify, hit.score, hit.text, said, call.id]
+
+  - type: prose
+    id: read-the-trace
+    body: |-
+      Read the trace from the top. At each step ask two things. Were its inputs right? Was
+      its output right?
+
+      The first step with good inputs and a bad output is where it broke. Guess why, then
+      check the guess against the record. Four usual suspects: the **prompt**, a vague
+      **tool contract**, **retrieval** that missed the right document, or plain **code**. A
+      tool contract is its name, description and schema.
+
+  - type: bug-hunt
+    id: hunt-bad-step
+    concept: agents.trace-to-root-cause
+    difficulty: 2
+    language: text
+    code: |
+      1  model      said "Two nights from 3 April, hotel h-204."
+      2  search     "check-in rules"  -> kb-31 0.88, kb-07 0.64
+      3  book_room  {"hotel": "h-204", "date": "03/04/2026", "nights": 2, "guest": "<email:7f3a>"}
+      4  result     {"booking": "B-5521", "check_in": "2026-03-04"}
+      5  model      said "Booked: two nights from 3 April."
+    prompt: >-
+      Here's the guest's trace. Tap the first step with good inputs and a bad output.
+    lines: [3]
+    reasons:
+      - text: The date it sent reads two ways
+        correct: true
+        feedback: >-
+          Yes. 03/04 is 3 April to the guest, 4 March to the booking system.
+      - text: The booking system misread a clear date
+        feedback: >-
+          Most people land here, since step 4 is where it shows. But 03/04 was never clear.
+      - text: Search returned the wrong document
+        feedback: >-
+          kb-31 holds the check-in rules and scored highest. Retrieval did its job this time.
+      - text: The model misheard the guest
+        feedback: >-
+          Step 1 says 3 April, exactly right. The intent was fine until it became a string.
+
+  - type: multiple-choice
+    id: pick-retrieval-cause
+    concept: agents.trace-to-root-cause
+    difficulty: 3
+    language: text
+    code: |
+      1  model   said "Guest asks if they can cancel for free."
+      2  search  "free cancellation"  k=3
+                 -> kb-03 0.79, kb-11 0.77, kb-25 0.74
+                    kb-48 0.71  (rank 4, not sent)
+      3  model   said "Yes, free until the day before arrival."
+    question: The guest's rate is non-refundable, as kb-48 says. Which suspect is it?
+    choices:
+      - text: Retrieval, kb-48 never reached the model
+        correct: true
+        feedback: >-
+          Right. The model never saw kb-48. It answered faithfully from what it got.
+      - text: The prompt, it should warn about rates
+        feedback: >-
+          A warning can't help a model that never saw the rate rules. Check its inputs first.
+      - text: The tool contract, `k` is too small
+        feedback: >-
+          Raising `k` might hide it once. The ranking put the key rule fourth, so fix retrieval.
+      - text: The model invented a policy
+        feedback: >-
+          kb-03 says "free until the day before". The model repeated a real document.
+
+  - type: prose
+    id: fix-replay-keep
+    body: |-
+      Fix the cause, not the symptom. For the wrong booking that's the contract: `date` is
+      `YYYY-MM-DD` in the hotel's local time, and anything else gets an actionable error.
+
+      Then **replay** the failing run, as in Watching agents in production. Same guest
+      message, recorded tool results, new contract. Last, add it to the eval set from
+      Evaluating an agent. It's now a **regression case**: a change that breaks it fails.
+
+  - type: ai-review
+    id: review-careful-prompt
+    concept: agents.fix-and-replay
+    difficulty: 3
+    language: ts
+    request: Fix the agent booking the wrong check-in date.
+    flawClass: edge-case
+    code: |
+      const SYSTEM = 'You book hotel rooms. Be careful with dates. Double-check them.';
+      const bookRoom = {
+        name: 'book_room',
+        description: 'Book a room at a hotel.',
+        input_schema: {
+          type: 'object',
+          properties: {
+            hotel: { type: 'string' },
+            date: { type: 'string' },
+            nights: { type: 'integer', minimum: 1 },
+            guest: { type: 'string', description: 'Guest email.' },
+          },
+          required: ['hotel', 'date', 'nights', 'guest'],
+        },
+      };
+    prompt: >-
+      An assistant wrote this fix. One replay of the 3 April run booked the right day, so it
+      looks done. Tap the line that still lets it happen.
+    lines: [9]
+    reasons:
+      - text: '`date` still accepts any string at all'
+        correct: true
+        feedback: >-
+          Yes. The model still has to guess. Put the format in the contract.
+      - text: The warning should be in capitals
+        feedback: >-
+          Louder words make a right guess likelier, not certain. The gap is in the schema.
+      - text: '`nights` needs a maximum'
+        feedback: >-
+          A cap is sensible, but nights were right. The date was the problem.
+      - text: '`hotel` should be an enum'
+        feedback: >-
+          Hotel ids came through fine. A long enum costs tokens and fixes nothing here.
+    fix: |
+      date: {
+        type: 'string',
+        pattern: '^\\d{4}-\\d{2}-\\d{2}$',
+        description: "Check-in date as YYYY-MM-DD, in the hotel's local time.",
+      },
+      // and book_room itself rejects anything else:
+      // "date must be YYYY-MM-DD, for example 2026-04-03"
+    verify:
+      question: How do you prove the real fix holds?
+      choices:
+        - text: Replay it ten times, then add it to evals
+          correct: true
+          feedback: >-
+            Right. Repeats rule out luck, and the eval case guards every later change.
+        - text: Replay it once and look for 3 April
+          feedback: >-
+            The prompt-only fix passed that too. One run can be luck.
+        - text: Test a booking for 25 December
+          feedback: >-
+            25/12 reads one way only. Dates read two ways when both parts are 12 or under.
+        - text: Ask the model which date format it uses
+          feedback: >-
+            What it says isn't what it does. Run the inputs and check the booking.
+
+  - type: code-challenge
+    id: write-first-bad-step
+    concept: agents.trace-to-root-cause
+    difficulty: 4
+    language: ts
+    starter: trace.starter.ts
+    solution: trace.solution.ts
+    tests: trace.tests.ts
+    prompt: >-
+      Write `firstBadStep(trace, expect)`. It walks a recorded trace in order and returns
+      the first step that breaks an expectation, or `null`.
+
+
+      A `search` step fails when `expect.mustRetrieve` is set and its `doc` isn't among the
+      `k` highest-scoring hits. Hits are recorded in arrival order. Return `{ step, cause:
+      "retrieval", detail: doc }`.
+
+
+      A `tool` step fails when its tool has a contract and an argument is missing. It also
+      fails when `String(value)` doesn't match the pattern. Return `{ step, cause: "contract", detail:
+      argName }`. Model steps always pass.
+
+
+      Run it on the replayed booking and get `null`: that's your proof.
+    hints:
+      - '`expect.contracts[step.tool]` is `undefined` for a tool with no contract. Treat it as no rules.'
+      - Sort a copy of the hits by score, highest first, before taking the first `k`.
+      - '`Object.entries(contract)` gives each argument name with its pattern, in order.'
+
+  - type: explain-back
+    id: explain-wrong-booking
+    concept: agents.fix-and-replay
+    difficulty: 4
+    audience: reviewer
+    kind: explain
+    prompt: >-
+      Your pull request changes the `date` schema, not the prompt. Explain to the reviewer
+      why the agent booked 4 March.
+    rubric:
+      - The decision log shows the model sent `03/04/2026`, which reads as two dates.
+      - The root cause was the contract, so the fix goes in the schema and the tool, not the prompt.
+      - The failing run was replayed to pass, and joined the eval set as a regression case.
+    modelAnswer: >-
+      The guest asked for 3 April. The decision log shows the model meant that, but sent
+      `03/04/2026`, day first. The booking system read it month first: 4 March. Our
+      `date` parameter had no format, so the model picked one. A prompt line would make a
+      right guess likelier, not certain. So the schema now requires `YYYY-MM-DD` in the
+      hotel's local time, and the tool rejects anything else. I replayed the run ten times:
+      3 April every time. It's in the eval set now, so a change that breaks it fails.
+
+recap:
+  - Log every step's tool, arguments, retrieved doc ids and scores, and reason, with personal data redacted.
+  - Find the first step with good inputs and a bad output, then test your suspect against the record.
+  - Fix the root cause, replay the failing run to prove it, and keep it as an eval case.
+
+recall:
+  - id: card-decision-log
+    concept: agents.decision-logs
+    front: What does a decision log record for each step of an agent run?
+    back: >-
+      The tool, its arguments, the retrieved document ids with scores, and the reason the
+      model gave, with personal data redacted.
+  - id: card-first-bad-step
+    concept: agents.trace-to-root-cause
+    front: How do you find where in a trace an agent run went wrong?
+    back: >-
+      Walk it from the top. The first step with good inputs and a bad output is where it
+      broke.
+  - id: card-four-suspects
+    concept: agents.trace-to-root-cause
+    front: Name the four usual root causes of a wrong agent action.
+    back: >-
+      The prompt, a vague tool contract, retrieval that missed the right document, and plain
+      code.
+  - id: card-replay-and-keep
+    concept: agents.fix-and-replay
+    front: After fixing an agent bug, what two things prove it stays fixed?
+    back: >-
+      Replaying the failing run, several times, until it passes, and adding it to the eval set
+      as a regression case.
+
+references:
+  - kind: spec
+    title: "Date and Time on the Internet: Timestamps (RFC 3339)"
+    authors: G. Klyne, C. Newman
+    year: 2002
+    venue: IETF
+    url: https://www.rfc-editor.org/rfc/rfc3339
+    note: Defines `full-date`, the YYYY-MM-DD form that leaves no doubt about day and month.
+    primary: true
+    verified: true
+  - kind: spec
+    title: "JSON Schema Validation: A Vocabulary for Structural Validation of JSON (2020-12)"
+    authors: A. Wright, H. Andrews, B. Hutton
+    year: 2022
+    venue: IETF Internet-Draft draft-bhutton-json-schema-validation-01
+    url: https://json-schema.org/draft/2020-12/json-schema-validation
+    note: 'Section 7: `format` is an annotation by default, and "date" means RFC 3339 full-date.'
+    verified: true
+  - kind: essay
+    title: Writing effective tools for agents, with agents
+    authors: Ken Aizawa
+    year: 2025
+    venue: Anthropic Engineering
+    url: https://www.anthropic.com/engineering/writing-tools-for-agents
+    note: Unambiguous parameter names and descriptions, and error messages that say how to fix the call.
+    primary: true
+    verified: true
+  - kind: spec
+    title: Semantic Conventions for Generative AI
+    authors: OpenTelemetry
+    venue: GitHub, open-telemetry/semantic-conventions-genai
+    url: https://github.com/open-telemetry/semantic-conventions-genai
+    note: Standard span names and attributes for model and tool calls. Still in development, so names change.
+    verified: true
+  - kind: book
+    title: "Postmortem Culture: Learning from Failure"
+    authors: John Lunney, Sue Lueder
+    year: 2016
+    venue: "Site Reliability Engineering (O'Reilly), chapter 15"
+    url: https://sre.google/sre-book/postmortem-culture/
+    note: Writing up a failure so the fix and the lesson outlast the incident.
+    verified: true
+
+deepDive: >-
+  The challenge ran on made-up traces. No model was called.
+
+
+  **Redacting without losing the thread.** Replace each email, phone number and name with a
+  keyed hash. An HMAC of the value works, with a secret only the logging service holds.
+  The same guest always gets the same token, so you can follow them across runs. Nobody
+  can turn the token back into the email. Run redaction before the record leaves the process,
+  never as a nightly clean-up. Watching agents in production kept message text off spans; a
+  decision log is the narrow exception, holding the arguments and the reason, redacted.
+
+
+  **`format` is a hint until you enforce it.** In JSON Schema, `"format": "date"` is an
+  annotation by default, and many validators don't check it. A `pattern`, or your own check
+  in the tool, is what turns "03/04/2026" into an error. Strict tool modes fix the shape of
+  the arguments, not their meaning.
+
+
+  **Code is a suspect too.** In Node, `new Date("03/04/2026")` gives 4 March: V8, Node's
+  JavaScript engine, reads that non-standard form month first, whatever the locale. If the model had
+  sent `2026-04-03` and your code reformatted it on the way, the logged arguments would be
+  right and the booking wrong. That's why you log the raw arguments and compare them with
+  what the downstream system received.
+
+
+  **The stated reason is evidence, not proof.** The text a model writes before a call shows
+  what it believed it was doing. It isn't guaranteed to be what drove the choice. Trust the
+  arguments and the retrieved ids over the reason when they disagree.
+
+
+  **Is it the prompt or the contract?** Ask where the fact lives. A rule about one tool's
+  argument belongs in that tool's schema and description, which the model reads at the
+  moment it writes the call. The system prompt is for behaviour across tools.

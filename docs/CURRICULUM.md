@@ -1,6 +1,6 @@
 # Curriculum
 
-The course holds 419 lessons. Each lesson is marked **E** (beginner-essential) or
+The course holds 423 lessons. Each lesson is marked **E** (beginner-essential) or
 **A** (advanced). The count is 250 E and 167 A. A module names its lab where a moving
 simulation teaches what a playground cannot; the rest are hands-on through playgrounds, sql
 steps and challenges.
@@ -531,7 +531,7 @@ The engineering around a model once it serves real users: the pipeline as a whol
 16. Working with a coding agent on a real repo `aisys.agent-workbench`: set up a coding agent's task so it can be checked: rules it can test, a scope contract, a verification gate, a reviewer pass and a handoff note. **A**
 17. Shape the build before you code `aisys.shaping-the-build`: state the outcome and its success metric, rank the assumptions by risk, pick the smallest testable slice, and write a spec that leaves room for judgement. **A**
 
-## Module 31: Agent engineering (10)
+## Module 31: Agent engineering (15)
 
 Systems where the model acts over many steps and tools, for a long time, with people in the
 loop. It sits in Python and AI engineering after AI systems; its folder number is 31 because
@@ -549,6 +549,10 @@ it was added later. It builds on `ai.agents`, `aisys.agent-harness`, `aisys.guar
 9. Evaluating an agent `agents.evals-for-agents`: outcome against trajectory, pass@k against pass^k, tool-call accuracy, environment-based tasks, repeated trials and variance, and red teaming. **A**
 10. Watching agents in production `agents.watching-agents`: spans per step and tool, cost per run and tenant, version tags, replay, an error taxonomy of hallucination, tool misuse, loops, refusals and truncation, drift, and OTel GenAI attributes. **A**
 11. Letting an agent babysit a pull request `agents.babysitting-a-pr`: a standing goal on a schedule with a done state, a budget and a stop, what the watcher may do alone, must ask about and never does (merge, deploy, loosen a check), and proving the change again after every fix. **A**
+12. The agent as a system `agents.agent-as-a-system`: the seven skills of agent engineering as one map, an agent as a backend of model, tools, retrieval, state and subagents, the data flow of one request, one owner per piece of state, and typed contracts between specialist agents. **A**
+13. When a part of the agent fails `agents.when-a-part-fails`: tool errors the model can act on, one layer of bounded retries with backoff and jitter, timeouts, a circuit breaker per tool, and fallbacks that tell the user the truth. **A**
+14. Designing for an agent that can be wrong `agents.designing-for-uncertainty`: expectations, honest confidence with sources, a clarifying question when a guess is costly, previews and undo, and a handoff to a person. **A**
+15. Debugging an agent from its trace `agents.debugging-from-a-trace`: a decision log of tools, arguments, retrieved context and reasons, a trace read to its root cause (prompt, tool contract, retrieval or code), a fix proved by replay and kept as an eval case. **A**
 
 ## Module 22: System design (12)
 
@@ -693,7 +697,7 @@ revalidation call reaches.
 3. Caching pages and data `nextserver.caching`: `'use cache'`, `cacheLife`, refreshing with `cacheTag` and `updateTag`, and the copy in the browser. Woven after reading `EXPLAIN`. **E**
 4. Deploying a Next.js app `nextserver.deploying`: `next start`, standalone output and its missing static files, and what a managed host does for you. Woven after reverse proxies. **A**
 
-## Module 32: Engineering judgment (11)
+## Module 32: Engineering judgment (12)
 
 Knowing what to verify: what breaks, what scales, what confuses the next reader, what leaks
 and what a change could regress, then pressure-testing designs, making the call, ranking

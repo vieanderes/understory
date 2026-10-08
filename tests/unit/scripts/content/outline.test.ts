@@ -257,7 +257,7 @@ describe('the real outline', () => {
   const { outline: raw, issues } = loadOutline(REPO);
   const outline = raw?.data ?? { modules: [] };
 
-  it('is readable and holds the 34 modules and 419 lessons of docs/CURRICULUM.md', () => {
+  it('is readable and holds the 34 modules and 423 lessons of docs/CURRICULUM.md', () => {
     expect(issues).toEqual([]);
     expect(outline.modules).toHaveLength(34);
     // Folders are numbered in the order modules were added, and the file lists them in course
@@ -266,7 +266,7 @@ describe('the real outline', () => {
     expect([...numbers].sort((a, b) => a - b)).toEqual([...Array(34).keys()]);
     expect(numbers.indexOf(30)).toBe(numbers.indexOf(14) + 1);
     expect(numbers.indexOf(31)).toBe(numbers.indexOf(21) + 1);
-    expect(outlineEntries(outline)).toHaveLength(419);
+    expect(outlineEntries(outline)).toHaveLength(423);
   });
 
   it('names every lesson id next to its title in docs/CURRICULUM.md, in order', () => {
@@ -288,7 +288,7 @@ describe('the real outline', () => {
       ...Array(8).fill('explain'),
     ]);
     const order = journeyOrder(outline).map(({ lesson }) => lesson.id);
-    expect(order).toHaveLength(419);
+    expect(order).toHaveLength(423);
     expect(order.indexOf('cs.complexity')).toBe(order.indexOf('js.arrays') + 1);
     expect(order.indexOf('cs.trees')).toBeLessThan(order.indexOf('db.indexes'));
     expect(order.indexOf('clean.naming')).toBe(order.indexOf('js.built-in-toolbox') + 1);

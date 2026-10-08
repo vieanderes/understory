@@ -47,6 +47,11 @@ export interface AssistantContext {
    */
   entry?: ScoutEntry;
   /**
+   * In a lesson: what the learner's record says about it, for the Tutor (core/scout,
+   * tutorEvidence). Built in the tab from the event log.
+   */
+  evidence?: string;
+  /**
    * The app guide, in `tutor` and `guide` modes: the places, the library, the routes and
    * the learner's situation, built in the tab from the navigation itself. Scout answers
    * "where is X" from it on any page. An assessment never gets it.
@@ -170,6 +175,7 @@ function tutorSystemPrompt(context: AssistantContext): string {
       ? ['', `The learner's code (${context.language || 'code'}):`, context.code]
       : []),
     ...(context.output ? ['', 'Their last run:', context.output] : []),
+    ...(context.evidence ? ['', 'What their record shows:', context.evidence] : []),
     ...appSection(context),
   ].join('\n');
 }

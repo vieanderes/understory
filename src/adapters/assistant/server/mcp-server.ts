@@ -115,6 +115,9 @@ export function pageText(context: AssistantContext): string {
         'British English.',
         '',
         `On screen now:\n${untrusted('page', `Lesson: ${context.taskTitle}\n\n${context.statement || '(nothing specific)'}`)}`,
+        ...(context.evidence
+          ? ['', `What their record shows:\n${untrusted('learner-record', context.evidence)}`]
+          : []),
         ...(context.app
           ? ['', 'If the learner asks about the app rather than the lesson, answer as its guide.']
           : []),

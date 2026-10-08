@@ -13,7 +13,8 @@ import {
   type LucideIcon,
 } from 'lucide-react';
 import Link from 'next/link';
-import { OwnPathPace } from './OwnPathTools';
+import { CutList, Destination, MilestoneLine } from '@/features/tutor/planner/AdvisorParts';
+import { MilestoneMark, OwnPathPace } from './OwnPathTools';
 import { useMemo } from 'react';
 import { buttonClass } from '@/components/ui/Button';
 import { InlineCode } from '@/components/ui/InlineCode';
@@ -96,6 +97,9 @@ export function PathView({
                 {path.promise}
               </p>
               {custom ? (
+                <Destination destination={path.destination} baseline={path.baseline} />
+              ) : null}
+              {custom ? (
                 <OwnPathPace
                   pathId={path.id}
                   minutesLeft={path.stages
@@ -168,6 +172,19 @@ export function PathView({
                     </div>
                     <p className="text-muted prose-measure">{stage.why}</p>
                   </div>
+                  {stage.milestone ? (
+                    <div className="prose-measure">
+                      <MilestoneLine
+                        milestone={stage.milestone}
+                        met={state.milestonesMet.get(path.id)?.has(stage.milestone.output)}
+                        action={
+                          custom ? (
+                            <MilestoneMark pathId={path.id} milestone={stage.milestone.output} />
+                          ) : undefined
+                        }
+                      />
+                    </div>
+                  ) : null}
                   <ol className="-mx-1 flex flex-col">
                     {stage.lessons.map((lesson) => (
                       <PathLessonRow
@@ -215,6 +232,11 @@ export function PathView({
               </li>
             );
           })}
+          {custom && path.cut?.length ? (
+            <li className="pt-2">
+              <CutList cut={path.cut} />
+            </li>
+          ) : null}
           {custom ? null : (
             <FinalStop path={path} lessonsDone={progress.ready && progress.nextId === undefined} />
           )}

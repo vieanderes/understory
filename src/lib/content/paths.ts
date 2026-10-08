@@ -28,6 +28,8 @@ export interface PathStage {
   why: string;
   /** What you leave the stage with. */
   artifact?: string;
+  /** On a path planned with Scout: what the learner makes to show they have the stage. */
+  milestone?: { output: string; check: string };
   lessons: PathLesson[];
   /** Worth doing if there is time; never counted towards finishing the path. */
   optional: PathLesson[];
@@ -55,6 +57,10 @@ export interface PathSummary {
   proof?: { title: string; evidence: string[] };
   coverage?: { covered: string[]; partial: string[]; outside: string[] };
   stages: PathStage[];
+  /** On a path planned with Scout (docs/SCOUT-ROLES.md): where it ends, where it started, what it left out. */
+  destination?: string;
+  baseline?: string;
+  cut?: { what: string; why: string; later: boolean; lessonIds: string[] }[];
   /** The lessons that finish the path, in order. */
   lessonIds: string[];
   minutes: number;

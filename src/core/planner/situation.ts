@@ -57,7 +57,19 @@ function draftLines(input: PlannerSituationInput): string[] {
   return [
     input.edited ? 'Current draft, edited by the learner: start from this one.' : 'Current draft:',
     [`Name: ${draft.name}.`, ...pace].join(' '),
-    ...draft.stages.map((s) => `- ${s.title}: ${s.lessonIds.join(', ')}`),
+    ...(draft.destination ? [`Destination: ${draft.destination}.`] : []),
+    ...(draft.baseline ? [`Baseline: ${draft.baseline}`] : []),
+    ...draft.stages.map(
+      (s) =>
+        `- ${s.title}: ${s.lessonIds.join(', ')}` +
+        (s.milestone ? `. Milestone: ${s.milestone.output} (check: ${s.milestone.check}).` : ''),
+    ),
+    ...(draft.cut ?? []).map(
+      (c) =>
+        `${c.later ? 'Left out for now' : 'Not needed for this destination'}: ${c.what}` +
+        (c.lessonIds.length ? ` (${c.lessonIds.join(', ')})` : '') +
+        `, because ${c.why}`,
+    ),
     ...(input.saved
       ? ['It is saved as one of their paths; changes are saved again when they press Save.']
       : []),

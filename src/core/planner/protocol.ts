@@ -29,8 +29,30 @@ export type AskBlock = z.infer<typeof askBlockSchema>;
 export const MAX_STAGES = 12;
 export const MAX_LESSONS = 200;
 
+export const MAX_CUTS = 8;
+
+/** A stage's milestone: what the learner makes that shows they have it, and how they know. */
+export const milestoneSchema = z.object({
+  output: line(160),
+  check: line(200),
+});
+
+/** Left out on purpose, with the reason, tied to the destination (docs/SCOUT-ROLES.md). */
+export const cutSchema = z.object({
+  what: line(80),
+  why: line(200),
+  /** False when the destination never needs it, not only not yet. */
+  later: z.boolean().default(true),
+  lessons: z.array(z.string().max(80)).max(MAX_LESSONS).default([]),
+});
+
 export const pathBlockSchema = z.object({
   name: line(80),
+  /** What the learner will be able to do or make at the end. */
+  destination: line(200).optional(),
+  /** Where they start, in a sentence. */
+  baseline: z.string().trim().max(300).optional(),
+  cut: z.array(cutSchema).max(MAX_CUTS).optional(),
   alternatives: z.array(line(80)).max(3).default([]),
   summary: z.string().trim().max(400).default(''),
   minutesPerWeek: z.int().min(15).max(3000).optional(),
@@ -41,6 +63,7 @@ export const pathBlockSchema = z.object({
         title: line(80),
         why: z.string().trim().max(240).default(''),
         lessons: z.array(z.string().max(80)).max(MAX_LESSONS),
+        milestone: milestoneSchema.optional(),
       }),
     )
     .min(1)

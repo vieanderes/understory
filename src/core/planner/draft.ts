@@ -2,6 +2,18 @@ import { lessonIndex, type LessonEntry, type PlannerCourse } from './course';
 import { cleanPathName } from './name';
 import type { PathBlock } from './protocol';
 
+export interface Milestone {
+  output: string;
+  check: string;
+}
+
+export interface DraftCut {
+  what: string;
+  why: string;
+  later: boolean;
+  lessonIds: string[];
+}
+
 /*
  * A draft path: what Scout proposed, checked against the course, and then whatever the
  * learner changed by hand. Scout sees the draft with every turn, so it refines what the
@@ -15,6 +27,7 @@ export interface DraftStage {
   title: string;
   why: string;
   lessonIds: string[];
+  milestone?: Milestone;
 }
 
 export interface Draft {
@@ -23,6 +36,11 @@ export interface Draft {
   summary: string;
   minutesPerWeek?: number;
   deadline?: string;
+  /** The Advisor's parts (docs/SCOUT-ROLES.md, section 4). */
+  destination?: string;
+  baseline?: string;
+  /** Left out on purpose. Its lessons are in no stage. */
+  cut?: DraftCut[];
   stages: DraftStage[];
 }
 
@@ -35,12 +53,24 @@ export interface ResolvedDraft {
 /** Scout's block, made safe: known lessons only, each once, no empty stages. */
 export function draftFromBlock(block: PathBlock, course: PlannerCourse): ResolvedDraft {
   const index = lessonIndex(course);
-  const seen = new Set<string>();
   let dropped = 0;
+  // A cut lesson is in no stage, so the cutlist claims its lessons first.
+  const cutIds = new Set<string>();
+  const cut: DraftCut[] = (block.cut ?? []).map(({ what, why, later, lessons }) => {
+    const lessonIds = lessons.filter((id) => {
+      const known = index.has(id) && !cutIds.has(id);
+      if (known) cutIds.add(id);
+      else dropped += 1;
+      return known;
+    });
+    return { what, why, later, lessonIds };
+  });
+  const seen = new Set<string>();
   const stages: DraftStage[] = [];
   for (const stage of block.stages) {
     const lessonIds: string[] = [];
     for (const id of stage.lessons) {
+      if (cutIds.has(id)) continue;
       if (!index.has(id) || seen.has(id)) {
         dropped += 1;
         continue;
@@ -48,7 +78,14 @@ export function draftFromBlock(block: PathBlock, course: PlannerCourse): Resolve
       seen.add(id);
       lessonIds.push(id);
     }
-    if (lessonIds.length > 0) stages.push({ title: stage.title, why: stage.why, lessonIds });
+    if (lessonIds.length > 0) {
+      stages.push({
+        title: stage.title,
+        why: stage.why,
+        lessonIds,
+        ...(stage.milestone ? { milestone: stage.milestone } : {}),
+      });
+    }
   }
   const name = cleanPathName(block.name);
   const alternatives = [...new Set(block.alternatives.map(cleanPathName))].filter(
@@ -61,6 +98,9 @@ export function draftFromBlock(block: PathBlock, course: PlannerCourse): Resolve
       summary: block.summary,
       ...(block.minutesPerWeek ? { minutesPerWeek: block.minutesPerWeek } : {}),
       ...(block.deadline ? { deadline: block.deadline } : {}),
+      ...(block.destination ? { destination: block.destination } : {}),
+      ...(block.baseline ? { baseline: block.baseline } : {}),
+      cut,
       stages,
     },
     dropped,
@@ -140,6 +180,26 @@ export function removeLesson(draft: Draft, lessonId: string): Draft {
 
 export function removeStage(draft: Draft, stageIndex: number): Draft {
   return { ...draft, stages: draft.stages.filter((_, i) => i !== stageIndex) };
+}
+
+/**
+ * Brings a cut item back: its lessons become a last stage, where fixOrder can place them,
+ * and it leaves the cutlist. A cut with no lessons only leaves the list.
+ */
+export function restoreCut(draft: Draft, cutIndex: number): Draft {
+  const cut = draft.cut ?? [];
+  const item = cut[cutIndex];
+  if (!item) return draft;
+  const inPath = new Set(draftLessonIds(draft));
+  const lessonIds = item.lessonIds.filter((id) => !inPath.has(id));
+  return {
+    ...draft,
+    cut: cut.filter((_, i) => i !== cutIndex),
+    stages:
+      lessonIds.length > 0
+        ? [...draft.stages, { title: item.what, why: item.why, lessonIds }]
+        : draft.stages,
+  };
 }
 
 export function renameDraft(draft: Draft, name: string): Draft {

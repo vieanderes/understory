@@ -324,7 +324,8 @@ the question box. The code is in `src/core/planner/`
 - **One protocol for all three providers.** MCP's `reply` carries text only, so structure
   travels as fenced JSON blocks in the Markdown: `scout-ask` (a question, 2 to 8 options,
   single or several) and `scout-path` (name, two other names, summary, minutes a week,
-  deadline, up to 12 stages of lesson ids). The panel draws them as chips and a draft card;
+  deadline, up to 12 stages of lesson ids, and the Advisor's parts: a destination, a
+  baseline, up to 8 cuts and a milestone per stage, `docs/SCOUT-ROLES.md`). The panel draws them as chips and a draft card;
   an unclosed block while streaming shows "Drafting your path", never raw JSON. A block that
   fails its zod schema is dropped and the prose still reads.
 - **The model is not trusted with facts.** Lesson ids are checked against the course,

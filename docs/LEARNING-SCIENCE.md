@@ -553,7 +553,11 @@ every day. The code is `src/core/plan/`, the screens `src/features/plan/` at `/p
 - **Paths planned with Scout.** A plan answers fixed questions; planning with Scout is a
   conversation for reasons the questions do not cover (a project, school, a particular kind of
   interview). Scout asks one question at a time and only what it cannot see, because each
-  extra question is a cost before any learning. A draft names what it builds on and the
+  extra question is a cost before any learning. It asks the destination first (an outcome,
+  not a topic) and the baseline only where placement leaves it unclear, then proposes the
+  order, a cutlist with a reason per cut, and per stage a milestone: something the learner
+  makes and can show. A milestone is marked met on the learner's word (`milestone_marked`),
+  like a capstone, and earns nothing: a model's opinion is never a fact in the log. A draft names what it builds on and the
   learner has not done (a gap), drawn as a knowledge gap and offered as one tap, but never
   forced: prerequisites are advice, never a lock, and a learner who knows the idea from
   elsewhere should not be sent back to it. Pace is shown in weeks at the learner's own minutes

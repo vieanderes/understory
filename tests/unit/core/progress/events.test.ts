@@ -175,6 +175,7 @@ describe('makeEvent', () => {
       plan_cleared: {},
       profile_set: { interests: ['web', 'ai'], news: true },
       news_read: { date: '2026-10-05' },
+      milestone_marked: { pathId: 'own-a1b2c3d4', milestone: 'A server that answers', met: true },
       custom_path_set: {
         pathId: 'own-a1b2c3d4',
         name: 'Backend in six weeks',

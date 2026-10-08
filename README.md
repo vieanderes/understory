@@ -1,14 +1,14 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/banner-dark.png">
-    <img alt="Understory. Learn software engineering from your first line of code to a system in production. 419 lessons, 9 learning paths, 40 timed test tasks, and Scout, an AI tutor on your own Claude." src="docs/assets/readme/banner-light.png" width="100%">
+    <img alt="Understory. Learn software engineering from your first line of code to a system in production. 423 lessons, 9 learning paths, 40 timed test tasks, and Scout, an AI tutor on your own Claude." src="docs/assets/readme/banner-light.png" width="100%">
   </picture>
 </p>
 
 <p align="center">
   <a href="https://github.com/vieanderes/understory/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/vieanderes/understory/ci.yml?branch=main&style=flat-square&label=ci&labelColor=0e0f11&color=4c55c7"></a>
   <a href="#meet-scout-your-ai-tutor"><img alt="AI tutor on your own Claude" src="https://img.shields.io/badge/AI_tutor-your_own_Claude-4c55c7?style=flat-square&labelColor=0e0f11"></a>
-  <img alt="419 lessons" src="https://img.shields.io/badge/lessons-419-4c55c7?style=flat-square&labelColor=0e0f11">
+  <img alt="423 lessons" src="https://img.shields.io/badge/lessons-423-4c55c7?style=flat-square&labelColor=0e0f11">
   <img alt="Next.js 16" src="https://img.shields.io/badge/Next.js-16-4c55c7?style=flat-square&labelColor=0e0f11">
   <img alt="WCAG 2.2 AA" src="https://img.shields.io/badge/WCAG-2.2_AA-4c55c7?style=flat-square&labelColor=0e0f11">
   <img alt="Local-first" src="https://img.shields.io/badge/local--first-no_account-4c55c7?style=flat-square&labelColor=0e0f11">
@@ -248,7 +248,7 @@ your weekly goal, export and import, and the offline download.
 |              | What you do                                                                                         | What is underneath                                                                                                                         |
 | ------------ | --------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
 | **Set up**   | Five short questions, then one or more paths, or a path you build from parts, chapters or lessons.  | Built from the learning paths and your progress; answers and progress live in the event log on your device.                                |
-| **Learn**    | Short lessons, one idea per screen. An explanation first, then you build, fix, predict or review.   | 419 lessons in 34 chapters. Every exercise has a solution that the build runs against its own tests before it ships.                       |
+| **Learn**    | Short lessons, one idea per screen. An explanation first, then you build, fix, predict or review.   | 423 lessons in 34 chapters. Every exercise has a solution that the build runs against its own tests before it ships.                       |
 | **Ask**      | Scout AI beside any lesson or page, on your own Claude.                                             | It reads the step on screen, answers in Markdown with highlighted code, and never sits in an exam.                                         |
 | **Practise** | Spaced, mixed sessions by topic, due items first, sized before you start.                           | FSRS scheduling, a mastery model per concept and confidence ratings on each answer. See [`LEARNING-SCIENCE.md`](docs/LEARNING-SCIENCE.md). |
 | **Rehearse** | Timed online coding tests in a simulator, with an optional guided mode.                             | 40 original tasks with hidden correctness and performance tests. See [Practise the real test](#practise-the-real-test).                    |

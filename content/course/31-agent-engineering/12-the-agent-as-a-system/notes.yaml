@@ -1,0 +1,159 @@
+summary: >-
+  A prompt is a recipe. A production agent needs a chef, and a chef has seven skills:
+  **system design**, tool and contract design, retrieval, reliability, security and safety,
+  evals and tracing, and product thinking. This lesson is about the first, because every
+  other skill hangs off it.
+
+
+  Seen as a system, an agent is a backend. The **model** decides the next step. **Tools**
+  act on the world. A **database** holds the story so far and the current state, because
+  the model forgets everything between calls. **Subagents** take specialist work. Following
+  one request through those parts tells you where each piece of data comes from, where it
+  is written down, and who reads it next.
+
+
+  Once there are several specialists, two rules keep them from tripping over each other.
+  Every **handoff** is a typed message with a goal, inputs, a reply schema and a status, so
+  the next agent never guesses. Every piece of state has **one owner** that may write it,
+  and anyone else asks the owner or writes through a version check. Without those rules,
+  parallel agents lose each other's work in silence. What to do when one of the parts stops
+  answering is the next lesson.
+remember:
+  - A production agent is a backend system, not a prompt, and it fails the way backends fail.
+  - The model decides, tools act, the database holds the story and state, and subagents do specialist work.
+  - The model forgets between calls, so anything the next turn or the next agent needs is written to the database.
+  - Every piece of state has one owner that may write it; others ask the owner or write through a version check.
+  - Saving a whole record you read earlier is a lost update waiting to happen when two agents run at once.
+  - A handoff carries a goal, the inputs it needs, a reply schema and a status, so nobody guesses.
+  - Check ownership before the version, because a write an agent may never make won't succeed on a retry.
+  - When an incident happens, name the missing skill first, then fix the part of the system it lives in.
+sections:
+  - title: Following one request through the system
+    body: |-
+      Take a customer who writes "where's my refund for order 5521?". Trace what is read and
+      written at each hop, and the system's shape appears.
+
+      1. The harness loads ticket `t-88` from the database: earlier messages, the triage
+         label, any notes. This is the **story**, and it is the only memory the model gets.
+      2. The model reads the story plus the new message and decides: hand the order check to
+         the research agent.
+      3. The harness writes a handoff record, status `pending`, owned by the orchestrator.
+      4. The research agent calls the orders tool. The tool's result goes into the event log
+         **before** anything else happens, so a crash afterwards loses nothing.
+      5. The research agent writes the fields it owns, `refundable` and `reason`, and sets
+         the handoff to `done`.
+      6. The writer agent gets a new handoff with those fields as inputs and writes `draft`.
+
+      Each hop has a reader and a writer you can name. If you can't name the writer of a
+      field, two agents are probably writing it. If you can't name where a fact came from,
+      tracing (from *Watching agents in production*) will not find it either.
+
+      ```ts
+      type Handoff = {
+        from: string;
+        to: string;
+        goal: string;
+        inputs: Record<string, string>;
+        replySchema: Record<string, 'string' | 'boolean' | 'number'>;
+        status: 'pending' | 'running' | 'done' | 'failed';
+      };
+      ```
+  - title: Choosing between one owner and a version check
+    body: |-
+      Both rules stop lost updates. They fit different shapes.
+
+      **One owner per field** suits specialists that each produce different facts. Triage
+      owns `priority`, research owns `refundable`, the writer owns `draft`. They can run in
+      parallel because they never write the same field. The update must still change only
+      the owned fields: an agent that saves the whole record it read earlier writes stale
+      copies of everyone else's fields, which is the bug in the lesson.
+
+      **A version check** suits state that several agents legitimately change, such as a
+      ticket's status. Every write names the version it read, and the database refuses it if
+      the version has moved. The loser reads the fresh record and decides again. This is the
+      same `WHERE version = $3` idea from *Optimistic locking*.
+
+      ```sql
+      UPDATE tickets SET status = $1, version = version + 1
+      WHERE id = $2 AND version = $3;
+      ```
+
+      **One owner per record** is the simplest of all: only the orchestrator writes the
+      ticket, and specialists return results it applies. It costs a little latency and buys
+      a single place to look when a field is wrong.
+
+      The lesson's `applyUpdate` uses owners and a record version together. Owners stop
+      cross-agent erasing; the version stops a write built on a stale read. The cost is that
+      any parallel write makes yours stale, so busy records move to a version per field.
+
+      Avoid the fourth option, a lock held while a model thinks. Model calls take seconds,
+      and a crashed agent can hold the lock until it expires.
+  - title: Mapping incidents to the seven skills
+    body: |-
+      The seven skills are most useful as a checklist after something goes wrong. Ask which
+      skill would have prevented it, then fix the part of the system that skill covers.
+
+      - The agent refunded an order twice after a timeout: **reliability**, an idempotency
+        key on the refund tool.
+      - The agent called a search tool with a made-up filter: **tool and contract design**,
+        a stricter schema and an actionable error.
+      - The answer quoted last year's returns policy: **retrieval**, fresher documents and
+        better ranking.
+      - A pasted email told the agent to forward the customer list: **security**, a
+        permission boundary on the email tool.
+      - Nobody could say why the agent chose a tool: **evals and tracing**, every decision
+        logged with its inputs.
+      - Users kept retyping the same question: **product thinking**, a clarifying question
+        when confidence is low.
+      - Two agents erased each other's fields: **system design**, one owner per piece of
+        state.
+
+      Most incidents touch two skills. Start with the one whose fix lives in code, because
+      a prompt change is the easiest fix to regress.
+pitfalls:
+  - '**Saving the whole record.** An agent reads a ticket, changes one field and saves all of it, erasing another agent''s write. Update only the owned fields, guarded by the version read.'
+  - '**Keeping state in the conversation.** The next turn or the next agent then depends on a transcript nobody controls. Write facts to the database and pass a typed handoff.'
+  - '**Untyped handoffs.** "Look into this" leaves the next agent to guess the goal and the reply shape. Send a goal, inputs, a reply schema and a status.'
+  - '**Two owners in disguise.** A field "mostly" written by triage but sometimes by the writer has two owners. Pick one, or put it behind a version check.'
+  - '**Retrying a not-owner error.** Retrying a write the agent may never make loops for ever. Check ownership first and treat it as a bug, not a conflict.'
+verify:
+  - lens: breaks
+    check: Two agents that read the same ticket and both save never erase each other's field, in a test that forces that interleaving.
+  - lens: confuses
+    check: Every field in the ticket record names exactly one owner in code, so a reader can tell who wrote a wrong value.
+  - lens: tests
+    check: A test sends a handoff missing its reply schema and asserts the receiving agent refuses it instead of guessing.
+  - lens: scales
+    check: With ten agents writing one ticket, a single record version makes most parallel writes stale, so version each field or let the orchestrator apply results.
+  - lens: leaks
+    check: A handoff carries only the inputs the next agent needs, not the whole chat with the customer's personal details.
+interview:
+  - question: Walk me through how you'd structure an agent that handles support tickets with several specialists.
+    answer: >-
+      I'd treat it as a backend. A triage agent labels the ticket, a research agent checks
+      orders, a writer drafts the reply, and an orchestrator in code runs the flow. The
+      ticket lives in a database, because the model forgets between calls. Each field has
+      one owner: triage writes `priority`, research writes `refundable`, the writer writes
+      `draft`. Handoffs are typed messages with a goal, inputs, a reply schema and a
+      status, so I can validate them and trace them. Tool results are logged before the
+      next step. The trade-off is more structure than a single prompt, which only pays off
+      once the specialists really need separate context or can run in parallel.
+  - question: Two agents keep overwriting each other's changes to the same record. How do you fix it?
+    answer: >-
+      It's a lost update, the same race as two people saving one form. Each agent reads the
+      record, changes a field and saves the whole thing, so the later save erases the
+      earlier one. I'd make each agent write only the fields it owns, through one update
+      function that refuses a field owned by someone else. For state several agents
+      legitimately share, I'd add a version: every write names the version it read, and a
+      moved version is refused, so the agent re-reads and decides again. I'd avoid holding
+      a lock during a model call, because calls are slow and a crashed agent can keep it.
+      Then I'd add a test that forces both reads before both writes.
+  - question: What goes into a handoff between two agents, and why not pass the whole conversation?
+    answer: >-
+      A goal, the inputs the receiver needs, the schema of the reply I expect, and a
+      status. The schema lets me validate the answer in code and merge it without another
+      model call. The status lets the orchestrator see what's pending, done or failed. The
+      whole conversation costs tokens on every turn, buries the task, can leak personal
+      details the receiver doesn't need, and still leaves the receiver to guess what was
+      asked. A typed handoff is also what makes tracing readable: one record per piece of
+      delegated work, with its inputs and its result.

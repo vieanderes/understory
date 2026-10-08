@@ -1,0 +1,326 @@
+id: agents.agent-as-a-system
+title: The agent as a system
+objective: See a production agent as a backend system of model, tools, retrieval, state and subagents, follow the data through it, give each piece of state one owner and connect specialists with typed contracts.
+level: advanced
+minutes: 10
+concepts: [agents.seven-skills, agents.data-flow, agents.state-ownership, agents.specialist-contracts]
+prerequisites: [agents.orchestration, scale.locks, sysdesign.case-ai-agent]
+opening:
+  text: >-
+    You'll see a production agent as the backend it really is, and stop three agents from overwriting each other's work. It's where a clever prompt becomes a system you can trust.
+
+steps:
+  - type: prose
+    id: recipe-and-chef
+    body: |-
+      A prompt is a recipe. Agent engineering is being the chef. The chef's map has
+      **seven skills**:
+
+      1. System design: here
+      2. Tool and contract design: *Designing tools a model uses well*
+      3. Retrieval engineering: *RAG*
+      4. Reliability engineering: next lesson
+      5. Security and safety: *What an agent may touch*
+      6. Evals and tracing: *Evaluating an agent*
+      7. Product thinking: *Designing for an agent that can be wrong*
+
+  - type: multiple-choice
+    id: match-incident-to-skill
+    concept: agents.seven-skills
+    difficulty: 1
+    question: A research agent retried a dead API all night, with no backoff. Which skill was missing?
+    choices:
+      - text: Retrieval engineering
+        feedback: >-
+          Retrieval decides what the agent reads. Nothing came back at all. The trouble was how it kept calling.
+      - text: Product thinking
+        feedback: >-
+          Product thinking shapes what the user sees. Nobody saw this one, apart from whoever paid the bill.
+      - text: Reliability engineering
+        correct: true
+        feedback: >-
+          Yes. Capped retries with backoff, and a circuit breaker, end the all-nighter.
+      - text: Security and safety
+        feedback: >-
+          Nobody attacked anything. A dead service and a loop with no limit did the damage.
+
+  - type: prose
+    id: agent-is-a-backend
+    body: |-
+      Under the chat window, an agent is a backend. The **model** decides what happens next.
+      **Tools** act: they look up an order or send an email. A **database** holds the story so
+      far and the current state, because the model forgets everything between calls.
+      **Subagents** take specialist work. The code running the loop is the harness, from
+      *Case study: an AI agent that takes actions*.
+
+  - type: parsons
+    id: arrange-request-flow
+    concept: agents.data-flow
+    difficulty: 2
+    language: ts
+    prompt: >-
+      A customer asks where their refund is. Follow the data through one turn: read, decide,
+      act, write down, pass on. One block doesn't belong.
+    blocks:
+      - id: load-ticket
+        code: 'const ticket = await db.tickets.get(ticketId);'
+        subgoal: 'Load the story from the database'
+      - id: model-decides
+        code: 'const step = await model.decide(ticket, message);'
+        subgoal: 'Let the model decide'
+      - id: tool-acts
+        code: 'const result = await tools.run(step.call);'
+        subgoal: 'Let a tool act'
+      - id: record-result
+        code: "await db.events.append(ticketId, { from: 'tool', result });"
+        subgoal: 'Write down what happened'
+      - id: hand-off
+        code: "return writer.run({ goal: 'reply', inputs: { ticket, result } });"
+        subgoal: 'Hand off to a specialist'
+    distractors:
+      - id: model-remembers
+        code: 'await model.remember(result);'
+        feedback: >-
+          A model keeps nothing between calls. The database holds the story, so the next turn
+          can read it.
+
+  - type: prose
+    id: owners-and-handoffs
+    body: |-
+      Now split a ticket across three specialists: triage labels it, research checks the
+      order, a writer drafts the reply. In *One agent or many*, a handoff was a brief. Here it
+      becomes a typed **handoff** with a status, so code can check it.
+
+      Each field gets one **owner**, the only agent that writes it. Each write also names
+      the version it read, as in *Optimistic locking*.
+
+  - type: fill-blank
+    id: fill-handoff
+    concept: agents.specialist-contracts
+    difficulty: 2
+    language: ts
+    prompt: >-
+      Triage hands work to the research agent. Pass only what it needs, say what shape the
+      answer takes, and mark the work as not started.
+    template: |
+      const handoff: Handoff = {
+        from: 'triage',
+        to: 'research',
+        goal: 'Can order 5521 be refunded?',
+        inputs: {{1}},
+        {{2}}: { refundable: 'boolean', reason: 'string' },
+        status: {{3}},
+      };
+    blanks:
+      - key: '1'
+        answer: "{ orderId: '5521' }"
+      - key: '2'
+        answer: replySchema
+      - key: '3'
+        answer: "'pending'"
+    bank: ['chatHistory', "'done'", "{ orderId: '5521' }", 'notes', "'pending'", 'replySchema']
+
+  - type: ai-review
+    id: review-shared-ticket
+    concept: agents.state-ownership
+    difficulty: 3
+    language: ts
+    request: Run the triage and writer agents at the same time to cut reply time.
+    flawClass: race
+    code: |
+      async function triageAgent(id: string) {
+        const ticket = await db.tickets.get(id);
+        ticket.priority = await classifyPriority(ticket.text);
+        await db.tickets.save(ticket);
+      }
+
+      async function writerAgent(id: string) {
+        const ticket = await db.tickets.get(id);
+        ticket.draft = await writeReply(ticket.text);
+        await db.tickets.save(ticket);
+      }
+
+      await Promise.all([triageAgent(id), writerAgent(id)]);
+    prompt: >-
+      An assistant wrote this. Run one at a time, each agent saved its field fine. In
+      production, a ticket triage marked `urgent` showed `normal` and waited six hours. Tap
+      the two lines at fault.
+    lines: [4, 10]
+    reasons:
+      - text: '`classifyPriority` returned the wrong label'
+        feedback: >-
+          The logs said `urgent`. The label was right; a later save wiped it out.
+      - text: '`Promise.all` runs the agents in a random order'
+        feedback: >-
+          Order isn't the bug. Whichever saves second erases the other, because both save everything.
+      - text: Each save writes back a whole, stale copy
+        correct: true
+        feedback: >-
+          Yes. The writer saves the copy it read, so triage's `urgent` is erased.
+      - text: Both agents should share one model call
+        feedback: >-
+          That merges two specialists into one prompt. The overwrite happens in the database, not the model.
+    fix: |
+      async function writerAgent(id: string) {
+        const ticket = await db.tickets.get(id);
+        const draft = await writeReply(ticket.text);
+        // Write only the field the writer owns, on the version it read.
+        // A stale result goes back to the orchestrator, which re-runs on fresh data.
+        return db.tickets.update(id, { agent: 'writer', baseVersion: ticket.version, changes: { draft } });
+      }
+    verify:
+      question: Which test would have caught this before release?
+      choices:
+        - text: Each agent run alone, checking its own field
+          feedback: >-
+            That's the test that already passed. Alone, nobody saves over anybody.
+        - text: A snapshot of the writer's reply text
+          feedback: >-
+            The reply was fine. The damage was to a field the writer never meant to touch.
+        - text: Both agents read, then both save, on a fake database
+          correct: true
+          feedback: >-
+            Right. Forcing that interleaving makes the lost update show every time.
+
+  - type: code-challenge
+    id: write-apply-update
+    concept: agents.state-ownership
+    difficulty: 4
+    language: ts
+    starter: update.starter.ts
+    solution: update.solution.ts
+    tests: update.tests.ts
+    prompt: >-
+      Write `applyUpdate(record, update)`, the one door every agent writes a ticket through.
+      Today it lets the last writer win.
+
+
+      1. Every field in `update.changes` must be owned by `update.agent` in `OWNERS`.
+      Otherwise return `{ ok: false, reason: 'not-owner', field }` for the first bad field.
+      A field with no owner counts as bad.
+
+      2. If `update.baseVersion` isn't `record.version`, return `{ ok: false, reason: 'stale' }`.
+
+      3. Otherwise return `{ ok: true, record }` with the changes merged and the version one
+      higher. Don't change the record you were given.
+
+
+      Example: on a version 3 ticket, `{ agent: 'writer', baseVersion: 3, changes: { draft: 'Hi' } }`
+      returns the ticket at version 4 with `draft: 'Hi'`. The same update from `research`
+      returns `not-owner` for `draft`.
+    hints:
+      - Check ownership first. A write the agent may never make won't succeed on a retry either.
+      - '`OWNERS[field]` is `undefined` for a field nobody owns, so one comparison covers both cases.'
+      - Build the new record with spreads, so the original object is never touched.
+
+  - type: explain-back
+    id: defend-the-database
+    concept: agents.data-flow
+    difficulty: 4
+    audience: teammate
+    kind: risk
+    prompt: >-
+      A teammate's pull request drops the ticket database. The three agents would pass one long
+      conversation along instead. What could go wrong, and how would you check?
+    rubric:
+      - The model forgets between calls, so a fact missing from the conversation is gone, and a crash loses everything.
+      - Every agent reads everything, so tokens grow each hop and details get buried or leak to agents that don't need them.
+      - Nobody owns a field, so agents contradict each other unseen; a parallel test asserting both fields survive would show it.
+    modelAnswer: >-
+      The model keeps nothing between calls, so the conversation becomes the only copy of the
+      ticket. If a run crashes, the story is gone. Every agent reads the whole thing every
+      turn, so cost grows with each hop. The writer also sees personal details it never needed.
+      Nothing owns the priority any more. Triage and the writer can contradict each other,
+      and no record shows who changed it. I'd check by running triage and the writer in
+      parallel on one ticket and asserting both fields survive. I'd also kill a run halfway
+      and see what can be recovered.
+
+recap:
+  - Name the seven skills a production agent needs, and spot which one an incident lacked.
+  - Follow one request through model, tools, database and subagents.
+  - Give each field one owner, guard writes with a version, and hand off with a typed message.
+
+recall:
+  - id: card-seven-skills
+    concept: agents.seven-skills
+    front: What are the seven skills of agent engineering?
+    back: >-
+      System design, tool and contract design, retrieval, reliability, security and safety,
+      evals and tracing, and product thinking.
+  - id: card-where-state-lives
+    concept: agents.data-flow
+    front: Why does an agent system need a database when it already has a model?
+    back: >-
+      The model forgets everything between calls. The database holds the story and the
+      current state, so every turn and every subagent reads the same truth.
+  - id: card-one-owner
+    concept: agents.state-ownership
+    front: Two agents write the same ticket. Which two guards stop lost updates?
+    back: >-
+      Each field has one owner that alone may write it, and every write carries the version
+      it read, refused if the version has moved.
+  - id: card-handoff-fields
+    concept: agents.specialist-contracts
+    front: What four things does a typed handoff between specialists carry?
+    back: >-
+      The goal, the inputs it needs, the schema of the reply it wants, and a status such as
+      pending, done or failed.
+
+references:
+  - kind: essay
+    title: Building effective agents
+    authors: Erik Schluntz and Barry Zhang
+    year: 2024
+    venue: Anthropic Engineering
+    url: https://www.anthropic.com/engineering/building-effective-agents
+    note: The building blocks of agent systems, from an augmented model to orchestrators and workers.
+    primary: true
+    verified: true
+  - kind: essay
+    title: How we built our multi-agent research system
+    authors: Jeremy Hadfield, Barry Zhang, Kenneth Lien, Florian Scholz, Jeremy Fox and Daniel Ford
+    year: 2025
+    venue: Anthropic Engineering
+    url: https://www.anthropic.com/engineering/multi-agent-research-system
+    note: What a lead agent must tell its subagents, why agents are stateful, and why subagents write results to storage instead of passing them along.
+    primary: true
+    verified: true
+  - kind: book
+    title: Designing Data-Intensive Applications
+    authors: Martin Kleppmann
+    year: 2017
+    venue: O'Reilly Media
+    note: Chapter 7, "Preventing Lost Updates", on compare-and-set and why last write wins loses data.
+    verified: true
+  - kind: book
+    title: Patterns of Enterprise Application Architecture
+    authors: Martin Fowler
+    year: 2002
+    venue: Addison-Wesley
+    note: The Optimistic Offline Lock pattern, the version check used in this lesson.
+    verified: true
+
+deepDive: >-
+  **Who owns what.** Ownership can sit on a whole record or on single fields. Field owners
+  stop agents erasing each other's fields. A record owner is simpler: one agent, often the
+  orchestrator, writes the ticket, and specialists return results it applies.
+
+
+  **Why both guards.** Ownership alone lets the writer save a draft built from a ticket that
+  research has since changed, say `refundable` flipped to false. The draft then promises a
+  refund nobody will pay. The version check catches that.
+
+
+  **The price of one version.** A single version on the whole record makes any parallel
+  write stale, even to a field you don't depend on. Ten agents on one ticket would retry
+  constantly. The fixes are a version per field, or checking only the fields you read.
+
+
+  **Status as a state machine.** A handoff's status is worth constraining in code:
+  `pending` to `running` to `done` or `failed`, and nothing else. A handoff that jumps back
+  from `done` to `running` usually means a retry ran twice.
+
+
+  **When a part fails.** This lesson assumed every agent and tool answers. What happens
+  when the research agent's order API goes down is the next lesson, *When a part of the
+  agent fails*.

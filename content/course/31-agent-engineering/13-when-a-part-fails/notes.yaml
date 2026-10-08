@@ -1,0 +1,157 @@
+summary: >-
+  Agents call services, and services go down. A weather API returns `503`, a shipping-quote
+  service times out, a search index is rebuilding. In ordinary code a failure like that is a
+  stack trace. Inside an agent it's quieter and costlier: the harness turns the failure into
+  text, the model reads "Error: 503", and calls the tool again. Every retry is a full model
+  turn, with its tokens and its seconds. Some runs burn their whole budget that way. Others
+  end with a result the model invented to fill the gap.
+
+
+  This lesson applies the reliability habits from Failure handling and Cost, latency and
+  fallbacks inside the agent loop. Each call gets a **timeout**. Transient failures are
+  retried in code, with backoff and jitter, in **one layer only**, because retries in the
+  HTTP client, the tool wrapper, the harness and the model multiply. What still fails comes
+  back as a **tool error** the model can act on: whether retrying can help, and what to do
+  instead. A **circuit breaker per tool** opens after repeated failures, so the model hears
+  "unavailable" at once instead of waiting on a dead service.
+
+
+  When a part stays down, the agent takes a **fallback path**, such as cached data labelled
+  with its age, another source, or a person. If none works, it gives a **degraded answer**:
+  it keeps the work that succeeded and says plainly what it couldn't do. Reach for all of
+  this on any tool that talks to a network. A pure function in your own process needs none
+  of it.
+remember:
+  - Retries belong in code, not in the model, because every model retry is a full turn of tokens and time with no backoff.
+  - Retry in one layer only; retries in the client, the tool wrapper, the harness and the caller multiply into dozens of calls.
+  - Every tool call gets a timeout, and the whole call, retries included, gets one overall deadline.
+  - A failed tool returns an error the model can act on, saying whether retrying can help and what to do instead.
+  - A circuit breaker per tool opens after a few failures in a row and answers "unavailable" instantly, without touching the network.
+  - After a cool-down, one trial call goes through; a success closes the breaker and a failure reopens it.
+  - A retried write carries an idempotency key, such as the tool-call id, so it never happens twice.
+  - When a part stays down, take a fallback or give a degraded answer that names the gap; never invent the missing result.
+sections:
+  - title: The four layers that retry
+    body: |-
+      Count who retries when a tool's service goes down. The HTTP client or SDK often
+      retries by default, two or three attempts. The tool wrapper may loop. The harness may
+      re-run a tool that threw. And the model, reading an error, calls the tool again on its
+      next turn. Each layer multiplies the ones below it.
+
+      ```text
+      client: 3 attempts
+      x wrapper: 4 attempts
+      x harness: 3 re-runs
+      x model: 5 turns that call the tool again
+      = 180 calls to a service that is already down
+      ```
+
+      Pick one layer to retry, and make the others pass the failure straight up. The
+      client or SDK is usually the right one: it knows the transport, and its retries are
+      cheap. The wrapper then turns the final failure into a tool error. The harness never
+      re-runs a tool on its own. The model's layer is cut by the breaker and by a message
+      that says not to call again.
+
+      Cap time as well as attempts. Three attempts with a five-second timeout and backoff
+      can take over fifteen seconds. Give the whole tool call a deadline, and stop retrying when
+      the next attempt can't fit inside it. The model then hears about the failure while
+      there's still time to do something else.
+  - title: An error the model can act on
+    body: |-
+      The model only knows what the tool result tells it. "Error: 503" invites another try.
+      A result that says what happened, and what to do, ends the loop in one turn.
+
+      ```json
+      {
+        "ok": false,
+        "error": "unavailable",
+        "retryable": false,
+        "message": "get_forecast is unavailable. Don't call it again in this task. Use the cached forecast or tell the user."
+      }
+      ```
+
+      `retryable` tells the model whether calling again later could help. A `400` because the
+      date was wrong is not retryable, but the model can fix the date, as in Designing tools a
+      model uses well. A `503` after retries are spent is not worth another call this task.
+
+      Many tool formats have an error flag on the result, such as `is_error`. Set it, so the
+      model and your traces both see the failure as a failure. And keep raw stack traces and
+      internal hostnames out of the message: it goes into the model's context, and sometimes
+      into its reply to the user.
+  - title: Fallbacks, honestly labelled
+    body: |-
+      A fallback is a second way to get a good-enough result. Order them by how close they
+      are to the real answer:
+
+      - **Cached data**, labelled with its age: "Forecast from 6 hours ago".
+      - **Another source**: a second weather provider, a rate card instead of a live quote.
+      - **A person**: hand the step to support, as in Designing the human's part.
+
+      Each fallback is honest about what it is. A cached forecast passed off as live is a
+      small lie the user may plan a day around.
+
+      When no fallback works, the agent gives a degraded answer. It finishes the parts that
+      don't depend on the broken tool, states what it couldn't do, and says what the user
+      can do about it.
+
+      ```text
+      Train booked: 08:12 to the coast, seat 42.
+      I couldn't get Saturday's forecast; the weather service is down.
+      Check it on Friday before you pack.
+      ```
+
+      Test this path on purpose. Point the tool at a fake that always fails, and run your
+      eval set. The answers should name the gap, not paper over it.
+pitfalls:
+  - '**Passing the raw error to the model.** "Error: 503" reads as "try again". Say whether retrying helps and what to do instead.'
+  - '**Retrying in every layer.** Each layer looks reasonable alone. Together they turn one question into dozens of calls. Retry in one place.'
+  - '**Throwing from the tool to get a retry.** A throw hands the failure to the harness, which may re-run the tool. Return a tool error instead.'
+  - '**No deadline on the whole call.** Per-attempt timeouts plus backoff can still take a minute. Cap the total.'
+  - '**Retrying a write without a key.** A timeout doesn''t mean the booking failed. Send an idempotency key so the retry is safe.'
+  - '**Filling the gap with a guess.** A confident made-up result is the worst failure, because the user can''t see it. Say what couldn''t be done.'
+verify:
+  - lens: breaks
+    check: With the weather service returning 503 for ten minutes, one user question makes a bounded number of calls and gets an answer within the deadline.
+  - lens: scales
+    check: Only one layer retries, so a fleet of agents hitting an outage sends the service a few calls each, not dozens.
+  - lens: leaks
+    check: Tool error messages carry no stack traces, hostnames or keys, since they land in the model's context and maybe its reply.
+  - lens: tests
+    check: A fake that always fails proves the breaker opens, calls stop, and the final answer names the missing result instead of inventing it.
+  - lens: confuses
+    check: Traces mark an open-breaker result as unavailable, not as a tool that ran and returned nothing.
+interview:
+  - question: A tool your agent depends on goes down mid-task. What should happen?
+    answer: >-
+      The agent should notice quickly, stop calling it, and finish honestly. Each call has a
+      timeout, and transient failures are retried in code with backoff and jitter, in one
+      layer. If it still fails, the tool returns an error the model can read: it failed,
+      retrying won't help now, and here's what to do instead. A circuit breaker per tool opens
+      after a few failures, so later calls get "unavailable" instantly. The agent then takes
+      a fallback, such as cached data labelled with its age or another source, or it tells
+      the user what it couldn't do. The trade-off is that an outage now shows in the answer,
+      which is better than a wrong answer that looks right.
+  - question: Why shouldn't the model itself be the one that retries a failed tool?
+    answer: >-
+      Because a model retry is the most expensive retry you can make. Each one is a full turn:
+      the whole context is read again, tokens are billed, and the user waits seconds. The
+      model also has no clock, so it can't back off; it calls again at once. And it multiplies
+      every retry below it in the client and the wrapper. So code does the cheap retries, and
+      the model gets a clear result once they're spent. The model's job is the decision a
+      retry can't make: use another source, re-plan, or tell the user.
+  - question: What's the problem with retries in several layers?
+    answer: >-
+      They multiply. If the SDK tries three times, the wrapper four and the harness three, one
+      failure becomes 36 calls, and the agent may call the tool again on top of that. During
+      an outage that's a flood against a service that's trying to recover, and minutes of
+      waiting for the user. Pick one layer to retry, usually the client closest to the
+      network, and make the others pass the failure up. Then add an overall deadline so the
+      total time is capped, whatever the attempt count.
+  - question: How do you test that an agent degrades gracefully?
+    answer: >-
+      Inject the failure. Point each tool at a fake that always fails, or times out, and run
+      the eval set. Check three things: the number of calls to the failing tool is bounded,
+      the run ends within its deadline, and the final answer names what couldn't be done
+      instead of inventing it. A fake clock makes the breaker's cool-down testable without
+      real waiting. The trap is testing only a fake that fails once and recovers: it passes
+      code that would multiply retries during a real outage.

@@ -1,0 +1,364 @@
+id: agents.when-a-part-fails
+title: When a part of the agent fails
+objective: Keep an agent working when a tool or service fails, with clear tool errors, one layer of bounded retries with backoff and jitter, a circuit breaker per tool and a fallback that tells the user the truth.
+level: advanced
+minutes: 10
+concepts: [agents.failing-tools, agents.degraded-answers, agents.error-budget-across-layers]
+prerequisites: [scale.failure-handling, ai.failures, aisys.cost-and-latency, agents.long-running-loops, agents.tool-design]
+opening:
+  text: >-
+    You'll keep an agent useful when one of its services goes down halfway through a task.
+    No more runs that burn their budget calling a dead API, or answers made up to fill the gap.
+
+steps:
+  - type: predict-output
+    id: predict-dead-forecast
+    concept: agents.failing-tools
+    difficulty: 1
+    language: ts
+    code: |
+      // The harness turns every tool failure into text for the model.
+      async function runTool(call: ToolCall): Promise<string> {
+        try {
+          return JSON.stringify(await tools[call.name](call.input));
+        } catch (error) {
+          return `Error: ${(error as Error).message}`;
+        }
+      }
+      // The weather service answers every request with 503 for ten minutes.
+    question: A trip-planning agent needs Saturday's forecast. What does it most likely do?
+    choices:
+      - text: Call `get_forecast` again, turn after turn
+        correct: true
+        feedback: >-
+          Right. Nothing says stop, and each new try is a full model turn.
+      - text: Wait a while, then retry with backoff
+        feedback: >-
+          Backoff lives in code. The model has no clock and no reason to wait, so it calls again at once.
+      - text: Stop the run with an exception
+        feedback: >-
+          The `catch` turned the failure into text. To the loop it's an ordinary result, so the run carries on.
+      - text: Tell the user the forecast is down
+        feedback: >-
+          Some runs end there. But `Error: 503` doesn't say giving up is right, so many try again first.
+
+  - type: prose
+    id: name-tool-errors
+    body: |-
+      Each of those retries was a model turn: seconds and thousands of tokens, for nothing.
+
+      So retry in code: a **timeout** on every call, then backoff and jitter, as in Failure
+      handling. A retried booking sends an idempotency key, an id that lets the service spot
+      a repeat. If it still fails, return a **tool error**: what failed, whether retrying
+      can help, and what to do instead.
+
+  - type: fill-blank
+    id: fill-forecast-error
+    concept: agents.failing-tools
+    difficulty: 2
+    language: ts
+    prompt: >-
+      Finish the forecast tool. Every call gets a deadline. A failure says whether a later
+      retry can help, and what to do now.
+    template: |
+      async function getForecast(city: string): Promise<ToolResult> {
+        const reply = await fetch(`${WEATHER_URL}/forecast?city=${encodeURIComponent(city)}`, {
+          signal: AbortSignal.{{1}}(3000),
+        }).catch(() => null);
+        if (reply?.ok) return { ok: true, data: await reply.json() };
+        const status = reply?.status ?? 0; // 0: timed out or no connection
+        return {
+          ok: false,
+          retryable: status === 0 || status === 429 || status >= {{2}},
+          message: `Forecast unavailable (${status}). {{3}}`,
+        };
+      }
+    blanks:
+      - key: '1'
+        answer: timeout
+      - key: '2'
+        answer: '500'
+      - key: '3'
+        answer: Tell the user, and plan without it.
+    bank: [timeout, abort, '500', '400', 'Tell the user, and plan without it.', 'Try again.']
+
+  - type: ai-review
+    id: review-retries-on-retries
+    concept: agents.error-budget-across-layers
+    difficulty: 3
+    language: ts
+    request: The shipping-quote tool fails now and then. Make it retry with backoff.
+    flawClass: performance
+    code: |
+      // The HTTP client already retries twice: three attempts per request.
+      const http = createHttpClient({ retries: 2, timeoutMs: 5000 });
+
+      export async function getShippingQuote(args: QuoteArgs): Promise<ToolResult> {
+        for (let attempt = 1; attempt <= 4; attempt++) {
+          try {
+            return { ok: true, data: await http.post('/quotes', args) };
+          } catch (error) {
+            if (attempt === 4) return toolError(error);
+            await sleep(backoffWithJitter(attempt));
+          }
+        }
+        throw new Error('unreachable');
+      }
+    prompt: >-
+      An assistant wrote this. Its test used a fake that failed once, then answered. In an
+      outage, the model called the tool three times, and the service saw 36 calls. Tap the
+      line at fault.
+    lines: [5]
+    reasons:
+      - text: It adds a retry layer on top of two others
+        correct: true
+        feedback: >-
+          Yes. Client, wrapper and model multiply. Retry in one layer only.
+      - text: The backoff needs more jitter
+        feedback: >-
+          Jitter spreads many callers apart. It doesn't cut how many calls one question makes.
+      - text: The timeout of 5 seconds is too long
+        feedback: >-
+          A shorter timeout shortens each wait. The number of calls still multiplies across three layers.
+      - text: It should throw instead of returning an error
+        feedback: >-
+          Throwing hands the failure to the harness, which may re-run the tool. That adds a layer.
+    fix: |
+      // One layer retries: the HTTP client. The breaker then cuts the model's repeat calls.
+      export async function getShippingQuote(args: QuoteArgs): Promise<ToolResult> {
+        try {
+          return { ok: true, data: await http.post('/quotes', args) };
+        } catch (error) {
+          return toolError(error);
+        }
+      }
+    verify:
+      question: Which test proves the fix?
+      choices:
+        - text: A fake that always fails, counting calls per question
+          correct: true
+          feedback: >-
+            Yes. Only a lasting outage shows the layers multiplying.
+        - text: A fake that fails once, then returns a quote
+          feedback: >-
+            That's the test the old code passed too. One blip never reaches the second layer.
+        - text: A check that the quoted price is right
+          feedback: >-
+            Prices only show the happy path. The fault appears when the service stays down.
+
+  - type: prose
+    id: name-tool-breaker
+    body: |-
+      One layer of retries still costs a model turn per call. So give each tool a **circuit
+      breaker**, as in Failure handling: after a few failures in a row, it opens.
+
+      While it's open, the wrapper doesn't touch the network. It answers at once:
+      "`get_forecast` is unavailable. Don't call it again in this task." After a cool-down,
+      one trial call goes through.
+
+  - type: code-challenge
+    id: write-call-tool
+    concept: agents.failing-tools
+    difficulty: 4
+    language: ts
+    starter: breaker.starter.ts
+    solution: breaker.solution.ts
+    tests: breaker.tests.ts
+    prompt: >-
+      Write `callTool(name, args, deps)`. Each tool name gets its own breaker in
+      `deps.breakers`, created as `{ failures: 0, openUntil: 0 }`. Read the time from
+      `deps.now()`.
+
+
+      1. Open (`now() < openUntil`): return the `unavailable` error at once, without calling
+      `deps.run`. It has `retryable: false` and a message naming the tool.
+
+      2. Otherwise call `deps.run(name, args)`. A success resets `failures` and returns `{ ok:
+      true, data }`.
+
+      3. A failure adds one to `failures`. At `deps.threshold`, set `openUntil` to now plus
+      `cooldownMs` and return `unavailable`. Below it, return `failed` with `retryable: true`.
+
+
+      After the cool-down, the next call is the trial. If it fails, the breaker opens again.
+    hints:
+      - The open check comes first, before `deps.run`. That's what makes an open breaker instant.
+      - Don't reset `failures` when the breaker opens. Then one failed trial is enough to reopen it.
+      - 'Start with `const breaker = deps.breakers.get(name) ?? { failures: 0, openUntil: 0 }`, and `set` it back.'
+
+  - type: prose
+    id: name-degraded-answer
+    body: |-
+      An open breaker doesn't end the task. Take a fallback path, as in Cost, latency and
+      fallbacks: yesterday's cached forecast labelled with its age, another source, or a person.
+
+      If nothing works, give a **degraded answer**: finish what you can, and say plainly what
+      you couldn't do. "Train booked. I couldn't get Saturday's forecast" beats a confident
+      guess.
+
+  - type: bug-hunt
+    id: pick-honest-answer
+    concept: agents.degraded-answers
+    difficulty: 3
+    language: ts
+    code: |
+      async function forecastOrFallback(city: string): Promise<ToolResult> {
+        const live = await callTool('get_forecast', { city }, deps);
+        if (live.ok) return live;
+        const cached = forecastCache.get(city); // { forecast, savedAt }
+        if (cached) return { ok: true, data: cached.forecast };
+        return {
+          ok: false, error: 'unavailable', retryable: false,
+          message: "No forecast. Tell the user, and don't guess one.",
+        };
+      }
+    prompt: >-
+      The weather service was down for two days. The agent told users "Saturday looks sunny",
+      from a forecast saved on Wednesday. Tap the line at fault.
+    lines: [5]
+    reasons:
+      - text: The cached forecast goes out without its age
+        correct: true
+        feedback: >-
+          Yes. The model can't label what it can't see. Send `savedAt` with it.
+      - text: It shouldn't fall back to a cache at all
+        feedback: >-
+          A cache is a fair fallback when it says how old it is. Hiding the age is the fault.
+      - text: The final error should be retryable
+        feedback: >-
+          The service is already down and the breaker open. Another try only delays the honest answer.
+    fix: |
+      async function forecastOrFallback(city: string): Promise<ToolResult> {
+        const live = await callTool('get_forecast', { city }, deps);
+        if (live.ok) return live;
+        const cached = forecastCache.get(city);
+        if (cached) {
+          const note = 'Cached, not live. Tell the user how old it is.';
+          return { ok: true, data: { ...cached.forecast, savedAt: cached.savedAt, note } };
+        }
+        return {
+          ok: false, error: 'unavailable', retryable: false,
+          message: "No forecast. Tell the user, and don't guess one.",
+        };
+      }
+
+  - type: explain-back
+    id: explain-why-not-retry-forever
+    concept: agents.degraded-answers
+    difficulty: 4
+    audience: incident
+    kind: decide
+    prompt: >-
+      The weather service is down. In the incident channel, someone proposes raising retries
+      to ten so users stop seeing "couldn't". Give your call and why.
+    rubric:
+      - More retries multiply through the layers and the model's own calls, adding load to a service trying to recover.
+      - Each extra attempt makes the user wait longer, and a dead service doesn't come back sooner.
+      - Keep one capped retry layer and the breaker; the agent finishes what it can and names the gap.
+    modelAnswer: >-
+      I'd leave retries where they are. Ten retries in the client become dozens of calls per
+      question once the model calls the tool again. That's load on a service that's trying
+      to come back. Users would also wait longer for the same failure. The breaker already stops
+      calls, and its trial call will tell us when the service is back. Meanwhile the agent books
+      the train and says it couldn't get the forecast. That's an answer users can act on, which
+      a long spinner isn't.
+
+recap:
+  - Give every tool call a timeout, retry in code, and return an error the model can act on.
+  - Retry in one layer only, because retries in the client, tool, loop and caller multiply.
+  - Open a breaker per tool, take a fallback, and tell the user plainly what couldn't be done.
+
+recall:
+  - id: card-tool-error-parts
+    concept: agents.failing-tools
+    front: What should a failed tool call tell the model?
+    back: >-
+      That it failed, whether retrying later can help, and what to do instead, such as use
+      another source or tell the user.
+  - id: card-why-not-model-retries
+    concept: agents.failing-tools
+    front: Why should retries happen in code rather than by the model calling again?
+    back: >-
+      Each model retry is a full turn of tokens and seconds, and the model has no clock for
+      backoff. Code retries cheaply with backoff and jitter.
+  - id: card-retry-layers
+    concept: agents.error-budget-across-layers
+    front: An HTTP client, a tool wrapper and the harness each retry. What goes wrong?
+    back: >-
+      The attempts multiply, so one question becomes dozens of calls and minutes of waiting.
+      Pick one layer to retry, and cap the total time.
+  - id: card-retried-writes
+    concept: agents.failing-tools
+    front: What keeps a retried write, such as a booking, from happening twice?
+    back: >-
+      An idempotency key, such as the tool-call id. The service returns the first result
+      for a key it has already seen.
+  - id: card-degraded-answer
+    concept: agents.degraded-answers
+    front: What does a good degraded answer contain?
+    back: >-
+      The work that succeeded, a plain statement of what couldn't be done, and what the user
+      can do about it. Never a made-up result.
+
+references:
+  - kind: essay
+    title: Exponential Backoff And Jitter
+    authors: Marc Brooker
+    year: 2015
+    venue: AWS Architecture Blog
+    url: https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/
+    note: Why clients that retry together need a random part in each wait.
+    primary: true
+    verified: true
+  - kind: essay
+    title: CircuitBreaker
+    authors: Martin Fowler
+    year: 2014
+    venue: martinfowler.com
+    url: https://martinfowler.com/bliki/CircuitBreaker.html
+    note: The closed, open and half-open states, with a worked example.
+    primary: true
+    verified: true
+  - kind: book
+    title: 'Site Reliability Engineering, chapter 22: Addressing Cascading Failures'
+    authors: Mike Ulrich
+    year: 2016
+    venue: O'Reilly
+    url: https://sre.google/sre-book/addressing-cascading-failures/
+    note: Retry amplification across layers, deadlines and degraded modes.
+    verified: true
+  - kind: essay
+    title: Building effective agents
+    authors: Erik Schluntz and Barry Zhang
+    year: 2024
+    venue: Anthropic Engineering
+    url: https://www.anthropic.com/engineering/building-effective-agents
+    note: Tool design, stopping conditions and ground truth from the environment.
+    verified: true
+
+deepDive: >-
+  The breaker ran in TypeScript against a fake clock and a fake service. No agent or real
+  API was called.
+
+
+  **Why the arithmetic is so bad in an agent.** In a web service, three retry layers multiply
+  calls to the dependency. In an agent there's a fourth: the model itself, which reads an
+  error and calls the tool again. Every one of those calls fans out into the layers below. A
+  breaker is what cuts the model's layer, because an instant "unavailable" gives it nothing
+  to retry.
+
+
+  **A deadline for the whole call.** Per-attempt timeouts aren't enough. Two retries of a
+  five-second timeout, plus backoff, can take more than fifteen seconds. Give the tool call one
+  overall deadline, and stop retrying when it can't fit another attempt.
+
+
+  **Half-open with many callers.** The `callTool` in the challenge lets every call through
+  once the cool-down ends. With one agent that's a single trial. With fifty agents sharing a
+  breaker, mark the breaker as trialling so only one call goes through. Keep the shared
+  state somewhere all of them can read, such as Redis.
+
+
+  **Breakers and stall detection.** Stall detection from Loops that run for hours notices
+  the same result coming back. An open breaker produces exactly that, so the two agree: the
+  agent re-plans around the missing tool, and escalates if it can't.

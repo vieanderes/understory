@@ -92,9 +92,10 @@ export function ScoutPanel({
     [entries],
   );
   const library = useMemo(() => {
-    if (!entries || !catalog) return '';
-    const moduleOf = (id: string) => catalog.lessons[id]?.moduleId;
-    const path = status === 'ready' ? pathUnderWay(state, paths, catalog) : undefined;
+    if (!entries) return '';
+    // The catalogue only adds chapters: a lesson's own references need nothing more.
+    const moduleOf = (id: string) => catalog?.lessons[id]?.moduleId;
+    const path = status === 'ready' && catalog ? pathUnderWay(state, paths, catalog) : undefined;
     const moduleIds = lesson
       ? [moduleOf(lesson.key)].filter((m): m is string => m !== undefined)
       : [...new Set((path?.lessonIds ?? []).flatMap((id) => moduleOf(id) ?? []))];

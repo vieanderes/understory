@@ -15,6 +15,7 @@ code, and heed deprecation notices.
 | ------------------------------------------------------------- | --------------------------------------------------------------------------------- |
 | A path (the front door: goal, stages, lessons)                | `content/tracks/<id>.yaml`, `src/lib/content/paths.ts`, `src/features/paths/`     |
 | A lesson, a recall card, a reference                          | `content/course/<module>/<lesson>/` and `docs/CONTENT-GUIDE.md`                   |
+| A vocabulary word                                             | `content/glossary/<area>/<id>.yaml` and `docs/VOCABULARY.md`                      |
 | A lesson's lecture notes, a capstone's worked solution        | `notes.yaml` beside the lesson, `content/capstones/`, and `docs/LECTURE-BRIEF.md` |
 | What a lesson file may contain                                | `src/core/content/schema.ts`, then the validator and the docs                     |
 | A learning rule (mastery, XP, weekly goal, ranks, scheduling) | `src/core/`, test first, and `docs/LEARNING-SCIENCE.md`                           |

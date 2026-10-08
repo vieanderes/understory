@@ -29,12 +29,15 @@ const PATH = [
     name: 'First programs in two weeks!',
     alternatives: ['Code from zero, gently'],
     summary: 'Small programs that calculate and decide.',
+    destination: 'Write a small program that works out a bill and decides on a tip',
     minutesPerWeek: 120,
+    cut: [{ what: 'Loops', why: 'Nothing here repeats yet.', lessons: ['basics.loops'] }],
     stages: [
       {
         title: 'Calculating',
         why: 'Numbers and text first.',
         lessons: ['basics.operators', 'made.up-lesson'],
+        milestone: { output: 'A bill splitter that prints each share', check: 'Try three totals' },
       },
       { title: 'Deciding', why: 'Then choices.', lessons: ['basics.conditions'] },
     ],
@@ -127,6 +130,10 @@ test('plan a path with Scout in the builder, change the draft and save it to Lea
 
   await card.getByRole('button', { name: 'Open draft' }).click();
   const draft = scout.getByRole('region', { name: 'Draft path' });
+  // The Advisor's parts: where it ends, what a stage makes, what was left out.
+  await expect(draft.getByText(/works out a bill and decides on a tip/)).toBeVisible();
+  await expect(draft.getByText('A bill splitter that prints each share')).toBeVisible();
+  await expect(draft.getByText('Left out for now · 1')).toBeVisible();
   await draft.getByRole('button', { name: /^Add/ }).click();
   await expect(draft.getByText(/builds on/)).toBeHidden();
   await draft.getByRole('button', { name: 'Code from zero, gently' }).click();
@@ -141,6 +148,11 @@ test('plan a path with Scout in the builder, change the draft and save it to Lea
   await expect(learn.getByText('Small programs that calculate and decide.')).toBeVisible();
   await expect(learn.getByRole('region', { name: 'Calculating', exact: true })).toBeVisible();
   await expect(learn.getByText(/About \d+ weeks? at 2 h a week/)).toBeVisible();
+  await expect(learn.getByText(/works out a bill and decides on a tip/)).toBeVisible();
+  // A milestone is met on the learner's word.
+  await learn.getByRole('button', { name: 'Mark met' }).click();
+  await expect(learn.getByRole('button', { name: 'Met' })).toHaveAttribute('aria-pressed', 'true');
+  await expect(learn.getByText('Left out for now · 1')).toBeVisible();
 
   // Away from the builder Scout is the usual assistant again.
   if (!(await scout.isVisible())) await page.getByRole('button', { name: 'Ask Scout AI' }).click();

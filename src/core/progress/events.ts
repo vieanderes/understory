@@ -284,6 +284,21 @@ export const ownPathStageSchema = z.strictObject({
   title: z.string().trim().min(1).max(80),
   why: z.string().trim().max(240).optional(),
   lessonIds: z.array(idSchema).min(1).max(200),
+  /** What the learner makes to show they have the stage, and how they know. */
+  milestone: z
+    .strictObject({
+      output: z.string().trim().min(1).max(160),
+      check: z.string().trim().min(1).max(200),
+    })
+    .optional(),
+});
+
+/** Left out of a planned path on purpose, with the reason (docs/SCOUT-ROLES.md). */
+export const ownPathCutSchema = z.strictObject({
+  what: z.string().trim().min(1).max(80),
+  why: z.string().trim().min(1).max(200),
+  later: z.boolean(),
+  lessonIds: z.array(idSchema).max(200),
 });
 
 /**
@@ -297,6 +312,10 @@ export const customPathSetPayloadSchema = z.strictObject({
   name: z.string().trim().min(1).max(48),
   lessonIds: z.array(idSchema).max(1000),
   stages: z.array(ownPathStageSchema).max(12).optional(),
+  /** What the learner will be able to do or make at the end, and where they started. */
+  destination: z.string().trim().min(1).max(200).optional(),
+  baseline: z.string().trim().max(300).optional(),
+  cut: z.array(ownPathCutSchema).max(8).optional(),
   /** One or two sentences on what the path is for, shown as its promise. */
   summary: z.string().trim().max(400).optional(),
   /** The pace it was planned for, so the path can say how long it takes. */
@@ -307,6 +326,17 @@ export const customPathSetPayloadSchema = z.strictObject({
     })
     .optional(),
   origin: z.enum(['builder', 'scout']),
+});
+
+/**
+ * The learner says a milestone of their path is met, or takes it back. Their word, as a
+ * capstone is: Scout never marks one. Keyed by the milestone's text, so reordering the
+ * stages keeps the mark.
+ */
+export const milestoneMarkedPayloadSchema = z.strictObject({
+  pathId: ownPathIdSchema,
+  milestone: z.string().trim().min(1).max(160),
+  met: z.boolean(),
 });
 
 /** A news edition was opened. Read state is a fact, so it follows the progress file. */
@@ -439,6 +469,7 @@ export const LATEST_VERSION = {
   profile_set: 1,
   news_read: 1,
   custom_path_set: 2,
+  milestone_marked: 1,
   words_added: 1,
   words_removed: 1,
   word_reviewed: 1,
@@ -573,6 +604,12 @@ export const customPathSetEventSchema = envelope(
   customPathSetPayloadSchema,
 );
 
+export const milestoneMarkedEventSchema = envelope(
+  'milestone_marked',
+  LATEST_VERSION.milestone_marked,
+  milestoneMarkedPayloadSchema,
+);
+
 export const wordsAddedEventSchema = envelope(
   'words_added',
   LATEST_VERSION.words_added,
@@ -619,6 +656,7 @@ export const storyEventSchema = z.discriminatedUnion('type', [
   profileSetEventSchema,
   newsReadEventSchema,
   customPathSetEventSchema,
+  milestoneMarkedEventSchema,
   wordsAddedEventSchema,
   wordsRemovedEventSchema,
   wordReviewedEventSchema,

@@ -462,6 +462,9 @@ export function PathBuilder({ tree }: { tree: CourseTree }) {
       ...(stages ? { stages } : {}),
       ...(existing?.summary ? { summary: existing.summary } : {}),
       ...(existing?.pace ? { pace: existing.pace } : {}),
+      ...(existing?.destination ? { destination: existing.destination } : {}),
+      ...(existing?.baseline ? { baseline: existing.baseline } : {}),
+      ...(existing?.cut ? { cut: existing.cut } : {}),
       origin: existing?.origin ?? 'builder',
     });
     const others = chosenPathIds(state.settings[CHOSEN_PATH]).filter((id) => id !== pathId);

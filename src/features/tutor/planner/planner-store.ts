@@ -127,8 +127,17 @@ export function resetPlanner(): () => void {
 
 /** What makes two drafts the same path, for "is there anything to save". */
 export function draftKey(draft: Draft): string {
-  const { name, summary, minutesPerWeek, deadline, stages } = draft;
-  return JSON.stringify({ name, summary, minutesPerWeek, deadline, stages });
+  const { name, summary, minutesPerWeek, deadline, destination, baseline, cut, stages } = draft;
+  return JSON.stringify({
+    name,
+    summary,
+    minutesPerWeek,
+    deadline,
+    destination,
+    baseline,
+    cut: cut?.length ? cut : undefined,
+    stages,
+  });
 }
 
 export function draftFromOwnPath(path: OwnPath): Draft {
@@ -138,10 +147,16 @@ export function draftFromOwnPath(path: OwnPath): Draft {
     summary: path.summary ?? '',
     ...(path.pace?.minutesPerWeek ? { minutesPerWeek: path.pace.minutesPerWeek } : {}),
     ...(path.pace?.deadline ? { deadline: path.pace.deadline } : {}),
+    ...(path.destination ? { destination: path.destination } : {}),
+    ...(path.baseline ? { baseline: path.baseline } : {}),
+    ...(path.cut?.length
+      ? { cut: path.cut.map((c) => ({ ...c, lessonIds: [...c.lessonIds] })) }
+      : {}),
     stages: (path.stages ?? [{ title: 'Your lessons', lessonIds: path.lessonIds }]).map((s) => ({
       title: s.title,
       why: s.why ?? '',
       lessonIds: [...s.lessonIds],
+      ...(s.milestone ? { milestone: s.milestone } : {}),
     })),
   };
 }

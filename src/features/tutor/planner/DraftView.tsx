@@ -13,10 +13,12 @@ import {
   removeLesson,
   removeStage,
   renameDraft,
+  restoreCut,
   type Draft,
   type DraftFacts,
 } from '@/core/planner';
 import { cn } from '@/lib/cn';
+import { CutList, Destination, MilestoneLine } from './AdvisorParts';
 import { paceLine, sizeLine } from './facts';
 import type { PlannerCourse } from './usePlannerCourse';
 import { lessonInfo } from './usePlannerCourse';
@@ -164,6 +166,8 @@ export function DraftView({
         <div className="flex flex-col gap-3">
           <NameField draft={draft} onChange={onChange} />
 
+          <Destination destination={draft.destination} baseline={draft.baseline} />
+
           <div className="flex flex-col gap-0.5">
             {draft.summary ? <p className="text-sm text-pretty">{draft.summary}</p> : null}
             <p className="t-figure text-muted text-sm">{sizeLine(draft, facts)}</p>
@@ -232,6 +236,11 @@ export function DraftView({
                       <p className="t-figure text-faint text-sm">
                         {stage.lessonIds.length} · {formatMinutes(minutes)}
                       </p>
+                      {stage.milestone ? (
+                        <div className="pt-0.5">
+                          <MilestoneLine milestone={stage.milestone} />
+                        </div>
+                      ) : null}
                     </div>
                     {draft.stages.length > 1 ? (
                       <button
@@ -298,6 +307,10 @@ export function DraftView({
               );
             })}
           </ol>
+          <CutList
+            cut={draft.cut ?? []}
+            onRestore={(i) => onChange(fixOrder(restoreCut(draft, i), course, completed))}
+          />
           <p className="text-faint text-sm text-pretty">
             To add lessons or change the shape, tell Scout. It sees this draft as it is now.
           </p>

@@ -186,6 +186,7 @@ function plannedStages(
         tests: mostly ? (tryIt.get(chapter.id) ?? []) : [],
         lessons: located.map((l) => pathLesson(l.lesson)),
         optional: [],
+        ...(stage.milestone ? { milestone: stage.milestone } : {}),
       },
     ];
   });
@@ -212,7 +213,8 @@ export function restage(
 /** A learner's own path as a path like any other, so Learn shows it with the same page. */
 export function ownPathSummary(
   tree: CourseTree,
-  own: Pick<OwnPath, 'id' | 'name' | 'lessonIds'> & Partial<Pick<OwnPath, 'stages' | 'summary'>>,
+  own: Pick<OwnPath, 'id' | 'name' | 'lessonIds'> &
+    Partial<Pick<OwnPath, 'stages' | 'summary' | 'destination' | 'baseline' | 'cut'>>,
   written: readonly PathSummary[] = [],
 ): PathSummary {
   const tryIt = tryItByChapter(written);
@@ -236,6 +238,9 @@ export function ownPathSummary(
     practice: [],
     readyWhen: [],
     stages,
+    ...(own.destination ? { destination: own.destination } : {}),
+    ...(own.baseline ? { baseline: own.baseline } : {}),
+    ...(own.cut?.length ? { cut: own.cut } : {}),
     lessonIds: lessons.map((l) => l.id),
     minutes: lessons.reduce((sum, l) => sum + l.minutes, 0),
   };

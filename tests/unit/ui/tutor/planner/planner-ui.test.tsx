@@ -241,6 +241,38 @@ describe('DraftView', () => {
     await user.click(screen.getByRole('button', { name: 'Remove Lesson web.http' }));
     expect(onChange.mock.calls[0]![0].stages[0].lessonIds).toEqual(['web.rest']);
   });
+
+  it('shows the destination, each milestone and the cutlist, and brings a cut back in order', async () => {
+    const user = userEvent.setup();
+    const onChange = setup({
+      ...DRAFT,
+      destination: 'Ship a small REST API',
+      baseline: 'Writes scripts.',
+      cut: [
+        { what: 'HTTP basics', why: 'Known already.', later: true, lessonIds: ['web.http'] },
+        { what: 'Kubernetes', why: 'One service needs none.', later: false, lessonIds: [] },
+      ],
+      stages: [
+        {
+          title: 'APIs',
+          why: '',
+          lessonIds: ['web.rest'],
+          milestone: { output: 'An API that rejects bad input', check: 'Its tests pass' },
+        },
+      ],
+    });
+    expect(screen.getByText('Ship a small REST API')).toBeInTheDocument();
+    expect(screen.getByText('Starting from: Writes scripts.')).toBeInTheDocument();
+    expect(screen.getByText('An API that rejects bad input')).toBeInTheDocument();
+    expect(screen.getByText('Left out for now · 2')).toBeInTheDocument();
+    expect(screen.getByText(/Not needed for this destination/)).toBeInTheDocument();
+    expect(screen.getAllByRole('button', { name: 'Bring back' })).toHaveLength(1);
+    await user.click(screen.getByText('Left out for now · 2'));
+    await user.click(screen.getByRole('button', { name: 'Bring back' }));
+    const next = onChange.mock.calls[0]![0] as Draft;
+    expect(next.cut?.map((c) => c.what)).toEqual(['Kubernetes']);
+    expect(next.stages.flatMap((st) => st.lessonIds)).toEqual(['web.http', 'web.rest']);
+  });
 });
 
 describe('the planner store', () => {

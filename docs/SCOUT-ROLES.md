@@ -78,37 +78,25 @@ The learner answers two questions (destination, then baseline where unknown), no
 Sequencing, cuts and milestones are Scout's proposals, which is what an advisor is for.
 
 **Protocol** (`src/core/planner/protocol.ts`), all fields optional so old paths still parse:
+`destination` (one line), `baseline` (one sentence), `cut` (up to 8 items of `what`, `why`,
+`later`, `lessons`) and a `milestone` (`output`, `check`) per stage.
 
-```ts
-destination: line(200),                       // "Ship a small REST API with auth and tests"
-baseline: z.string().trim().max(300),         // one sentence, in their words where they gave them
-cut: z.array(z.object({
-  what: line(80),                             // a chapter, topic or lesson group
-  why: line(200),
-  later: z.boolean().default(true),           // false: not needed for this destination at all
-  lessons: z.array(z.string().max(80)).max(MAX_LESSONS).default([]),
-})).max(8).default([]),
-// per stage:
-milestone: z.object({
-  output: line(160),                          // "A deployed endpoint that rejects bad input with 400"
-  check: line(200),                           // how they will know: a test passes, a review, a demo
-  capstone: z.string().optional(),            // when a course capstone or checkpoint already is the proof
-}).optional(),
-```
-
-`draft.ts` checks cut lesson ids against the course, drops cut lessons from the stages, and
-prefers a stage's own capstone or checkpoint as its milestone when the stage ends at one.
+`draftFromBlock` checks cut lesson ids against the course and keeps cut lessons out of every
+stage. `restoreCut` brings an item back as a last stage, which `fixOrder` then places. Where a
+stage ends a chapter, the rules let its capstone or checkpoint be the milestone.
 
 **Rules added to `PLANNER_RULES`:** ask the destination first; a milestone is an output, never
 "finish the lessons"; at most eight cuts, each with a reason tied to the destination; say in
 one sentence what was cut.
 
-**Storage.** `ownPathStageSchema` and the own-path event gain the optional fields. The Swift
-decoder in `ios/UnderstoryKit` ignores unknown keys today; confirm before landing. A new event,
-`milestone_marked { pathId, stageIndex, note? }`, records the learner's word, as capstones are.
+**Storage.** `custom_path_set` keeps the new fields, optional, so older events still read; the
+Swift decoder ignores keys it does not know. `milestone_marked { pathId, milestone, met }`
+records the learner's word, keyed by the milestone's text so reordering stages keeps the mark,
+and earns no XP.
 
-**Screens.** The draft view and the path page show the destination at the top, the milestone
-under each stage, and a collapsed "Left out for now" list with a control to bring an item back.
+**Screens.** The draft view and the path page show the destination under the name, the
+milestone under each stage (with Mark met on the path page), and a collapsed "Left out for
+now" list. In the draft an item with lessons can be brought back.
 
 ## 5. Librarian: defending the curriculum
 

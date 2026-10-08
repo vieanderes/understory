@@ -23,8 +23,8 @@ import type { UnknownEvent } from './upcast';
 /** 2: `capstoneAdrs` joined the state. 3: `pathExams`. 4: `onlineTests`. 5: `plan`.
  * 6: `profile`, `newsRead`, `customPath`, and XP for timed tests. 7: `lessonCompletedOn`.
  * 8: `customPath` became `ownPaths`, several named paths. 9: `placementByArea`.
- * 10: `vocabulary`. */
-export const REDUCER_VERSION = 10;
+ * 10: `vocabulary`. 11: `milestonesMet`. */
+export const REDUCER_VERSION = 11;
 
 /** A day's worth of XP by 24-hour cooldown key, so "no grinding" can be checked. One
  * day of slack either side of midnight is not modelled; a plain 24h window from the
@@ -146,6 +146,8 @@ export interface ProgressState {
   readonly newsRead: ReadonlySet<string>;
   /** The paths the learner made, by id, in the order they were first made. */
   readonly ownPaths: ReadonlyMap<string, OwnPath>;
+  /** Per own path, the milestones the learner has marked met, by their text. */
+  readonly milestonesMet: ReadonlyMap<string, ReadonlySet<string>>;
   readonly assumedConcepts: ReadonlySet<string>;
   /** How many placements were finished. A later one rotates its items. */
   readonly placementsCompleted: number;
@@ -185,6 +187,7 @@ export function initialProgressState(): ProgressState {
     profile: undefined,
     newsRead: new Set(),
     ownPaths: new Map(),
+    milestonesMet: new Map(),
     assumedConcepts: new Set(),
     placementsCompleted: 0,
     placementByArea: {},
@@ -544,6 +547,16 @@ export function applyEvent(state: ProgressState, event: StoryEvent | UnknownEven
       if (path.lessonIds.length === 0) ownPaths.delete(pathId);
       else ownPaths.set(pathId, { id: pathId, ...path });
       return { ...state, ownPaths };
+    }
+
+    case 'milestone_marked': {
+      const { pathId, milestone, met } = event.payload;
+      const marked = new Set(state.milestonesMet.get(pathId));
+      if (met) marked.add(milestone);
+      else marked.delete(milestone);
+      const milestonesMet = new Map(state.milestonesMet);
+      milestonesMet.set(pathId, marked);
+      return { ...state, milestonesMet };
     }
 
     case 'news_read':

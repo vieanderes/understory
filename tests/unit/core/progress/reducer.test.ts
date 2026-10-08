@@ -405,6 +405,44 @@ describe('applyEvent', () => {
     ]);
   });
 
+  it('keeps an own path’s destination, cutlist and milestones as planned', () => {
+    const at = (key: string) => depsFor('device-1', '2026-09-18T10:00:00Z', key);
+    const planned = makeEvent(at('a'), 'custom_path_set', {
+      pathId: 'own-a1b2c3d4',
+      name: 'A small API',
+      lessonIds: ['web.http'],
+      destination: 'Ship a small REST API',
+      baseline: 'Writes scripts.',
+      cut: [{ what: 'GraphQL', why: 'Not for this API.', later: true, lessonIds: ['web.graphql'] }],
+      stages: [
+        {
+          title: 'HTTP',
+          lessonIds: ['web.http'],
+          milestone: { output: 'A server that answers', check: 'curl shows it' },
+        },
+      ],
+      origin: 'scout',
+    });
+    const path = reduce([planned]).ownPaths.get('own-a1b2c3d4');
+    expect(path?.destination).toBe('Ship a small REST API');
+    expect(path?.cut?.[0]?.what).toBe('GraphQL');
+    expect(path?.stages?.[0]?.milestone?.output).toBe('A server that answers');
+  });
+
+  it('marks a milestone met on the learner’s word, the latest mark winning, and grants no XP', () => {
+    const at = (key: string) => depsFor('device-1', '2026-09-18T10:00:00Z', key);
+    const mark = (key: string, milestone: string, met: boolean) =>
+      makeEvent(at(key), 'milestone_marked', { pathId: 'own-a1b2c3d4', milestone, met });
+    const state = reduce([
+      mark('a', 'A server that answers', true),
+      mark('b', 'Tests that pass', true),
+      mark('c', 'Tests that pass', false),
+    ]);
+    expect([...(state.milestonesMet.get('own-a1b2c3d4') ?? [])]).toEqual(['A server that answers']);
+    expect(state.xpByLocalDate).toEqual({});
+    expect(reduce([]).milestonesMet.size).toBe(0);
+  });
+
   it('keeps every online-test sitting as a fact, and grants XP for the score', () => {
     const payload = {
       attemptId: 'a1',

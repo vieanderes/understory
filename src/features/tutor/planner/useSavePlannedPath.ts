@@ -25,11 +25,15 @@ export function useSavePlannedPath() {
         pathId,
         name: draft.name,
         lessonIds: draftLessonIds(draft),
-        stages: draft.stages.map(({ title, why, lessonIds }) => ({
+        stages: draft.stages.map(({ title, why, lessonIds, milestone }) => ({
           title,
           ...(why ? { why } : {}),
           lessonIds,
+          ...(milestone ? { milestone } : {}),
         })),
+        ...(draft.destination ? { destination: draft.destination } : {}),
+        ...(draft.baseline ? { baseline: draft.baseline } : {}),
+        ...(draft.cut?.length ? { cut: draft.cut } : {}),
         ...(draft.summary ? { summary: draft.summary } : {}),
         ...(draft.minutesPerWeek
           ? {

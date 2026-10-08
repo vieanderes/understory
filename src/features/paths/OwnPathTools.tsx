@@ -1,9 +1,9 @@
 'use client';
 
-import { Pencil, Trash2 } from 'lucide-react';
+import { Check, Pencil, Trash2 } from 'lucide-react';
 import Link from 'next/link';
 import { useSyncExternalStore } from 'react';
-import { buttonClass } from '@/components/ui/Button';
+import { Button, buttonClass } from '@/components/ui/Button';
 import { formatMinutes } from '@/core/insight';
 import { pathPace } from '@/core/planner/pace';
 import { useNow } from '@/features/catalog/useNow';
@@ -139,5 +139,28 @@ export function OwnPathPace({ pathId, minutesLeft }: { pathId: string; minutesLe
           : `. To finish by ${deadline} it needs ${formatMinutes(minutesPerWeekNeeded ?? 0)} a week.`
         : '.'}
     </p>
+  );
+}
+
+/**
+ * Marks a milestone of an own path met, or takes the mark back. The learner's word, as a
+ * capstone is: Scout never marks one.
+ */
+export function MilestoneMark({ pathId, milestone }: { pathId: string; milestone: string }) {
+  const store = useStore();
+  const { status, state } = useProgress();
+  if (status !== 'ready') return null;
+  const met = state.milestonesMet.get(pathId)?.has(milestone) ?? false;
+  return (
+    <Button
+      variant="quiet"
+      size="md"
+      aria-pressed={met}
+      onClick={() => void store.record('milestone_marked', { pathId, milestone, met: !met })}
+      className="text-muted hover:text-fg -my-1 shrink-0"
+    >
+      {met ? <Check aria-hidden size={16} strokeWidth={2} className="text-success" /> : null}
+      {met ? 'Met' : 'Mark met'}
+    </Button>
   );
 }

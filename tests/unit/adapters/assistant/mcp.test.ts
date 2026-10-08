@@ -7,7 +7,7 @@ import { collect, CONTEXT } from './fixtures';
 const { POST: mcpPost } = await import('@/app/api/mcp/route');
 const bridge = await import('@/app/api/assistant/bridge/route');
 const { getBridgeStore } = await import('@/adapters/assistant/server/bridge-store');
-const { MCP_INSTRUCTIONS, handleMcpRequest, untrusted } =
+const { MCP_INSTRUCTIONS, handleMcpRequest, pageText, untrusted } =
   await import('@/adapters/assistant/server/mcp-server');
 const {
   createMcpPort,
@@ -454,6 +454,19 @@ describe('MCP server hardening', () => {
     const course = await client.callTool({ name: 'get_course', arguments: { code: pair.code } });
     expect(textOf(course)).toBe('# The course\n- web.http | HTTP');
     expect(MCP_INSTRUCTIONS).toContain('get_course');
+  });
+
+  it('carries the same role rules in get_task as the other providers', () => {
+    const text = pageText({
+      taskTitle: 'Closures',
+      statement: '',
+      language: '',
+      code: '',
+      output: '',
+      mode: 'tutor',
+      entry: 'stuck',
+    });
+    expect(text).toMatch(/one-sentence answer/i);
   });
 
   it('refuses a browser request from another site', async () => {

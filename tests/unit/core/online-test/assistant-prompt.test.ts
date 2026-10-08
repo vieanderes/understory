@@ -69,6 +69,18 @@ describe('assistant system prompts', () => {
     expect(prompt).not.toContain('News /signal');
   });
 
+  it('carries the rules of the roles its entry picks (docs/SCOUT-ROLES.md)', () => {
+    const lesson = assistantSystemPrompt({ ...base, mode: 'tutor', taskTitle: 'Closures' });
+    expect(lesson).toMatch(/one-sentence answer/i);
+    const stuck = assistantSystemPrompt({ ...base, mode: 'tutor', entry: 'stuck' });
+    expect(stuck).toMatch(/one-sentence answer/i);
+  });
+
+  it('gives the assessment no study role, whatever entry the tab sends', () => {
+    const prompt = assistantSystemPrompt({ ...base, entry: 'lesson' });
+    expect(prompt).not.toMatch(/one-sentence answer/i);
+  });
+
   it('keeps the assessment prompt as the default', () => {
     expect(assistantSystemPrompt(base)).toContain('online coding assessment');
   });

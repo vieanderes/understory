@@ -466,7 +466,7 @@ describe('MCP server hardening', () => {
       mode: 'tutor',
       entry: 'stuck',
     });
-    expect(text).toMatch(/one-sentence answer/i);
+    expect(text).toMatch(/diagnose before you explain/i);
   });
 
   it('refuses a browser request from another site', async () => {

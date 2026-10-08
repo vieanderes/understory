@@ -35,6 +35,7 @@ import {
   type TutorMessage,
   useHistory,
   useQueuedQuestion,
+  useTutorEntry,
   useTutorDocked,
   useTutorFocusRequest,
   useTutorOpen,
@@ -164,6 +165,8 @@ export function StudyAssistant({
   const opening = useTutorFocusRequest();
   // A question a page asked on the learner's behalf (askTutor), waiting for the panel.
   const queued = useQueuedQuestion();
+  // The button that asked, if one did: it picks Scout's roles for this conversation.
+  const entry = useTutorEntry();
 
   // Scout plans only where a "Plan with Scout" control opened it, on Learn or the builder.
   // Its conversation is kept, so planning again from there picks up where it was left.
@@ -247,6 +250,7 @@ export function StudyAssistant({
       scope
         ? {
             mode: 'tutor',
+            ...(entry ? { entry } : {}),
             taskTitle: scope.title,
             statement: scope.onScreen,
             language: scope.language ?? '',
@@ -261,7 +265,7 @@ export function StudyAssistant({
             code: '',
             output: '',
           },
-    [scope, guide],
+    [scope, guide, entry],
   );
 
   // On a phone the sheet covers the page a link opens, so following one closes it; desktop
@@ -415,6 +419,7 @@ export function StudyAssistant({
                     {...(latestNews ? { latestNews } : {})}
                     onFollowLink={followLink}
                     context={context}
+                    {...(scope ? { lesson: scope } : {})}
                     queued={queued}
                     takeQueued={takeQueuedQuestion}
                     transcript={history}

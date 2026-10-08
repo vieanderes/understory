@@ -15,6 +15,7 @@ import {
 } from '@/core/content/twin';
 import type { RunProgress, RunResult } from '@/core/ports/code-runner';
 import { loadingLabel } from '@/core/running/python-packages';
+import { runSummary } from '@/core/scout';
 import { clearDraft, draftKey, readDraft, writeDraft } from '@/features/editor/draft-store';
 import { LazyCodeEditor } from '@/features/editor/LazyCodeEditor';
 import type { DisposableRunner } from '@/features/editor/sandbox-runner';
@@ -25,6 +26,7 @@ import {
   useChallengeLanguage,
 } from '../challenge-language';
 import type { StepProps } from '../contract';
+import { AskScoutWhy } from '../parts/AskScoutWhy';
 import { Feedback } from '../parts/Feedback';
 import { HintLadder, type SolutionState } from '../parts/HintLadder';
 import { RichText } from '../parts/RichText';
@@ -409,6 +411,10 @@ export function CodeChallengeStep({
           runningLabel={runningLabel}
           timeoutMs={timeoutMs}
         />
+
+        {result && result.status !== 'passed' && !running && !(checked && grade?.correct) ? (
+          <AskScoutWhy prompt={step.prompt.md} run={runSummary(result)} />
+        ) : null}
 
         {checked && grade ? (
           <Feedback verdict={grade.correct ? 'right' : 'wrong'}>

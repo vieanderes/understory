@@ -1,6 +1,8 @@
 'use client';
 
 import { useMemo, type ReactNode } from 'react';
+import { conceptView } from '@/core/insight';
+import { tutorEvidence } from '@/core/scout';
 import { useCatalog } from '@/features/catalog/useCatalog';
 import { useOverview } from '@/features/catalog/useOverview';
 import {
@@ -11,8 +13,10 @@ import {
 import { Markdown } from '@/features/online-test/assistant/Markdown';
 import { useProgress } from '@/features/store/StoreProvider';
 import { buildAppGuide } from './app-guide';
+import { CheckBlock } from './CheckBlock';
 import { learnerSituation, type PathIndexEntry } from './learner-situation';
 import { PlanOffer } from './planner/PlanOffer';
+import type { TutorScope } from './tutor-store';
 
 /*
  * The assistant panel as Scout opens it: the same panel as the simulator, plus a map of the
@@ -25,6 +29,8 @@ export interface ScoutPanelProps extends Omit<AssistantPanelProps, 'inAppLinks'>
   paths: readonly PathIndexEntry[];
   latestNews?: string;
   onFollowLink: () => void;
+  /** In a lesson, what the Tutor needs to read the learner's record for it. */
+  lesson?: Pick<TutorScope, 'key' | 'concepts' | 'stepPrompts'>;
 }
 
 export function ScoutPanel({
@@ -33,6 +39,7 @@ export function ScoutPanel({
   paths,
   latestNews,
   onFollowLink,
+  lesson,
   ...panel
 }: ScoutPanelProps) {
   const { status, state } = useProgress();
@@ -58,7 +65,26 @@ export function ScoutPanel({
       }),
     [pathname, status, state, paths, catalog, due, latestNews],
   );
-  const withApp = useMemo(() => ({ ...context, app }), [context, app]);
+  // The Tutor's view of the learner's record for this lesson (docs/SCOUT-ROLES.md, section 6).
+  const evidence = useMemo(() => {
+    if (!lesson || status !== 'ready' || !catalog) return '';
+    const now = new Date();
+    const concepts = (lesson.concepts ?? []).flatMap((id) => {
+      const concept = catalog.concepts.find((c) => c.id === id);
+      return concept
+        ? [{ title: concept.title, state: conceptView(concept, state, now).state }]
+        : [];
+    });
+    const misses = (state.confidentMisses[lesson.key] ?? []).map((m) => ({
+      prompt: lesson.stepPrompts?.[m.stepId] ?? m.stepId,
+      confidence: m.confidence,
+    }));
+    return tutorEvidence({ concepts, misses });
+  }, [lesson, status, catalog, state]);
+  const withApp = useMemo(
+    () => ({ ...context, app, ...(evidence ? { evidence } : {}) }),
+    [context, app, evidence],
+  );
   const links = useMemo(() => ({ onFollow: onFollowLink }), [onFollowLink]);
 
   return (
@@ -66,7 +92,7 @@ export function ScoutPanel({
   );
 }
 
-/** Scout's usual replies, with its offer to plan a path drawn as a button. */
+/** Scout's usual replies: its offer to plan drawn as a button, its checks as taps. */
 function offerToPlan(text: string, reply: ReplyState): ReactNode {
   return (
     <Markdown
@@ -75,6 +101,10 @@ function offerToPlan(text: string, reply: ReplyState): ReactNode {
       blocks={{
         'scout-plan': (body, closed) =>
           closed ? <PlanOffer body={body} live={!reply.streaming} /> : null,
+        'scout-check': (body, closed) =>
+          closed ? (
+            <CheckBlock body={body} canSend={reply.latest && reply.canSend} onSend={reply.send} />
+          ) : null,
       }}
     />
   );

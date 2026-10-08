@@ -123,6 +123,22 @@ export function LessonPlayer({
   // sits on the fixed footer. A registration with an external store, undone on unmount.
   useEffect(() => dockTutorTrigger(), []);
 
+  // What the Tutor needs to read the learner's record for this lesson.
+  const concepts = useMemo(
+    () => [
+      ...new Set(
+        lesson.steps.flatMap((s) =>
+          'concept' in s && typeof s.concept === 'string' ? [s.concept] : [],
+        ),
+      ),
+    ],
+    [lesson.steps],
+  );
+  const stepPrompts = useMemo(
+    () => Object.fromEntries(lesson.steps.map((s) => [s.id, stepText(s).slice(0, 240)])),
+    [lesson.steps],
+  );
+
   // Tells the study assistant what is on screen, so it answers about this step. Publishing
   // to an external store, not mirroring state: the assistant lives outside the player.
   useEffect(() => {
@@ -130,13 +146,15 @@ export function LessonPlayer({
     setTutorScope({
       key: lesson.id,
       title: lesson.title,
+      concepts,
+      stepPrompts,
       onScreen: current ? stepText(current) : `${lesson.objective}\n\n${lesson.opening.text}`,
       ...(current && 'language' in current && typeof current.language === 'string'
         ? { language: current.language }
         : {}),
     });
     return () => setTutorScope(null);
-  }, [lesson, stage, step]);
+  }, [lesson, stage, step, concepts, stepPrompts]);
 
   // The next step's chunk is fetched while this one is read, so a code step never waits.
   useEffect(() => {

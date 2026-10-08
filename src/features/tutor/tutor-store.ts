@@ -1,6 +1,7 @@
 'use client';
 
 import { useSyncExternalStore } from 'react';
+import type { ScoutEntry } from '@/core/scout';
 
 /*
  * The study assistant's two pieces of outside state (src/features/tutor):
@@ -19,6 +20,10 @@ export interface TutorScope {
   onScreen: string;
   code?: string;
   language?: string;
+  /** In a lesson: the concepts its steps give evidence for, for the Tutor's record. */
+  concepts?: readonly string[];
+  /** In a lesson: each step's task as text, by step id, to name the steps missed. */
+  stepPrompts?: Readonly<Record<string, string>>;
 }
 
 export interface TutorMessage {
@@ -33,6 +38,11 @@ let scope: TutorScope | null = null;
 const scopeListeners = new Set<() => void>();
 
 export function setTutorScope(next: TutorScope | null): void {
+  // A button's entry belongs to the conversation it started, not to the next lesson's.
+  if (next?.key !== scope?.key && entry !== null) {
+    entry = null;
+    notifyUi();
+  }
   scope = next;
   scopeListeners.forEach((notify) => notify());
 }
@@ -269,10 +279,16 @@ export function useTutorAvailable(pathname: string | null): boolean {
  * it as its first act. Kept until the panel takes it, so it survives the lazy panel loading.
  */
 let queued: string | null = null;
+/**
+ * Where the asked question came from (docs/SCOUT-ROLES.md): it picks Scout's roles for the
+ * rest of that conversation, until the learner moves to another lesson or page.
+ */
+let entry: ScoutEntry | null = null;
 
 /** Opens Scout and has it ask this question, as if the learner had typed it. */
-export function askTutor(question: string): void {
+export function askTutor(question: string, from?: ScoutEntry): void {
   queued = question;
+  entry = from ?? null;
   notifyUi();
   setTutorOpen(true);
 }
@@ -283,6 +299,14 @@ export function takeQueuedQuestion(): string | null {
   queued = null;
   if (question !== null) notifyUi();
   return question;
+}
+
+export function useTutorEntry(): ScoutEntry | null {
+  return useSyncExternalStore(
+    subscribeUi,
+    () => entry,
+    () => null,
+  );
 }
 
 export function useQueuedQuestion(): string | null {

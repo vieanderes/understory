@@ -443,6 +443,48 @@ describe('applyEvent', () => {
     expect(reduce([]).milestonesMet.size).toBe(0);
   });
 
+  it('keeps a lesson’s steps answered wrongly while sure, until they are answered right', () => {
+    const at = (key: string) => depsFor('device-1', '2026-09-18T10:00:00Z', key);
+    const answer = (
+      key: string,
+      stepId: string,
+      correct: boolean,
+      confidence?: 'guess' | 'fairly' | 'certain',
+    ) =>
+      makeEvent(at(key), 'step_answered', {
+        lessonId: 'js.closures',
+        stepId,
+        stepType: 'multiple-choice',
+        concept: 'js.closures',
+        difficulty: 2,
+        tryNumber: 1,
+        hintsUsed: 0,
+        revealed: false,
+        score: correct ? 1 : 0,
+        correct,
+        ...(confidence ? { confidence } : {}),
+        mode: 'guided',
+        context: 'lesson',
+      });
+    const state = reduce([
+      answer('a', 'q1', false, 'certain'),
+      answer('b', 'q2', false, 'guess'),
+      answer('c', 'q3', false, 'fairly'),
+      answer('d', 'q1', true, 'certain'),
+    ]);
+    expect(state.confidentMisses['js.closures']).toEqual([{ stepId: 'q3', confidence: 'fairly' }]);
+    const many = reduce(
+      ['a', 'b', 'c', 'd', 'e', 'f'].map((k) => answer(k, `s${k}`, false, 'certain')),
+    );
+    expect(many.confidentMisses['js.closures']?.map((m) => m.stepId)).toEqual([
+      'sb',
+      'sc',
+      'sd',
+      'se',
+      'sf',
+    ]);
+  });
+
   it('keeps every online-test sitting as a fact, and grants XP for the score', () => {
     const payload = {
       attemptId: 'a1',

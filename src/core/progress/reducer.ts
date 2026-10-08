@@ -23,8 +23,26 @@ import type { UnknownEvent } from './upcast';
 /** 2: `capstoneAdrs` joined the state. 3: `pathExams`. 4: `onlineTests`. 5: `plan`.
  * 6: `profile`, `newsRead`, `customPath`, and XP for timed tests. 7: `lessonCompletedOn`.
  * 8: `customPath` became `ownPaths`, several named paths. 9: `placementByArea`.
- * 10: `vocabulary`. 11: `milestonesMet`. */
-export const REDUCER_VERSION = 11;
+ * 10: `vocabulary`. 11: `milestonesMet`. 12: `confidentMisses`. */
+export const REDUCER_VERSION = 12;
+
+const MISSES_PER_LESSON = 5;
+
+/** A wrong answer given with confidence joins its lesson's misses; a right one clears it. */
+function noteMiss(
+  misses: ProgressState['confidentMisses'],
+  answer: { lessonId: string; stepId: string; correct: boolean; confidence?: string | undefined },
+): ProgressState['confidentMisses'] {
+  const { lessonId, stepId, correct, confidence } = answer;
+  const before = misses[lessonId] ?? [];
+  const others = before.filter((m) => m.stepId !== stepId);
+  if (correct || (confidence !== 'fairly' && confidence !== 'certain')) {
+    if (others.length === before.length) return misses;
+    return { ...misses, [lessonId]: others };
+  }
+  const miss = { stepId, confidence } as const;
+  return { ...misses, [lessonId]: [...others, miss].slice(-MISSES_PER_LESSON) };
+}
 
 /** A day's worth of XP by 24-hour cooldown key, so "no grinding" can be checked. One
  * day of slack either side of midnight is not modelled; a plain 24h window from the
@@ -146,6 +164,13 @@ export interface ProgressState {
   readonly newsRead: ReadonlySet<string>;
   /** The paths the learner made, by id, in the order they were first made. */
   readonly ownPaths: ReadonlyMap<string, OwnPath>;
+  /**
+   * Per lesson, the steps last answered wrongly while fairly sure or certain, oldest first,
+   * at most five: the clearest sign of a misconception, for Scout's Tutor.
+   */
+  readonly confidentMisses: Readonly<
+    Record<string, readonly { stepId: string; confidence: 'fairly' | 'certain' }[]>
+  >;
   /** Per own path, the milestones the learner has marked met, by their text. */
   readonly milestonesMet: ReadonlyMap<string, ReadonlySet<string>>;
   readonly assumedConcepts: ReadonlySet<string>;
@@ -188,6 +213,7 @@ export function initialProgressState(): ProgressState {
     newsRead: new Set(),
     ownPaths: new Map(),
     milestonesMet: new Map(),
+    confidentMisses: {},
     assumedConcepts: new Set(),
     placementsCompleted: 0,
     placementByArea: {},
@@ -337,6 +363,7 @@ export function applyEvent(state: ProgressState, event: StoryEvent | UnknownEven
 
       let next: ProgressState = {
         ...state,
+        confidentMisses: noteMiss(state.confidentMisses, event.payload),
         concepts: { ...state.concepts, [concept]: nextRecord },
         xpByLocalDate: addXp(state, localDate, xp),
         lastGradedAt: { ...state.lastGradedAt, [itemKey]: event.at },

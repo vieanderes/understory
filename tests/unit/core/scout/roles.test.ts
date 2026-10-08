@@ -55,7 +55,7 @@ describe('entryOf', () => {
 describe('roleRules', () => {
   it('carries the Tutor’s rules in a lesson', () => {
     const rules = roleRules('lesson');
-    expect(rules).toMatch(/one-sentence answer/i);
+    expect(rules).toMatch(/diagnose before you explain/i);
     expect(rules).toMatch(/hint/i);
   });
 

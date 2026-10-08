@@ -4,6 +4,7 @@ import { useMemo, useState } from 'react';
 import type { CompiledMultipleChoiceStep, CompiledPredictStep } from '@/core/content/compiled';
 import { mulberry32, shuffle } from '@/core/util';
 import type { StepProps } from '../contract';
+import { AskScoutWhy } from '../parts/AskScoutWhy';
 import { ChoiceList } from '../parts/ChoiceList';
 import { CodeView } from '../parts/CodeView';
 import { Feedback } from '../parts/Feedback';
@@ -59,6 +60,15 @@ export function ChoiceStep({
       {phase === 'checked' && grade && picked ? (
         <Feedback verdict={grade.correct ? 'right' : 'wrong'}>
           <RichText value={picked.feedback} />
+          {grade.correct ? null : (
+            <div className="pt-1">
+              <AskScoutWhy
+                prompt={step.question.md}
+                picked={picked.text.md}
+                feedback={picked.feedback.md}
+              />
+            </div>
+          )}
         </Feedback>
       ) : null}
     </StepLayout>

@@ -71,14 +71,26 @@ describe('assistant system prompts', () => {
 
   it('carries the rules of the roles its entry picks (docs/SCOUT-ROLES.md)', () => {
     const lesson = assistantSystemPrompt({ ...base, mode: 'tutor', taskTitle: 'Closures' });
-    expect(lesson).toMatch(/one-sentence answer/i);
+    expect(lesson).toMatch(/diagnose before you explain/i);
     const stuck = assistantSystemPrompt({ ...base, mode: 'tutor', entry: 'stuck' });
-    expect(stuck).toMatch(/one-sentence answer/i);
+    expect(stuck).toMatch(/diagnose before you explain/i);
+  });
+
+  it('diagnoses as the Tutor, with the learner’s record and the check block', () => {
+    const prompt = assistantSystemPrompt({
+      ...base,
+      mode: 'tutor',
+      taskTitle: 'Closures',
+      evidence: '- Closures: was solid, has slipped (a gap)',
+    });
+    expect(prompt).toMatch(/diagnose before you explain/i);
+    expect(prompt).toContain('```scout-check');
+    expect(prompt).toContain('What their record shows:\n- Closures: was solid');
   });
 
   it('gives the assessment no study role, whatever entry the tab sends', () => {
     const prompt = assistantSystemPrompt({ ...base, entry: 'lesson' });
-    expect(prompt).not.toMatch(/one-sentence answer/i);
+    expect(prompt).not.toMatch(/diagnose before you explain/i);
   });
 
   it('keeps the assessment prompt as the default', () => {

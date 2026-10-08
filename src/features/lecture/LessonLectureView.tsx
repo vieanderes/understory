@@ -123,7 +123,8 @@ export function LessonLectureView({
           </Heading>
           {lecture.deeper.map((part, i) => (
             <div key={i} className="flex flex-col gap-2">
-              <Heading level={item} className="font-medium">
+              {/* The vocabulary links a word straight to the section that explains it. */}
+              <Heading level={item} id={anchor(`deeper-${i}`)} className="font-medium">
                 <RichHtml value={part.title} inline />
               </Heading>
               <RichHtml value={part.body} className="lecture-prose" />

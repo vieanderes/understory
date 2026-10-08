@@ -20,6 +20,11 @@ import type {
   RawLesson,
   RawModule,
 } from '@/core/content/catalog';
+import {
+  GLOSSARY_DIR,
+  glossaryEntrySchema,
+  type RawGlossaryEntry,
+} from '@/core/content/glossary-schema';
 import { idsLockSchema } from '@/core/content/lock';
 import {
   CAPSTONES_DIR,
@@ -507,3 +512,32 @@ export function loadTracks(root = contentRoot()): LoadedTracks {
 }
 
 export type { Guide };
+
+export interface LoadedGlossary {
+  entries: RawGlossaryEntry[];
+  issues: Issue[];
+  checked: number;
+}
+
+/**
+ * Every word in `content/glossary/<area>/<id>.yaml`, areas in folder order, words by id.
+ * The id and the area come from the path; a file that fails its schema is an issue.
+ */
+export function loadGlossary(root = contentRoot()): LoadedGlossary {
+  const reading = new Reading(root);
+  const base = path.join(root, GLOSSARY_DIR);
+  if (!fs.existsSync(base)) return { entries: [], issues: [], checked: 0 };
+  const entries: RawGlossaryEntry[] = [];
+  const areas = fs
+    .readdirSync(base, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name)
+    .sort();
+  for (const area of areas) {
+    const found = readDir(reading, `${GLOSSARY_DIR}/${area}`, glossaryEntrySchema, 'A glossary word');
+    for (const [id, { path: rel, data }] of Object.entries(found)) {
+      entries.push({ id, area, path: rel, data });
+    }
+  }
+  return { entries, issues: reading.issues, checked: reading.checked };
+}

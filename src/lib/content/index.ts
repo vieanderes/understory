@@ -7,6 +7,7 @@ export {
   getCatalogSummary,
   getConcept,
   getCourse,
+  getGlossary,
   getLesson,
   getLessonByRoute,
   getManifest,

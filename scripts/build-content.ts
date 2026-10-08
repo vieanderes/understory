@@ -14,6 +14,7 @@ import { loadOutline } from '../src/lib/content/outline';
 import { checkContent } from './lib/check';
 import { compileCatalog, languagesOf, writeBundle } from './lib/compile';
 import { writeJsonSchemas } from './lib/json-schema';
+import { addGlossary } from './lib/glossary';
 import { addPlacement } from './lib/placement';
 import { addPracticeCatalog } from './lib/practice-catalog';
 import { createRenderer } from './lib/render';
@@ -36,6 +37,7 @@ async function main(): Promise<number> {
   const bundle = compileCatalog(catalog, renderer, loadOutline(root).outline?.data);
   addPracticeCatalog(bundle);
   await addPlacement(bundle, catalog, root);
+  const words = await addGlossary(bundle, catalog, root);
   writeBundle(path.join(root, 'public/content/v1'), bundle);
   // After the lesson bundle, which clears its folder first. The references run here,
   // because every expected value of the simulator is what solution.ts returns.
@@ -50,7 +52,7 @@ async function main(): Promise<number> {
 
   const lessons = [...bundle.files.keys()].filter((name) => name.startsWith('lessons/')).length;
   console.log(
-    `build:content: ${lessons} lessons, ${online.tasks} online-test tasks, revision ${bundle.manifest.contentRev}, ${schemas.length} schemas.`,
+    `build:content: ${lessons} lessons, ${words} words, ${online.tasks} online-test tasks, revision ${bundle.manifest.contentRev}, ${schemas.length} schemas.`,
   );
   return 0;
 }

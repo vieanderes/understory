@@ -1,8 +1,8 @@
 # Scout's five roles
 
 A design for growing Scout AI from one helpful assistant into five jobs a good mentor does:
-Advisor, Librarian, Tutor, Editor and Roommate. Nothing here is built yet. Each role lands
-as its own pull request, in the order of section 9.
+Advisor, Librarian, Tutor, Editor and Roommate. Each role landed as its own pull request
+(issues #55 to #60), in the order of section 9.
 
 ## 1. Why
 
@@ -146,8 +146,13 @@ when `verified` is false.
 options, exactly one correct, validated in core. It is drawn like a multiple-choice step and
 records nothing (principle 5). A wrong pick goes back to step 2 with the pick in the turn.
 
-**Entry.** "Ask Scout" next to a wrong answer and in a failing run's output sends the step,
-the pick or the run, and starts in this role.
+**Entry.** "Ask Scout why" under a wrong pick and beside a failing run sends the task, the
+pick with the lesson's feedback, or the failing tests (`stuckQuestion`, `runSummary`), and
+starts in this role (`entry: 'stuck'`). The entry holds for that conversation until the
+learner moves to another lesson or page.
+
+**Record.** `confidentMisses` in the reducer keeps, per lesson, the last five steps answered
+wrongly while fairly sure or certain, cleared when the step is later answered right.
 
 ## 7. Editor: feedback on the learner's work
 
@@ -187,8 +192,8 @@ that the field takes for granted, and offers one connection.
 - Short: three to five sentences. No blocks.
 
 **Entry.** Automatic only, so no button: in a lesson, Scout takes this role when the learner
-asks why something matters, for an analogy, or how someone outside would see it. Open
-question 2 asks whether a quiet line at lesson end should invite it.
+asks why something matters, for an analogy, or how someone outside would see it. Its field
+changes within a conversation; nothing remembers fields across conversations.
 
 ## 9. Build order
 
@@ -208,14 +213,11 @@ sections, with the MCP server reading the same sections, so every provider behav
 `docs/LEARNING-SCIENCE.md` (diagnosis, feedback, milestones), a row per protocol in the
 `docs/ARCHITECTURE.md` decision table, and the Scout line in `docs/ROADMAP.md`.
 
-## 10. Open questions
+## 10. Decisions taken
 
-1. **Priority.** `docs/ROADMAP.md` puts product work fourth, after the known gaps, content and
-   launch. Does this go ahead of them?
-2. **Roommate entry.** A single line at lesson end, "See it from outside", or only when asked?
-3. **Milestone proof.** On the learner's word, like capstones today, or with an Editor review
-   attached when they mark it?
-4. **Unverified references.** About 190 are `verified: false`. Recommend them with the label,
-   or hold them back until checked?
-5. **Cost.** The library slice and the Tutor's context add tokens on every lesson question.
-   Measure on the API-key provider before landing, against a budget per question.
+1. **Priority.** Built ahead of the roadmap's fourth item, at the learner's request.
+2. **Roommate entry.** Only when asked; no line at lesson end.
+3. **Milestone proof.** On the learner's word, like capstones.
+4. **Unchecked references.** Recommended, with "Not yet checked by a person" on the card.
+5. **Cost.** A lesson question now carries up to 30 references (about 3,000 characters) and
+   the Tutor's record. Measure on the API-key provider and trim the slice if it costs too much.

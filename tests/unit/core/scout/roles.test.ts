@@ -59,6 +59,12 @@ describe('roleRules', () => {
     expect(rules).toMatch(/hint/i);
   });
 
+  it('carries the Editor’s rules and its block for the learner’s own work', () => {
+    const rules = roleRules('work');
+    expect(rules).toContain('```scout-review');
+    expect(rules).toMatch(/never rewrite/i);
+  });
+
   it('is empty where no role has rules yet', () => {
     expect(roleRules('test')).toBe('');
   });

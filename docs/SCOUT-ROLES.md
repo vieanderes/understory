@@ -153,21 +153,22 @@ the pick or the run, and starts in this role.
 Real-time here means as soon as the learner asks, on their latest version; not as they type,
 which would cost tokens and move text off the device unasked.
 
-**Where.** Explain-back (today's push-back), a code challenge after a run, a capstone write-up,
-and the explanation steps of chapter 33. Each sends the work with its rubric, the same way
-`pushBackQuestion` does, through one core builder: `editorRequest({ kind, work, rubric, model? })`.
+**Where.** Explain-back's "Ask Scout to push back", which keeps its single follow-up
+question, and "Ask Scout to review" after a passing code run (`editorRequest`). Both start
+Scout in this role (`entry: 'work'`). Capstone write-ups and chapter 33's explanation steps
+are next.
 
 **Rules.**
 
 - Quote the learner's own words or lines; never rewrite the whole piece.
 - At most three notes, most important first, each tagged `keep`, `fix` or `missing`.
 - One note must be a `keep` when something works, so they know what to repeat.
-- End with one revision prompt. For explain-back, keep today's single follow-up question.
-- No score, no "good job".
+- End with one next step. No score, no "good job".
 
 **Block.** `scout-review { notes: [{ tag, quote?, note }], next }`, drawn as a short list with
-the quote highlighted. "Revise" puts the learner's text back in the field; the next request
-carries both versions, and Scout says first what changed.
+the learner's words quoted. Reviewing code again sends the version reviewed before, and
+Scout says first what changed. An explain-back is locked once compared, so it has no revise
+loop.
 
 ## 8. Roommate: a stranger's lens
 

@@ -14,6 +14,7 @@ import { Markdown } from '@/features/online-test/assistant/Markdown';
 import { useProgress } from '@/features/store/StoreProvider';
 import { buildAppGuide } from './app-guide';
 import { CheckBlock } from './CheckBlock';
+import { ReviewBlock } from './ReviewBlock';
 import { learnerSituation, type PathIndexEntry } from './learner-situation';
 import { PlanOffer } from './planner/PlanOffer';
 import type { TutorScope } from './tutor-store';
@@ -101,6 +102,7 @@ function offerToPlan(text: string, reply: ReplyState): ReactNode {
       blocks={{
         'scout-plan': (body, closed) =>
           closed ? <PlanOffer body={body} live={!reply.streaming} /> : null,
+        'scout-review': (body, closed) => (closed ? <ReviewBlock body={body} /> : null),
         'scout-check': (body, closed) =>
           closed ? (
             <CheckBlock body={body} canSend={reply.latest && reply.canSend} onSend={reply.send} />

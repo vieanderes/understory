@@ -24,7 +24,11 @@ const raw = (id: string, area: string, data: Partial<GlossaryEntry> = {}): RawGl
 });
 
 const world = { lessonIds: new Set(['js.closures', 'js.scope']) };
-const rules = (entries: RawGlossaryEntry[]) => checkGlossary(entries, world).map((i) => i.rule);
+/** Only the rule under test: a lesson nobody pins is a separate rule. */
+const rules = (entries: RawGlossaryEntry[]) =>
+  checkGlossary(entries, world)
+    .map((i) => i.rule)
+    .filter((rule) => rule !== 'glossary-lesson-unpinned');
 
 describe('glossaryEntrySchema', () => {
   it('accepts a minimal entry and rejects unknown keys', () => {
@@ -60,6 +64,7 @@ describe('checkGlossary', () => {
         raw('scope', 'javascript', {
           term: 'scope',
           usage: 'That name is out of scope here.',
+          lessons: ['js.scope'],
         }),
       ],
       world,
@@ -86,6 +91,17 @@ describe('checkGlossary', () => {
       world,
     );
     expect(issues.filter((i) => i.rule === 'glossary-duplicate')).toHaveLength(2);
+  });
+
+  it('needs every lesson to be pinned by at least one word, so a new lesson brings its words', () => {
+    const issues = checkGlossary([raw('closure', 'javascript', { lessons: ['js.closures'] })], world);
+    expect(issues.filter((i) => i.rule === 'glossary-lesson-unpinned')).toEqual([
+      expect.objectContaining({ path: 'content/glossary', where: 'js.scope' }),
+    ]);
+  });
+
+  it('asks nothing of a tree with no vocabulary yet', () => {
+    expect(checkGlossary([], world)).toEqual([]);
   });
 
   it('finds one id in two areas', () => {

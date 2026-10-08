@@ -94,7 +94,7 @@ export const glossaryEntrySchema = z.strictObject({
     .describe('1: everyone says it. 2: working vocabulary. 3: a deeper cut.'),
   lessons: z
     .array(idSchema)
-    .max(4)
+    .max(8)
     .optional()
     .describe('Lesson ids that teach the word, pinned first. The rest are found by the build.'),
 });
@@ -252,6 +252,20 @@ export function checkGlossary(entries: readonly RawGlossaryEntry[], world: Gloss
         `Keep code to ${EXAMPLE_MAX_LINES} lines. A word's example shows one thing.`,
         'example',
       );
+    }
+  }
+  // The vocabulary grows with the course: a lesson is not done until a word names it as the
+  // place that word is taught. A tree with no vocabulary at all (a test fixture) is exempt.
+  if (entries.length > 0) {
+    const pinned = new Set(entries.flatMap((entry) => entry.data.lessons ?? []));
+    for (const lesson of [...world.lessonIds].filter((id) => !pinned.has(id)).sort()) {
+      issues.push({
+        severity: 'error',
+        path: GLOSSARY_DIR,
+        where: lesson,
+        rule: 'glossary-lesson-unpinned',
+        message: `No word names "${lesson}" as a lesson that teaches it. Add the lesson to the \`lessons\` of the words it teaches, or write the new ones. \`pnpm glossary:gaps ${lesson}\` lists candidates (docs/VOCABULARY.md).`,
+      });
     }
   }
   return issues;

@@ -74,6 +74,21 @@ give the professional the precise version in the second paragraph.
 - **level**: 1 for words every engineer uses daily, 2 for the working vocabulary of the
   area, 3 for words a specialist uses. Level 1 words come first to a new learner.
 
+## Growing with the course
+
+The vocabulary is part of writing a lesson, never a separate task.
+
+- Every lesson must be named in the `lessons` of at least one word. The validator
+  (`glossary-lesson-unpinned`) fails a new or renamed lesson until a word pins it, so a
+  lesson cannot land without its words, locally or in CI.
+- `pnpm glossary:gaps <lesson id>` shows what to do: the existing words the lesson says,
+  most said first, and the key terms it bolds or defines that no word covers yet. With no
+  id it lists every lesson no word pins.
+- Pin the words the lesson teaches, not the ones it merely uses. Write a word for each term
+  of the profession it introduces. A word may pin up to eight lessons.
+- Lesson links inside a word page are found anew on every build, so words pick up new
+  lessons that mention them without anyone editing the word.
+
 ## How it is built
 
 - `scripts/lib/glossary.ts` reads the files, checks them, finds where each word appears in

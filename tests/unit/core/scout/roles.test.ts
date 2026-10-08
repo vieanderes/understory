@@ -65,6 +65,15 @@ describe('roleRules', () => {
     expect(rules).toMatch(/never rewrite/i);
   });
 
+  it('offers the Tutor, the Librarian and the Roommate in a lesson, leading with the Tutor', () => {
+    const rules = roleRules('lesson');
+    expect(rules).toContain('- Tutor: when');
+    expect(rules).toContain('- Librarian: when');
+    expect(rules).toContain('- Roommate: when the learner asks why something matters');
+    expect(rules).toContain('When unsure, be the Tutor.');
+    expect(rules).toMatch(/where the analogy breaks/);
+  });
+
   it('is empty where no role has rules yet', () => {
     expect(roleRules('test')).toBe('');
   });

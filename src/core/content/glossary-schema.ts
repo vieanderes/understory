@@ -26,12 +26,14 @@ export const GLOSSARY_BUNDLE_FILE = 'glossary.json';
 
 /** The areas, in the order the filter shows them. */
 export const GLOSSARY_AREAS = [
+  { id: 'basics', title: 'Programming basics' },
   { id: 'web', title: 'The web' },
   { id: 'javascript', title: 'JavaScript' },
   { id: 'typescript', title: 'TypeScript' },
   { id: 'react', title: 'React and the front end' },
   { id: 'css', title: 'CSS' },
   { id: 'python', title: 'Python' },
+  { id: 'algorithms', title: 'Algorithms and data structures' },
   { id: 'sql', title: 'Databases and SQL' },
   { id: 'testing', title: 'Testing' },
   { id: 'security', title: 'Security' },
@@ -39,6 +41,7 @@ export const GLOSSARY_AREAS = [
   { id: 'patterns', title: 'Patterns and architecture' },
   { id: 'ai', title: 'AI engineering' },
   { id: 'tooling', title: 'Tooling and delivery' },
+  { id: 'cloud', title: 'Cloud and operations' },
   { id: 'career', title: 'Career and teamwork' },
 ] as const;
 

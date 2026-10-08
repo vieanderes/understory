@@ -2,7 +2,7 @@
 
 import { useMemo, type ReactNode } from 'react';
 import { conceptView } from '@/core/insight';
-import { tutorEvidence } from '@/core/scout';
+import { cutText, librarySlice, libraryText, tutorEvidence, type LibraryEntry } from '@/core/scout';
 import { useCatalog } from '@/features/catalog/useCatalog';
 import { useOverview } from '@/features/catalog/useOverview';
 import {
@@ -14,10 +14,12 @@ import { Markdown } from '@/features/online-test/assistant/Markdown';
 import { useProgress } from '@/features/store/StoreProvider';
 import { buildAppGuide } from './app-guide';
 import { CheckBlock } from './CheckBlock';
+import { ReadingBlock } from './ReadingBlock';
 import { ReviewBlock } from './ReviewBlock';
-import { learnerSituation, type PathIndexEntry } from './learner-situation';
+import { learnerSituation, pathUnderWay, type PathIndexEntry } from './learner-situation';
 import { PlanOffer } from './planner/PlanOffer';
 import type { TutorScope } from './tutor-store';
+import { useScoutLibrary } from './useScoutLibrary';
 
 /*
  * The assistant panel as Scout opens it: the same panel as the simulator, plus a map of the
@@ -82,19 +84,57 @@ export function ScoutPanel({
     }));
     return tutorEvidence({ concepts, misses });
   }, [lesson, status, catalog, state]);
+  // The Librarian's slice of the course's references: this lesson's and its chapter's, or
+  // elsewhere the chapters of the path under way, with what that path leaves out.
+  const entries = useScoutLibrary();
+  const libraryById = useMemo(
+    () => new Map<string, LibraryEntry>((entries ?? []).map((e) => [e.id, e])),
+    [entries],
+  );
+  const library = useMemo(() => {
+    if (!entries || !catalog) return '';
+    const moduleOf = (id: string) => catalog.lessons[id]?.moduleId;
+    const path = status === 'ready' ? pathUnderWay(state, paths, catalog) : undefined;
+    const moduleIds = lesson
+      ? [moduleOf(lesson.key)].filter((m): m is string => m !== undefined)
+      : [...new Set((path?.lessonIds ?? []).flatMap((id) => moduleOf(id) ?? []))];
+    const slice = librarySlice(entries, {
+      ...(lesson ? { lessonId: lesson.key } : {}),
+      moduleIds,
+    });
+    const cut = path ? (state.ownPaths.get(path.id)?.cut ?? []) : [];
+    return [libraryText(slice), cutText(cut)].filter(Boolean).join('\n\n');
+  }, [entries, catalog, status, state, paths, lesson]);
   const withApp = useMemo(
-    () => ({ ...context, app, ...(evidence ? { evidence } : {}) }),
-    [context, app, evidence],
+    () => ({
+      ...context,
+      app,
+      ...(evidence ? { evidence } : {}),
+      ...(library ? { library } : {}),
+    }),
+    [context, app, evidence, library],
   );
   const links = useMemo(() => ({ onFollow: onFollowLink }), [onFollowLink]);
 
   return (
-    <AssistantPanel renderReply={offerToPlan} {...panel} context={withApp} inAppLinks={links} />
+    <AssistantPanel
+      renderReply={(text, reply) => scoutReply(text, reply, libraryById)}
+      {...panel}
+      context={withApp}
+      inAppLinks={links}
+    />
   );
 }
 
-/** Scout's usual replies: its offer to plan drawn as a button, its checks as taps. */
-function offerToPlan(text: string, reply: ReplyState): ReactNode {
+/**
+ * Scout's usual replies: its offer to plan drawn as a button, its checks as taps, its notes
+ * and its reading list as short lists.
+ */
+function scoutReply(
+  text: string,
+  reply: ReplyState,
+  library: ReadonlyMap<string, LibraryEntry>,
+): ReactNode {
   return (
     <Markdown
       text={text}
@@ -103,6 +143,8 @@ function offerToPlan(text: string, reply: ReplyState): ReactNode {
         'scout-plan': (body, closed) =>
           closed ? <PlanOffer body={body} live={!reply.streaming} /> : null,
         'scout-review': (body, closed) => (closed ? <ReviewBlock body={body} /> : null),
+        'scout-reading': (body, closed) =>
+          closed ? <ReadingBlock body={body} library={library} /> : null,
         'scout-check': (body, closed) =>
           closed ? (
             <CheckBlock body={body} canSend={reply.latest && reply.canSend} onSend={reply.send} />

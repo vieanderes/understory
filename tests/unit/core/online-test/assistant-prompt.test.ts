@@ -88,6 +88,16 @@ describe('assistant system prompts', () => {
     expect(prompt).toContain('What their record shows:\n- Closures: was solid');
   });
 
+  it('carries the course’s references for the Librarian, in a lesson and elsewhere', () => {
+    const library = '[web.http#r2] rfc · RFC 9110 · primary';
+    for (const mode of ['tutor', 'guide'] as const) {
+      const prompt = assistantSystemPrompt({ ...base, mode, library });
+      expect(prompt).toContain('The course’s references (recommend only these):\n' + library);
+      expect(prompt).toContain('```scout-reading');
+    }
+    expect(assistantSystemPrompt({ ...base, library })).not.toContain(library);
+  });
+
   it('gives the assessment no study role, whatever entry the tab sends', () => {
     const prompt = assistantSystemPrompt({ ...base, entry: 'lesson' });
     expect(prompt).not.toMatch(/diagnose before you explain/i);

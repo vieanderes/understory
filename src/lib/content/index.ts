@@ -22,6 +22,8 @@ export { getOnlineTestIndex } from './online-tests';
 export { getPlanCatalog } from './plan-catalog';
 export { getPlannerCourse } from './planner-course';
 export type { PlannerCourseFile } from './planner-course';
+export { getScoutLibrary } from './scout-library';
+export type { ScoutLibraryFile } from './scout-library';
 export { getPath, getPaths } from './paths';
 export type { PathLesson, PathStage, PathSummary, PathTest } from './paths';
 export {

@@ -52,6 +52,11 @@ export interface AssistantContext {
    */
   evidence?: string;
   /**
+   * In the study modes: a slice of the course's references for the Librarian (core/scout,
+   * libraryText), and what the learner's path leaves out on purpose.
+   */
+  library?: string;
+  /**
    * The app guide, in `tutor` and `guide` modes: the places, the library, the routes and
    * the learner's situation, built in the tab from the navigation itself. Scout answers
    * "where is X" from it on any page. An assessment never gets it.
@@ -88,6 +93,12 @@ export const PLAN_OFFER = [
 ].join('\n');
 
 const optional = (text: string): string[] => (text ? [text] : []);
+
+function librarySection(context: AssistantContext): string[] {
+  return context.library
+    ? ['', 'The course’s references (recommend only these):', context.library]
+    : [];
+}
 
 function appSection(context: AssistantContext): string[] {
   return context.app ? ['', 'About Understory:', context.app] : [];
@@ -176,6 +187,7 @@ function tutorSystemPrompt(context: AssistantContext): string {
       : []),
     ...(context.output ? ['', 'Their last run:', context.output] : []),
     ...(context.evidence ? ['', 'What their record shows:', context.evidence] : []),
+    ...librarySection(context),
     ...appSection(context),
   ].join('\n');
 }
@@ -197,6 +209,7 @@ function guideSystemPrompt(context: AssistantContext): string {
     '',
     `Page: ${context.taskTitle}`,
     ...(context.statement ? ['On screen now:', context.statement] : []),
+    ...librarySection(context),
     ...appSection(context),
   ].join('\n');
 }

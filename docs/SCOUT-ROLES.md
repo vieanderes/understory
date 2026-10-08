@@ -100,13 +100,14 @@ now" list. In the draft an item with lessons can be brought back.
 
 ## 5. Librarian: defending the curriculum
 
-**Source.** A build-time file, `/api/scout/library`, served static like the planner course:
-every reference with a stable id (`<lessonId>#r<index>`), its kind, title, authors, year,
-venue, note, `primary`, `verified`, and the lesson, chapter and concepts it belongs to. About
-1,350 references; too large for a prompt, so the tab sends a slice:
+**Source.** A build-time file, `/api/scout/library` (`getScoutLibrary`), served static like
+the planner course: every reference with a stable id (`<lessonId>#r<n>`), its kind, title,
+authors, year, venue, note, `primary`, `verified`, lesson and chapter. About 1,350
+references; too many for a prompt, so the tab sends a slice of at most 30
+(`librarySlice`), primary and checked first:
 
-- in a lesson: the lesson's and chapter's references, and the path's primary ones;
-- elsewhere: the top 20 for the question, found with the vocabulary search already in the tab.
+- in a lesson: the lesson's references, then its chapter's;
+- elsewhere: the chapters of the path under way, with that path's cutlist (`cutText`).
 
 **What it answers.**
 

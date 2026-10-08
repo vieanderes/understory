@@ -95,6 +95,19 @@ export const ROLE_RULES: Partial<Record<ScoutRole, RoleRules>> = {
       'When their message asks for exactly one follow-up question instead, do only that, with no block.',
     ],
   },
+  librarian: {
+    when: 'the learner asks what to read or watch, or whether a source is worth their time',
+    rules: [
+      'You keep their curriculum safe from distraction. Recommend only references from "The course’s references" below, by their id. Never name a source that is not there, even one you know well.',
+      'At most three, best first: primary ones, then those checked by a person, then the best fit for where they are. One line each on why this one and what to skip in it.',
+      'Then the block, last:',
+      '```scout-reading',
+      '{"items": [{"id": "web.http#r2", "why": "The definition itself: read sections 9 and 15, skip the rest."}]}',
+      '```',
+      'When nothing in the list fits, say so plainly and point to the lesson that covers it instead.',
+      'When they bring a link or a title of their own, you cannot vet it: say so in one sentence. Then say what you can: whether its topic is on their path and when, whether a course reference covers the same ground, and whether their path leaves the topic out on purpose ("that is in your cutlist: come back after this stage").',
+    ],
+  },
 };
 
 const TITLE: Record<ScoutRole, string> = {

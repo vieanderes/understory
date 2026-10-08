@@ -1,0 +1,322 @@
+id: agents.babysitting-a-pr
+title: Letting an agent babysit a pull request
+objective: Give an agent a standing goal to watch a pull request, with a schedule, a stop condition and gates on what it may change, and make it prove the change again after every fix.
+level: advanced
+minutes: 10
+concepts: [agents.standing-goals, agents.watch-gates, agents.revalidation]
+prerequisites: [agents.long-running-loops, agents.what-an-agent-may-touch, agents.human-in-the-loop, aisys.agent-workbench]
+opening:
+  text: >-
+    You'll hand a pull request to an agent that checks it every hour and stops in time. You
+    get your evenings back without a surprise merge.
+
+steps:
+  - type: prose
+    id: name-standing-goal
+    body: |-
+      A pull request rarely lands in one go. CI goes red, a reviewer asks for changes.
+      Someone keeps coming back.
+
+      Give that job to an agent as a **standing goal**: a task on a schedule. Every hour it
+      checks the PR, fixes red CI, answers comments and posts a status. Like any loop in Loops
+      that run for hours, it needs a done state, a budget and a stop.
+
+  - type: multiple-choice
+    id: pick-stop-condition
+    concept: agents.standing-goals
+    difficulty: 1
+    question: An agent checks a booking-form PR every hour. Which goal tells it when to stop?
+    choices:
+      - text: Approved and green, or 12 runs, then hand off
+        correct: true
+        feedback: >-
+          Yes. A done state, a budget and a person to hand to.
+      - text: Keep the PR healthy and ready for review
+        feedback: >-
+          It sounds sensible, but nothing says when it's finished. The agent checks for ever.
+      - text: Stop the first time every CI job is green
+        feedback: >-
+          Green comes long before review is done. It would stop with comments still unanswered.
+      - text: Run every hour until someone turns it off
+        feedback: >-
+          Then the budget is whoever remembers. A forgotten watcher runs for weeks.
+
+  - type: prose
+    id: name-three-lists
+    body: |-
+      The watcher's rules fit in three lists.
+
+      *Alone*: push to its own branch, reply to comments, re-run a flaky job once. *Ask
+      first*: edit outside the scope, change a dependency, disagree with a reviewer.
+      *Never*: merge, deploy, force-push others' branches, loosen a check, resolve its own
+      review. These are its **watch gates**, enforced by the harness.
+
+  - type: fill-blank
+    id: fill-watch-policy
+    concept: agents.watch-gates
+    difficulty: 2
+    language: yaml
+    prompt: >-
+      Finish the watcher's policy. It needs a budget, one safe retry, and a moment where it
+      asks a person.
+    template: |
+      goal: Get the booking-form PR approved with CI green
+      every: 1h
+      stop_when: [approved_and_green, {{1}}, same_failure_twice]
+      alone: [push_own_branch, reply_to_comments, {{2}}]
+      ask_first: [change_dependency, edit_outside_scope, {{3}}]
+      never: [merge, deploy, force_push_others, loosen_a_check, resolve_own_review]
+    blanks:
+      - key: '1'
+        answer: runs >= 12
+      - key: '2'
+        answer: rerun_flaky_job_once
+      - key: '3'
+        answer: disagree_with_reviewer
+    bank: [runs >= 12, ci_green, rerun_flaky_job_once, rerun_until_green, disagree_with_reviewer, merge_when_approved]
+
+  - type: ai-review
+    id: review-rerun-until-green
+    concept: agents.watch-gates
+    difficulty: 3
+    language: ts
+    request: When CI is red, re-run the flaky jobs so the PR can carry on.
+    flawClass: logic
+    code: |
+      async function handleRedCi(pr: PullRequest) {
+        const failed = await ci.failedJobs(pr.headCommit);
+        for (const job of failed) {
+          let result = job.result;
+          while (result === 'failed') {
+            result = await ci.rerun(job.id); // flaky, try again
+          }
+        }
+        await pr.comment('CI is green again.');
+      }
+    prompt: >-
+      An assistant wrote this for the watcher. Its test used a job that failed once, then
+      passed. A month later, a cart bug that failed one run in three shipped behind a green
+      tick. Tap the lines at fault.
+    lines: [5, 6, 7]
+    reasons:
+      - text: Re-running until green hides a real failure
+        correct: true
+        feedback: >-
+          Right. An intermittent bug passes eventually. One retry, then investigate.
+      - text: It should re-run every job, not only failed ones
+        feedback: >-
+          More re-runs cost more and find nothing new. The trouble is never stopping.
+      - text: The comment should come before the re-runs
+        feedback: >-
+          Order of the message isn't the issue. Whatever it says, the green tick is false.
+      - text: Jobs should be re-run in parallel
+        feedback: >-
+          That makes it faster. A loop that keeps going until green still hides the bug.
+    fix: |
+      for (const job of failed) {
+        if (job.reruns === 0 && (await ci.rerun(job.id)) === 'passed') {
+          await pr.comment(`${job.name} failed once and passed on one re-run. Marked flaky.`);
+          continue;
+        }
+        return investigate(job); // read the log, fix the branch or hand off
+      }
+    verify:
+      question: Which test proves the fix?
+      choices:
+        - text: An always-failing job is re-run once, then investigated
+          correct: true
+          feedback: >-
+            Yes. It shows the loop stops and the failure reaches someone.
+        - text: A job that fails once, then passes on re-run
+          feedback: >-
+            That's the test the old code passed too. It can't see a loop that never ends.
+        - text: CI shows green on the PR after the watcher runs
+          feedback: >-
+            Green is exactly what the broken loop produced. It proves nothing about the cause.
+
+  - type: prose
+    id: name-stale-proof
+    body: |-
+      Proof belongs to one commit. Test output, screenshots and the green tick all describe
+      the code that existed when they ran.
+
+      So every new commit makes the old proof **stale**: a one-line fix for a review comment,
+      a rebase, a formatting change. **Revalidation** means the watcher runs the checks again
+      on the new head, refreshes the proof, and only then says "ready".
+
+  - type: parsons
+    id: arrange-hourly-run
+    concept: agents.revalidation
+    difficulty: 3
+    language: ts
+    prompt: >-
+      Arrange one hourly run of the watcher. It fixes what it may, then proves the new commit
+      before it reports. Two blocks don't belong.
+    blocks:
+      - id: load-snapshot
+        code: 'const pr = await loadSnapshot(prId);'
+        subgoal: 'Look at the PR'
+      - id: check-stop
+        code: 'if (shouldStop(pr)) return handOff(pr);'
+        subgoal: 'Check the stop conditions'
+      - id: fix-branch
+        code: 'await fixBranch(pr.failures, pr.newComments);'
+        subgoal: 'Fix CI and answer review'
+      - id: push-head
+        code: 'const head = await pushOwnBranch();'
+      - id: run-checks
+        code: 'const result = await runChecks(head);'
+        subgoal: 'Prove the new commit'
+      - id: capture-proof
+        code: 'const proof = await captureProof(head, result);'
+      - id: post-status
+        code: 'await postStatus(pr, result, proof);'
+        subgoal: 'Report'
+    distractors:
+      - id: reuse-old-proof
+        code: 'const proof = pr.lastProof;'
+        feedback: >-
+          That proof describes an older commit. The fix changed the code it was about.
+      - id: merge-if-approved
+        code: 'if (pr.approved) await merge(pr);'
+        feedback: >-
+          Merging is on the never list. An approval tells a person they may merge.
+
+  - type: code-challenge
+    id: write-next-action
+    concept: agents.standing-goals
+    difficulty: 4
+    language: ts
+    starter: watch.starter.ts
+    solution: watch.solution.ts
+    tests: watch.tests.ts
+    prompt: >-
+      Write `nextAction(pr)`. It returns what the watcher does on this run, as a string. Check
+      in this order:
+
+
+      1. `requested` is in `NEVER`: `"refuse: <action>"`. In `ASK_FIRST`: `"ask: <action>"`.
+
+      2. `runsSoFar >= maxRuns`: `"hand-off: out of runs"`. `sameFailureCount >= 2`:
+      `"hand-off: stuck"`.
+
+      3. CI pending: `"wait"`. CI red: `"fix-ci"`. New comments: `"answer-comments"`.
+
+      4. `proofCommit` isn't `headCommit`: `"refresh-proof"`.
+
+      5. Approved: `"stop: done"`. Otherwise `"post-status"`.
+
+
+      So an approved, green PR whose proof is from an older commit gets `"refresh-proof"`.
+    hints:
+      - The gates come first, so a forbidden request is refused even on a perfect PR.
+      - Each rule is one `if` that returns. The order of the `if`s is the policy.
+      - '`NEVER.includes(pr.requested)` needs `pr.requested` to exist first, since it is optional.'
+
+  - type: explain-back
+    id: explain-why-rerun-checks
+    concept: agents.revalidation
+    difficulty: 4
+    audience: reviewer
+    kind: risk
+    prompt: >-
+      CI was green an hour ago. The watcher then pushed a one-line fix for a comment. A
+      reviewer asks why it re-ran everything. What could go wrong if it hadn't?
+    rubric:
+      - The green result and screenshots belong to the old commit, not the new head.
+      - A one-line change can break a test or a screen that the old proof never saw.
+      - You check by making the proof name the commit it ran on and comparing it with the head.
+    modelAnswer: >-
+      The green tick was for the commit before the fix. It says nothing about the code you're
+      approving now. A one-line change can still break a test or shift a screen, and the old
+      screenshot would hide it. So the watcher re-runs the checks on the new head and labels
+      the proof with that commit. You can check it: if the proof's commit isn't the PR's head,
+      it's stale.
+
+recap:
+  - Give a watching agent a schedule, a done state, a run budget and a hand-off when stuck.
+  - Gate it in three lists, alone, ask first and never, and it never merges or loosens a check.
+  - Every new commit makes the proof stale, so it re-runs the checks and refreshes the proof.
+
+recall:
+  - id: card-standing-goal-parts
+    concept: agents.standing-goals
+    front: What must a standing goal like "check this PR every hour" include?
+    back: >-
+      A done state, such as approved and green, a budget of runs, and a stop when stuck that
+      hands the PR to a person.
+  - id: card-watch-never-list
+    concept: agents.watch-gates
+    front: Name four things a PR-watching agent must never do.
+    back: >-
+      Merge, deploy, force-push someone else's branch, and loosen or disable a check. Resolving
+      its own review is on the list too.
+  - id: card-flaky-rerun
+    concept: agents.watch-gates
+    front: Why may a watcher re-run a flaky job once, but not until it passes?
+    back: >-
+      One retry absorbs real flakiness. Retrying until green turns an intermittent bug into a
+      green tick and ships it.
+  - id: card-stale-proof
+    concept: agents.revalidation
+    front: When does a watcher's proof go stale, and what does it do then?
+    back: >-
+      On any new commit, rebase or fix. It re-runs the checks on the new head and refreshes
+      the test output and screenshots before saying ready.
+
+references:
+  - kind: essay
+    title: Eradicating Non-Determinism in Tests
+    authors: Martin Fowler
+    year: 2011
+    venue: martinfowler.com
+    url: https://martinfowler.com/articles/nonDeterminism.html
+    note: Why non-deterministic tests are dangerous, and why to quarantine and fix them rather than re-run them.
+    primary: true
+    verified: true
+  - kind: essay
+    title: Flaky Tests at Google and How We Mitigate Them
+    authors: John Micco
+    year: 2016
+    venue: Google Testing Blog
+    url: https://testing.googleblog.com/2016/05/flaky-tests-at-google-and-how-we.html
+    note: How common flaky tests are at scale, and why re-runs need limits and tracking.
+    verified: true
+  - kind: essay
+    title: Building effective agents
+    authors: Erik Schluntz and Barry Zhang
+    year: 2024
+    venue: Anthropic Engineering
+    url: https://www.anthropic.com/engineering/building-effective-agents
+    note: Stopping conditions, ground truth from the environment, and checkpoints for people.
+    primary: true
+    verified: true
+  - kind: docs
+    title: About protected branches
+    venue: GitHub Docs
+    url: https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches
+    note: Required reviews, approval of the most recent push, stale approvals and push restrictions, so the platform enforces the never list too.
+    verified: true
+
+deepDive: >-
+  The `nextAction` policy ran in TypeScript on made-up snapshots. No agent or CI was called.
+
+
+  **Enforce the never list twice.** The harness refuses a forbidden action, and the platform
+  refuses it again. On GitHub, a token that can push can usually merge too, so the token
+  alone isn't enough. Give it no admin or deploy rights. Keep it off the list of who may
+  push to the main branch, and require a person to approve the most recent push. That's
+  least privilege from What an agent may touch. A fooled or confused agent still can't
+  merge, whatever its prompt says.
+
+
+  **What "same failure" means.** It's stall detection from Loops that run for hours, applied
+  to CI. Compare a fingerprint of the failure, not the job name:
+  the failing test and the first line of its error. Two runs that fail the same test the same
+  way mean the agent's fix didn't work. A third attempt rarely does better, so hand off.
+
+
+  **Approval on an old commit.** GitHub can dismiss stale approvals when a new push changes
+  the diff, and many teams turn that on.
+  If yours don't, the watcher should still say what changed since the approval, so the
+  reviewer can decide whether to look again.

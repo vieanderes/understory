@@ -1,6 +1,6 @@
 # Curriculum
 
-The course holds 417 lessons. Each lesson is marked **E** (beginner-essential) or
+The course holds 419 lessons. Each lesson is marked **E** (beginner-essential) or
 **A** (advanced). The count is 250 E and 167 A. A module names its lab where a moving
 simulation teaches what a playground cannot; the rest are hands-on through playgrounds, sql
 steps and challenges.
@@ -548,6 +548,7 @@ it was added later. It builds on `ai.agents`, `aisys.agent-harness`, `aisys.guar
 8. Designing the human's part `agents.human-in-the-loop`: approval checkpoints, risk-ranked queues, suggest, edit and accept with diffs and sources, interrupt and resume, clarifying questions, automation bias, reviewer workload, and corrections as ground truth. **A**
 9. Evaluating an agent `agents.evals-for-agents`: outcome against trajectory, pass@k against pass^k, tool-call accuracy, environment-based tasks, repeated trials and variance, and red teaming. **A**
 10. Watching agents in production `agents.watching-agents`: spans per step and tool, cost per run and tenant, version tags, replay, an error taxonomy of hallucination, tool misuse, loops, refusals and truncation, drift, and OTel GenAI attributes. **A**
+11. Letting an agent babysit a pull request `agents.babysitting-a-pr`: a standing goal on a schedule with a done state, a budget and a stop, what the watcher may do alone, must ask about and never does (merge, deploy, loosen a check), and proving the change again after every fix. **A**
 
 ## Module 22: System design (12)
 
@@ -709,7 +710,8 @@ builds on, and later lessons refer back to its five questions.
 8. Making the call `judgment.trade-offs`: build or buy, boring technology, one-way and two-way doors, and the rule of three. Woven after recording decisions. **A**
 9. From intent to a ranked list `judgment.intents-and-priorities`: jobs to be done, intent mapping, impact and effort, MoSCoW, RICE and non-goals. Woven after shaping the build. **A**
 10. Drawing the workflow `judgment.workflows-on-paper`: swimlanes for people, AI and system, then sequence and state diagrams in Mermaid, with failure paths. Woven after intents and priorities. **A**
-11. Reviewing a whole change `judgment.reviewing-a-change`: an end-to-end review of an AI-written pull request for security, efficiency, regressions and tests, and explaining the verdict. Woven after coding agents. **A**
+11. Reviewing a whole change `judgment.reviewing-a-change`: an end-to-end review of an AI-written pull request for security, efficiency, regressions and tests, explaining the verdict, and deep-reading the trunk while gating the leaves. Woven after coding agents. **A**
+12. Merge ready is not launch ready `judgment.ready-to-launch`: independent agents attack the whole product before launch (features, bugs, performance, security), and the launch goes out as an experiment with guardrails and a tested way back. Woven after babysitting a pull request. **A**
 
 ## Module 33: Explaining your work (8)
 

@@ -37,3 +37,9 @@ def _():
 def _():
     result = gate(CONTRACT, {"test": 2, "typecheck": 0}, ["src/billing/tax.py", "src/orders/search.py", "package.json"])
     assert result == ["failed: test", "not run: lint", "forbidden: src/billing/tax.py", "out of scope: package.json"]
+
+
+@test("a forbidden folder inside an allowed one is still forbidden")
+def _():
+    contract = {"required": [], "allowed": ["src/"], "forbidden": ["src/billing/"]}
+    assert gate(contract, {}, ["src/billing/tax.py", "src/orders/search.py"]) == ["forbidden: src/billing/tax.py"]

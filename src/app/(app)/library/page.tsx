@@ -1,7 +1,7 @@
 import type { Metadata } from 'next';
 import { LABS } from '@/features/labs/registry';
 import { LibraryIndex, SHELF_ICONS, type Shelf } from '@/features/library/LibraryIndex';
-import { getManifest, getOnlineTestIndex, getPaths } from '@/lib/content';
+import { getGlossary, getManifest, getOnlineTestIndex, getPaths } from '@/lib/content';
 import { listDates } from '@/lib/news';
 
 export const metadata: Metadata = {
@@ -10,11 +10,12 @@ export const metadata: Metadata = {
 };
 
 export default async function LibraryPage() {
-  const [manifest, paths, dates, tests] = await Promise.all([
+  const [manifest, paths, dates, tests, glossary] = await Promise.all([
     getManifest(),
     getPaths(),
     listDates(),
     getOnlineTestIndex(),
+    getGlossary(),
   ]);
   const lessons = manifest.modules.reduce((sum, m) => sum + m.lessons.length, 0);
   const shelves: Shelf[] = [
@@ -44,6 +45,13 @@ export default async function LibraryPage() {
       title: 'Labs',
       note: 'Mechanisms you step through',
       count: `${LABS.length} labs`,
+    },
+    {
+      href: '/vocabulary',
+      icon: SHELF_ICONS.vocabulary,
+      title: 'Vocabulary',
+      note: 'Every word the course teaches, and a deck to learn them by',
+      count: `${glossary.words.length} words`,
     },
     {
       href: '/progress',

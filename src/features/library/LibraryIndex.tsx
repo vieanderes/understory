@@ -4,6 +4,7 @@ import {
   FlaskConical,
   Gauge,
   GraduationCap,
+  Languages,
   Headphones,
   ChartColumn,
   NotebookPen,
@@ -58,6 +59,7 @@ export const SHELF_ICONS = {
   decisions: NotebookPen,
   level: Gauge,
   news: Newspaper,
+  vocabulary: Languages,
 } as const;
 
 const HOW = [

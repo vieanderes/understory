@@ -122,6 +122,14 @@ Only cite what you are sure exists, with correct authors, year and venue. Set
 `verified: false` on every reference: a person checks them before they ship. Do not invent
 URLs. If you are unsure of a URL, leave `url` out.
 
+## Vocabulary
+
+A lesson brings its words. When it teaches a term of the profession, that term belongs in the
+vocabulary (`docs/VOCABULARY.md`): add your lesson id to the `lessons` of each word it
+teaches, and write a word for any term no word covers yet. `pnpm glossary:gaps <lesson id>`
+lists the words your lesson says and the bold terms the vocabulary lacks. The validator fails
+a lesson that no word pins.
+
 ## Check your work
 
 ```sh
@@ -129,13 +137,14 @@ export PATH=$HOME/.nvm/versions/node/v24.21.0/bin:$PATH
 pnpm validate:content --strict --only=<your lesson dir>
 pnpm content:readability --only=<your lesson dir>
 pnpm exec tsc --noEmit -p tsconfig.content.json
+pnpm glossary:check
 ```
 
 All three must be clean for your lessons. `--only` filters the report to your files, because
 other authors are mid-edit elsewhere. The validator also runs every reference solution
 against its tests and requires every starter to fail. Do not run `--write-lock`, do not run
 git commands that change anything, do not change dependencies or any file outside your
-lesson directories.
+lesson directories and `content/glossary/`.
 
 ## Report
 

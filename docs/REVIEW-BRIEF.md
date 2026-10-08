@@ -52,6 +52,9 @@ For each reference, find it. Confirm title, authors, year, venue and URL exactly
 - Explain-backs: the `audience` and `kind` fit the prompt (a `decide` prompt names the
   choice to defend, a `risk` prompt asks what could go wrong), and the chapter does not ask
   the same thing of the same listener every time. `pnpm content:readability` reports it.
+- The lesson's words are in the vocabulary: every term it teaches is a word in
+  `content/glossary/` that pins the lesson, and each word's short meaning matches how the
+  lesson uses it. `pnpm glossary:gaps <lesson id>` shows what is missing.
 - The notes' "Before you ship" checks (`verify` in `notes.yaml`): each is true, specific to
   the lesson and filed under the right lens. A `leaks` check names what is exposed; a
   `tests` check names the test, not "add tests".

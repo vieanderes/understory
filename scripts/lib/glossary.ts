@@ -28,7 +28,7 @@ import { createRenderer, type Renderer } from './render';
 /** Prose a learner reads in a step: never code, ids or answers' internals. */
 const PROSE_KEYS = new Set(['body', 'question', 'prompt', 'text', 'feedback', 'explanation']);
 
-function proseIn(value: unknown, key = ''): string[] {
+export function proseIn(value: unknown, key = ''): string[] {
   if (typeof value === 'string') return PROSE_KEYS.has(key) ? [value] : [];
   if (Array.isArray(value)) return value.flatMap((item) => proseIn(item, key));
   if (value !== null && typeof value === 'object') {

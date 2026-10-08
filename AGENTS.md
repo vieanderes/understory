@@ -52,6 +52,9 @@ code, and heed deprecation notices.
     `pnpm test:e2e tests/e2e/<name>.spec.ts`. Only a release, or a change to the build, the
     content pipeline, the gates or the runners, needs the full `pnpm check` and `pnpm test:e2e`,
     which take about fifteen minutes and an hour. Run long commands in the background.
+13. A lesson brings its words. Every lesson is pinned by at least one vocabulary word, and a
+    term it teaches gets a word in `content/glossary/` (`docs/VOCABULARY.md`). The validator
+    enforces the pin; `pnpm glossary:gaps <lesson id>` lists candidates.
 
 ## Commits
 

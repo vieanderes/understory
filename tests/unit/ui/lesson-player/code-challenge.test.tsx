@@ -6,6 +6,9 @@ import type { RunProgress, RunRequest, RunResult } from '@/core/ports/code-runne
 import type { LazyCodeEditorProps } from '@/features/editor/LazyCodeEditor';
 import type { Submission } from '@/features/lesson-player/contract';
 import { CodeChallengeStep } from '@/features/lesson-player/steps/CodeChallengeStep';
+import { setTutorOpen, takeQueuedQuestion } from '@/features/tutor/tutor-store';
+
+vi.mock('next/navigation', () => ({ usePathname: () => '/learn/javascript/functions' }));
 
 // CodeMirror has its own tests (tests/unit/ui/editor) and an e2e suite. Here the editor
 // is a plain field, so the step's own logic is what is under test.
@@ -193,6 +196,37 @@ describe('CodeChallengeStep', () => {
       revealed: false,
     });
     expect(screen.getByRole('status')).toHaveTextContent('All tests pass');
+  });
+
+  it('offers Scout as the Tutor after a failing run, with the failing tests', async () => {
+    setup({ outcomes: [FAILED] });
+    await runTests();
+    await userEvent.click(screen.getByRole('button', { name: 'Ask Scout why' }));
+    const question = takeQueuedQuestion();
+    expect(question).toContain('Write add(a, b).');
+    expect(question).toContain('- adds: Expected 3, received 0');
+    act(() => setTutorOpen(false, { remember: false }));
+  });
+
+  it('offers Scout as the Editor after a passing run, and sends the earlier code on a revision', async () => {
+    setup({ outcomes: [PASSED] });
+    await runTests();
+    expect(screen.queryByRole('button', { name: 'Ask Scout why' })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Ask Scout to review' }));
+    const first = takeQueuedQuestion();
+    expect(first).toContain('Review my code');
+    expect(first).toContain('return 0;');
+    expect(first).not.toContain('earlier version');
+
+    const field = screen.getByRole('textbox');
+    await userEvent.clear(field);
+    await userEvent.type(field, 'export const add = (a: number, b: number) => a + b;');
+    await runTests();
+    await userEvent.click(screen.getByRole('button', { name: 'Ask Scout to review' }));
+    const second = takeQueuedQuestion();
+    expect(second).toContain('My earlier version');
+    expect(second).toContain('a + b');
+    act(() => setTutorOpen(false, { remember: false }));
   });
 
   it('uses one runner for every run of a mount and disposes it on unmount', async () => {

@@ -26,7 +26,7 @@ import {
   useChallengeLanguage,
 } from '../challenge-language';
 import type { StepProps } from '../contract';
-import { AskScoutWhy } from '../parts/AskScoutWhy';
+import { AskScoutReview, AskScoutWhy } from '../parts/AskScoutWhy';
 import { Feedback } from '../parts/Feedback';
 import { HintLadder, type SolutionState } from '../parts/HintLadder';
 import { RichText } from '../parts/RichText';
@@ -128,6 +128,8 @@ export function CodeChallengeStep({
 
   // What a run that finishes later must report: the help taken by then, not at its start.
   const help = useRef({ hintsUsed: 0, revealed: false });
+  // The code last sent to Scout for review, so a revision goes with the version before it.
+  const [reviewed, setReviewed] = useState<string | null>(null);
   const latest = useRef<PerLanguage<RunResult>>({});
   const runner = useRef<Promise<DisposableRunner> | null>(null);
   const mounted = useRef(false);
@@ -412,8 +414,19 @@ export function CodeChallengeStep({
           timeoutMs={timeoutMs}
         />
 
-        {result && result.status !== 'passed' && !running && !(checked && grade?.correct) ? (
-          <AskScoutWhy prompt={step.prompt.md} run={runSummary(result)} />
+        {result && !running ? (
+          result.status === 'passed' ? (
+            <AskScoutReview
+              sent={reviewed}
+              onSent={setReviewed}
+              task={step.prompt.md}
+              work={code}
+              language={language}
+              run={runSummary(result)}
+            />
+          ) : checked && grade?.correct ? null : (
+            <AskScoutWhy prompt={step.prompt.md} run={runSummary(result)} />
+          )
         ) : null}
 
         {checked && grade ? (

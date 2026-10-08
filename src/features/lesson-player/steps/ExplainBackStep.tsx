@@ -79,6 +79,7 @@ export function ExplainBackStep({
         rubric: step.rubric,
         modelAnswer: step.modelAnswer.md,
       }),
+      'work',
     );
   }
 

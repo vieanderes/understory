@@ -119,15 +119,31 @@ to learn or which path to take, and it offers to plan one with you: a button tak
 planner. In the coding simulator the same assistant plays the one employers switch on,
 and every prompt goes into your report.
 
+### Five roles, one Scout
+
+Scout does the jobs a good mentor does, and picks the one that fits from where you asked.
+There is no switch to find.
+
+| Role          | What it does for you                                                                                                                                           |
+| ------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Advisor**   | Plans a path with you: where you want to end up, where you start, the order, what to leave out for now and why, and a milestone you make at each stage.        |
+| **Tutor**     | Finds the one wrong idea before it explains, fixes only that, then checks with a question you answer in a tap. "Ask Scout why" sits under a wrong answer.      |
+| **Editor**    | "Ask Scout to review" after a passing run: at most three notes on your own lines, each to keep, fix or add, and one next step. It never rewrites your work.    |
+| **Librarian** | Recommends only references the course carries, best first, and says which are not yet checked. Bring it a link and it tells you whether it fits your path now. |
+| **Roommate**  | Ask why something matters, and it looks at the lesson from another field, asks the naive question first and says where its analogy breaks.                     |
+
+Scout never grades. Nothing it says moves your XP, mastery or reviews. The design is in
+[`SCOUT-ROLES.md`](docs/SCOUT-ROLES.md).
+
 ### Plan a path with Scout
 
 Not sure which path fits, or none fits quite? Build your own, by hand or with Scout: in the
 builder ("Build your own path" on Learn), press **Plan with Scout** and talk it through, with
-Scout beside the builder. Scout starts with what brings you here,
-whatever it is: interviews coming up, a new career, your current work, a project of your own,
-school, a coding test, or plain curiosity. Then it asks only what changes the plan: what you
-already know, how much time you have and by when, which kinds of interviews or what you want
-to build. Each question comes with answers to tap, and you can always type your own.
+Scout beside the builder. Scout starts with where you want to end up:
+what you will be able to do or make, whether for interviews, a new career, your current work,
+a project of your own, school, a coding test, or plain curiosity. Then it asks only what
+changes the plan: what you already know that your placement does not show, how much time you
+have and by when, which kinds of interviews or what you want to build. Each question comes with answers to tap, and you can always type your own.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/scout-planner-dark.png">
@@ -136,7 +152,10 @@ to build. Each question comes with answers to tap, and you can always type your 
 
 After a few questions Scout drafts the path: whole chapters where a chapter fits, single
 lessons where only part of one does, in stages with a reason each, sized to your weeks, and
-with a name of its own and two others to pick from. Open the draft to rename it, take out a
+with a name of its own and two others to pick from. Each stage ends in a milestone, something
+you make that shows you have it, and a folded list says what Scout left out for now and why,
+so a tempting detour has an answer. Mark a milestone met on the path page when you have made
+it. Open the draft to rename it, take out a
 lesson or a stage, or add the lessons it builds on that you have not done yet. The builder
 ticks what Scout drafts, and your ticks go back to Scout, so you can switch between ticking by
 hand and asking at any point. Ask for changes ("shorter", "more practice", "add system
@@ -235,7 +254,9 @@ one step away.
 On a wide screen the rail beside them shows your paths with their progress, how many
 practice questions are due, and this week's XP against your goal. **Progress** has the
 figures and the concept map, scoped to one path, part or the whole course. The **Library**
-holds every path, chapter, lecture, lab and test to browse. **Settings** holds your answers,
+holds every path, chapter, lecture, lab and test to browse. **Vocabulary** holds 743 words
+in 17 areas, each with a plain explanation, the word it is always confused with and the
+lessons that teach it, and a deck that drills them on the same schedule as your reviews. **Settings** holds your answers,
 your weekly goal, export and import, and the offline download.
 
 <picture>
@@ -1295,6 +1316,8 @@ docs/                          the documents below
 | [`CONTENT-GUIDE.md`](docs/CONTENT-GUIDE.md)       | How to write a lesson                                       |
 | [`WRITING-GUIDE.md`](docs/WRITING-GUIDE.md)       | How lesson text should read                                 |
 | [`DESIGN.md`](docs/DESIGN.md)                     | Tokens, type, motion and the page review checklist          |
+| [`SCOUT-ROLES.md`](docs/SCOUT-ROLES.md)           | Scout's five roles and how it picks one                     |
+| [`VOCABULARY.md`](docs/VOCABULARY.md)             | The vocabulary: what a learner gets, how to write a word    |
 | [`MOBILE-EDITING.md`](docs/MOBILE-EDITING.md)     | Writing code on a phone                                     |
 | [`SANDBOX.md`](docs/SANDBOX.md)                   | How learner code runs safely in the browser                 |
 | [`ONLINE-TEST.md`](docs/ONLINE-TEST.md)           | The online-test simulator: how it matches, how to add tasks |

@@ -11,8 +11,9 @@ import {
   validateTestsOnPaths,
   type OnlineTestIds,
 } from '../../src/core/content/notes-check';
+import { checkGlossary } from '../../src/core/content/glossary-schema';
 import { validateCatalog, validateOutline } from '../../src/core/content/validate';
-import { contentRoot, loadRawCatalog, loadTracks } from '../../src/lib/content/fs';
+import { contentRoot, loadGlossary, loadRawCatalog, loadTracks } from '../../src/lib/content/fs';
 import { loadOutline, readInterestLessonIds } from '../../src/lib/content/outline';
 import { checkPlacementContent, PLACEMENT_PATH } from './placement';
 import { jsdomPlaygroundGate, type PlaygroundGate } from './playground-gate';
@@ -175,6 +176,15 @@ export async function checkContent(
   // A content tree without placement (a test fixture) has nothing to check.
   const hasPlacement = fs.existsSync(path.join(root ?? contentRoot(), PLACEMENT_PATH));
   const placementIssues = hasPlacement && !unreadable ? checkPlacementContent(catalog, root) : [];
+  const glossary = loadGlossary(root);
+  const lessonIds = new Set(allLessons(catalog).map(({ lesson }) => lesson.data.id));
+  const glossaryIssues = [
+    ...glossary.issues,
+    // An unreadable lesson would make every word that pins it look wrong.
+    ...checkGlossary(glossary.entries, { lessonIds }).filter(
+      (issue) => !(unreadable && issue.rule === 'glossary-lesson-unknown'),
+    ),
+  ];
   return {
     catalog,
     issues: [
@@ -182,10 +192,11 @@ export async function checkContent(
       ...outline.issues,
       ...ruleIssues,
       ...placementIssues,
+      ...glossaryIssues,
       ...(await runGate(catalog, gate)),
       ...(await runPlaygroundGate(catalog, playgroundGate)),
       ...(await sqlGate(sqlSteps(catalog))),
     ],
-    checked: checked + outline.checked,
+    checked: checked + outline.checked + glossary.checked,
   };
 }

@@ -28,6 +28,11 @@ import type {
   ManifestLesson,
   ManifestModule,
 } from '@/core/content/compiled';
+import {
+  compiledGlossarySchema,
+  GLOSSARY_BUNDLE_FILE,
+  type CompiledGlossary,
+} from '@/core/content/glossary-schema';
 import type { CompiledPlacementFile } from '@/core/content/placement-schema';
 import type { Concept } from '@/core/content/schema';
 import { ContentError, contentRoot } from './fs';
@@ -64,6 +69,7 @@ interface Cache {
   stamp: string;
   manifest: Manifest;
   lessons: Map<string, CompiledLesson>;
+  glossary?: CompiledGlossary;
 }
 
 let cache: Cache | undefined;
@@ -118,6 +124,13 @@ function load(entry: ManifestLesson | undefined): CompiledLesson | undefined {
 export async function getPlacement(): Promise<CompiledPlacementFile> {
   const { dir } = current();
   return readJson(dir, 'placement.json', compiledPlacementSchema) as CompiledPlacementFile;
+}
+
+/** The vocabulary, every word in full (`glossary.json`). Read once per content build. */
+export async function getGlossary(): Promise<CompiledGlossary> {
+  const store = current();
+  store.glossary ??= readJson(store.dir, GLOSSARY_BUNDLE_FILE, compiledGlossarySchema);
+  return store.glossary;
 }
 
 export async function getManifest(): Promise<Manifest> {

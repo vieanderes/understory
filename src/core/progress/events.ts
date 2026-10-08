@@ -3,6 +3,7 @@ import { idSchema, localIdSchema } from '@/core/content/ids';
 import { cardStateSchema, ratingSchema } from '@/core/scheduling/card-state';
 import { PLAN_GOALS } from '@/core/plan/plan';
 import { INTERESTS } from '@/core/profile/interests';
+import { termIdSchema } from '@/core/vocabulary/ids';
 import type { Clock } from '@/core/ports/clock';
 import type { IdGen } from '@/core/ports/id-gen';
 
@@ -354,6 +355,40 @@ export const readingCollectedPayloadSchema = z.strictObject({
   referenceKey: z.string().min(1),
 });
 
+/*
+ * The vocabulary (src/core/vocabulary). The deck is a set of choices, so adding and
+ * removing words are facts; a removed word keeps its card, so adding it back resumes its
+ * schedule. Each word has one FSRS card whichever drill reviewed it.
+ */
+const termIdsSchema = z.array(termIdSchema).min(1).max(2000);
+
+export const wordsAddedPayloadSchema = z.strictObject({ termIds: termIdsSchema });
+export const wordsRemovedPayloadSchema = z.strictObject({ termIds: termIdsSchema });
+
+export const wordDrillSchema = z.enum(['meaning', 'recall', 'gap', 'snippet']);
+export type WordDrill = z.infer<typeof wordDrillSchema>;
+
+export const wordReviewedPayloadSchema = z.strictObject({
+  termId: termIdSchema,
+  drill: wordDrillSchema,
+  correct: z.boolean(),
+  rating: ratingSchema,
+  retrievabilityBefore: z.number().min(0).max(1).optional(),
+  state: cardStateSchema,
+  durationMs: z.int().min(0).optional(),
+});
+
+/** A speed round: a game against the clock that never touches the schedule. */
+export const wordRoundFinishedPayloadSchema = z
+  .strictObject({
+    right: z.int().min(0),
+    total: z.int().min(1),
+    seconds: z.int().min(1).max(600),
+    /** "deck", "all" or an area id. */
+    scope: z.string().min(1).max(40),
+  })
+  .refine((p) => p.right <= p.total, 'right cannot exceed total.');
+
 // ---------------------------------------------------------------------------
 // Envelope
 // ---------------------------------------------------------------------------
@@ -404,6 +439,10 @@ export const LATEST_VERSION = {
   profile_set: 1,
   news_read: 1,
   custom_path_set: 2,
+  words_added: 1,
+  words_removed: 1,
+  word_reviewed: 1,
+  word_round_finished: 1,
 } as const;
 
 export type EventType = keyof typeof LATEST_VERSION;
@@ -534,6 +573,27 @@ export const customPathSetEventSchema = envelope(
   customPathSetPayloadSchema,
 );
 
+export const wordsAddedEventSchema = envelope(
+  'words_added',
+  LATEST_VERSION.words_added,
+  wordsAddedPayloadSchema,
+);
+export const wordsRemovedEventSchema = envelope(
+  'words_removed',
+  LATEST_VERSION.words_removed,
+  wordsRemovedPayloadSchema,
+);
+export const wordReviewedEventSchema = envelope(
+  'word_reviewed',
+  LATEST_VERSION.word_reviewed,
+  wordReviewedPayloadSchema,
+);
+export const wordRoundFinishedEventSchema = envelope(
+  'word_round_finished',
+  LATEST_VERSION.word_round_finished,
+  wordRoundFinishedPayloadSchema,
+);
+
 export const storyEventSchema = z.discriminatedUnion('type', [
   placementAnsweredEventSchema,
   placementCompletedEventSchema,
@@ -559,6 +619,10 @@ export const storyEventSchema = z.discriminatedUnion('type', [
   profileSetEventSchema,
   newsReadEventSchema,
   customPathSetEventSchema,
+  wordsAddedEventSchema,
+  wordsRemovedEventSchema,
+  wordReviewedEventSchema,
+  wordRoundFinishedEventSchema,
 ]);
 
 export type StoryEvent = z.infer<typeof storyEventSchema>;

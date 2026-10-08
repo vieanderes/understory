@@ -206,6 +206,28 @@ describe('makeEvent', () => {
         ],
         assistantPrompts: 0,
       },
+      words_added: { termIds: ['closure', 'n-plus-one'] },
+      words_removed: { termIds: ['closure'] },
+      word_reviewed: {
+        termId: 'closure',
+        drill: 'gap',
+        correct: true,
+        rating: 3,
+        retrievabilityBefore: 0.82,
+        state: {
+          due: '2026-10-04T09:00:00.000Z',
+          stability: 3.1,
+          difficulty: 5,
+          reps: 1,
+          lapses: 0,
+          state: 'review',
+          scheduledDays: 3,
+          elapsedDays: 0,
+          lastReview: '2026-10-01T09:00:00.000Z',
+        },
+        durationMs: 4200,
+      },
+      word_round_finished: { right: 18, total: 21, seconds: 60, scope: 'deck' },
     };
 
     for (const type of Object.keys(LATEST_VERSION) as (keyof typeof LATEST_VERSION)[]) {

@@ -22,8 +22,9 @@ import type { UnknownEvent } from './upcast';
 
 /** 2: `capstoneAdrs` joined the state. 3: `pathExams`. 4: `onlineTests`. 5: `plan`.
  * 6: `profile`, `newsRead`, `customPath`, and XP for timed tests. 7: `lessonCompletedOn`.
- * 8: `customPath` became `ownPaths`, several named paths. 9: `placementByArea`. */
-export const REDUCER_VERSION = 9;
+ * 8: `customPath` became `ownPaths`, several named paths. 9: `placementByArea`.
+ * 10: `vocabulary`. */
+export const REDUCER_VERSION = 10;
 
 /** A day's worth of XP by 24-hour cooldown key, so "no grinding" can be checked. One
  * day of slack either side of midnight is not modelled; a plain 24h window from the
@@ -78,6 +79,22 @@ export type OnlineTestAttempt = PayloadOf<'online_test_submitted'> & { readonly 
 /** The current decision record of one part's capstone. */
 /** An own path as Learn shows it: the latest `custom_path_set` for its id. */
 export type OwnPath = Omit<PayloadOf<'custom_path_set'>, 'pathId'> & { readonly id: string };
+
+/** One speed round of the vocabulary, with the learner's date. */
+export type WordRound = PayloadOf<'word_round_finished'> & { readonly localDate: string };
+
+/** The learner's words: the deck, a card per reviewed word, and the speed rounds. */
+export interface VocabularyState {
+  /** Word id to the learner's date it joined the deck, in the order words joined. */
+  readonly deck: ReadonlyMap<string, string>;
+  /** Kept when a word leaves the deck, so adding it back resumes its schedule. */
+  readonly cards: Readonly<Record<string, CardState>>;
+  readonly reviews: number;
+  readonly correct: number;
+  /** Reviews per learner's date, for "today" and the run of days. */
+  readonly reviewedOn: Readonly<Record<string, number>>;
+  readonly rounds: readonly WordRound[];
+}
 
 export interface CapstoneAdr {
   readonly partId: string;
@@ -138,6 +155,7 @@ export interface ProgressState {
   >;
   readonly collectedReadings: ReadonlySet<string>;
   readonly aiReviewsPassed: number;
+  readonly vocabulary: VocabularyState;
   /** Internal bookkeeping for the "same item within 24h" XP rule. Not part of the
    * public read model's meaning, but part of the state so folding stays pure. */
   readonly lastGradedAt: Readonly<Record<string, string>>;
@@ -172,6 +190,14 @@ export function initialProgressState(): ProgressState {
     placementByArea: {},
     collectedReadings: new Set(),
     aiReviewsPassed: 0,
+    vocabulary: {
+      deck: new Map(),
+      cards: {},
+      reviews: 0,
+      correct: 0,
+      reviewedOn: {},
+      rounds: [],
+    },
     lastGradedAt: {},
   };
 }
@@ -548,6 +574,59 @@ export function applyEvent(state: ProgressState, event: StoryEvent | UnknownEven
       return {
         ...state,
         collectedReadings: new Set(state.collectedReadings).add(event.payload.referenceKey),
+      };
+
+    case 'words_added': {
+      const deck = new Map(state.vocabulary.deck);
+      for (const id of event.payload.termIds) if (!deck.has(id)) deck.set(id, event.localDate);
+      return { ...state, vocabulary: { ...state.vocabulary, deck } };
+    }
+
+    case 'words_removed': {
+      const deck = new Map(state.vocabulary.deck);
+      for (const id of event.payload.termIds) deck.delete(id);
+      return { ...state, vocabulary: { ...state.vocabulary, deck } };
+    }
+
+    case 'word_reviewed': {
+      const { termId, rating, correct, retrievabilityBefore, state: card } = event.payload;
+      const { vocabulary } = state;
+      const prior = vocabulary.cards[termId];
+      const itemKey = `word#${termId}`;
+      // A word is recall, like a fact card: the same base, spacing bonus and cram rule.
+      const xp = xpFor({
+        kind: 'recall',
+        score: scoreFromRating(rating),
+        retrievabilityBefore,
+        wasScheduled: prior === undefined || new Date(prior.due).getTime() <= at.getTime(),
+        challengeFirstWrongAttempt: false,
+        withinCooldown: withinCooldown(state, itemKey, event.at),
+      });
+      return {
+        ...state,
+        vocabulary: {
+          ...vocabulary,
+          cards: { ...vocabulary.cards, [termId]: card },
+          reviews: vocabulary.reviews + 1,
+          correct: vocabulary.correct + (correct ? 1 : 0),
+          reviewedOn: {
+            ...vocabulary.reviewedOn,
+            [event.localDate]: (vocabulary.reviewedOn[event.localDate] ?? 0) + 1,
+          },
+        },
+        xpByLocalDate: addXp(state, event.localDate, xp),
+        lastGradedAt: { ...state.lastGradedAt, [itemKey]: event.at },
+      };
+    }
+
+    case 'word_round_finished':
+      // No XP: a round is a game that can be replayed at once, and XP is not for grinding.
+      return {
+        ...state,
+        vocabulary: {
+          ...state.vocabulary,
+          rounds: [...state.vocabulary.rounds, { ...event.payload, localDate: event.localDate }],
+        },
       };
 
     case 'ai_hours_reported':

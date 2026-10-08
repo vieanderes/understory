@@ -17,4 +17,6 @@ export {
   type ConceptRecord,
   type ProgressState,
   type TestOutAttempt,
+  type VocabularyState,
+  type WordRound,
 } from './reducer';

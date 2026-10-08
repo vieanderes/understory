@@ -90,6 +90,14 @@ function questionText(question: BridgeQuestion, context: AssistantContext): stri
 }
 
 /** The app guide for the study modes, so an app connection can give directions as well. */
+function library(context: AssistantContext): string[] {
+  if (!context.library) return [];
+  return [
+    '',
+    `The course’s references (recommend only these):\n${untrusted('library', context.library)}`,
+  ];
+}
+
 function appGuide(context: AssistantContext): string[] {
   if (!context.app) return [];
   return ['', NAVIGATION_RULES, PLAN_OFFER, '', `The app:\n${untrusted('app-guide', context.app)}`];
@@ -121,6 +129,7 @@ export function pageText(context: AssistantContext): string {
         ...(context.app
           ? ['', 'If the learner asks about the app rather than the lesson, answer as its guide.']
           : []),
+        ...library(context),
         ...appGuide(context),
       ].join('\n')
     : context.mode === 'guide'
@@ -130,6 +139,7 @@ export function pageText(context: AssistantContext): string {
           ...[roleRules(entryOf(context))].filter(Boolean),
           '',
           `The page offers:\n${untrusted('page', `Page: ${context.taskTitle}\n\n${context.statement || '(nothing specific)'}`)}`,
+          ...library(context),
           ...appGuide(context),
         ].join('\n')
       : untrusted(

@@ -49,7 +49,7 @@ export function ownPathEntries(
  * most done that is not finished. The plan's own choice needs the plan catalogue, which
  * Scout does not load; the chosen path covers anyone who has opened Learn.
  */
-function pathUnderWay(
+export function pathUnderWay(
   state: SituationState,
   paths: readonly PathIndexEntry[],
   catalog: CatalogFile | null,

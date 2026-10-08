@@ -469,6 +469,21 @@ describe('MCP server hardening', () => {
     expect(text).toMatch(/diagnose before you explain/i);
   });
 
+  it('fences the course’s references in get_task, in a lesson and on a page', () => {
+    for (const mode of ['tutor', 'guide'] as const) {
+      const text = pageText({
+        taskTitle: 'Closures',
+        statement: '',
+        language: '',
+        code: '',
+        output: '',
+        mode,
+        library: '[web.http#r2] rfc · RFC 9110',
+      });
+      expect(text).toContain('<untrusted source="library">\n[web.http#r2] rfc · RFC 9110');
+    }
+  });
+
   it('refuses a browser request from another site', async () => {
     const response = await mcpPost(
       new Request(`${ORIGIN}/api/mcp`, {

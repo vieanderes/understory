@@ -1,6 +1,6 @@
 'use client';
 
-import { ArrowRight, Check, ChevronDown, ListChecks, Timer } from 'lucide-react';
+import { ArrowRight, Check, ChevronDown, Languages, ListChecks, Timer } from 'lucide-react';
 import Link from 'next/link';
 import { useMemo, useState } from 'react';
 import { buttonClass } from '@/components/ui/Button';
@@ -14,6 +14,7 @@ import {
 } from '@/core/practice';
 import { INTERESTS, type Interest } from '@/core/profile/interests';
 import { topicCounts, type TopicCount } from '@/core/practice/topic-counts';
+import { dueWords } from '@/core/vocabulary/deck';
 import { useCatalog } from '@/features/catalog/useCatalog';
 import { useProgress } from '@/features/store/StoreProvider';
 import { rowAction, rowArrow, rowItem, rowList } from '@/components/ui/rows';
@@ -85,6 +86,7 @@ const metaOf = ({ due, fresh }: TopicCount) =>
  */
 export function PracticeHome({ parts }: { parts: PracticePart[] }) {
   const { status, state } = useProgress();
+  const wordsDue = dueWords(state.vocabulary, new Date()).length;
   const { catalog } = useCatalog();
   const [picked, setPicked] = useState<readonly Interest[] | null>(null);
   const [length, setLength] = useState<Length>('10');
@@ -228,6 +230,30 @@ export function PracticeHome({ parts }: { parts: PracticePart[] }) {
           ))}
           </ul>
         </div>
+      </section>
+
+      <section aria-labelledby="words-title" className="flex flex-col gap-2">
+        <div className="flex flex-col gap-0.5">
+          <h2 id="words-title" className="t-section">
+            Words
+          </h2>
+          <p className="text-muted">The language of software, a few words at a time.</p>
+        </div>
+        <ul className={rowList('items-start')}>
+          <li className={rowItem}>
+            <Link href="/vocabulary" className={rowAction()}>
+              <Languages aria-hidden size={20} strokeWidth={2} className="text-muted shrink-0" />
+              <span className="flex min-w-0 flex-1 flex-col">
+                <span className="font-medium">Vocabulary</span>
+                <span className="text-muted text-sm">Look a word up, or review your deck</span>
+              </span>
+              {status === 'ready' && wordsDue > 0 ? (
+                <span className="t-figure text-muted shrink-0 text-sm">{wordsDue} due</span>
+              ) : null}
+              <ArrowRight aria-hidden size={16} strokeWidth={2} className={rowArrow} />
+            </Link>
+          </li>
+        </ul>
       </section>
 
       <section aria-labelledby="tests-title" className="flex flex-col gap-2">

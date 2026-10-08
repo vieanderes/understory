@@ -1,6 +1,12 @@
 import type { MetadataRoute } from 'next';
 import { LABS } from '@/features/labs/registry';
-import { getAllLessonRoutes, getLectureIndex, getPaths, getTrackIds } from '@/lib/content';
+import {
+  getAllLessonRoutes,
+  getGlossary,
+  getLectureIndex,
+  getPaths,
+  getTrackIds,
+} from '@/lib/content';
 import { SITE_URL } from '@/lib/site';
 
 /**
@@ -9,11 +15,12 @@ import { SITE_URL } from '@/lib/site';
  * the learner's own data.
  */
 export default async function sitemap(): Promise<MetadataRoute.Sitemap> {
-  const [lessons, lectures, paths, tracks] = await Promise.all([
+  const [lessons, lectures, paths, tracks, glossary] = await Promise.all([
     getAllLessonRoutes(),
     getLectureIndex(),
     getPaths(),
     getTrackIds(),
+    getGlossary(),
   ]);
   const chapters = [...lectures.parts.flatMap((part) => part.chapters), ...lectures.woven];
 
@@ -31,6 +38,8 @@ export default async function sitemap(): Promise<MetadataRoute.Sitemap> {
     entry('/practise/online-test', 0.8),
     entry('/labs', 0.7),
     entry('/library', 0.6),
+    entry('/vocabulary', 0.7),
+    ...glossary.words.map((w) => entry(`/vocabulary/${w.id}`, 0.5)),
     entry('/signal', 0.5),
     entry('/lectures/fast-track', 0.6),
     ...paths.map((p) => entry(`/paths/${p.id}`, 0.8)),

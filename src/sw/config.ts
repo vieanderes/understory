@@ -55,6 +55,8 @@ export const SHELL_ROUTES: readonly string[] = [
   '/signal',
   '/settings',
   '/decisions',
+  '/vocabulary',
+  '/vocabulary/review',
   '/practise/session/5',
   '/practise/session/10',
   '/practise/session/20',
@@ -75,6 +77,7 @@ export const PRECACHE_FILES: readonly string[] = [
 export const CONTENT_INDEX_FILES: readonly string[] = [
   '/content/v1/manifest.json',
   '/content/v1/catalog.json',
+  '/content/v1/words.json',
 ];
 
 /** How long network-first waits before it answers from the cache. A tunnel often stalls instead of failing. */

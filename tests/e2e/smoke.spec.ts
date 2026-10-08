@@ -15,6 +15,8 @@ const ROUTES: { path: string; heading: RegExp }[] = [
   { path: '/decisions', heading: /decisions?\. One per capstone\./ },
   { path: '/start', heading: /Find your level/ },
   { path: '/labs', heading: /Mechanisms you can step through/ },
+  { path: '/vocabulary', heading: /The language of software/ },
+  { path: '/vocabulary/closure', heading: /^closure$/ },
   { path: '/signal', heading: /\w+ \d+ \w+/ },
   { path: '/signal/week/2026-W38', heading: /Sep/ },
   { path: '/signal/month/2026-09', heading: /September 2026/ },

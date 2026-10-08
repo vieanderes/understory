@@ -13,6 +13,8 @@
  * and the transcript in the report do not care which one answered.
  */
 
+import { entryOf, roleRules, type ScoutEntry } from '../scout';
+
 export type AssistantProviderId = 'api-key' | 'claude-cli' | 'mcp';
 
 export interface AssistantTurn {
@@ -39,6 +41,11 @@ export interface AssistantContext {
    * carry the blocks in PLANNER_RULES, and the course comes from the server, never the tab.
    */
   mode?: 'test' | 'tutor' | 'guide' | 'planner';
+  /**
+   * Where the question came from, when a button asked it: the learner's own work, or help
+   * after a wrong answer. It picks Scout's roles (core/scout); without it the mode does.
+   */
+  entry?: ScoutEntry;
   /**
    * The app guide, in `tutor` and `guide` modes: the places, the library, the routes and
    * the learner's situation, built in the tab from the navigation itself. Scout answers
@@ -74,6 +81,8 @@ export const PLAN_OFFER = [
   '```',
   'Use it at most once per reply, and only for planning, never for a single lesson or page.',
 ].join('\n');
+
+const optional = (text: string): string[] => (text ? [text] : []);
 
 function appSection(context: AssistantContext): string[] {
   return context.app ? ['', 'About Understory:', context.app] : [];
@@ -144,10 +153,8 @@ export function assistantSystemPrompt(context: AssistantContext, course?: string
 function tutorSystemPrompt(context: AssistantContext): string {
   return [
     'You are the study assistant in Understory, a course that teaches software engineering from a first line of code to production systems.',
-    'The learner is studying the lesson below and asks you for help. Explain clearly and concretely for someone who may be new to the idea.',
-    'Start with the one-sentence answer, then one small example, then stop. Offer to go deeper rather than writing an essay.',
-    'Use Markdown. Put code in fenced blocks with the language named (```ts, ```python). Keep examples short and runnable.',
-    'If the learner is working on an exercise, help them think it through first: a hint, then a nudge, and the full answer when they ask for it.',
+    'The learner is studying the lesson below and asks you for help.',
+    roleRules(entryOf(context)),
     'Use British English.',
     ...(context.app
       ? [
@@ -178,6 +185,7 @@ function guideSystemPrompt(context: AssistantContext): string {
     'Ask one short question when the right choice depends on them: what they already know, their goal, their time.',
     'Answer in two or three sentences, then name one concrete next step. Offer more rather than writing an essay.',
     'Use Markdown sparingly. Use British English.',
+    ...optional(roleRules(entryOf(context))),
     NAVIGATION_RULES,
     PLAN_OFFER,
     '',

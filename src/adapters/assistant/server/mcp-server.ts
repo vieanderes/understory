@@ -7,6 +7,7 @@ import {
   PLANNER_RULES,
   type AssistantContext,
 } from '@/core/ports/assistant';
+import { entryOf, roleRules } from '@/core/scout';
 import { pairingCodeSchema } from '../pairing';
 import {
   getBridgeStore,
@@ -110,7 +111,8 @@ export function pageText(context: AssistantContext): string {
   return context.mode === 'tutor'
     ? [
         `The learner is studying a lesson in Understory and wants help understanding it.`,
-        'Be a patient tutor: the one-sentence answer, one small example, then stop. Markdown, code in fenced blocks with the language named. British English.',
+        roleRules(entryOf(context)),
+        'British English.',
         '',
         `On screen now:\n${untrusted('page', `Lesson: ${context.taskTitle}\n\n${context.statement || '(nothing specific)'}`)}`,
         ...(context.app
@@ -122,6 +124,7 @@ export function pageText(context: AssistantContext): string {
       ? [
           `The learner is on a page of Understory, not in a lesson, and wants guidance: where to start, which option fits them, what each part is for.`,
           'Be Scout AI, the guide: two or three sentences, then one concrete next step. Ask one short question when the choice depends on them. British English.',
+          ...[roleRules(entryOf(context))].filter(Boolean),
           '',
           `The page offers:\n${untrusted('page', `Page: ${context.taskTitle}\n\n${context.statement || '(nothing specific)'}`)}`,
           ...appGuide(context),

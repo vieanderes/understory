@@ -1,5 +1,6 @@
 import * as z from '@/core/zod';
 import type { AssistantErrorCode } from '@/core/ports/assistant';
+import { SCOUT_ENTRIES } from '@/core/scout';
 
 /*
  * The wire format shared by the assistant routes and the browser adapters.
@@ -34,6 +35,7 @@ export const contextSchema = z.object({
   code: z.string().max(MAX_TEXT),
   output: z.string().max(MAX_TEXT),
   mode: z.enum(['test', 'tutor', 'guide', 'planner']).optional(),
+  entry: z.enum(SCOUT_ENTRIES).optional(),
   // A few hundred tokens in practice; the ceiling only stops a tab padding the prompt.
   app: z.string().max(8_000).optional(),
   // A draft of up to 200 lessons and the progress per chapter: a few thousand characters.
